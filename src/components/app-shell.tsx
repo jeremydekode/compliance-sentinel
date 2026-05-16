@@ -1,6 +1,8 @@
 import { Link, useLocation } from "@tanstack/react-router";
-import { LayoutDashboard, FolderOpen, ShieldCheck, FileSearch, Settings, Zap } from "lucide-react";
+import { LayoutDashboard, FolderOpen, ShieldCheck, FileSearch, Settings, Zap, Scale, UserRound, ChevronDown } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useRole, ROLE_META, type UserRole } from "@/lib/role";
+import { useState, useRef, useEffect } from "react";
 
 const NAV = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard },
@@ -83,13 +85,95 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             <ShieldCheck className="size-4 text-primary/60" />
             <span className="text-foreground font-semibold">{currentNav?.label ?? "Compliance Sentinel"}</span>
           </div>
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-muted-foreground/60 font-medium">Powered by Gemini 3.1</span>
+          <div className="flex items-center gap-3">
+            <span className="text-xs text-muted-foreground/60 font-medium hidden lg:inline">Powered by Gemini 3.1</span>
+            <RoleSwitcher />
           </div>
         </header>
 
         <div className="flex-1 min-w-0">{children}</div>
       </main>
+    </div>
+  );
+}
+
+function RoleSwitcher() {
+  const [role, setRoleHook] = useRole();
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    function onClick(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onClick);
+    return () => document.removeEventListener("mousedown", onClick);
+  }, []);
+
+  const Icon = role === "legal" ? Scale : UserRound;
+  const meta = ROLE_META[role];
+
+  const options: { value: UserRole; label: string; description: string }[] = [
+    { value: "compliance", label: "Compliance Officer", description: "Triage every change, propose amendments, route for legal." },
+    { value: "legal",      label: "Head of Legal",      description: "Review batch summary, sign off, return for revision." },
+  ];
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        onClick={() => setOpen(o => !o)}
+        className={cn(
+          "flex items-center gap-2 px-3 py-1.5 rounded-lg border bg-card text-xs font-medium transition-colors",
+          "hover:border-primary/40 hover:bg-muted/40"
+        )}
+      >
+        <span className={cn("size-6 rounded-full grid place-items-center",
+          role === "legal" ? "bg-violet-100 text-violet-700" : "bg-blue-100 text-blue-700"
+        )}>
+          <Icon className="size-3" />
+        </span>
+        <div className="text-left leading-tight">
+          <div className="text-[9px] uppercase tracking-widest text-muted-foreground font-bold">Viewing as</div>
+          <div className={cn("font-semibold", meta.color)}>{meta.label}</div>
+        </div>
+        <ChevronDown className={cn("size-3 text-muted-foreground transition-transform", open && "rotate-180")} />
+      </button>
+
+      {open && (
+        <div className="absolute right-0 mt-2 w-72 rounded-xl border bg-card shadow-lg overflow-hidden z-30">
+          <div className="px-3 py-2 border-b bg-muted/30">
+            <div className="text-[9px] uppercase tracking-widest font-black text-muted-foreground">Switch role</div>
+            <div className="text-[10px] text-muted-foreground mt-0.5">Demo only — affects the report review interface.</div>
+          </div>
+          {options.map(opt => {
+            const active = opt.value === role;
+            const OptIcon = opt.value === "legal" ? Scale : UserRound;
+            return (
+              <button
+                key={opt.value}
+                onClick={() => { setRoleHook(opt.value); setOpen(false); }}
+                className={cn(
+                  "w-full text-left px-3 py-2.5 flex items-start gap-2.5 transition-colors border-b last:border-b-0",
+                  active ? "bg-primary/5" : "hover:bg-muted/40"
+                )}
+              >
+                <span className={cn("size-7 rounded-full grid place-items-center shrink-0 mt-0.5",
+                  opt.value === "legal" ? "bg-violet-100 text-violet-700" : "bg-blue-100 text-blue-700"
+                )}>
+                  <OptIcon className="size-3.5" />
+                </span>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-semibold">{opt.label}</span>
+                    {active && <span className="text-[9px] font-bold uppercase tracking-widest text-primary">active</span>}
+                  </div>
+                  <div className="text-[10px] text-muted-foreground leading-snug mt-0.5">{opt.description}</div>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }

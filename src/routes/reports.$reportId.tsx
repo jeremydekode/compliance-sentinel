@@ -8,6 +8,8 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { AIAssistant } from "@/components/ai-assistant";
 import { ApprovalWorkflow } from "@/components/approval-workflow";
+import { LegalReviewView } from "@/components/legal-review-view";
+import { useRole } from "@/lib/role";
 import { MD } from "@/components/md";
 import { exportExcel, exportHtmlPresentation } from "@/lib/exports";
 import { impactClasses, formatDate, statusMeta, changeTypeMeta } from "@/lib/format";
@@ -33,6 +35,7 @@ export const Route = createFileRoute("/reports/$reportId")({
 
 function ReportPage() {
   const { reportId } = Route.useParams();
+  const [role] = useRole();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<"analysis" | "gaps">("analysis");
   const [exporting, setExporting] = useState<null | "xlsx" | "html">(null);
@@ -112,6 +115,24 @@ function ReportPage() {
     finally { setExporting(null); }
   }
 
+  // ── Head of Legal view ────────────────────────────────────────
+  if (role === "legal") {
+    return (
+      <AppShell>
+        <div style={{ height: "calc(100vh - 3.5rem)" }}>
+          <LegalReviewView
+            report={report.data}
+            changes={allChanges}
+            impacts={allImpacts}
+            sopById={sopById}
+          />
+        </div>
+        <AIAssistant reportId={reportId} />
+      </AppShell>
+    );
+  }
+
+  // ── Compliance Officer view (default) ─────────────────────────
   return (
     <AppShell>
       <div className="flex flex-col overflow-hidden" style={{ height: "calc(100vh - 3.5rem)" }}>

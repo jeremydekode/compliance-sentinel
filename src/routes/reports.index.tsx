@@ -149,29 +149,35 @@ function ReportsList() {
       <div className="p-8 max-w-[1400px] mx-auto space-y-8">
         <div className="flex items-end justify-between">
           <div>
-            <h1 className="text-3xl font-bold tracking-tight">Regulatory Analyses</h1>
+            <h1 className="text-3xl font-bold tracking-tight">
+              {workspace === "forms" ? "Form Updates" : "Regulatory Analyses"}
+            </h1>
             <p className="text-muted-foreground mt-1 text-lg">
-              Manage intelligence reports and map regulatory impact across your SOPs.
+              {workspace === "forms"
+                ? "Propagate form metadata changes across all downstream documents in the Knowledge Base."
+                : "Manage intelligence reports and map regulatory impact across your SOPs."}
             </p>
           </div>
           <div className="flex items-center gap-2">
-            <Button
-              size="lg"
-              variant="outline"
-              onClick={() => setShowFormUpdate(true)}
-              className="gap-2 h-12 px-5 rounded-xl font-bold border-amber-300 text-amber-900 hover:bg-amber-50"
-            >
-              <FileEdit className="size-4" /> Form Update
-            </Button>
-            <Button
-              size="lg"
-              onClick={() => setShowUpload(!showUpload)}
-              variant={showUpload ? "outline" : "default"}
-              className="gap-2 h-12 px-6 rounded-xl font-bold shadow-lg shadow-primary/10 transition-all active:scale-95"
-            >
-              {showUpload ? <X className="size-4" /> : <Plus className="size-4" />}
-              {showUpload ? "Cancel" : "Regulatory Change"}
-            </Button>
+            {workspace === "forms" ? (
+              <Button
+                size="lg"
+                onClick={() => setShowFormUpdate(true)}
+                className="gap-2 h-12 px-6 rounded-xl font-bold bg-amber-600 hover:bg-amber-700 text-white shadow-lg shadow-amber-500/20 active:scale-95"
+              >
+                <FileEdit className="size-4" /> New Form Update
+              </Button>
+            ) : (
+              <Button
+                size="lg"
+                onClick={() => setShowUpload(!showUpload)}
+                variant={showUpload ? "outline" : "default"}
+                className="gap-2 h-12 px-6 rounded-xl font-bold shadow-lg shadow-primary/10 transition-all active:scale-95"
+              >
+                {showUpload ? <X className="size-4" /> : <Plus className="size-4" />}
+                {showUpload ? "Cancel" : "New Regulatory Analysis"}
+              </Button>
+            )}
           </div>
         </div>
 

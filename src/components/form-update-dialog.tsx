@@ -21,8 +21,7 @@ export function FormUpdateDialog({
   onCreated: (reportId: string) => void;
 }) {
   const createFn = useServerFn(createFormUpdateReport);
-  const [currentWorkspace] = useWorkspace();
-  const [workspace, setWorkspaceLocal] = useState<WorkspaceId>(currentWorkspace === "forms" ? "forms" : "forms");
+  const [workspace] = useWorkspace();
 
   const [formId, setFormId] = useState("");
   const [friendlyName, setFriendlyName] = useState("");
@@ -202,26 +201,16 @@ export function FormUpdateDialog({
           {/* Step 3 — Submit details */}
           <section className="space-y-3">
             <div className="text-[10px] font-black uppercase tracking-widest text-muted-foreground">Step 3 · Submission details</div>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              <div>
-                <label className="block text-xs font-semibold mb-1.5">Analysis name</label>
-                <input
-                  type="text" value={customTitle} onChange={(e) => setCustomTitle(e.target.value)}
-                  placeholder={formId ? `${formId} update` : "e.g. FGROP 037 v10 → v11"}
-                  className="w-full text-sm px-3 py-2 rounded-lg border bg-card focus:outline-none focus:ring-1 focus:ring-amber-500"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-semibold mb-1.5">Workspace</label>
-                <select
-                  value={workspace} onChange={(e) => setWorkspaceLocal(e.target.value as WorkspaceId)}
-                  className="w-full text-sm px-3 py-2 rounded-lg border bg-card focus:outline-none focus:ring-1 focus:ring-amber-500"
-                >
-                  {(Object.keys(WORKSPACES) as WorkspaceId[]).map((id) => (
-                    <option key={id} value={id}>{WORKSPACES[id].name}</option>
-                  ))}
-                </select>
-              </div>
+            <div>
+              <label className="block text-xs font-semibold mb-1.5">Analysis name</label>
+              <input
+                type="text" value={customTitle} onChange={(e) => setCustomTitle(e.target.value)}
+                placeholder={formId ? `${formId} update` : "e.g. FGROP 037 v10 → v11"}
+                className="w-full text-sm px-3 py-2 rounded-lg border bg-card focus:outline-none focus:ring-1 focus:ring-amber-500"
+              />
+              <p className="text-[10px] text-muted-foreground mt-1.5">
+                Will be saved in <span className="font-semibold">{WORKSPACES[workspace].name}</span> workspace.
+              </p>
             </div>
             <div>
               <label className="block text-xs font-semibold mb-1.5">Notes for the analyst (optional)</label>

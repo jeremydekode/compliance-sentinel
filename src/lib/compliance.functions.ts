@@ -16,6 +16,8 @@ export const createReport = createServerFn({ method: "POST" })
     z.object({
       filename: z.string(),
       fileUrl: z.string().nullable(),
+      customTitle: z.string().optional(),
+      notes: z.string().optional(),
       detected: z
         .object({
           doc_type: z.string(),
@@ -81,11 +83,15 @@ export const createReport = createServerFn({ method: "POST" })
       const chunks: any[] = matchedChunks ?? [];
       const sopIds = Array.from(new Set(chunks.map((c: any) => c.sop_id as string)));
 
+      // Internal-only doc types (regulatory benchmarks must never appear as amendment targets)
+      const INTERNAL_DOC_TYPES = ["sop", "it_policy", "policy"];
+
       if (sopIds.length > 0) {
         const { data: sopDocs } = await supabase
           .from("sop_documents")
           .select("*")
-          .in("id", sopIds);
+          .in("id", sopIds)
+          .in("doc_type", INTERNAL_DOC_TYPES);
         relevantSops = (sopDocs ?? []) as any[];
       }
 
@@ -95,7 +101,7 @@ export const createReport = createServerFn({ method: "POST" })
         const { data: allSops } = await supabase
           .from("sop_documents")
           .select("*")
-          .in("doc_type", ["sop", "it_policy", "policy", "rmit_reg", "fatf", "circular"]);
+          .in("doc_type", INTERNAL_DOC_TYPES);
         relevantSops = (allSops ?? []) as any[];
       }
       kbAll = relevantSops;
@@ -131,7 +137,8 @@ export const createReport = createServerFn({ method: "POST" })
       throw new Error(`AI Analysis failed: ${e.message}`);
     }
 
-    const displayName = data.filename.replace(/\.[^.]+$/, "").trim() || data.filename;
+    const fallbackName = data.filename.replace(/\.[^.]+$/, "").trim() || data.filename;
+    const displayName = (data.customTitle ?? "").trim() || fallbackName;
 
     const { data: report, error } = await supabase
       .from("analysis_reports")
@@ -145,6 +152,7 @@ export const createReport = createServerFn({ method: "POST" })
           kb_size: kbAll.length,
           detected: detected ?? null,
           old_policy_name: oldDoc?.title ?? null,
+          analyst_notes: data.notes ?? null,
         },
       })
       .select()
@@ -197,6 +205,134 @@ export const createReport = createServerFn({ method: "POST" })
       matchedToKbCount: matchedImpacts.filter((m: any) => m.sop_id).length,
       kbSize: kbAll.length,
       candidateKbSize: relevantSops.length,
+    };
+  });
+
+export const rerunReport = createServerFn({ method: "POST" })
+  .inputValidator(z.object({ reportId: z.string() }))
+  .handler(async ({ data }) => {
+    // 1. Load existing report
+    const { data: report, error: repErr } = await supabase
+      .from("analysis_reports").select("*").eq("id", data.reportId).single();
+    if (repErr || !report) throw new Error("Report not found");
+    if (!report.source_file_url) throw new Error("Report has no source file URL — cannot rerun");
+
+    const detected = (report.summary_json as any)?.detected ?? null;
+
+    // 2. Re-fetch the new policy
+    const newPolicy = await fetchFile(report.source_file_url);
+
+    // 3. Find the old policy in KB (same logic as createReport)
+    const oldDocTypes =
+      detected?.doc_type === "rmit_reg" ? ["rmit_reg", "rmit"] :
+      detected?.doc_type ? [detected.doc_type] : ["__none__"];
+    const { data: oldDocs } = await supabase
+      .from("sop_documents").select("*")
+      .in("doc_type", oldDocTypes)
+      .neq("version", detected?.version ?? "")
+      .order("created_at", { ascending: false }).limit(1);
+    const oldDoc = oldDocs?.[0];
+    let oldPolicy: { buffer: Buffer; mimeType: string } | undefined = undefined;
+    if (oldDoc?.file_url) {
+      try { oldPolicy = await fetchFile(oldDoc.file_url); }
+      catch (e) { console.error("Rerun: failed to fetch old policy:", e); }
+    }
+
+    // 4. Find relevant internal SOPs (same logic as createReport)
+    const INTERNAL_DOC_TYPES = ["sop", "it_policy", "policy"];
+    let relevantSops: any[] = [];
+    try {
+      const queryText = `${report.policy_name} ${detected?.summary || ""} ${detected?.tags?.join(" ") || ""}`;
+      const embedding = await generateQueryEmbedding(queryText);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: matchedChunks } = await (supabase as any).rpc("match_sop_chunks", {
+        query_embedding: embedding, match_threshold: 0.2, match_count: 50,
+      });
+      const chunks: any[] = matchedChunks ?? [];
+      const sopIds = Array.from(new Set(chunks.map((c: any) => c.sop_id as string)));
+      if (sopIds.length > 0) {
+        const { data: sopDocs } = await supabase
+          .from("sop_documents").select("*").in("id", sopIds).in("doc_type", INTERNAL_DOC_TYPES);
+        relevantSops = (sopDocs ?? []) as any[];
+      }
+      if (relevantSops.length === 0) {
+        const { data: allSops } = await supabase
+          .from("sop_documents").select("*").in("doc_type", INTERNAL_DOC_TYPES);
+        relevantSops = (allSops ?? []) as any[];
+      }
+    } catch (e: any) {
+      console.error("Rerun: SOP lookup failed:", e);
+    }
+
+    const sopsForAi = await Promise.all(relevantSops.map(async s => {
+      if (s.file_url) {
+        try {
+          const f = await fetchFile(s.file_url);
+          return { title: s.title, buffer: f.buffer, mimeType: f.mimeType };
+        } catch { /* fall through */ }
+      }
+      return { title: s.title, text: `[No content indexed for ${s.title}]` };
+    }));
+
+    // 5. Run AI analysis
+    const aiResult = await analyzePolicy(
+      { name: report.policy_name ?? "policy", buffer: newPolicy.buffer, mimeType: newPolicy.mimeType },
+      oldPolicy ? { name: oldDoc!.title, buffer: oldPolicy.buffer, mimeType: oldPolicy.mimeType } : undefined,
+      sopsForAi
+    );
+
+    // 6. Wipe old changes/impacts for this report and re-insert
+    await supabase.from("sop_impacts").delete().eq("report_id", report.id);
+    await supabase.from("regulatory_changes").delete().eq("report_id", report.id);
+
+    await supabase.from("analysis_reports").update({
+      summary_json: {
+        ...aiResult.summary,
+        kb_size: relevantSops.length,
+        detected: detected ?? null,
+        old_policy_name: oldDoc?.title ?? null,
+        last_rerun_at: new Date().toISOString(),
+      },
+    }).eq("id", report.id);
+
+    if (aiResult.changes.length > 0) {
+      await supabase.from("regulatory_changes").insert(
+        aiResult.changes.map((c: any, i: number) => ({
+          chapter_ref: c.chapter_ref,
+          old_requirement: c.old_requirement,
+          new_requirement: c.new_requirement,
+          change_summary: c.change_summary,
+          impact: c.impact,
+          tone_shift: c.tone_shift,
+          pages: c.pages,
+          legal_refs: c.legal_refs,
+          related_instruments: c.related_instruments,
+          report_id: report.id,
+          position: i,
+        }))
+      );
+    }
+
+    const matchedImpacts = aiResult.impacts.map((m: any) => {
+      const aiTitle = (m.sop_title ?? "").toLowerCase().trim();
+      const sop = relevantSops.find(s => {
+        const stored = (s.title ?? "").toLowerCase().trim();
+        return stored === aiTitle || stored.includes(aiTitle) || aiTitle.includes(stored);
+      });
+      return { ...m, sop_id: sop?.id ?? null, sop_title: sop ? sop.title : m.sop_title };
+    });
+
+    if (matchedImpacts.length > 0) {
+      await supabase.from("sop_impacts").insert(
+        matchedImpacts.map((m: any, i: number) => ({ ...m, report_id: report.id, position: i }))
+      );
+    }
+
+    return {
+      reportId: report.id as string,
+      changesCount: aiResult.changes.length,
+      impactCount: matchedImpacts.length,
+      matchedToKbCount: matchedImpacts.filter((m: any) => m.sop_id).length,
     };
   });
 

@@ -24,6 +24,22 @@ function cleanSopTitle(title: string | null | undefined): string {
   return title.replace(/\s*\(no matching internal doc(?:\s+found)?\)/gi, "").trim();
 }
 
+function ExecBullets({ value }: { value: any }) {
+  const bullets: string[] = Array.isArray(value)
+    ? value.filter((b: any) => typeof b === "string" && b.trim().length > 0)
+    : typeof value === "string" && value.trim()
+      ? value.split(/(?<=[.!?])\s+(?=[A-Z])/).filter(s => s.trim().length > 0)
+      : [];
+  if (bullets.length === 0) return null;
+  return (
+    <ul className="space-y-1.5 list-disc pl-5 marker:text-violet-500/60">
+      {bullets.map((b, i) => (
+        <li key={i} className="text-sm leading-relaxed text-foreground/85">{b.trim()}</li>
+      ))}
+    </ul>
+  );
+}
+
 export function LegalReviewView({
   report, changes, impacts, sopById,
 }: {
@@ -175,21 +191,7 @@ export function LegalReviewView({
             <div className="text-[10px] uppercase tracking-widest font-black text-violet-700 dark:text-violet-400 mb-2">
               Compliance Officer's Briefing
             </div>
-            <p className="text-sm leading-relaxed text-foreground/85">{summary.executive}</p>
-            {summary.immediate_actions?.length > 0 && (
-              <div className="mt-3 pt-3 border-t">
-                <div className="text-[10px] uppercase tracking-widest font-black text-muted-foreground mb-1.5">
-                  Recommended Immediate Actions
-                </div>
-                <ul className="space-y-1">
-                  {summary.immediate_actions.slice(0, 4).map((a: string, i: number) => (
-                    <li key={i} className="text-xs text-foreground/80 flex items-start gap-2">
-                      <span className="text-violet-500 mt-0.5">▸</span><span>{a}</span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
+            <ExecBullets value={summary.executive} />
           </Card>
         )}
 

@@ -39,6 +39,9 @@ function ReportsList() {
   const [showUpload, setShowUpload] = useState(false);
   const [file, setFile] = useState<File | null>(null);
   const [detected, setDetected] = useState<DetectedMeta | null>(null);
+  const [analysisName, setAnalysisName] = useState("");
+  const [overrideDocType, setOverrideDocType] = useState<string>("");
+  const [notes, setNotes] = useState("");
   const [running, setRunning] = useState(false);
   const [stepIdx, setStepIdx] = useState(-1);
 
@@ -80,19 +83,35 @@ function ReportsList() {
     }
 
     try {
-      setStepIdx(7); 
-      const res = await create({ data: { filename: file.name, fileUrl, detected: detected ?? undefined } });
-      
-      setStepIdx(8); 
+      setStepIdx(7);
+      // Merge user overrides into detected meta
+      const detectedWithOverrides = detected ? {
+        ...detected,
+        doc_type: (overrideDocType || detected.doc_type) as DetectedMeta["doc_type"],
+      } : undefined;
+      const res = await create({
+        data: {
+          filename: file.name,
+          fileUrl,
+          detected: detectedWithOverrides,
+          customTitle: analysisName.trim() || undefined,
+          notes: notes.trim() || undefined,
+        },
+      });
+
+      setStepIdx(8);
       await new Promise((r) => setTimeout(r, 800));
-      
+
       toast.success("Analysis complete");
       qc.invalidateQueries({ queryKey: ["reports"] });
-      
+
       // Close upload and reset
       setShowUpload(false);
       setFile(null);
       setDetected(null);
+      setAnalysisName("");
+      setOverrideDocType("");
+      setNotes("");
       setRunning(false);
       setStepIdx(-1);
 
@@ -163,7 +182,11 @@ function ReportsList() {
                     onChange={(e) => {
                       const f = e.target.files?.[0] ?? null;
                       setFile(f);
-                      setDetected(f ? autoDetectDocMeta(f.name) : null);
+                      const meta = f ? autoDetectDocMeta(f.name) : null;
+                      setDetected(meta);
+                      setAnalysisName(f ? f.name.replace(/\.[^.]+$/, "") : "");
+                      setOverrideDocType(meta?.doc_type ?? "");
+                      setNotes("");
                     }}
                   />
                   <div className={cn("size-16 mx-auto rounded-full grid place-items-center mb-4 transition-transform duration-300", file ? "bg-primary text-white scale-110" : "bg-muted text-muted-foreground")}>
@@ -178,22 +201,69 @@ function ReportsList() {
                 </label>
 
                 {detected && (
-                  <div className="rounded-2xl border border-primary/10 bg-white/50 dark:bg-slate-900/50 p-6 shadow-sm">
-                    <div className="flex items-center gap-1.5 text-[10px] font-black text-primary uppercase tracking-[0.2em] mb-4">
-                      <Sparkles className="size-3.5" /> Intelligence Pre-processing
+                  <div className="rounded-2xl border border-primary/10 bg-white/50 dark:bg-slate-900/50 p-6 shadow-sm space-y-5">
+                    <div className="flex items-center gap-1.5 text-[10px] font-black text-primary uppercase tracking-[0.2em]">
+                      <Sparkles className="size-3.5" /> Submission Details
+                      <span className="ml-2 text-muted-foreground/70 font-medium normal-case tracking-normal text-[10px]">— review &amp; adjust before running</span>
                     </div>
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
+
+                    {/* Editable analysis name */}
+                    <div>
+                      <label className="block text-[10px] uppercase tracking-widest text-muted-foreground font-bold mb-1.5">
+                        Analysis Name <span className="text-rose-500">*</span>
+                      </label>
+                      <input
+                        type="text"
+                        value={analysisName}
+                        onChange={(e) => setAnalysisName(e.target.value)}
+                        placeholder="e.g. RMiT Nov 2025 — Q2 review"
+                        className="w-full text-sm font-medium px-3 py-2 rounded-lg border bg-card focus:outline-none focus:ring-1 focus:ring-primary"
+                      />
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      {/* Doc type override */}
                       <div>
-                        <div className="text-[10px] uppercase tracking-widest text-muted-foreground font-bold mb-1.5">Instrument</div>
-                        <div className="font-black text-sm">{DOC_TYPE_LABEL[detected.doc_type]}</div>
+                        <label className="block text-[10px] uppercase tracking-widest text-muted-foreground font-bold mb-1.5">
+                          Document Type <span className="text-muted-foreground/60 font-normal normal-case tracking-normal">(detected: {DOC_TYPE_LABEL[detected.doc_type]})</span>
+                        </label>
+                        <select
+                          value={overrideDocType}
+                          onChange={(e) => setOverrideDocType(e.target.value)}
+                          className="w-full text-sm font-medium px-3 py-2 rounded-lg border bg-card focus:outline-none focus:ring-1 focus:ring-primary"
+                        >
+                          {(Object.entries(DOC_TYPE_LABEL) as [string, string][]).map(([k, label]) => (
+                            <option key={k} value={k}>{label}</option>
+                          ))}
+                        </select>
                       </div>
+
+                      {/* Version (read-only auto-detected) */}
                       <div>
-                        <div className="text-[10px] uppercase tracking-widest text-muted-foreground font-bold mb-1.5">Version</div>
-                        <div className="font-black text-sm">{detected.version || "v1.0.0"}</div>
+                        <label className="block text-[10px] uppercase tracking-widest text-muted-foreground font-bold mb-1.5">Detected Version</label>
+                        <div className="px-3 py-2 rounded-lg border bg-muted/40 text-sm font-mono">{detected.version || "v1.0.0"}</div>
                       </div>
+                    </div>
+
+                    {/* Notes / context */}
+                    <div>
+                      <label className="block text-[10px] uppercase tracking-widest text-muted-foreground font-bold mb-1.5">
+                        Notes for the analyst <span className="text-muted-foreground/60 font-normal normal-case tracking-normal">(optional)</span>
+                      </label>
+                      <textarea
+                        value={notes}
+                        onChange={(e) => setNotes(e.target.value)}
+                        placeholder="e.g. Focus on operational resilience clauses; benchmark against legacy 2023 baseline."
+                        rows={2}
+                        className="w-full text-xs px-3 py-2 rounded-lg border bg-card focus:outline-none focus:ring-1 focus:ring-primary resize-none"
+                      />
+                    </div>
+
+                    {/* Tags display */}
+                    {detected.tags.length > 0 && (
                       <div>
-                        <div className="text-[10px] uppercase tracking-widest text-muted-foreground font-bold mb-1.5">Semantic Tags</div>
-                        <div className="flex flex-wrap gap-1.5 mt-1">
+                        <div className="text-[10px] uppercase tracking-widest text-muted-foreground font-bold mb-1.5">Semantic Tags (auto)</div>
+                        <div className="flex flex-wrap gap-1.5">
                           {detected.tags.map((t) => (
                             <Badge key={t} variant="outline" className="text-[9px] bg-primary/5 border-primary/10 font-bold uppercase py-0">
                               {t}
@@ -201,7 +271,7 @@ function ReportsList() {
                           ))}
                         </div>
                       </div>
-                    </div>
+                    )}
                   </div>
                 )}
 

@@ -13,13 +13,15 @@ import { useRole } from "@/lib/role";
 import { MD } from "@/components/md";
 import { exportExcel, exportHtmlPresentation } from "@/lib/exports";
 import { impactClasses, formatDate, statusMeta, changeTypeMeta } from "@/lib/format";
-import { updateImpact } from "@/lib/compliance.functions";
+import { updateImpact, rerunReport } from "@/lib/compliance.functions";
 import { cn } from "@/lib/utils";
+import { diffOld, diffNew } from "@/lib/text-diff";
 import {
   ArrowLeft, FileSpreadsheet, Presentation, Loader2,
   ArrowRightLeft, CheckCircle2, XCircle, UserCheck,
   Scale, FileText, AlertCircle, Sparkles, ExternalLink,
-  ArrowDownToLine, MoveDown, AlertTriangle,
+  ArrowDownToLine, MoveDown, AlertTriangle, LayoutGrid,
+  CircleDot, Circle, RefreshCw, PanelLeftClose, PanelLeftOpen,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -36,9 +38,14 @@ export const Route = createFileRoute("/reports/$reportId")({
 function ReportPage() {
   const { reportId } = Route.useParams();
   const [role] = useRole();
+  // selectedId: null = Summary view, "<uuid>" = a specific change
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<"analysis" | "gaps">("analysis");
   const [exporting, setExporting] = useState<null | "xlsx" | "html">(null);
+  const [rerunning, setRerunning] = useState(false);
+  const [registerCollapsed, setRegisterCollapsed] = useState(false);
+  const rerun = useServerFn(rerunReport);
+  const qc = useQueryClient();
 
   const report = useQuery({
     queryKey: ["report", reportId],
@@ -96,10 +103,30 @@ function ReportPage() {
   const newPolicyName: string = report.data.policy_name ?? "Updated policy";
   const s = statusMeta(report.data.status);
 
-  const selectedChange = allChanges.find(c => c.id === selectedId) ?? allChanges[0] ?? null;
+  // null selectedId = Summary view; otherwise show the specific change
+  const showSummary = selectedId === null;
+  const selectedChange = showSummary ? null : (allChanges.find(c => c.id === selectedId) ?? null);
 
   const impactsForChange = (chapter_ref: string) =>
     allImpacts.filter(i => (i.chapter ?? "").trim().toLowerCase() === (chapter_ref ?? "").trim().toLowerCase());
+
+  // Approval rollup per change — used for status pill on each register tile
+  function changeStatusRollup(chapter_ref: string) {
+    const list = impactsForChange(chapter_ref);
+    const total = list.length;
+    if (total === 0) return { total: 0, decided: 0, approved: 0, allApproved: false, allDecided: false };
+    const approved = list.filter(i => i.status === "approved").length;
+    const rejected = list.filter(i => i.status === "rejected").length;
+    const routed   = list.filter(i => i.status === "routed").length;
+    const decided  = approved + rejected + routed;
+    return {
+      total,
+      decided,
+      approved,
+      allApproved: approved === total,
+      allDecided: decided === total,
+    };
+  }
 
   const counts = {
     high: allChanges.filter(c => c.impact === "high").length,
@@ -113,6 +140,23 @@ function ReportPage() {
     try { await fn(); }
     catch (e: any) { toast.error("Export failed", { description: e?.message }); }
     finally { setExporting(null); }
+  }
+
+  async function handleRerun() {
+    if (rerunning) return;
+    if (!confirm("Re-run the AI analysis on this report?\n\nThis will replace all current changes and SOP impacts with a fresh analysis using the latest prompts and KB documents. Approval decisions on existing impacts will be lost.")) return;
+    setRerunning(true);
+    try {
+      const result = await rerun({ data: { reportId } });
+      toast.success(`Re-analysis complete: ${result.changesCount} changes, ${result.impactCount} SOP impacts`);
+      qc.invalidateQueries({ queryKey: ["report", reportId] });
+      qc.invalidateQueries({ queryKey: ["changes", reportId] });
+      qc.invalidateQueries({ queryKey: ["impacts", reportId] });
+    } catch (e: any) {
+      toast.error("Re-analysis failed", { description: e?.message });
+    } finally {
+      setRerunning(false);
+    }
   }
 
   // ── Head of Legal view ────────────────────────────────────────
@@ -150,6 +194,13 @@ function ReportPage() {
             </div>
           </div>
           <div className="flex items-center gap-1.5 shrink-0">
+            <Button variant="outline" size="sm" disabled={rerunning} className="h-7 text-xs gap-1.5"
+              onClick={handleRerun}
+              title="Re-run AI analysis on this report (replaces current changes)">
+              {rerunning ? <Loader2 className="size-3 animate-spin" /> : <RefreshCw className="size-3" />}
+              <span className="hidden sm:inline">{rerunning ? "Re-analysing…" : "Re-run"}</span>
+            </Button>
+            <div className="h-4 w-px bg-border mx-0.5" />
             <Button variant="outline" size="sm" disabled={!!exporting} className="h-7 text-xs gap-1.5"
               onClick={() => runExport("html", () => exportHtmlPresentation(report.data, allChanges, allImpacts))}>
               {exporting === "html" ? <Loader2 className="size-3 animate-spin" /> : <Presentation className="size-3" />}
@@ -190,29 +241,74 @@ function ReportPage() {
         {activeTab === "analysis" ? (
           <div className="flex-1 flex min-h-0 overflow-hidden">
 
-            {/* ── Left: Change Register ─────────────────────────────── */}
-            <div className="w-64 lg:w-72 shrink-0 border-r flex flex-col overflow-hidden bg-slate-50/60 dark:bg-slate-900/30">
-              {/* Stats bar */}
-              <div className="px-3 py-2.5 border-b bg-card grid grid-cols-3 gap-1 text-center">
-                <StatPill label="High" count={counts.high} color="text-rose-600" />
-                <StatPill label="Med" count={counts.medium} color="text-amber-600" />
-                <StatPill label="Low" count={counts.low} color="text-emerald-600" />
-              </div>
-              {/* Executive summary mini */}
-              {summary.executive && (
-                <div className="px-3 py-2.5 border-b text-[10px] text-muted-foreground leading-relaxed line-clamp-2">
-                  {summary.executive}
+            {/* ── Left: Change Register (collapsible) ───────────────── */}
+            {registerCollapsed ? (
+              <div className="w-10 shrink-0 border-r flex flex-col items-center bg-slate-50/60 dark:bg-slate-900/30">
+                <button
+                  onClick={() => setRegisterCollapsed(false)}
+                  title="Expand change register"
+                  className="w-full py-3 text-muted-foreground hover:text-foreground hover:bg-white dark:hover:bg-slate-800/60 transition-colors border-b"
+                >
+                  <PanelLeftOpen className="size-4 mx-auto" />
+                </button>
+                <div className="py-3 px-2 text-center border-b w-full bg-card">
+                  <div className="text-rose-600 text-sm font-display font-black leading-none">{counts.high}</div>
+                  <div className="text-amber-600 text-sm font-display font-black leading-none mt-1.5">{counts.medium}</div>
+                  <div className="text-emerald-600 text-sm font-display font-black leading-none mt-1.5">{counts.low}</div>
                 </div>
-              )}
+                <div className="flex-1 flex items-center justify-center px-1">
+                  <div className="text-[9px] uppercase tracking-widest font-bold text-muted-foreground -rotate-90 whitespace-nowrap">
+                    {allChanges.length} changes
+                  </div>
+                </div>
+              </div>
+            ) : (
+            <div className="w-64 lg:w-72 shrink-0 border-r flex flex-col overflow-hidden bg-slate-50/60 dark:bg-slate-900/30">
+              {/* Stats bar with collapse toggle */}
+              <div className="px-3 py-2.5 border-b bg-card flex items-center gap-2">
+                <div className="grid grid-cols-3 gap-1 text-center flex-1">
+                  <StatPill label="High" count={counts.high} color="text-rose-600" />
+                  <StatPill label="Med" count={counts.medium} color="text-amber-600" />
+                  <StatPill label="Low" count={counts.low} color="text-emerald-600" />
+                </div>
+                <button
+                  onClick={() => setRegisterCollapsed(true)}
+                  title="Collapse change register"
+                  className="shrink-0 p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
+                >
+                  <PanelLeftClose className="size-3.5" />
+                </button>
+              </div>
               {/* Change list */}
               <div className="flex-1 overflow-y-auto">
+                {/* Summary pseudo-item */}
+                <button
+                  onClick={() => setSelectedId(null)}
+                  className={cn(
+                    "w-full text-left px-3 py-2.5 border-b border-slate-200 dark:border-slate-700 transition-all",
+                    "hover:bg-white dark:hover:bg-slate-800/60",
+                    showSummary
+                      ? "bg-white dark:bg-slate-800 border-l-[3px] border-l-primary shadow-sm"
+                      : "border-l-[3px] border-l-transparent"
+                  )}
+                >
+                  <div className="flex items-center gap-2">
+                    <LayoutGrid className="size-3.5 text-primary shrink-0" />
+                    <span className="text-[11px] font-black uppercase tracking-widest text-foreground/90">Summary Overview</span>
+                  </div>
+                  <p className="text-[10px] text-muted-foreground leading-snug mt-0.5">
+                    All {allChanges.length} changes at a glance · {allImpacts.length} SOP actions
+                  </p>
+                </button>
+
                 {allChanges.length === 0 ? (
                   <div className="px-4 py-8 text-center text-xs text-muted-foreground italic">No changes extracted.</div>
                 ) : (
                   allChanges.map(c => {
-                    const isSelected = (selectedId ?? allChanges[0]?.id) === c.id;
+                    const isSelected = selectedId === c.id;
                     const isNew = !c.old_requirement || (c.old_requirement as string).toLowerCase().startsWith("n/a");
-                    const changeImpacts = impactsForChange(c.chapter_ref);
+                    const roll = changeStatusRollup(c.chapter_ref);
+                    const headline = (c.change_summary ?? "").trim() || c.chapter_ref;
                     return (
                       <button
                         key={c.id}
@@ -222,39 +318,68 @@ function ReportPage() {
                           "hover:bg-white dark:hover:bg-slate-800/60",
                           isSelected
                             ? "bg-white dark:bg-slate-800 border-l-[3px] border-l-primary shadow-sm"
-                            : "border-l-[3px] border-l-transparent"
+                            : "border-l-[3px] border-l-transparent",
+                          roll.allApproved && !isSelected && "bg-emerald-50/40 dark:bg-emerald-900/10"
                         )}
                       >
+                        {/* Top row: impact + status pills */}
                         <div className="flex items-center justify-between gap-2 mb-1">
-                          <span className="font-mono text-[11px] font-bold text-foreground/90 truncate">{c.chapter_ref}</span>
+                          <span className={cn(
+                            "text-[8px] font-black uppercase tracking-widest px-1.5 py-0.5 rounded",
+                            c.impact === "high" ? "bg-rose-100 text-rose-700" :
+                            c.impact === "medium" ? "bg-amber-100 text-amber-700" :
+                            "bg-emerald-100 text-emerald-700"
+                          )}>{c.impact}</span>
                           <div className="flex items-center gap-1 shrink-0">
-                            {changeImpacts.length > 0 && (
-                              <span className="text-[8px] font-bold bg-primary/10 text-primary px-1 py-0.5 rounded">{changeImpacts.length}</span>
+                            {isNew && (
+                              <span className="inline-flex items-center gap-0.5 text-[8px] font-bold text-emerald-600 bg-emerald-100 px-1 py-0.5 rounded">
+                                <Sparkles className="size-2.5" /> NEW
+                              </span>
                             )}
-                            <span className={cn(
-                              "text-[8px] font-black uppercase tracking-widest px-1.5 py-0.5 rounded",
-                              c.impact === "high" ? "bg-rose-100 text-rose-700" :
-                              c.impact === "medium" ? "bg-amber-100 text-amber-700" :
-                              "bg-emerald-100 text-emerald-700"
-                            )}>{c.impact}</span>
+                            {roll.total > 0 && (
+                              <span className={cn(
+                                "text-[8px] font-black px-1 py-0.5 rounded inline-flex items-center gap-0.5",
+                                roll.allApproved ? "bg-emerald-100 text-emerald-700" :
+                                roll.allDecided  ? "bg-amber-100 text-amber-700" :
+                                roll.decided > 0 ? "bg-blue-100 text-blue-700" :
+                                                   "bg-slate-100 text-slate-600"
+                              )}>
+                                {roll.allApproved
+                                  ? <CheckCircle2 className="size-2.5" />
+                                  : roll.decided > 0
+                                    ? <CircleDot className="size-2.5" />
+                                    : <Circle className="size-2.5" />}
+                                {roll.decided}/{roll.total}
+                              </span>
+                            )}
                           </div>
                         </div>
-                        <p className="text-[10px] text-muted-foreground leading-snug line-clamp-2">{c.change_summary}</p>
-                        {isNew && (
-                          <span className="mt-1 inline-flex items-center gap-1 text-[9px] font-semibold text-emerald-600">
-                            <Sparkles className="size-2.5" /> New obligation
-                          </span>
-                        )}
+                        {/* Headline — short description */}
+                        <p className="text-[12px] font-semibold leading-snug text-foreground line-clamp-2">{headline}</p>
+                        {/* Subline — paragraph reference */}
+                        <p className="font-mono text-[10px] text-muted-foreground mt-0.5 truncate">{c.chapter_ref}</p>
                       </button>
                     );
                   })
                 )}
               </div>
             </div>
+            )}
 
-            {/* ── Right: Change Detail ──────────────────────────────── */}
+            {/* ── Right: Summary or Change Detail ──────────────────── */}
             <div className="flex-1 overflow-y-auto bg-background">
-              {selectedChange ? (
+              {showSummary ? (
+                <SummaryOverview
+                  changes={allChanges}
+                  impacts={allImpacts}
+                  summary={summary}
+                  newPolicyName={newPolicyName}
+                  oldPolicyName={oldPolicyName}
+                  sopById={sopById}
+                  onSelectChange={(id) => setSelectedId(id)}
+                  changeStatusRollup={changeStatusRollup}
+                />
+              ) : selectedChange ? (
                 <ChangeDetailPanel
                   change={selectedChange}
                   impacts={impactsForChange(selectedChange.chapter_ref)}
@@ -289,7 +414,222 @@ function cleanSopTitle(title: string | null | undefined): string {
   return title.replace(/\s*\(no matching internal doc(?:\s+found)?\)/gi, "").trim();
 }
 
+export function ExecutiveSummary({ value }: { value: any }) {
+  const bullets: string[] = Array.isArray(value)
+    ? value.filter((b: any) => typeof b === "string" && b.trim().length > 0)
+    : typeof value === "string" && value.trim()
+      ? value.split(/(?<=[.!?])\s+(?=[A-Z])/).filter(s => s.trim().length > 0)
+      : [];
+
+  if (bullets.length === 0) return null;
+  return (
+    <ul className="space-y-1.5 list-disc pl-5 marker:text-primary/60">
+      {bullets.map((b, i) => (
+        <li key={i} className="text-sm leading-relaxed">{b.trim()}</li>
+      ))}
+    </ul>
+  );
+}
+
+function DiffText({ side, oldText, newText }: { side: "old" | "new"; oldText: string; newText: string }) {
+  const segs = side === "old" ? diffOld(oldText, newText) : diffNew(oldText, newText);
+  return (
+    <>
+      {segs.map((s, i) => {
+        if (s.type === "common") return <span key={i}>{s.text}</span>;
+        if (s.type === "removed")
+          return <span key={i} className="bg-rose-200 dark:bg-rose-900/50 text-rose-900 dark:text-rose-200 line-through decoration-rose-700/60 rounded px-0.5">{s.text}</span>;
+        return <span key={i} className="bg-emerald-200 dark:bg-emerald-900/50 text-emerald-900 dark:text-emerald-100 font-semibold rounded px-0.5">{s.text}</span>;
+      })}
+    </>
+  );
+}
+
 // ── Sub-components ────────────────────────────────────────────────────────────
+
+// ── Summary Overview ─────────────────────────────────────────────────────────
+
+function SummaryOverview({
+  changes, impacts, summary, newPolicyName, oldPolicyName, sopById,
+  onSelectChange, changeStatusRollup,
+}: {
+  changes: any[];
+  impacts: any[];
+  summary: any;
+  newPolicyName: string;
+  oldPolicyName: string;
+  sopById: Map<string, any>;
+  onSelectChange: (id: string) => void;
+  changeStatusRollup: (chapter_ref: string) => {
+    total: number; decided: number; approved: number; allApproved: boolean; allDecided: boolean;
+  };
+}) {
+  const totalImpacts = impacts.length;
+  const approvedImpacts = impacts.filter(i => i.status === "approved").length;
+  const routedImpacts = impacts.filter(i => i.status === "routed").length;
+  const rejectedImpacts = impacts.filter(i => i.status === "rejected").length;
+  const pendingImpacts = totalImpacts - approvedImpacts - routedImpacts - rejectedImpacts;
+  const progressPct = totalImpacts === 0 ? 0 : Math.round(((approvedImpacts + routedImpacts + rejectedImpacts) / totalImpacts) * 100);
+
+  // Group impacts by SOP doc title
+  const docMap = new Map<string, { count: number; approved: number; sopId?: string }>();
+  for (const imp of impacts) {
+    const sop = imp.sop_id ? sopById.get(imp.sop_id) : undefined;
+    const title = (sop?.title ?? imp.sop_title ?? "Unmatched")
+      .replace(/\s*\(no matching internal doc(?:\s+found)?\)/gi, "").trim();
+    const existing = docMap.get(title) ?? { count: 0, approved: 0, sopId: sop?.id };
+    existing.count += 1;
+    if (imp.status === "approved") existing.approved += 1;
+    docMap.set(title, existing);
+  }
+  const docList = Array.from(docMap.entries()).sort((a, b) => b[1].count - a[1].count);
+
+  return (
+    <div className="h-full flex flex-col">
+      {/* Header */}
+      <div className="shrink-0 px-6 py-4 border-b bg-card">
+        <div className="flex items-center gap-2 text-[10px] font-black uppercase tracking-widest text-primary mb-1">
+          <LayoutGrid className="size-3" /> Summary Overview
+        </div>
+        <h1 className="font-display text-xl font-bold leading-tight">{newPolicyName}</h1>
+        <p className="text-xs text-muted-foreground mt-1">
+          Benchmarked against <span className="font-semibold">{oldPolicyName}</span> ·{" "}
+          {changes.length} regulatory changes mapped to {totalImpacts} SOP actions
+        </p>
+      </div>
+
+      {/* Body */}
+      <div className="flex-1 overflow-y-auto">
+        <div className="p-6 space-y-6">
+
+          {/* Progress bar */}
+          <div className="rounded-xl border bg-card p-4">
+            <div className="flex items-center justify-between mb-2">
+              <div className="text-[10px] font-black uppercase tracking-widest text-muted-foreground">Triage Progress</div>
+              <div className="text-xs font-bold">{progressPct}%</div>
+            </div>
+            <div className="h-2 bg-slate-100 dark:bg-slate-800 rounded-full overflow-hidden mb-3">
+              <div className="h-full bg-gradient-to-r from-emerald-500 to-emerald-400 transition-all" style={{ width: `${progressPct}%` }} />
+            </div>
+            <div className="grid grid-cols-4 gap-2 text-center">
+              <ProgressStat label="Approved" count={approvedImpacts} color="text-emerald-600" />
+              <ProgressStat label="Routed" count={routedImpacts} color="text-amber-600" />
+              <ProgressStat label="Rejected" count={rejectedImpacts} color="text-slate-500" />
+              <ProgressStat label="Pending" count={pendingImpacts} color="text-blue-600" />
+            </div>
+          </div>
+
+          {/* Executive summary */}
+          {summary.executive && (
+            <div>
+              <div className="text-[10px] font-black uppercase tracking-widest text-muted-foreground mb-2">Executive Summary</div>
+              <div className="rounded-xl border bg-card p-4 text-sm leading-relaxed text-foreground/85">
+                <ExecutiveSummary value={summary.executive} />
+              </div>
+            </div>
+          )}
+
+          {/* Affected internal documents */}
+          {docList.length > 0 && (
+            <div>
+              <div className="text-[10px] font-black uppercase tracking-widest text-muted-foreground mb-2">
+                Affected Internal Documents ({docList.length})
+              </div>
+              <div className="rounded-xl border bg-card overflow-hidden divide-y">
+                {docList.map(([title, info]) => (
+                  <div key={title} className="px-4 py-2.5 flex items-center justify-between gap-3 hover:bg-muted/30 transition-colors">
+                    <div className="min-w-0 flex-1">
+                      <div className="font-semibold text-sm truncate">{title}</div>
+                      <div className="text-[10px] text-muted-foreground mt-0.5">
+                        {info.count} {info.count === 1 ? "amendment" : "amendments"} · {info.approved} approved
+                      </div>
+                    </div>
+                    <div className="shrink-0 flex items-center gap-2">
+                      {info.approved === info.count && info.count > 0 && (
+                        <CheckCircle2 className="size-4 text-emerald-600" />
+                      )}
+                      <div className="text-xs font-mono text-muted-foreground">{info.approved}/{info.count}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Changes table */}
+          <div>
+            <div className="text-[10px] font-black uppercase tracking-widest text-muted-foreground mb-2">
+              All Changes ({changes.length}) — click to review
+            </div>
+            <div className="rounded-xl border bg-card overflow-hidden">
+              <table className="w-full text-xs">
+                <thead className="bg-muted/50">
+                  <tr>
+                    <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-widest text-muted-foreground w-24">Clause</th>
+                    <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-widest text-muted-foreground">Change</th>
+                    <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-widest text-muted-foreground w-16">Impact</th>
+                    <th className="text-left px-3 py-2 text-[9px] font-black uppercase tracking-widest text-muted-foreground w-20">Progress</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y">
+                  {changes.map(c => {
+                    const roll = changeStatusRollup(c.chapter_ref);
+                    return (
+                      <tr
+                        key={c.id}
+                        onClick={() => onSelectChange(c.id)}
+                        className="cursor-pointer hover:bg-muted/40 transition-colors"
+                      >
+                        <td className="px-3 py-2.5 font-mono font-bold align-top">{c.chapter_ref}</td>
+                        <td className="px-3 py-2.5 text-foreground/80 leading-snug">
+                          <div className="line-clamp-2">{c.change_summary}</div>
+                        </td>
+                        <td className="px-3 py-2.5 align-top">
+                          <span className={cn(
+                            "text-[9px] font-black uppercase tracking-widest px-1.5 py-0.5 rounded",
+                            c.impact === "high" ? "bg-rose-100 text-rose-700" :
+                            c.impact === "medium" ? "bg-amber-100 text-amber-700" :
+                            "bg-emerald-100 text-emerald-700"
+                          )}>{c.impact}</span>
+                        </td>
+                        <td className="px-3 py-2.5 align-top">
+                          {roll.total === 0 ? (
+                            <span className="text-[10px] text-muted-foreground italic">no SOPs</span>
+                          ) : (
+                            <span className={cn(
+                              "text-[10px] font-bold inline-flex items-center gap-1 px-1.5 py-0.5 rounded",
+                              roll.allApproved ? "bg-emerald-100 text-emerald-700" :
+                              roll.allDecided  ? "bg-amber-100 text-amber-700" :
+                              roll.decided > 0 ? "bg-blue-100 text-blue-700" :
+                                                 "bg-slate-100 text-slate-600"
+                            )}>
+                              {roll.allApproved ? <CheckCircle2 className="size-2.5" /> : <Circle className="size-2.5" />}
+                              {roll.decided}/{roll.total}
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ProgressStat({ label, count, color }: { label: string; count: number; color: string }) {
+  return (
+    <div>
+      <div className={cn("text-base font-display font-black leading-none", color)}>{count}</div>
+      <div className="text-[9px] uppercase tracking-widest text-muted-foreground font-semibold mt-0.5">{label}</div>
+    </div>
+  );
+}
 
 function StatPill({ label, count, color }: { label: string; count: number; color: string }) {
   return (
@@ -390,8 +730,8 @@ function ChangeDetailPanel({
                     <span className="text-[10px] text-rose-600/70 dark:text-rose-400/60 truncate">{oldPolicyName}</span>
                   </div>
                 </div>
-                <div className="p-5 text-sm leading-relaxed text-foreground/70 bg-rose-50/20 dark:bg-rose-950/10 min-h-[100px]">
-                  {change.old_requirement}
+                <div className="p-5 text-sm leading-relaxed text-foreground/75 bg-rose-50/20 dark:bg-rose-950/10 min-h-[100px] whitespace-pre-wrap">
+                  <DiffText side="old" oldText={change.old_requirement ?? ""} newText={change.new_requirement ?? ""} />
                 </div>
               </div>
               {/* NEW */}
@@ -405,8 +745,8 @@ function ChangeDetailPanel({
                     <span className="text-[10px] text-blue-600/70 dark:text-blue-400/60 truncate">{newPolicyName}</span>
                   </div>
                 </div>
-                <div className="p-5 text-sm leading-relaxed font-medium bg-blue-50/20 dark:bg-blue-950/10 min-h-[100px]">
-                  <MD>{change.new_requirement}</MD>
+                <div className="p-5 text-sm leading-relaxed font-medium bg-blue-50/20 dark:bg-blue-950/10 min-h-[100px] whitespace-pre-wrap">
+                  <DiffText side="new" oldText={change.old_requirement ?? ""} newText={change.new_requirement ?? ""} />
                 </div>
               </div>
             </div>
@@ -570,17 +910,17 @@ function ImpactCard({
             {imp.find_text && (
               <div>
                 <div className="text-[9px] uppercase tracking-widest font-black text-rose-600 dark:text-rose-400 mb-1.5">
-                  Find — current text to replace
+                  Find — current text to replace <span className="text-muted-foreground font-normal normal-case">(deletions struck through)</span>
                 </div>
-                <div className="text-xs leading-relaxed bg-rose-50 dark:bg-rose-950/20 border border-rose-100 dark:border-rose-900/40 p-3 rounded-lg font-mono text-foreground/75">
-                  {imp.find_text}
+                <div className="text-xs leading-relaxed bg-rose-50 dark:bg-rose-950/20 border border-rose-100 dark:border-rose-900/40 p-3 rounded-lg font-mono text-foreground/85 whitespace-pre-wrap">
+                  <DiffText side="old" oldText={imp.find_text ?? ""} newText={imp.edited_text ?? imp.replace_text ?? ""} />
                 </div>
               </div>
             )}
             {/* Replace */}
             <div>
               <div className="text-[9px] uppercase tracking-widest font-black text-blue-600 dark:text-blue-400 mb-1.5">
-                Replace with — amended text
+                Replace with — amended text {!editMode && <span className="text-muted-foreground font-normal normal-case">(additions highlighted)</span>}
               </div>
               {editMode ? (
                 <textarea
@@ -589,8 +929,8 @@ function ImpactCard({
                   onChange={e => setEditedText(e.target.value)}
                 />
               ) : (
-                <div className="text-xs leading-relaxed bg-blue-50 dark:bg-blue-950/20 border border-blue-100 dark:border-blue-900/40 p-3 rounded-lg font-mono text-foreground/90">
-                  {imp.edited_text ?? imp.replace_text}
+                <div className="text-xs leading-relaxed bg-blue-50 dark:bg-blue-950/20 border border-blue-100 dark:border-blue-900/40 p-3 rounded-lg font-mono text-foreground/90 whitespace-pre-wrap">
+                  <DiffText side="new" oldText={imp.find_text ?? ""} newText={imp.edited_text ?? imp.replace_text ?? ""} />
                 </div>
               )}
             </div>

@@ -114,6 +114,24 @@ function buildPresentation(report: any, changes: any[], impacts: any[]) {
 
   const slides: string[] = [];
 
+  // Normalise executive summary: accept array (new) or string (legacy)
+  const execBullets: string[] = Array.isArray(s.executive)
+    ? s.executive.filter((b: any) => typeof b === "string" && b.trim().length > 0)
+    : (typeof s.executive === "string" && s.executive.trim()
+        ? s.executive.split(/(?<=[.!?])\s+(?=[A-Z])/).filter((x: string) => x.trim().length > 0)
+        : []);
+
+  // Top-N key changes for the briefing highlight (capped to fit slide)
+  const keyChanges = [...changes]
+    .sort((a, b) => {
+      const score = (x: any) => x.impact === "high" ? 0 : x.impact === "medium" ? 1 : 2;
+      return score(a) - score(b);
+    })
+    .slice(0, 5);
+
+  // Cap bullets too — too many lines overflow the slide
+  const cappedBullets = execBullets.slice(0, 4);
+
   slides.push(`
     <h1>Executive Summary</h1>
     <div class="body">
@@ -122,13 +140,35 @@ function buildPresentation(report: any, changes: any[], impacts: any[]) {
         <div class="stat-box"><div class="stat-l">Clauses After</div><div class="stat-n">${esc(s.after_count ?? "—")}</div></div>
         <div class="stat-box"><div class="stat-l">Effective Date</div><div class="stat-n">${esc(s.effective_date ?? "—")}</div></div>
       </div>
-      <div class="exec-box">${mdInline(s.executive ?? "")}</div>
-      ${(s.immediate_actions ?? []).length ? `
-        <div><h2>Immediate Actions</h2>
-          <ol class="actions">${(s.immediate_actions ?? []).map((a: string) => `<li>${mdInline(a)}</li>`).join("")}</ol>
+
+      ${keyChanges.length ? `
+        <div>
+          <h2>Key Changes Between the Two Documents</h2>
+          <ul class="key-changes">
+            ${keyChanges.map((c: any) => `
+              <li>
+                <span class="kc-ref">${esc(c.chapter_ref ?? "")}</span>
+                <span class="kc-pill" style="background:${impactColor(c.impact)}">${esc((c.impact ?? "").toUpperCase())}</span>
+                <span class="kc-text">${mdInline(c.change_summary ?? "")}</span>
+              </li>
+            `).join("")}
+          </ul>
+        </div>` : ""}
+
+      ${cappedBullets.length ? `
+        <div>
+          <h2>Strategic Briefing</h2>
+          <ul class="exec-bullets">
+            ${cappedBullets.map((b: string) => `<li>${mdInline(b)}</li>`).join("")}
+          </ul>
         </div>` : ""}
     </div>
   `);
+
+  const truncate = (txt: string, max: number) => {
+    const s = (txt ?? "").trim();
+    return s.length > max ? s.slice(0, max).replace(/\s+\S*$/, "") + "…" : s;
+  };
 
   const chunkChanges: any[][] = [];
   for (let i = 0; i < changes.length; i += 4) chunkChanges.push(changes.slice(i, i + 4));
@@ -140,27 +180,25 @@ function buildPresentation(report: any, changes: any[], impacts: any[]) {
           ${group.map((ch) => {
             const matched = impactsForChange(ch.chapter_ref);
             const labels = diffLabels(ch, report?.policy_name);
+            const shownSops = matched.slice(0, 2);
+            const extraSops = matched.length - shownSops.length;
             const beforeBlock = labels.showBefore
-              ? `<div class="ba-l">${esc(labels.beforeLabel)}</div><div class="ba-old">${mdInline(ch.old_requirement ?? "")}</div>`
-              : "";
-            const cmp = labels.kind === "kb" && labels.comparedAgainst.length
-              ? `<div class="ba-cmp"><strong>Compared against:</strong> ${labels.comparedAgainst.map(esc).join(" · ")}</div>`
+              ? `<div class="ba-l">${esc(labels.beforeLabel)}</div><div class="ba-old">${esc(truncate(ch.old_requirement ?? "", 180))}</div>`
               : "";
             const sopsBlock = matched.length
-              ? `<div class="sops"><div class="ba-l">Affected SOP file(s)</div><ul>${matched.map((m: any) => {
+              ? `<div class="sops"><div class="ba-l">Affected SOP file(s)</div><ul>${shownSops.map((m: any) => {
                   const loc = formatLoc(m);
-                  return `<li><strong>${esc(m.sop_title)}</strong>${loc ? ` — <span style="color:#64748b">${esc(loc)}</span>` : ""}</li>`;
-                }).join("")}</ul></div>`
+                  return `<li><strong>${esc(truncate(m.sop_title, 60))}</strong>${loc ? ` — <span style="color:#64748b">${esc(loc)}</span>` : ""}</li>`;
+                }).join("")}${extraSops > 0 ? `<li style="color:#64748b;font-style:italic">+ ${extraSops} more</li>` : ""}</ul></div>`
               : `<div class="sops"><em style="color:#94a3b8">No matching SOP found in your Knowledge Base.</em></div>`;
             return `
             <div class="change-card">
               <div class="change-head">
-                <div class="change-ref">${mdInline(ch.chapter_ref)}</div>
+                <div class="change-ref">${esc(ch.chapter_ref)}</div>
                 <span class="impact-pill" style="background:${impactColor(ch.impact)}">${esc(ch.impact?.toUpperCase())}</span>
               </div>
               ${beforeBlock}
-              <div class="ba-l">${esc(labels.afterLabel)}</div><div class="ba-new">${mdInline(ch.new_requirement ?? "")}</div>
-              <div class="ba-foot">${esc(labels.footer)}${cmp}</div>
+              <div class="ba-l">${esc(labels.afterLabel)}</div><div class="ba-new">${esc(truncate(ch.new_requirement ?? "", 200))}</div>
               ${sopsBlock}
             </div>`;
           }).join("")}
@@ -170,23 +208,17 @@ function buildPresentation(report: any, changes: any[], impacts: any[]) {
   });
 
   slides.push(`
-    <h1>Structural Changes</h1>
-    <div class="body">
+    <h1>Structural Changes &amp; Impact Breakdown</h1>
+    <div class="body combo-body">
+      <div class="impact-strip">
+        <div class="big-stat" style="background:${impactColor("high")}"><div class="big-n">${counts.high}</div><div class="big-l">High Impact</div></div>
+        <div class="big-stat" style="background:${impactColor("medium")}"><div class="big-n">${counts.medium}</div><div class="big-l">Medium Impact</div></div>
+        <div class="big-stat" style="background:${impactColor("low")}"><div class="big-n">${counts.low}</div><div class="big-l">Low Impact</div></div>
+      </div>
       <div class="three-col">
         <div class="struct green"><div class="struct-tag">NEW SECTIONS</div><ul>${(s.structural?.added ?? []).map((x: string) => `<li>${mdInline(x)}</li>`).join("") || "<li><em>None</em></li>"}</ul></div>
         <div class="struct blue"><div class="struct-tag">RENAMED</div><ul>${(s.structural?.renamed ?? []).map((x: string) => `<li>${mdInline(x)}</li>`).join("") || "<li><em>None</em></li>"}</ul></div>
         <div class="struct amber"><div class="struct-tag">RESTRUCTURED</div><ul>${(s.structural?.restructured ?? []).map((x: string) => `<li>${mdInline(x)}</li>`).join("") || "<li><em>None</em></li>"}</ul></div>
-      </div>
-    </div>
-  `);
-
-  slides.push(`
-    <h1>Impact Breakdown</h1>
-    <div class="body">
-      <div class="three-col">
-        <div class="big-stat" style="background:${impactColor("high")}"><div class="big-n">${counts.high}</div><div class="big-l">High Impact</div></div>
-        <div class="big-stat" style="background:${impactColor("medium")}"><div class="big-n">${counts.medium}</div><div class="big-l">Medium Impact</div></div>
-        <div class="big-stat" style="background:${impactColor("low")}"><div class="big-n">${counts.low}</div><div class="big-l">Low Impact</div></div>
       </div>
     </div>
   `);
@@ -218,25 +250,6 @@ function buildPresentation(report: any, changes: any[], impacts: any[]) {
     `);
   });
 
-  slides.push(`
-    <h1>Recommended Next Steps</h1>
-    <div class="body">
-      <div class="three-col">
-        ${(s.timeline ?? []).map((p: any, i: number) => `
-          <div class="phase">
-            <div class="phase-num">${i + 1}</div>
-            <h2>${mdInline(p.phase ?? "")}</h2>
-            <div class="phase-sub">${mdInline(p.window ?? "")}</div>
-            ${p.focus ? `<p>${mdInline(p.focus)}</p>` : ""}
-            ${Array.isArray(p.bullets) && p.bullets.length
-              ? `<ul class="phase-bullets">${p.bullets.map((b: string) => `<li>${mdInline(b)}</li>`).join("")}</ul>`
-              : ""}
-          </div>
-        `).join("")}
-      </div>
-    </div>
-  `);
-
   const css = `
     *,*::before,*::after{box-sizing:border-box}
     html,body{margin:0;padding:0;background:#e2e8f0;font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:#0f172a}
@@ -244,25 +257,38 @@ function buildPresentation(report: any, changes: any[], impacts: any[]) {
     .toolbar h1{margin:0;font-size:14px;font-weight:600}
     .toolbar button{cursor:pointer;padding:8px 16px;border-radius:6px;border:0;background:#4f46e5;color:#fff;font-weight:600;font-size:13px}
     .deck{display:flex;flex-direction:column;align-items:center;padding:24px;gap:24px}
-    .slide{width:1280px;height:720px;background:#fff;padding:44px 64px 56px;border-radius:8px;box-shadow:0 10px 30px rgba(0,0,0,.12);position:relative;overflow:hidden;display:flex;flex-direction:column}
-    .slide h1{font-size:28px;font-weight:800;margin:0;padding-bottom:12px;border-bottom:3px solid #0f172a}
-    .slide h2{font-size:16px;font-weight:700;margin:0 0 6px}
-    .slide p{margin:0 0 8px;font-size:14px;line-height:1.5}
-    .body{flex:1;min-height:0;padding-top:18px;padding-bottom:24px;display:flex;flex-direction:column;gap:14px;overflow:hidden}
-    .stats-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
-    .stat-box{border:1px solid #e2e8f0;border-radius:8px;padding:14px}
-    .stat-l{font-size:11px;text-transform:uppercase;color:#64748b;letter-spacing:.05em}
-    .stat-n{font-size:26px;font-weight:700;margin-top:6px}
+    .slide{width:1280px;height:720px;background:#fff;padding:36px 56px 48px;border-radius:8px;box-shadow:0 10px 30px rgba(0,0,0,.12);position:relative;overflow:hidden;display:flex;flex-direction:column}
+    .slide h1{font-size:24px;font-weight:800;margin:0;padding-bottom:10px;border-bottom:3px solid #0f172a}
+    .slide h2{font-size:14px;font-weight:700;margin:0 0 4px}
+    .slide p{margin:0 0 6px;font-size:13px;line-height:1.45}
+    .body{flex:1;min-height:0;padding-top:14px;padding-bottom:20px;display:flex;flex-direction:column;gap:10px;overflow:hidden}
+    .stats-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
+    .stat-box{border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px}
+    .stat-l{font-size:10px;text-transform:uppercase;color:#64748b;letter-spacing:.05em}
+    .stat-n{font-size:20px;font-weight:700;margin-top:4px;line-height:1.1}
     .exec-box{background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:14px;font-size:14px;line-height:1.5}
     .actions{margin:0;padding-left:20px;font-size:14px;line-height:1.6}
-    .changes-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;flex:1;min-height:0;overflow:hidden}
-    .change-card{border:1px solid #e2e8f0;border-radius:8px;padding:12px;display:flex;flex-direction:column;gap:4px;overflow:hidden;font-size:12px}
-    .change-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
-    .change-ref{font-weight:700;font-size:13px}
-    .ba-l{font-size:10px;text-transform:uppercase;color:#64748b;margin-top:4px}
-    .ba-old{background:#f1f5f9;padding:6px 8px;border-radius:4px;font-size:12px}
-    .ba-new{background:#eff6ff;border:1px solid #bfdbfe;padding:6px 8px;border-radius:4px;font-size:12px}
-    .sops ul{margin:2px 0 0;padding-left:16px;font-size:11px}
+    .key-changes{margin:4px 0 0;padding:0;list-style:none;display:flex;flex-direction:column;gap:4px}
+    .key-changes li{display:flex;align-items:flex-start;gap:8px;font-size:12px;line-height:1.35;padding:6px 8px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:5px}
+    .kc-ref{font-family:ui-monospace,Menlo,monospace;font-weight:700;font-size:11px;color:#0f172a;flex-shrink:0;min-width:90px}
+    .kc-pill{color:#fff;padding:1px 6px;border-radius:4px;font-size:9px;font-weight:700;letter-spacing:.04em;flex-shrink:0;align-self:center}
+    .kc-text{flex:1;color:#334155}
+    .exec-bullets{margin:4px 0 0;padding-left:18px;font-size:12px;line-height:1.45}
+    .exec-bullets li{margin-bottom:3px;color:#334155}
+    .combo-body{gap:18px}
+    .impact-strip{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
+    .impact-strip .big-stat{padding:18px;border-radius:8px}
+    .impact-strip .big-n{font-size:42px}
+    .impact-strip .big-l{font-size:12px;margin-top:4px}
+    .changes-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;flex:1;min-height:0;overflow:hidden}
+    .change-card{border:1px solid #e2e8f0;border-radius:6px;padding:10px;display:flex;flex-direction:column;gap:3px;overflow:hidden;font-size:11px;min-height:0}
+    .change-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;gap:6px}
+    .change-ref{font-weight:700;font-size:12px;font-family:ui-monospace,Menlo,monospace}
+    .ba-l{font-size:9px;text-transform:uppercase;color:#64748b;margin-top:3px;letter-spacing:.04em;font-weight:600}
+    .ba-old{background:#f1f5f9;padding:5px 7px;border-radius:4px;font-size:11px;line-height:1.35;color:#334155;max-height:48px;overflow:hidden}
+    .ba-new{background:#eff6ff;border:1px solid #bfdbfe;padding:5px 7px;border-radius:4px;font-size:11px;line-height:1.35;color:#1e293b;max-height:56px;overflow:hidden}
+    .sops ul{margin:2px 0 0;padding-left:14px;font-size:10px;line-height:1.4}
+    .sops li{margin-bottom:1px}
     .impact-pill{color:#fff;padding:3px 10px;border-radius:4px;font-size:10px;font-weight:700;letter-spacing:.04em}
     .three-col{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;flex:1;min-height:0}
     .struct{border-radius:8px;padding:14px;border:1.5px solid;overflow:hidden;display:flex;flex-direction:column}

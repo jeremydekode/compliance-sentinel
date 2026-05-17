@@ -79,15 +79,16 @@ function Present() {
             <Stat label="Effective Date" value={s.effective_date ?? "—"} />
           </div>
           <div className="mt-6 p-6 bg-primary/5 border border-primary/20 rounded-xl">
-            <MD>{s.executive ?? ""}</MD>
-          </div>
-          <div className="mt-4">
-            <h3 className="font-display font-semibold mb-2">Immediate Actions</h3>
-            <ol className="space-y-2 text-base">
-              {(s.immediate_actions ?? []).map((a: string, i: number) => (
-                <li key={i}><span className="font-semibold text-primary">{i + 1}.</span> {a}</li>
-              ))}
-            </ol>
+            {(() => {
+              const bullets: string[] = Array.isArray(s.executive)
+                ? s.executive.filter((b: any) => typeof b === "string" && b.trim())
+                : typeof s.executive === "string" && s.executive.trim()
+                  ? s.executive.split(/(?<=[.!?])\s+(?=[A-Z])/).filter((x: string) => x.trim())
+                  : [];
+              return bullets.length > 0
+                ? <ul className="list-disc pl-6 space-y-2 text-base leading-relaxed marker:text-primary">{bullets.map((b, i) => <li key={i}>{b.trim()}</li>)}</ul>
+                : <MD>{(s.executive as any) ?? ""}</MD>;
+            })()}
           </div>
         </SlideBox>
 

@@ -1,5 +1,5 @@
 import { Link, useLocation } from "@tanstack/react-router";
-import { LayoutDashboard, FolderOpen, ShieldCheck, FileSearch, Settings, Zap, Scale, UserRound, ChevronDown } from "lucide-react";
+import { LayoutDashboard, FolderOpen, ShieldCheck, FileSearch, Settings, Zap, Scale, UserRound, ChevronDown, PanelLeftClose, PanelLeftOpen } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useRole, ROLE_META, type UserRole } from "@/lib/role";
 import { useState, useRef, useEffect } from "react";
@@ -11,33 +11,64 @@ const NAV = [
   { to: "/settings", label: "Settings", icon: Settings },
 ] as const;
 
+const SIDEBAR_KEY = "sidebar_collapsed";
+
 export function AppShell({ children }: { children: React.ReactNode }) {
   const loc = useLocation();
   const currentNav = NAV.find((n) =>
     n.to === "/" ? loc.pathname === "/" : loc.pathname.startsWith(n.to)
   );
 
+  const [collapsed, setCollapsed] = useState(false);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const stored = window.localStorage.getItem(SIDEBAR_KEY);
+    if (stored === "1") setCollapsed(true);
+  }, []);
+  function toggleCollapsed() {
+    setCollapsed((prev) => {
+      const next = !prev;
+      if (typeof window !== "undefined") window.localStorage.setItem(SIDEBAR_KEY, next ? "1" : "0");
+      return next;
+    });
+  }
+
   return (
     <div className="flex min-h-screen bg-background">
       {/* Sidebar */}
-      <aside className="hidden md:flex w-60 shrink-0 flex-col bg-sidebar text-sidebar-foreground border-r border-sidebar-border">
-        {/* Logo */}
-        <div className="flex items-center gap-3 px-5 py-5 border-b border-sidebar-border">
-          <div className="size-9 rounded-xl bg-gradient-to-br from-sidebar-primary/30 to-sidebar-primary/10 grid place-items-center ring-1 ring-sidebar-primary/20">
+      <aside className={cn(
+        "hidden md:flex shrink-0 flex-col bg-sidebar text-sidebar-foreground border-r border-sidebar-border transition-[width] duration-200",
+        collapsed ? "w-14" : "w-60"
+      )}>
+        {/* Logo + collapse button */}
+        <div className={cn(
+          "flex items-center border-b border-sidebar-border",
+          collapsed ? "flex-col gap-2 px-2 py-3" : "gap-3 px-5 py-5"
+        )}>
+          <div className="size-9 rounded-xl bg-gradient-to-br from-sidebar-primary/30 to-sidebar-primary/10 grid place-items-center ring-1 ring-sidebar-primary/20 shrink-0">
             <ShieldCheck className="size-5 text-sidebar-primary" />
           </div>
-          <div>
-            <div className="font-display text-sm font-bold leading-tight text-sidebar-foreground">
-              Compliance Sentinel
+          {!collapsed && (
+            <div className="flex-1 min-w-0">
+              <div className="font-display text-sm font-bold leading-tight text-sidebar-foreground truncate">
+                Compliance Sentinel
+              </div>
+              <div className="text-[10px] text-sidebar-foreground/50 font-medium uppercase tracking-widest">
+                Intelligence Platform
+              </div>
             </div>
-            <div className="text-[10px] text-sidebar-foreground/50 font-medium uppercase tracking-widest">
-              Intelligence Platform
-            </div>
-          </div>
+          )}
+          <button
+            onClick={toggleCollapsed}
+            title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+            className="p-1.5 rounded-lg text-sidebar-foreground/50 hover:text-sidebar-foreground hover:bg-sidebar-accent/40 transition-colors"
+          >
+            {collapsed ? <PanelLeftOpen className="size-3.5" /> : <PanelLeftClose className="size-3.5" />}
+          </button>
         </div>
 
         {/* Nav */}
-        <nav className="flex-1 p-3 space-y-0.5 pt-4">
+        <nav className={cn("flex-1 space-y-0.5 pt-4", collapsed ? "p-2" : "p-3")}>
           {NAV.map((n) => {
             const active =
               n.to === "/" ? loc.pathname === "/" : loc.pathname.startsWith(n.to);
@@ -45,35 +76,43 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               <Link
                 key={n.to}
                 to={n.to}
+                title={collapsed ? n.label : undefined}
                 className={cn(
-                  "flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm transition-all duration-150 font-medium",
+                  "flex items-center rounded-xl text-sm transition-all duration-150 font-medium",
+                  collapsed ? "justify-center px-2 py-2.5" : "gap-3 px-3 py-2.5",
                   active
                     ? "bg-sidebar-accent text-sidebar-accent-foreground shadow-sm"
                     : "text-sidebar-foreground/60 hover:bg-sidebar-accent/40 hover:text-sidebar-foreground"
                 )}
               >
                 <n.icon className={cn("size-4 shrink-0", active ? "opacity-100" : "opacity-60")} />
-                {n.label}
-                {active && (
-                  <span className="ml-auto size-1.5 rounded-full bg-sidebar-primary" />
-                )}
+                {!collapsed && <>{n.label}{active && (<span className="ml-auto size-1.5 rounded-full bg-sidebar-primary" />)}</>}
               </Link>
             );
           })}
         </nav>
 
         {/* Footer */}
-        <div className="p-4 border-t border-sidebar-border">
-          <div className="flex items-center gap-2.5 rounded-xl bg-sidebar-accent/40 px-3 py-2.5">
-            <div className="size-6 rounded-lg bg-gradient-to-br from-sidebar-primary/20 to-sidebar-primary/5 grid place-items-center">
-              <Zap className="size-3.5 text-sidebar-primary" />
+        <div className={cn("border-t border-sidebar-border", collapsed ? "p-2" : "p-4")}>
+          {collapsed ? (
+            <div className="flex items-center justify-center py-2" title="AI Engine · Gemini 3.1 Active">
+              <div className="size-7 rounded-lg bg-gradient-to-br from-sidebar-primary/20 to-sidebar-primary/5 grid place-items-center relative">
+                <Zap className="size-3.5 text-sidebar-primary" />
+                <span className="absolute -top-0.5 -right-0.5 size-2 rounded-full bg-emerald-400 shadow-[0_0_6px_2px_rgba(52,211,153,0.4)]" />
+              </div>
             </div>
-            <div>
-              <div className="text-[10px] font-bold text-sidebar-foreground/90 uppercase tracking-widest">AI Engine</div>
-              <div className="text-[10px] text-sidebar-foreground/40 font-medium">Gemini 3.1 Active</div>
+          ) : (
+            <div className="flex items-center gap-2.5 rounded-xl bg-sidebar-accent/40 px-3 py-2.5">
+              <div className="size-6 rounded-lg bg-gradient-to-br from-sidebar-primary/20 to-sidebar-primary/5 grid place-items-center">
+                <Zap className="size-3.5 text-sidebar-primary" />
+              </div>
+              <div>
+                <div className="text-[10px] font-bold text-sidebar-foreground/90 uppercase tracking-widest">AI Engine</div>
+                <div className="text-[10px] text-sidebar-foreground/40 font-medium">Gemini 3.1 Active</div>
+              </div>
+              <span className="ml-auto size-1.5 rounded-full bg-emerald-400 shadow-[0_0_6px_2px_rgba(52,211,153,0.4)]" />
             </div>
-            <span className="ml-auto size-1.5 rounded-full bg-emerald-400 shadow-[0_0_6px_2px_rgba(52,211,153,0.4)]" />
-          </div>
+          )}
         </div>
       </aside>
 

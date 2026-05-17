@@ -63,6 +63,7 @@ export interface AnalysisResult {
 }
 
 export interface RegulatoryDelta {
+  title?: string;
   chapter_ref: string;
   pages: string;
   legal_refs: string[];
@@ -105,30 +106,78 @@ Compare Document A against Document B section by section.` : `# DOCUMENT PROVIDE
 - NEW POLICY: First attachment (treat as entirely new requirements)
 `}
 
-# WHAT CONSTITUTES A MATERIAL POLICY CHANGE (EXTRACT THESE):
+# WHAT CONSTITUTES A MATERIAL POLICY CHANGE (EXTRACT EVERY ONE OF THESE):
+
+## Category A — Quantitative shifts
 - A reporting/notification deadline changed (e.g. "24 hours" → "6 hours", "annual" → "semi-annual")
 - A monetary or quantitative threshold changed (e.g. "RM 10 million" → "RM 5 million")
-- A new mandatory control, capability, or system is introduced (e.g. kill-switch, session recording, BCP testing frequency)
-- A requirement scope expanded or contracted (e.g. now applies to third-party arrangements, or intra-group transactions)
-- A "should" or "may" became a "shall" or "must" (guidance hardened into mandate)
-- An entirely new section or chapter was added with substantive obligations
-- A compliance review/audit frequency changed
+- A compliance review/audit frequency changed (e.g. "every 3 years" → "annually")
+- A retention period, downtime cap, response time, or coverage % changed
+
+## Category B — New requirements (often have NO old equivalent — STILL EXTRACT)
+- A new mandatory control, capability, or system is introduced (e.g. kill-switch, stand-in processing arrangements, out-of-band communication, public uptime disclosure)
+- An entirely new section, chapter, or appendix was added with substantive obligations
+- A new technical security standard appears (e.g. API security controls, MFA upgrade, SBOM adoption)
+- A new emerging-technology governance requirement (e.g. AI, quantum, cloud exit strategy)
+- A new disclosure or transparency obligation (e.g. public reporting, customer notification)
+- A new sub-paragraph mandating something the old policy didn't address at all
+**For NEW requirements with no prior baseline, set old_requirement to "N/A - new requirement" — do NOT skip the entry.**
+
+## Category C — Tone or scope shifts
+- A requirement scope expanded or contracted (e.g. now applies to third-party arrangements, merchant acquirers, intra-group transactions)
+- A "should" / "may" / "encouraged to" / "strongly encourages" became a "shall" / "must" / "is required to" (guidance hardened into mandate)
 - A new definition was added that changes the scope of who is regulated
 - An exemption was removed or a new exemption was added
+- Even soft language like "strongly encourages adopting X" counts as a material shift if X was previously unmentioned — extract it.
+
+## Category D — Cross-reference / consolidation
+- A control was moved from one section to another AND its wording strengthened
+- Multiple existing requirements were consolidated under a single mandatory standard
+
+# WHERE TO LOOK (cover ALL these locations exhaustively):
+- Main numbered paragraphs (5.x, 8.x, 10.x, 11.x, 12.x …)
+- ALL Appendices (Appendix 1, 2, 3, 5, 9, 10, etc.) — appendices often contain critical new technical mandates
+- Footnotes and tables that introduce new obligations
+- Sub-paragraphs (a), (b), (c), (i), (ii), (iii)
 
 # WHAT IS NOT A MATERIAL CHANGE (DO NOT INCLUDE):
-- Rewording the same meaning without changing the obligation
-- Renumbering or reformatting lists or appendices
+- Rewording the same obligation without changing the substantive meaning
+- Pure renumbering with no wording change
 - Grammar, punctuation, or typographical corrections
 - Adding a cross-reference or footnote without changing the obligation
-- Cosmetic restructuring of the same content into sub-paragraphs
+- Purely cosmetic restructuring of identical content into sub-paragraphs
+
+# ❗ CRITICAL ANTI-HALLUCINATION RULES (apply BEFORE every entry):
+
+## Rule 1 — Verbatim verification
+Before claiming a change exists, you MUST extract the verbatim text of the old requirement AND the verbatim text of the new requirement, side by side. If the substantive wording is identical (only the paragraph number changed, e.g. 10.38 → 10.42), this is NOT a delta. Do NOT include it. Renumbering alone is not a material change.
+
+## Rule 2 — Respect the S / G mandate classifier
+BNM regulatory documents use a strict classifier system. ALWAYS preserve it in your output:
+- "S X.X" (Standard) = MANDATORY obligation
+- "G X.X" (Guidance) = NON-MANDATORY recommendation ("may consider", "should consider", "is encouraged to")
+- "P X.X" (Paragraph) = neutral paragraph
+
+If the new clause is prefixed "G" (Guidance), you MUST NOT describe it as a "mandate", "shall", "must", or "mandatory" — even if the topic sounds important. For example, "G 10.15(a) — A financial institution may consider adopting an SBOM" is GUIDANCE, not a mandate. Your title/tone_shift must reflect this faithfully (e.g. "tone_shift": "New guidance — encouraged adoption").
+
+## Rule 3 — Effective date vs transition deadline
+- "Effective date" = when the policy comes into force (the regulator's stated come-into-effect date, e.g. "28 November 2025").
+- "Transition deadline" = a future date by which institutions must complete implementation of a specific capability (e.g. "30 September 2027" for stand-in processing).
+Do NOT conflate these. The summary's effective_date field must be the policy's come-into-force date, NOT a transition deadline.
 
 # SELF-CHECK BEFORE EACH ENTRY:
-"Would the Head of Compliance need to commission a project to update internal SOPs, controls, or staff training because of this change?" If NO → skip it.
+1. Did I quote the old text verbatim? Is it substantively different from the new text (not just renumbered)?
+2. Did I check the S/G/P prefix? Is my tone_shift accurate to that classifier?
+3. Would the Head of Compliance need to commission a project, write a new control, update an SOP, retrain staff, modify a system, or notify a customer because of this change?
+If YES to all → extract it. If text is identical but renumbered → SKIP. If unsure on substance → extract it (false positives are easy to filter; missing a real change is a compliance risk).
+
+# COMPLETENESS REQUIREMENT:
+Sweep the ENTIRE document including all appendices before finalising. A typical major policy revision contains 10–25 material changes. If your output has fewer than 10 entries on a major policy, re-scan for missed items in: (a) new appendices, (b) new sub-paragraphs, (c) softly-worded new obligations, (d) anything introduced as a "kill switch", "stand-in", "out-of-band", "SBOM", "API security", "cloud exit", "public disclosure", or "emerging technology" requirement.
 
 # OUTPUT FORMAT (JSON Array):
 [{
-  "chapter_ref": "Specific chapter/paragraph/section reference from the NEW document (e.g. 'Paragraph 10.31(a)')",
+  "title": "Short 3-6 word headline naming the change (e.g. 'Digital Fraud Kill Switch', 'Public Uptime Disclosure', 'Stricter MFA & OTP Rules', 'Cloud Exit Strategy')",
+  "chapter_ref": "Specific chapter/paragraph/section reference from the NEW document (e.g. 'Paragraph 10.31(a)' or 'Appendix 5, Part E')",
   "pages": "",
   "legal_refs": ["Statutory or regulatory references cited"],
   "related_instruments": ["Related guidelines or instruments mentioned"],
@@ -136,10 +185,11 @@ Compare Document A against Document B section by section.` : `# DOCUMENT PROVIDE
   "old_requirement": "The previous obligation verbatim from the legacy doc, or 'N/A - new requirement'",
   "new_requirement": "The new/changed obligation verbatim from the updated doc",
   "change_summary": "One sentence: what operationally changed",
-  "tone_shift": "e.g. 'Guidance → Mandate', 'Relaxed → Prescriptive'"
+  "tone_shift": "e.g. 'Guidance → Mandate', 'Relaxed → Prescriptive', 'New requirement'"
 }]
 
 Return ONLY material, actionable changes. Be thorough — missing a real change is a compliance risk.
+There is NO upper limit on the number of changes you may return. List every material policy shift you can detect, even if it produces 20, 50, or more entries. Do not summarise multiple distinct obligations into a single entry.
   `;
 
   const parts: any[] = [
@@ -153,7 +203,7 @@ Return ONLY material, actionable changes. Be thorough — missing a real change 
 
   const response = await generateWithFallback({
     contents: [{ role: "user", parts }],
-    config: { responseMimeType: "application/json" },
+    config: { responseMimeType: "application/json", maxOutputTokens: 32768 },
   });
 
   const text = response.text ?? "";
@@ -247,8 +297,15 @@ You have one specific REGULATORY CHANGE. Your task is to find the EXACT location
    - Be specific — use the same professional regulatory tone as the original SOP.
 4. If no SOP is affected by this change, return an empty array [].
 5. Prefer "find_replace" when you can identify exact text. Use "insertion" for new clauses. Use "new_section" only if an entirely new section must be created.
+6. There is NO upper limit on the number of impacts you may return. If a single regulatory change affects 7 different internal SOPs (or 7 different paragraphs in the same SOP), return all 7 entries. Do NOT consolidate distinct affected paragraphs into a single entry.
 
 # CRITICAL: For find_text, provide VERBATIM text from the SOP (at least 20 words of context) so it can be found programmatically. Do not paraphrase or shorten.
+
+# ❗ ANTI-HALLUCINATION FOR SOP MAPPING:
+- The find_text MUST be a copy-paste-able string that actually exists in the attached SOP PDF. If you cannot locate a substantively matching passage, do NOT invent one — use change_type "insertion" or "new_section" instead and leave find_text empty.
+- The page number MUST be the actual page where the find_text appears in the SOP PDF. If you are uncertain of the exact page, set page to 0 — do NOT guess. A wrong page number is worse than no page number.
+- The paragraph reference MUST exist in the SOP. Do not invent section numbers like "Section 4.2" if the SOP only has sections 1-3.
+- If the SOP only contains 3 pages, do NOT cite page 4 or beyond.
 
 # OUTPUT FORMAT (JSON Array):
 [{
@@ -274,7 +331,7 @@ You have one specific REGULATORY CHANGE. Your task is to find the EXACT location
 
   const response = await generateWithFallback({
     contents: [{ role: "user", parts }],
-    config: { responseMimeType: "application/json" },
+    config: { responseMimeType: "application/json", maxOutputTokens: 32768 },
   });
 
   const text = response.text ?? "";
@@ -309,13 +366,12 @@ CHANGE SUMMARIES: ${changes.map(c => `[${c.chapter_ref}] ${c.change_summary}`).j
 
 OUTPUT JSON:
 {
-  "executive": "150-200 word strategic summary of the compliance paradigm shift and key operational impacts",
-  "effective_date": "Enforcement date from the policy, or 'Refer to policy document'",
+  "executive": ["4-6 concise bullet points (each 15-30 words) summarising the paradigm shift and key operational impacts. Each bullet must be a complete, standalone thought. Avoid invented numbers — do NOT cite specific paragraph numbers, downtime caps, or dates unless they were quoted verbatim in the extracted changes above."],
+  "effective_date": "The come-into-force date of the policy itself (e.g. '28 November 2025'), NOT a transition deadline for any specific capability. If unknown, use 'Refer to policy document'.",
+  "transition_deadline": "If the policy specifies a separate future date by which institutions must complete migration of a capability (e.g. '30 September 2027' for stand-in processing), record it here. Otherwise omit or use null.",
   "before_count": ${changes.length},
   "after_count": ${changes.length},
-  "immediate_actions": ["4 specific, actionable directives for the compliance team"],
-  "structural": { "added": [], "renamed": [], "restructured": [] },
-  "timeline": []
+  "structural": { "added": [], "renamed": [], "restructured": [] }
 }
   `;
 

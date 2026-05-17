@@ -74,42 +74,38 @@ export function ApprovalWorkflow({ report }: { report: any }) {
     }
   }
 
-  // Phase A — Compliance validation
+  // Phase A — Compliance validation (compact horizontal strip)
   if (status === "pending_validation" || status === "draft" || status === "pending_review") {
     return (
-      <Card className="p-5 border-blue-300 bg-blue-50/40">
-        <div className="flex items-start gap-3">
-          <ShieldCheck className="size-5 text-blue-700 mt-0.5 shrink-0" />
-          <div className="flex-1">
-            <div className="font-display font-semibold text-blue-900">
-              Step 7 · Phase A — Compliance Officer Review
-            </div>
-            <p className="text-sm text-blue-900/80 mt-1">
-              Review every draft annotation below. Approve, reject, or route for legal.
-              When all {stats.total} items have a decision, submit the Change Notice package to Legal for sign-off.
-            </p>
-            <div className="flex flex-wrap gap-2 mt-3 text-xs">
-              <Badge variant="outline" className="bg-white">Total {stats.total}</Badge>
-              <Badge variant="outline" className="bg-emerald-100 text-emerald-900 border-emerald-300">Approved {stats.approved}</Badge>
-              <Badge variant="outline" className="bg-amber-100 text-amber-900 border-amber-300">Routed {stats.routed}</Badge>
-              <Badge variant="outline" className="bg-muted">Rejected {stats.rejected}</Badge>
-              <Badge variant="outline" className="bg-blue-100 text-blue-900 border-blue-300">Pending {stats.pending}</Badge>
-            </div>
-            <div className="mt-4">
-              <Button
-                onClick={() => setLegalOpen(true)}
-                disabled={!allReviewed || !hasApproved}
-                className="gap-2"
-              >
-                <Scale className="size-4" />
-                Submit Change Notice to Legal
-              </Button>
-              {!allReviewed && (
-                <span className="ml-3 text-xs text-blue-900/70">
-                  Resolve all {stats.pending} pending items first.
-                </span>
-              )}
-            </div>
+      <div className="border-b border-blue-200 bg-blue-50/50 dark:bg-blue-950/20">
+        <div className="px-4 py-2 flex items-center gap-3 flex-wrap">
+          <ShieldCheck className="size-4 text-blue-700 shrink-0" />
+          <div className="text-xs font-bold text-blue-900 dark:text-blue-300 whitespace-nowrap">
+            Phase A · Compliance Review
+          </div>
+          <div className="h-4 w-px bg-blue-300/50" />
+          <div className="flex items-center gap-1.5 text-[11px] flex-wrap">
+            <span className="px-1.5 py-0.5 rounded bg-white border text-foreground/80"><span className="font-bold">{stats.total}</span> total</span>
+            <span className="px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800 border border-emerald-200"><span className="font-bold">{stats.approved}</span> approved</span>
+            <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-200"><span className="font-bold">{stats.routed}</span> routed</span>
+            <span className="px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 border border-slate-200"><span className="font-bold">{stats.rejected}</span> rejected</span>
+            <span className="px-1.5 py-0.5 rounded bg-blue-100 text-blue-800 border border-blue-200"><span className="font-bold">{stats.pending}</span> pending</span>
+          </div>
+          <div className="ml-auto flex items-center gap-2 shrink-0">
+            {!allReviewed && (
+              <span className="text-[10px] text-blue-900/70 italic hidden lg:inline">
+                Resolve {stats.pending} pending first
+              </span>
+            )}
+            <Button
+              size="sm"
+              onClick={() => setLegalOpen(true)}
+              disabled={!allReviewed || !hasApproved}
+              className="h-7 text-xs gap-1.5"
+            >
+              <Scale className="size-3" />
+              Submit to Legal
+            </Button>
           </div>
         </div>
 
@@ -164,74 +160,69 @@ export function ApprovalWorkflow({ report }: { report: any }) {
             </DialogFooter>
           </DialogContent>
         </Dialog>
-      </Card>
+      </div>
     );
   }
 
-  // Phase B — Pending Legal
+  // Phase B — Pending Legal (compact)
   if (status === "pending_legal") {
     return (
-      <Card className="p-5 border-violet-300 bg-violet-50/40">
-        <div className="flex items-start gap-3">
-          <Scale className="size-5 text-violet-700 mt-0.5 shrink-0" />
-          <div className="flex-1">
-            <div className="font-display font-semibold text-violet-900">
-              Step 7 · Phase B — Awaiting Legal Sign-Off
-            </div>
-            <p className="text-sm text-violet-900/80 mt-1">
-              {stats.approved + stats.routed} consolidated recommendations are queued for Legal.
-              Final sign-off unlocks Step 8 · Execution.
-            </p>
+      <div className="border-b border-violet-200 bg-violet-50/50 dark:bg-violet-950/20">
+        <div className="px-4 py-2 flex items-center gap-3 flex-wrap">
+          <Scale className="size-4 text-violet-700 shrink-0" />
+          <div className="text-xs font-bold text-violet-900 dark:text-violet-300 whitespace-nowrap">
+            Phase B · Awaiting Legal Sign-Off
+          </div>
+          <div className="h-4 w-px bg-violet-300/50" />
+          <div className="text-[11px] text-violet-900/80 dark:text-violet-300/80">
+            <span className="font-bold">{stats.approved + stats.routed}</span> items queued · Switch to <span className="font-semibold">Head of Legal</span> role to sign off
+          </div>
+          <div className="ml-auto shrink-0">
             <Button
-              className="mt-4 gap-2"
+              size="sm"
+              className="h-7 text-xs gap-1.5"
               disabled={busy === "fin"}
               onClick={() => run("fin", () => finLegal({ data: { reportId: report.id } }), "Legal sign-off recorded")}
             >
-              {busy === "fin" ? <Loader2 className="size-4 animate-spin" /> : <CheckCircle2 className="size-4" />}
-              Record Final Legal Sign-Off
+              {busy === "fin" ? <Loader2 className="size-3 animate-spin" /> : <CheckCircle2 className="size-3" />}
+              Record Sign-Off
             </Button>
           </div>
         </div>
-      </Card>
+      </div>
     );
   }
 
-  // Step 8 — Execution
+  // Step 8 — Execution (compact)
   if (status === "signed_off") {
     return (
-      <Card className="p-5 border-emerald-300 bg-emerald-50/40">
-        <div className="flex items-start gap-3">
-          <Rocket className="size-5 text-emerald-700 mt-0.5 shrink-0" />
-          <div className="flex-1">
-            <div className="font-display font-semibold text-emerald-900">
-              Step 8 · Execution &amp; Publish
-            </div>
-            <p className="text-sm text-emerald-900/80 mt-1">
-              Legal has signed off. Choose how the {stats.approved} approved changes get applied.
-            </p>
-            <div className="mt-4 flex flex-wrap gap-2">
-              <Button onClick={() => setExecOpen(true)} className="gap-2">
-                <Rocket className="size-4" /> Execute…
-              </Button>
-              <Button
-                variant="outline"
-                className="gap-2 border-emerald-300 text-emerald-900 hover:bg-emerald-50"
-                disabled={busy === "confirm"}
-                onClick={() =>
-                  run(
-                    "confirm",
-                    () => confirmManual({ data: { reportId: report.id } }),
-                    "Manual execution confirmed · report marked as Published"
-                  )
-                }
-              >
-                {busy === "confirm" ? <Loader2 className="size-4 animate-spin" /> : <CheckCircle2 className="size-4" />}
-                Confirm Manual Completion
-              </Button>
-            </div>
-            <p className="mt-2 text-xs text-emerald-900/70">
-              Use Confirm Manual Completion if the instruction memo has already been actioned outside the system.
-            </p>
+      <div className="border-b border-emerald-200 bg-emerald-50/50 dark:bg-emerald-950/20">
+        <div className="px-4 py-2 flex items-center gap-3 flex-wrap">
+          <Rocket className="size-4 text-emerald-700 shrink-0" />
+          <div className="text-xs font-bold text-emerald-900 dark:text-emerald-300 whitespace-nowrap">
+            Step 8 · Execute &amp; Publish
+          </div>
+          <div className="h-4 w-px bg-emerald-300/50" />
+          <div className="text-[11px] text-emerald-900/80 dark:text-emerald-300/80">
+            Legal signed off · <span className="font-bold">{stats.approved}</span> changes ready to apply
+          </div>
+          <div className="ml-auto flex items-center gap-1.5 shrink-0">
+            <Button size="sm" onClick={() => setExecOpen(true)} className="h-7 text-xs gap-1.5">
+              <Rocket className="size-3" /> Execute…
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 text-xs gap-1.5 border-emerald-300 text-emerald-900 hover:bg-emerald-50"
+              disabled={busy === "confirm"}
+              onClick={() =>
+                run("confirm", () => confirmManual({ data: { reportId: report.id } }),
+                  "Manual execution confirmed · report marked as Published")
+              }
+            >
+              {busy === "confirm" ? <Loader2 className="size-3 animate-spin" /> : <CheckCircle2 className="size-3" />}
+              Confirm Manual
+            </Button>
           </div>
         </div>
 
@@ -291,52 +282,49 @@ export function ApprovalWorkflow({ report }: { report: any }) {
             </DialogFooter>
           </DialogContent>
         </Dialog>
-      </Card>
+      </div>
     );
   }
 
   if (status === "published") {
     return (
-      <Card className="p-5 border-emerald-400 bg-emerald-100/50">
-        <div className="flex items-center gap-3">
-          <CheckCircle2 className="size-5 text-emerald-700" />
-          <div>
-            <div className="font-display font-semibold text-emerald-900">Published to Knowledge Base</div>
-            <p className="text-sm text-emerald-900/80">All approved changes applied. Affected SOPs versioned and timestamped.</p>
-          </div>
+      <div className="border-b border-emerald-300 bg-emerald-100/50 dark:bg-emerald-950/30">
+        <div className="px-4 py-2 flex items-center gap-3">
+          <CheckCircle2 className="size-4 text-emerald-700" />
+          <div className="text-xs font-bold text-emerald-900 dark:text-emerald-300">Published to Knowledge Base</div>
+          <div className="h-4 w-px bg-emerald-400/50" />
+          <div className="text-[11px] text-emerald-900/80 dark:text-emerald-300/80">All approved changes applied · SOPs versioned</div>
         </div>
-      </Card>
+      </div>
     );
   }
 
   if (status === "pending_manual") {
     return (
-      <Card className="p-5 border-amber-300 bg-amber-50/40">
-        <div className="flex items-start gap-3">
-          <FileText className="size-5 text-amber-700 mt-0.5 shrink-0" />
-          <div className="flex-1">
-            <div className="font-display font-semibold text-amber-900">Pending Manual Execution</div>
-            <p className="text-sm text-amber-900/80">
-              Instruction Memo issued. Awaiting human team to apply changes in source documents.
-              Once the edits have been made in the affected SOPs, confirm completion below to close out this report.
-            </p>
+      <div className="border-b border-amber-200 bg-amber-50/50 dark:bg-amber-950/20">
+        <div className="px-4 py-2 flex items-center gap-3 flex-wrap">
+          <FileText className="size-4 text-amber-700 shrink-0" />
+          <div className="text-xs font-bold text-amber-900 dark:text-amber-300 whitespace-nowrap">Pending Manual Execution</div>
+          <div className="h-4 w-px bg-amber-300/50" />
+          <div className="text-[11px] text-amber-900/80 dark:text-amber-300/80">
+            Instruction Memo issued · awaiting team to apply changes in source documents
+          </div>
+          <div className="ml-auto shrink-0">
             <Button
-              className="mt-4 gap-2"
+              size="sm"
+              className="h-7 text-xs gap-1.5"
               disabled={busy === "confirm"}
               onClick={() =>
-                run(
-                  "confirm",
-                  () => confirmManual({ data: { reportId: report.id } }),
-                  "Manual execution confirmed · report marked as Published"
-                )
+                run("confirm", () => confirmManual({ data: { reportId: report.id } }),
+                  "Manual execution confirmed · report marked as Published")
               }
             >
-              {busy === "confirm" ? <Loader2 className="size-4 animate-spin" /> : <CheckCircle2 className="size-4" />}
-              Confirm Manual Completion
+              {busy === "confirm" ? <Loader2 className="size-3 animate-spin" /> : <CheckCircle2 className="size-3" />}
+              Confirm Completion
             </Button>
           </div>
         </div>
-      </Card>
+      </div>
     );
   }
 

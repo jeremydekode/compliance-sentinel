@@ -234,7 +234,7 @@ function WorkspaceSwitcher() {
   }, []);
 
   const meta = WORKSPACES[ws];
-  const options: WorkspaceId[] = ['rmit', 'fatf'];
+  const options = Object.keys(WORKSPACES) as WorkspaceId[];
 
   return (
     <div ref={ref} className="relative">

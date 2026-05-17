@@ -17,6 +17,7 @@ export const createReport = createServerFn({ method: "POST" })
     z.object({
       filename: z.string(),
       fileUrl: z.string().nullable(),
+      workspace: z.enum(["rmit", "fatf"]).default("rmit"),
       customTitle: z.string().optional(),
       notes: z.string().optional(),
       detected: z
@@ -32,6 +33,7 @@ export const createReport = createServerFn({ method: "POST" })
   )
   .handler(async ({ data }) => {
     const detected = data.detected;
+    const workspace = data.workspace;
     
     // 1. Fetch the newly uploaded policy
     if (!data.fileUrl) throw new Error("No file URL provided for analysis");
@@ -43,9 +45,10 @@ export const createReport = createServerFn({ method: "POST" })
     const oldDocTypes = detected?.doc_type
       ? (REGULATION_FAMILIES[detected.doc_type] ?? [detected.doc_type])
       : ["__none__"];
-    const { data: oldDocs } = await supabase
+    const { data: oldDocs } = await (supabase as any)
       .from("sop_documents")
       .select("*")
+      .eq("workspace_id", workspace)
       .in("doc_type", oldDocTypes)
       .neq("version", detected?.version ?? "")
       .order("created_at", { ascending: false })
@@ -88,9 +91,10 @@ export const createReport = createServerFn({ method: "POST" })
       const INTERNAL_DOC_TYPES = INTERNAL_DOC_TYPES_CONST as readonly string[];
 
       if (sopIds.length > 0) {
-        const { data: sopDocs } = await supabase
+        const { data: sopDocs } = await (supabase as any)
           .from("sop_documents")
           .select("*")
+          .eq("workspace_id", workspace)
           .in("id", sopIds)
           .in("doc_type", INTERNAL_DOC_TYPES);
         relevantSops = (sopDocs ?? []) as any[];
@@ -99,9 +103,10 @@ export const createReport = createServerFn({ method: "POST" })
       // Fall back to ALL internal SOPs if chunk search returned nothing
       if (relevantSops.length === 0) {
         console.log("Chunk search returned nothing — fetching all internal SOPs as fallback.");
-        const { data: allSops } = await supabase
+        const { data: allSops } = await (supabase as any)
           .from("sop_documents")
           .select("*")
+          .eq("workspace_id", workspace)
           .in("doc_type", INTERNAL_DOC_TYPES);
         relevantSops = (allSops ?? []) as any[];
       }
@@ -142,13 +147,14 @@ export const createReport = createServerFn({ method: "POST" })
     const fallbackName = data.filename.replace(/\.[^.]+$/, "").trim() || data.filename;
     const displayName = (data.customTitle ?? "").trim() || fallbackName;
 
-    const { data: report, error } = await supabase
+    const { data: report, error } = await (supabase as any)
       .from("analysis_reports")
       .insert({
         title: displayName,
         policy_name: displayName,
         status: "pending_validation",
         source_file_url: data.fileUrl,
+        workspace_id: workspace,
         summary_json: {
           ...aiResult.summary,
           kb_size: kbAll.length,
@@ -225,11 +231,13 @@ export const rerunReport = createServerFn({ method: "POST" })
     const newPolicy = await fetchFile(report.source_file_url);
 
     // 3. Find the old policy in KB (same logic as createReport)
+    const workspace = ((report as any).workspace_id as string) ?? "rmit";
     const oldDocTypes = detected?.doc_type
       ? (REGULATION_FAMILIES[detected.doc_type] ?? [detected.doc_type])
       : ["__none__"];
-    const { data: oldDocs } = await supabase
+    const { data: oldDocs } = await (supabase as any)
       .from("sop_documents").select("*")
+      .eq("workspace_id", workspace)
       .in("doc_type", oldDocTypes)
       .neq("version", detected?.version ?? "")
       .order("created_at", { ascending: false }).limit(1);
@@ -253,13 +261,17 @@ export const rerunReport = createServerFn({ method: "POST" })
       const chunks: any[] = matchedChunks ?? [];
       const sopIds = Array.from(new Set(chunks.map((c: any) => c.sop_id as string)));
       if (sopIds.length > 0) {
-        const { data: sopDocs } = await supabase
-          .from("sop_documents").select("*").in("id", sopIds).in("doc_type", INTERNAL_DOC_TYPES);
+        const { data: sopDocs } = await (supabase as any)
+          .from("sop_documents").select("*")
+          .eq("workspace_id", workspace)
+          .in("id", sopIds).in("doc_type", INTERNAL_DOC_TYPES);
         relevantSops = (sopDocs ?? []) as any[];
       }
       if (relevantSops.length === 0) {
-        const { data: allSops } = await supabase
-          .from("sop_documents").select("*").in("doc_type", INTERNAL_DOC_TYPES);
+        const { data: allSops } = await (supabase as any)
+          .from("sop_documents").select("*")
+          .eq("workspace_id", workspace)
+          .in("doc_type", INTERNAL_DOC_TYPES);
         relevantSops = (allSops ?? []) as any[];
       }
     } catch (e: any) {
@@ -581,6 +593,7 @@ export const createSop = createServerFn({ method: "POST" })
       title: z.string().min(2).max(200),
       doc_type: z.enum(["sop", "rmit", "rmit_reg", "fatf", "circular", "it_policy", "policy"]),
       version: z.string().min(1).max(20),
+      workspace: z.enum(["rmit", "fatf"]).default("rmit"),
       summary: z.string().max(2000).optional(),
       tags: z.array(z.string().max(40)).max(20).optional(),
       file_url: z.string().nullable().optional(),
@@ -596,6 +609,7 @@ export const createSop = createServerFn({ method: "POST" })
         title: data.title,
         doc_type: data.doc_type,
         version: data.version,
+        workspace_id: data.workspace,
         summary: data.summary ?? null,
         tags: data.tags ?? [],
         file_url: data.file_url ?? null,

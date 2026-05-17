@@ -29,6 +29,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { ExternalLink, Eye, FileText, LayoutGrid, List, Loader2, Pencil, Plus, Trash2, Upload } from "lucide-react";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { createSop, deleteSop, updateSop } from "@/lib/compliance.functions";
+import { useWorkspace, WORKSPACES } from "@/lib/workspace";
 import { autoDetectDocMeta, DOC_TYPE_LABEL, type DetectedDocType, type DetectedMeta } from "@/lib/auto-detect";
 import { toast } from "sonner";
 
@@ -60,12 +61,15 @@ function KB() {
   const [editDoc, setEditDoc] = useState<any | null>(null);
   const [view, setView] = useState<"cards" | "table">("table");
 
+  const [workspace] = useWorkspace();
+
   const sops = useQuery({
-    queryKey: ["sops"],
+    queryKey: ["sops", workspace],
     queryFn: async () => {
-      const { data } = await supabase
+      const { data } = await (supabase as any)
         .from("sop_documents")
         .select("*")
+        .eq("workspace_id", workspace)
         .order("created_at", { ascending: false });
       return data ?? [];
     },
@@ -140,7 +144,7 @@ function KB() {
 
         {view === "cards" ? (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {sops.data?.map((s) => (
+            {sops.data?.map((s: any) => (
               <Card key={s.id} className="p-5 hover:shadow-md transition-shadow group relative">
                 <div className="flex items-start gap-3">
                   <div className="size-10 rounded-lg bg-accent grid place-items-center shrink-0">
@@ -208,7 +212,7 @@ function KB() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {sops.data?.map((s) => (
+                {sops.data?.map((s: any) => (
                   <TableRow key={s.id} className="align-middle">
                     <TableCell className="font-medium">{s.title}</TableCell>
                     <TableCell>
@@ -449,6 +453,7 @@ function UploadDialog({
   const [files, setFiles] = useState<Array<{ file: File; meta: DetectedMeta }>>([]);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState<{ current: number; total: number } | null>(null);
+  const [workspace] = useWorkspace();
 
   function handleFiles(selectedFiles: FileList | null) {
     if (!selectedFiles) return;
@@ -494,6 +499,7 @@ function UploadDialog({
             title: item.meta.title,
             doc_type: item.meta.doc_type,
             version: item.meta.version,
+            workspace,
             summary: item.meta.summary,
             tags: item.meta.tags,
             file_url: fileUrl,

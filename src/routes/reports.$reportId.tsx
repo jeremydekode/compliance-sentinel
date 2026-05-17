@@ -69,9 +69,13 @@ function ReportPage() {
     },
   });
   const sopsQuery = useQuery({
-    queryKey: ["sop_documents_all"],
+    queryKey: ["sop_documents_all", (report.data as any)?.workspace_id ?? "rmit"],
+    enabled: !!report.data,
     queryFn: async () => {
-      const { data } = await supabase.from("sop_documents").select("id,title,doc_type,version,file_url");
+      const ws = (report.data as any)?.workspace_id ?? "rmit";
+      const { data } = await (supabase as any).from("sop_documents")
+        .select("id,title,doc_type,version,file_url")
+        .eq("workspace_id", ws);
       return data ?? [];
     },
   });

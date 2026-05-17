@@ -21,6 +21,7 @@ import {
 import { formatDate, statusMeta } from "@/lib/format";
 import { deleteReport, createReport } from "@/lib/compliance.functions";
 import { autoDetectDocMeta, DOC_TYPE_LABEL, type DetectedMeta } from "@/lib/auto-detect";
+import { useWorkspace, WORKSPACES } from "@/lib/workspace";
 import { PIPELINE_STEPS } from "@/lib/mock-pipeline";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
@@ -44,13 +45,15 @@ function ReportsList() {
   const [notes, setNotes] = useState("");
   const [running, setRunning] = useState(false);
   const [stepIdx, setStepIdx] = useState(-1);
+  const [workspace] = useWorkspace();
 
   const reports = useQuery({
-    queryKey: ["reports", "all"],
+    queryKey: ["reports", "all", workspace],
     queryFn: async () => {
-      const { data } = await supabase
+      const { data } = await (supabase as any)
         .from("analysis_reports")
         .select("id, title, policy_name, status, created_at")
+        .eq("workspace_id", workspace)
         .order("created_at", { ascending: false });
       return data ?? [];
     },
@@ -93,6 +96,7 @@ function ReportsList() {
         data: {
           filename: file.name,
           fileUrl,
+          workspace,
           detected: detectedWithOverrides,
           customTitle: analysisName.trim() || undefined,
           notes: notes.trim() || undefined,
@@ -379,7 +383,7 @@ function ReportsList() {
           )}
 
           <div className="divide-y divide-border/50">
-            {reports.data?.map((r) => {
+            {reports.data?.map((r: any) => {
               const s = statusMeta(r.status);
               return (
                 <Link

@@ -48,7 +48,7 @@ export const createReport = createServerFn({ method: "POST" })
     z.object({
       filename: z.string(),
       fileUrl: z.string().nullable(),
-      workspace: z.enum(["rmit", "fatf"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms"]).default("rmit"),
       customTitle: z.string().optional(),
       notes: z.string().optional(),
       detected: z
@@ -677,7 +677,7 @@ export const createSop = createServerFn({ method: "POST" })
       title: z.string().min(2).max(200),
       doc_type: z.enum(["sop", "rmit", "rmit_reg", "fatf", "circular", "it_policy", "policy"]),
       version: z.string().min(1).max(20),
-      workspace: z.enum(["rmit", "fatf"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms"]).default("rmit"),
       summary: z.string().max(2000).optional(),
       tags: z.array(z.string().max(40)).max(20).optional(),
       file_url: z.string().nullable().optional(),
@@ -1143,7 +1143,7 @@ function escapeHtml(s: string): string {
  * Used to show indexing health in the KB list ("X chunks" or "Not indexed").
  */
 export const getChunkCounts = createServerFn({ method: "GET" })
-  .inputValidator(z.object({ workspace: z.enum(["rmit", "fatf"]).default("rmit") }))
+  .inputValidator(z.object({ workspace: z.enum(["rmit", "fatf", "forms"]).default("rmit") }))
   .handler(async ({ data }) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: sops } = await (supabase as any)
@@ -1215,4 +1215,217 @@ export const reindexSop = createServerFn({ method: "POST" })
     if (insErr) throw new Error(`Failed to insert chunks: ${insErr.message}`);
 
     return { chunkCount: chunks.length, message: `Indexed ${chunks.length} chunks` };
+  });
+
+// ── UC1: Form/Template Update Flow ───────────────────────────────────────────
+// Propagates form metadata changes (name, version, date, etc.) across all
+// downstream documents in the KB that reference the form.
+
+import { generateWithFallback as _gwf } from "./gemini";
+
+export const createFormUpdateReport = createServerFn({ method: "POST" })
+  .inputValidator(z.object({
+    workspace: z.enum(["rmit", "fatf", "forms"]).default("forms"),
+    formId: z.string().min(1),                  // e.g. "FGROP 037/2016"
+    friendlyName: z.string().optional(),         // e.g. "Account Opening Application Form"
+    customTitle: z.string().optional(),
+    notes: z.string().optional(),
+    newFileUrl: z.string().nullable().optional(), // optional new form file already uploaded
+    fieldChanges: z.array(z.object({
+      label: z.string().min(1),                  // e.g. "Name", "Version", "Date"
+      oldValue: z.string().min(1),
+      newValue: z.string().min(1),
+    })).min(1).max(20),
+  }))
+  .handler(async ({ data }) => {
+    const workspace = data.workspace;
+    const displayName =
+      (data.customTitle ?? "").trim() ||
+      `${data.formId} update — ${data.fieldChanges[0].oldValue.slice(0, 20)} → ${data.fieldChanges[0].newValue.slice(0, 20)}`;
+
+    // 1. Vector search for each old value in the workspace KB
+    const INTERNAL_DOC_TYPES = INTERNAL_DOC_TYPES_CONST as readonly string[];
+
+    // Build query embeddings (one per field change + one combined for the form ID)
+    const queryStrings = [
+      ...data.fieldChanges.map((c) => `${data.formId} ${c.oldValue}`),
+      `${data.formId} ${data.friendlyName ?? ""}`,
+    ];
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const chunkHits: Map<string, any[]> = new Map();
+    for (const qs of queryStrings) {
+      try {
+        const emb = await generateQueryEmbedding(qs);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const { data: hits } = await (supabase as any).rpc("match_sop_chunks", {
+          query_embedding: emb,
+          match_threshold: 0.15,
+          match_count: 40,
+        });
+        for (const h of hits ?? []) {
+          if (!chunkHits.has(h.sop_id)) chunkHits.set(h.sop_id, []);
+          // De-dupe by chunk id
+          if (!chunkHits.get(h.sop_id)!.some((x) => x.id === h.id)) {
+            chunkHits.get(h.sop_id)!.push(h);
+          }
+        }
+      } catch (e: any) {
+        console.warn("UC1 vector search failed:", e?.message);
+      }
+    }
+
+    // 2. Resolve sop_ids to internal SOP docs in this workspace
+    const candidateIds = Array.from(chunkHits.keys());
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: sops } = candidateIds.length > 0 ? await (supabase as any)
+      .from("sop_documents")
+      .select("*")
+      .eq("workspace_id", workspace)
+      .in("id", candidateIds)
+      .in("doc_type", INTERNAL_DOC_TYPES)
+      : { data: [] };
+    const sopsById = new Map<string, any>();
+    for (const s of sops ?? []) sopsById.set(s.id, s);
+
+    // 3. For each affected doc, ONE small AI call to produce find/replace impacts
+    const ai = new (await import("@google/genai")).GoogleGenAI({
+      apiKey: process.env.GOOGLE_GENERATIVE_AI_API_KEY || "",
+    });
+
+    const allImpacts: any[] = [];
+
+    for (const [sopId, chunks] of chunkHits.entries()) {
+      const sop = sopsById.get(sopId);
+      if (!sop) continue;
+      const chunkText = chunks
+        .slice(0, 8)
+        .map((c: any) => `[Section: ${c.chapter_ref || "?"} | Page: ${c.page_number || "?"}]\n${c.content}`)
+        .join("\n\n---\n\n");
+
+      const prompt = `
+# ROLE: FORM REFERENCE PROPAGATION ENGINE
+
+A bank form has been updated. Your job: find EVERY occurrence of the OLD values in the internal SOP document below, and propose a precise find/replace edit for each occurrence.
+
+# FORM BEING UPDATED:
+- Form identifier: ${data.formId}
+- Friendly name: ${data.friendlyName ?? "(not specified)"}
+
+# FIELD CHANGES TO PROPAGATE:
+${data.fieldChanges.map((c, i) => `
+  Change ${i + 1} — ${c.label}
+    OLD: "${c.oldValue}"
+    NEW: "${c.newValue}"
+`).join("")}
+
+# INTERNAL SOP DOCUMENT: "${sop.title}"
+The relevant text chunks (from vector search) are below. Find every occurrence of any OLD value within them.
+
+${chunkText}
+
+# RULES:
+1. For each occurrence: produce ONE impact entry with find_text containing 1-3 lines of verbatim surrounding context including the OLD value, and replace_text containing the same context with the OLD value swapped for the NEW value.
+2. If multiple OLD values appear in the SAME paragraph/cell/row, produce ONE consolidated impact for that row — not separate impacts per field. Update all OLD→NEW in one find_text/replace_text pair.
+3. Use the chunk's "Section" and "Page" metadata for paragraph and page fields.
+4. The action_description should be a concise headline like "Update form reference in [section context]" or "Update Form Name + Version + Date in Forms Reference Table".
+5. change_type = "find_replace" for all UC1 impacts (we are NEVER inserting new content, only swapping references).
+6. sop_title MUST be exactly "${sop.title}".
+7. Do NOT invent edits — only propose them where you can clearly see the OLD value in the chunks.
+
+# OUTPUT JSON ARRAY of impacts (same schema as regulatory analysis):
+[{
+  "sop_title": "${sop.title}",
+  "paragraph": "Section reference from the chunk metadata",
+  "action_description": "One-line headline describing the edit",
+  "change_type": "find_replace",
+  "chapter": "${data.formId}",
+  "find_text": "Verbatim text containing OLD value(s) with 1-3 lines of context",
+  "replace_text": "Same context with OLD value(s) swapped for NEW",
+  "page": <page number from chunk metadata or 0>,
+  "line_range": "<line range estimate or null>"
+}]
+
+Return ONLY the JSON array. No commentary.
+      `;
+
+      try {
+        const resp = await _gwf({
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          config: { responseMimeType: "application/json", maxOutputTokens: 16384 },
+        });
+        const text = resp.text ?? "";
+        const impacts = JSON.parse(text);
+        if (Array.isArray(impacts)) {
+          for (const imp of impacts) {
+            allImpacts.push({ ...imp, sop_id: sop.id, sop_title: sop.title });
+          }
+        }
+        // Mark variable as used in TS
+        void ai;
+      } catch (e: any) {
+        console.warn(`UC1: mapping failed for ${sop.title}:`, e?.message);
+      }
+    }
+
+    // 4. Create report row
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report, error } = await (supabase as any)
+      .from("analysis_reports")
+      .insert({
+        title: displayName,
+        policy_name: data.formId,
+        status: "pending_validation",
+        source_file_url: data.newFileUrl ?? null,
+        workspace_id: workspace,
+        summary_json: {
+          executive: [
+            `Form ${data.formId} updated with ${data.fieldChanges.length} field change(s).`,
+            `Found ${allImpacts.length} references across ${chunkHits.size} downstream document(s) requiring update.`,
+            `All edits are mechanical find/replace — no regulatory interpretation needed.`,
+          ],
+          effective_date: new Date().toISOString().slice(0, 10),
+          before_count: data.fieldChanges.length,
+          after_count: data.fieldChanges.length,
+          structural: { added: [], renamed: [], restructured: [] },
+          analyst_notes: data.notes ?? null,
+          old_policy_name: `${data.formId} (previous version)`,
+          uc1_form_update: true,
+          form_id: data.formId,
+          field_changes: data.fieldChanges,
+        },
+      })
+      .select()
+      .single();
+    if (error || !report) throw new Error(error?.message || "Failed to create form-update report");
+
+    // 5. Create one "regulatory_changes" row per field change (so it shows in Change Analysis tab)
+    await supabase.from("regulatory_changes").insert(
+      data.fieldChanges.map((c, i) => ({
+        chapter_ref: `${data.formId} · ${c.label}`,
+        old_requirement: c.oldValue,
+        new_requirement: c.newValue,
+        change_summary: `${c.label} update: "${c.oldValue}" → "${c.newValue}"`,
+        impact: "medium",
+        tone_shift: "Form metadata update — mechanical propagation",
+        pages: "",
+        legal_refs: [],
+        related_instruments: [data.formId],
+        report_id: report.id,
+        position: i,
+      }))
+    );
+
+    // 6. Insert impacts
+    if (allImpacts.length > 0) {
+      await supabase.from("sop_impacts").insert(
+        allImpacts.map((m: any, i: number) => ({ ...m, report_id: report.id, position: i }))
+      );
+    }
+
+    return {
+      reportId: report.id as string,
+      impactCount: allImpacts.length,
+      affectedDocs: chunkHits.size,
+    };
   });

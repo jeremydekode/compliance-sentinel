@@ -11,13 +11,15 @@ import {
   ArrowRight, 
   Trash2, 
   Upload, 
-  CheckCircle2, 
-  Loader2, 
-  Sparkles, 
-  Plus, 
+  CheckCircle2,
+  Loader2,
+  Sparkles,
+  Plus,
   X,
-  FileSearch
+  FileSearch,
+  FileEdit,
 } from "lucide-react";
+import { FormUpdateDialog } from "@/components/form-update-dialog";
 import { formatDate, statusMeta } from "@/lib/format";
 import { deleteReport, createReport } from "@/lib/compliance.functions";
 import { autoDetectDocMeta, DOC_TYPE_LABEL, type DetectedMeta } from "@/lib/auto-detect";
@@ -38,6 +40,7 @@ function ReportsList() {
   const nav = useNavigate();
   
   const [showUpload, setShowUpload] = useState(false);
+  const [showFormUpdate, setShowFormUpdate] = useState(false);
   const [file, setFile] = useState<File | null>(null);
   const [detected, setDetected] = useState<DetectedMeta | null>(null);
   const [analysisName, setAnalysisName] = useState("");
@@ -151,15 +154,25 @@ function ReportsList() {
               Manage intelligence reports and map regulatory impact across your SOPs.
             </p>
           </div>
-          <Button 
-            size="lg" 
-            onClick={() => setShowUpload(!showUpload)} 
-            variant={showUpload ? "outline" : "default"}
-            className="gap-2 h-12 px-6 rounded-xl font-bold shadow-lg shadow-primary/10 transition-all active:scale-95"
-          >
-            {showUpload ? <X className="size-4" /> : <Plus className="size-4" />}
-            {showUpload ? "Cancel" : "New Analysis"}
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button
+              size="lg"
+              variant="outline"
+              onClick={() => setShowFormUpdate(true)}
+              className="gap-2 h-12 px-5 rounded-xl font-bold border-amber-300 text-amber-900 hover:bg-amber-50"
+            >
+              <FileEdit className="size-4" /> Form Update
+            </Button>
+            <Button
+              size="lg"
+              onClick={() => setShowUpload(!showUpload)}
+              variant={showUpload ? "outline" : "default"}
+              className="gap-2 h-12 px-6 rounded-xl font-bold shadow-lg shadow-primary/10 transition-all active:scale-95"
+            >
+              {showUpload ? <X className="size-4" /> : <Plus className="size-4" />}
+              {showUpload ? "Cancel" : "Regulatory Change"}
+            </Button>
+          </div>
         </div>
 
         {showUpload && (
@@ -431,6 +444,15 @@ function ReportsList() {
           </div>
         </Card>
       </div>
+
+      <FormUpdateDialog
+        open={showFormUpdate}
+        onOpenChange={setShowFormUpdate}
+        onCreated={(reportId) => {
+          qc.invalidateQueries({ queryKey: ["reports"] });
+          nav({ to: "/reports/$reportId", params: { reportId } });
+        }}
+      />
     </AppShell>
   );
 }

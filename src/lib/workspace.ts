@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-export type WorkspaceId = "rmit" | "fatf";
+export type WorkspaceId = "rmit" | "fatf" | "forms";
 
 export const WORKSPACES: Record<WorkspaceId, {
   id: WorkspaceId;
@@ -12,7 +12,7 @@ export const WORKSPACES: Record<WorkspaceId, {
 }> = {
   rmit: {
     id: "rmit",
-    name: "MCB · BNM RMiT",
+    name: "BNM RMiT",
     short: "RMiT",
     tagline: "Tech Risk · Cyber Resilience",
     color: "text-blue-700",
@@ -20,11 +20,19 @@ export const WORKSPACES: Record<WorkspaceId, {
   },
   fatf: {
     id: "fatf",
-    name: "MCB · FATF AML/CFT",
+    name: "FATF AML/CFT",
     short: "FATF",
     tagline: "AML · CFT · Sanctions",
     color: "text-emerald-700",
     bgColor: "bg-emerald-100",
+  },
+  forms: {
+    id: "forms",
+    name: "Internal Forms",
+    short: "Forms",
+    tagline: "Form metadata propagation · Cross-reference updates",
+    color: "text-amber-700",
+    bgColor: "bg-amber-100",
   },
 };
 

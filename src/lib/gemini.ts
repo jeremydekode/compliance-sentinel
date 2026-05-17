@@ -11,7 +11,7 @@ const MODEL_FALLBACKS = [
 
 type GenerateParams = Omit<Parameters<typeof ai.models.generateContent>[0], "model">;
 
-async function generateWithFallback(params: GenerateParams): Promise<Awaited<ReturnType<typeof ai.models.generateContent>>> {
+export async function generateWithFallback(params: GenerateParams): Promise<Awaited<ReturnType<typeof ai.models.generateContent>>> {
   let lastError: unknown;
   for (const model of MODEL_FALLBACKS) {
     try {

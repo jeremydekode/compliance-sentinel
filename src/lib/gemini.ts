@@ -331,11 +331,25 @@ You have one specific REGULATORY CHANGE. Your task is to find the EXACT location
 
 # CRITICAL: For find_text, provide VERBATIM text from the SOP (at least 20 words of context) so it can be found programmatically. Do not paraphrase or shorten.
 
-# ❗ ANTI-HALLUCINATION FOR SOP MAPPING:
-- The find_text MUST be a copy-paste-able string that actually exists in the attached SOP PDF. If you cannot locate a substantively matching passage, do NOT invent one — use change_type "insertion" or "new_section" instead and leave find_text empty.
-- The page number MUST be the actual page where the find_text appears in the SOP PDF. If you are uncertain of the exact page, set page to 0 — do NOT guess. A wrong page number is worse than no page number.
-- The paragraph reference MUST exist in the SOP. Do not invent section numbers like "Section 4.2" if the SOP only has sections 1-3.
-- If the SOP only contains 3 pages, do NOT cite page 4 or beyond.
+# ❗ ANTI-HALLUCINATION RULES — READ CAREFULLY:
+
+## Rule A — find_text must come from the SOP, NEVER from the regulation
+The "Old Requirement" and "New Requirement" fields above contain REGULATION text. They are PROVIDED FOR CONTEXT ONLY — to help you understand what change to look for.
+You MUST NOT copy text from "Old Requirement" or "New Requirement" into the find_text field.
+The find_text field is a verbatim quote from the BANK'S INTERNAL SOP PDF that you can see attached below — NOT from the regulation.
+If the SOP does not contain matching anchor text, do NOT invent it from the regulation. Use change_type "insertion" with an empty find_text and the SOP's section heading as the paragraph reference.
+
+## Rule B — Consolidate related edits
+If a single regulatory change affects multiple closely-related items in the SAME SECTION of an SOP (e.g. "add Kuwait, Papua New Guinea, and update Myanmar" all in the same risk-country table), return ONE consolidated impact entry that updates the whole list/table at once, NOT one impact per item. Do not split a list update into N separate find/replace entries.
+
+## Rule C — Page numbers
+The page number MUST be the actual page where the find_text appears in the SOP PDF. If uncertain, set page to 0 — do NOT guess. A wrong page number is worse than no page number.
+
+## Rule D — Section references
+The paragraph reference MUST exist in the SOP. Do not invent section numbers like "Section 4.2" if the SOP only has sections 1-3. If the SOP only contains 30 pages, do NOT cite page 50.
+
+## Rule E — sop_title must match the actual document title
+Use the document title EXACTLY as it appears in the "--- INTERNAL DOCUMENT" header below (e.g., "R13 GL248"), NOT the long descriptive name from inside the document.
 
 # OUTPUT FORMAT (JSON Array):
 [{

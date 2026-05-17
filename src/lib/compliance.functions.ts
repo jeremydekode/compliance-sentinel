@@ -185,11 +185,7 @@ export const createReport = createServerFn({ method: "POST" })
     if (changesErr) throw new Error(`changes insert: ${changesErr.message}`);
 
     const matchedImpacts = aiResult.impacts.map((m: any) => {
-      const aiTitle = (m.sop_title ?? "").toLowerCase().trim();
-      const sop = relevantSops.find(s => {
-        const stored = (s.title ?? "").toLowerCase().trim();
-        return stored === aiTitle || stored.includes(aiTitle) || aiTitle.includes(stored);
-      });
+      const sop = matchSopByTitle(m.sop_title, relevantSops);
       return {
         ...m,
         sop_id: sop?.id ?? null,
@@ -329,11 +325,7 @@ export const rerunReport = createServerFn({ method: "POST" })
     }
 
     const matchedImpacts = aiResult.impacts.map((m: any) => {
-      const aiTitle = (m.sop_title ?? "").toLowerCase().trim();
-      const sop = relevantSops.find(s => {
-        const stored = (s.title ?? "").toLowerCase().trim();
-        return stored === aiTitle || stored.includes(aiTitle) || aiTitle.includes(stored);
-      });
+      const sop = matchSopByTitle(m.sop_title, relevantSops);
       return { ...m, sop_id: sop?.id ?? null, sop_title: sop ? sop.title : m.sop_title };
     });
 
@@ -901,6 +893,43 @@ ${data.amendedHtml}
       newFileUrl,
     };
   });
+
+/**
+ * Match an AI-returned sop_title against the KB sop_documents list.
+ * Strategy (in order):
+ *   1. Exact (case-insensitive) match on stored title
+ *   2. Code-pattern match: extract codes like "R13_GL248", "S08_GL151", "R13.PO004" from either side
+ *   3. Substring match (bidirectional)
+ */
+function matchSopByTitle(aiTitle: string | null | undefined, sops: any[]): any | undefined {
+  const ai = (aiTitle ?? "").toLowerCase().trim();
+  if (!ai || sops.length === 0) return undefined;
+
+  // 1. Exact match
+  let hit = sops.find(s => (s.title ?? "").toLowerCase().trim() === ai);
+  if (hit) return hit;
+
+  // 2. Code extraction — handles "R13_GL248", "R13 GL248", "S08-GL151", "S08.PO004", etc.
+  const codeRegex = /[a-z]\d+[\s_.\-]?[a-z]+\d+/gi;
+  const aiCodes = (ai.match(codeRegex) ?? []).map(normalizeCode);
+  if (aiCodes.length > 0) {
+    for (const s of sops) {
+      const storedCodes = ((s.title ?? "").match(codeRegex) ?? []).map(normalizeCode);
+      if (storedCodes.some((c: string) => aiCodes.includes(c))) return s;
+    }
+  }
+
+  // 3. Bidirectional substring
+  hit = sops.find(s => {
+    const stored = (s.title ?? "").toLowerCase().trim();
+    return stored.includes(ai) || ai.includes(stored);
+  });
+  return hit;
+}
+
+function normalizeCode(code: string): string {
+  return code.toLowerCase().replace(/[\s_.\-]+/g, "");
+}
 
 function escapeHtml(s: string): string {
   return String(s ?? "").replace(/[&<>"']/g, (c) =>

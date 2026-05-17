@@ -7,6 +7,7 @@ import { AppShell } from "@/components/app-shell";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { ApprovalWorkflow } from "@/components/approval-workflow";
+import { AmendmentPanel } from "@/components/amendment-panel";
 import { LegalReviewView } from "@/components/legal-review-view";
 import { useRole } from "@/lib/role";
 import { MD } from "@/components/md";
@@ -220,6 +221,13 @@ function ReportPage() {
         <div className="shrink-0">
           <ApprovalWorkflow report={report.data} />
         </div>
+
+        {/* ── Step 9 · Apply amendments to source docs ──────────────── */}
+        {(report.data.status === "signed_off" || report.data.status === "pending_manual" || report.data.status === "published") && (
+          <div className="shrink-0">
+            <AmendmentPanel reportId={reportId} />
+          </div>
+        )}
 
         {/* ── Section tabs ───────────────────────────────────────────── */}
         <div className="shrink-0 px-4 sm:px-6 border-b bg-card flex items-center gap-0">

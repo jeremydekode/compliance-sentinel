@@ -414,3 +414,64 @@ OUTPUT JSON:
   const summary = JSON.parse(summaryResponse.text ?? "{}");
   return { changes, impacts: allImpacts, summary };
 }
+
+/**
+ * DOCUMENT AMENDMENT ENGINE
+ * Takes a source document + approved edits, returns the full amended document as styled HTML.
+ * Used for the "Apply Changes to Source Documents" workflow.
+ */
+export async function generateAmendedDocument(
+  source: { title: string; buffer: Buffer; mimeType: string },
+  edits: Array<{
+    change_type: string;
+    paragraph?: string;
+    chapter?: string;
+    find_text?: string;
+    replace_text?: string;
+    edited_text?: string;
+  }>
+): Promise<string> {
+  const editsBlock = edits.map((e, i) => `
+EDIT ${i + 1} — ${(e.change_type || "edit").toUpperCase()}
+  Section / paragraph: ${e.paragraph ?? e.chapter ?? "(not specified)"}
+  Find (verbatim text to locate): ${e.find_text || "(none — locate by section heading)"}
+  Apply: ${e.edited_text ?? e.replace_text ?? "(no text)"}
+`).join("\n---\n");
+
+  const prompt = `
+# ROLE: DOCUMENT AMENDMENT ENGINE
+
+You are taking a source document and applying a set of approved edits to produce the FULL amended document.
+
+# RULES:
+1. Apply each edit EXACTLY as instructed. Do not add, remove, or modify any other content.
+2. For "find_replace": locate the find_text verbatim, replace it with the apply text.
+3. For "insertion" / "new_section": insert the apply text immediately AFTER the find_text (or at the end of the named section if find_text is empty).
+4. PRESERVE the document's original structure: section headings, numbering, lists, tables.
+5. Do NOT summarise, abbreviate, or paraphrase any text — output the FULL document text, edits applied.
+6. Output as clean semantic HTML. Allowed tags: <h1> <h2> <h3> <h4> <p> <ul> <ol> <li> <table> <thead> <tbody> <tr> <th> <td> <strong> <em> <blockquote>. No inline styles, no classes, no external resources.
+7. Wrap any newly inserted text in <mark class="amended">…</mark> so reviewers can spot the changes at a glance. Wrap any text that was replaced (the new replacement only, not the old) in the same <mark> tag.
+8. Do NOT include <html>, <head>, or <body> wrappers — output a fragment that starts at <h1>.
+
+# EDITS TO APPLY:
+${editsBlock}
+
+Output ONLY the amended document HTML. No commentary, no markdown fences.
+  `;
+
+  const response = await generateWithFallback({
+    contents: [{
+      role: "user",
+      parts: [
+        { text: prompt },
+        { inlineData: { data: source.buffer.toString("base64"), mimeType: source.mimeType } },
+      ],
+    }],
+    config: { maxOutputTokens: 32768 },
+  });
+
+  // Strip any accidental markdown code fences
+  let html = (response.text ?? "").trim();
+  html = html.replace(/^```html\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "");
+  return html;
+}

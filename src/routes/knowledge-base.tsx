@@ -70,6 +70,7 @@ function KB() {
         .from("sop_documents")
         .select("*")
         .eq("workspace_id", workspace)
+        .order("is_active", { ascending: false, nullsFirst: false })
         .order("created_at", { ascending: false });
       return data ?? [];
     },

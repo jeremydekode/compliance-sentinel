@@ -1,7 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { supabase } from "@/integrations/supabase/client";
-import { analyzePolicy, chunkDocument } from "./gemini";
+import { analyzePolicy, chunkDocument, generateAmendedDocument } from "./gemini";
 import { generateEmbedding, generateQueryEmbedding } from "./embeddings";
 import { REGULATION_FAMILIES, INTERNAL_DOC_TYPES as INTERNAL_DOC_TYPES_CONST, regulatorContext } from "./auto-detect";
 
@@ -706,3 +706,204 @@ export const clearWorkspace = createServerFn({ method: "POST" })
     }
     return { ok: true };
   });
+
+// ── Document Amendment (Step 9) ─────────────────────────────────────────────
+
+/**
+ * Aggregate view of which internal SOPs have approved edits ready to apply.
+ * Used to render the "Step 9 · Apply Approved Changes" card.
+ */
+export const getAmendableDocuments = createServerFn({ method: "GET" })
+  .inputValidator(z.object({ reportId: z.string() }))
+  .handler(async ({ data }) => {
+    const { data: impacts } = await supabase
+      .from("sop_impacts")
+      .select("*")
+      .eq("report_id", data.reportId)
+      .eq("status", "approved");
+
+    if (!impacts?.length) return { documents: [] };
+
+    // Group by sop_id (skip unmatched)
+    const map = new Map<string, any[]>();
+    for (const imp of impacts) {
+      if (!imp.sop_id) continue;
+      if (!map.has(imp.sop_id)) map.set(imp.sop_id, []);
+      map.get(imp.sop_id)!.push(imp);
+    }
+
+    const sopIds = Array.from(map.keys());
+    if (sopIds.length === 0) return { documents: [] };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: sops } = await (supabase as any)
+      .from("sop_documents")
+      .select("id,title,version,doc_type,file_url,is_active,workspace_id")
+      .in("id", sopIds);
+
+    const docs = (sops ?? []).map((s: any) => ({
+      sop_id: s.id,
+      title: s.title,
+      version: s.version,
+      doc_type: s.doc_type,
+      file_url: s.file_url,
+      is_active: s.is_active !== false,
+      edits_count: map.get(s.id)?.length ?? 0,
+      // applied edits won't be re-applied
+      applied_count: (map.get(s.id) ?? []).filter((i: any) => i.status === "applied").length,
+    }));
+
+    return { documents: docs };
+  });
+
+/**
+ * Generate a preview of an amended SOP by applying all approved edits.
+ * Returns the amended HTML for review BEFORE finalizing.
+ */
+export const generateDocumentPreview = createServerFn({ method: "POST" })
+  .inputValidator(z.object({ reportId: z.string(), sopId: z.string() }))
+  .handler(async ({ data }) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: sop, error: sopErr } = await (supabase as any)
+      .from("sop_documents").select("*").eq("id", data.sopId).single();
+    if (sopErr || !sop) throw new Error("SOP not found");
+    if (!sop.file_url) throw new Error("SOP has no source file — cannot amend");
+
+    const { data: impacts } = await supabase
+      .from("sop_impacts")
+      .select("*")
+      .eq("report_id", data.reportId)
+      .eq("sop_id", data.sopId)
+      .eq("status", "approved")
+      .order("position");
+    if (!impacts?.length) throw new Error("No approved edits to apply for this SOP");
+
+    const file = await fetchFile(sop.file_url);
+    const amendedHtml = await generateAmendedDocument(
+      { title: sop.title, buffer: file.buffer, mimeType: file.mimeType },
+      impacts.map((i: any) => ({
+        change_type: i.change_type ?? "find_replace",
+        paragraph: i.paragraph ?? undefined,
+        chapter: i.chapter ?? undefined,
+        find_text: i.find_text ?? undefined,
+        replace_text: i.replace_text ?? undefined,
+        edited_text: i.edited_text ?? undefined,
+      }))
+    );
+
+    return {
+      sopTitle: sop.title,
+      currentVersion: sop.version,
+      nextVersion: bumpVersion(sop.version ?? "1.0"),
+      editsApplied: impacts.length,
+      amendedHtml,
+      sourceFileMime: file.mimeType,
+    };
+  });
+
+/**
+ * Commit the amended document as a new version in the KB.
+ * - Stores the preview HTML to Supabase Storage as the new file.
+ * - Inserts new sop_documents row marked is_active=true.
+ * - Marks the old version is_active=false, superseded_by=<new id>.
+ * - Updates impacts: status='applied', applied_in_version=<new version>.
+ */
+export const finalizeDocumentAmendment = createServerFn({ method: "POST" })
+  .inputValidator(z.object({
+    reportId: z.string(),
+    sopId: z.string(),
+    amendedHtml: z.string(),
+  }))
+  .handler(async ({ data }) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: oldSop, error: sopErr } = await (supabase as any)
+      .from("sop_documents").select("*").eq("id", data.sopId).single();
+    if (sopErr || !oldSop) throw new Error("SOP not found");
+
+    const nextVersion = bumpVersion(oldSop.version ?? "1.0");
+    const safeTitle = (oldSop.title ?? "document").replace(/[^A-Za-z0-9._-]+/g, "_");
+
+    // Wrap fragment in a printable HTML shell
+    const fullHtml = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"/>
+<title>${escapeHtml(oldSop.title ?? "Amended Document")} — v${escapeHtml(nextVersion)}</title>
+<style>
+  body{font-family:Georgia,"Times New Roman",serif;color:#111;max-width:880px;margin:40px auto;padding:0 32px;line-height:1.55;font-size:13px}
+  h1{font-size:22px;margin:0 0 6px} h2{font-size:16px;margin:24px 0 8px}
+  h3{font-size:14px;margin:18px 0 6px} p{margin:0 0 10px}
+  table{width:100%;border-collapse:collapse;font-size:12px;margin:10px 0}
+  th,td{border:1px solid #ccc;padding:6px 8px;text-align:left;vertical-align:top}
+  th{background:#f5f5f5;font-weight:700}
+  ul,ol{margin:6px 0 10px 24px} li{margin-bottom:3px}
+  mark.amended{background:#fffacc;padding:1px 3px;border-radius:2px;border-bottom:2px solid #e0b800}
+  .doc-meta{border-top:1px solid #ddd;border-bottom:1px solid #ddd;padding:8px 0;margin:0 0 20px;display:flex;gap:24px;font-size:11px;color:#666}
+  .doc-meta strong{color:#111;margin-right:4px}
+  .toolbar{position:sticky;top:0;background:#fff;padding:8px 0;border-bottom:1px solid #eee;margin-bottom:14px;display:flex;justify-content:space-between;align-items:center}
+  .toolbar button{padding:6px 14px;border:1px solid #111;background:#111;color:#fff;border-radius:4px;cursor:pointer;font-size:12px}
+  @media print { .toolbar{display:none} body{margin:20px} }
+</style></head><body>
+<div class="toolbar"><strong>Amended document — v${escapeHtml(nextVersion)}</strong><button onclick="window.print()">Print / Save as PDF</button></div>
+<div class="doc-meta">
+  <div><strong>Document:</strong>${escapeHtml(oldSop.title ?? "")}</div>
+  <div><strong>Version:</strong>${escapeHtml(nextVersion)}</div>
+  <div><strong>Amended:</strong>${new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "long", year: "numeric" })}</div>
+</div>
+${data.amendedHtml}
+</body></html>`;
+
+    // Upload to Supabase Storage
+    const path = `amendments/${Date.now()}-${safeTitle}-v${nextVersion}.html`;
+    const { error: upErr } = await supabase.storage
+      .from("policies")
+      .upload(path, new Blob([fullHtml], { type: "text/html" }), { upsert: false, contentType: "text/html" });
+    if (upErr) throw new Error(`Failed to upload amended file: ${upErr.message}`);
+    const { data: urlData } = supabase.storage.from("policies").getPublicUrl(path);
+    const newFileUrl = urlData.publicUrl;
+
+    // Insert new sop_documents row (the amended version)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: newSop, error: insErr } = await (supabase as any)
+      .from("sop_documents")
+      .insert({
+        title: oldSop.title,
+        doc_type: oldSop.doc_type,
+        version: nextVersion,
+        summary: oldSop.summary,
+        tags: oldSop.tags,
+        file_url: newFileUrl,
+        workspace_id: oldSop.workspace_id ?? "rmit",
+        is_active: true,
+        parent_id: oldSop.id,
+        amended_from_report: data.reportId,
+        amended_at: new Date().toISOString(),
+      })
+      .select()
+      .single();
+    if (insErr || !newSop) throw new Error(`Failed to create new version: ${insErr?.message}`);
+
+    // Mark old version superseded
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase as any).from("sop_documents")
+      .update({ is_active: false, superseded_by: newSop.id })
+      .eq("id", oldSop.id);
+
+    // Mark impacts as applied
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase as any).from("sop_impacts")
+      .update({ status: "applied", applied_in_version: nextVersion, applied_at: new Date().toISOString() })
+      .eq("report_id", data.reportId)
+      .eq("sop_id", data.sopId)
+      .eq("status", "approved");
+
+    return {
+      newSopId: newSop.id as string,
+      newVersion: nextVersion,
+      newFileUrl,
+    };
+  });
+
+function escapeHtml(s: string): string {
+  return String(s ?? "").replace(/[&<>"']/g, (c) =>
+    c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : c === '"' ? "&quot;" : "&#39;"
+  );
+}

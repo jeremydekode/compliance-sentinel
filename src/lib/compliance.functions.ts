@@ -2,7 +2,24 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { supabase } from "@/integrations/supabase/client";
 import { analyzePolicy, chunkDocument, generateAmendedDocument, extractRegulatoryChanges, mapChangeToSops, generateAnalysisSummary } from "./gemini";
-import { applyEditsToDocx, looksLikeDocx } from "./docx-editor";
+import { applyEditsToDocx, looksLikeDocx, docxToText } from "./docx-editor";
+
+/**
+ * Wrap a fetched file as a PolicySource for Gemini.
+ * Gemini's inline data API doesn't accept DOCX — for DOCX we extract paragraph text
+ * and send as text content instead.
+ */
+function policySourceFromFile(
+  name: string,
+  file: { buffer: Buffer; mimeType: string },
+  hintUrl?: string | null
+): { name: string; buffer: Buffer; mimeType: string } | { name: string; text: string } {
+  if (looksLikeDocx(file.mimeType, hintUrl ?? null)) {
+    const text = docxToText(file.buffer);
+    return { name, text };
+  }
+  return { name, buffer: file.buffer, mimeType: file.mimeType };
+}
 import { generateEmbedding, generateQueryEmbedding } from "./embeddings";
 import { REGULATION_FAMILIES, INTERNAL_DOC_TYPES as INTERNAL_DOC_TYPES_CONST, regulatorContext } from "./auto-detect";
 
@@ -118,9 +135,13 @@ export const createReport = createServerFn({ method: "POST" })
       //    Stage B: for each change, vector-search relevant chunks across all SOPs in workspace,
       //             then ask AI to propose edits anchored ONLY to those real chunks
       console.log(`Starting analysis for ${data.filename}...`);
+      const newPolicySource = policySourceFromFile(data.filename, newPolicy, data.fileUrl);
+      const oldPolicySource = oldPolicy && oldDoc
+        ? policySourceFromFile(oldDoc.title, oldPolicy, oldDoc.file_url)
+        : undefined;
       const extractedChanges = await extractRegulatoryChanges(
-        { name: data.filename, buffer: newPolicy.buffer, mimeType: newPolicy.mimeType },
-        oldPolicy ? { name: oldDoc!.title, buffer: oldPolicy.buffer, mimeType: oldPolicy.mimeType } : undefined,
+        newPolicySource,
+        oldPolicySource,
         regulatorContext(detected?.doc_type)
       );
       console.log(`Extracted ${extractedChanges.length} regulatory changes. Now mapping each to SOP chunks...`);
@@ -334,10 +355,14 @@ export const rerunReport = createServerFn({ method: "POST" })
       return { title: s.title, text: `[No content indexed for ${s.title}]` };
     }));
 
-    // 5. Run AI analysis
+    // 5. Run AI analysis (convert DOCX → text for Gemini compatibility)
+    const newPolicySource = policySourceFromFile(report.policy_name ?? "policy", newPolicy, report.source_file_url);
+    const oldPolicySource = oldPolicy && oldDoc
+      ? policySourceFromFile(oldDoc.title, oldPolicy, oldDoc.file_url)
+      : undefined;
     const aiResult = await analyzePolicy(
-      { name: report.policy_name ?? "policy", buffer: newPolicy.buffer, mimeType: newPolicy.mimeType },
-      oldPolicy ? { name: oldDoc!.title, buffer: oldPolicy.buffer, mimeType: oldPolicy.mimeType } : undefined,
+      newPolicySource,
+      oldPolicySource,
       sopsForAi,
       regulatorContext(detected?.doc_type)
     );

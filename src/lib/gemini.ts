@@ -121,9 +121,25 @@ This document is a supervisory circular communicating clarifications, thematic f
 No specific regulator-family hints available. Apply general compliance-officer judgement.`;
 }
 
+type PolicySource =
+  | { name: string; buffer: Buffer; mimeType: string }
+  | { name: string; text: string };
+
+function policyToParts(label: string, src: PolicySource): any[] {
+  if ("text" in src) {
+    return [
+      { text: `\n--- ${label}: "${src.name}" (verbatim text) ---\n${src.text}\n--- END ${label} ---\n` },
+    ];
+  }
+  return [
+    { text: `\n--- ${label}: "${src.name}" (attached file) ---` },
+    { inlineData: { data: src.buffer.toString("base64"), mimeType: src.mimeType } },
+  ];
+}
+
 export async function extractRegulatoryChanges(
-  newPolicy: { name: string; buffer: Buffer; mimeType: string },
-  oldPolicy?: { name: string; buffer: Buffer; mimeType: string },
+  newPolicy: PolicySource,
+  oldPolicy?: PolicySource,
   regulatorCtx: RegulatorContext = "generic"
 ): Promise<RegulatoryDelta[]> {
   const prompt = `
@@ -222,13 +238,10 @@ Return ONLY material, actionable changes. Be thorough — missing a real change 
 There is NO upper limit on the number of changes you may return. List every material policy shift you can detect, even if it produces 20, 50, or more entries. Do not summarise multiple distinct obligations into a single entry.
   `;
 
-  const parts: any[] = [
-    { text: prompt },
-    { inlineData: { data: newPolicy.buffer.toString("base64"), mimeType: newPolicy.mimeType } },
-  ];
+  const parts: any[] = [{ text: prompt }];
+  parts.push(...policyToParts("NEW POLICY DOCUMENT", newPolicy));
   if (oldPolicy) {
-    parts.push({ text: "--- LEGACY BASELINE POLICY DOCUMENT ---" });
-    parts.push({ inlineData: { data: oldPolicy.buffer.toString("base64"), mimeType: oldPolicy.mimeType } });
+    parts.push(...policyToParts("LEGACY BASELINE POLICY DOCUMENT", oldPolicy));
   }
 
   const response = await generateWithFallback({
@@ -389,8 +402,8 @@ Use the document title EXACTLY as it appears in the "--- INTERNAL DOCUMENT" head
 }
 
 export async function analyzePolicy(
-  newPolicyData: { name: string; buffer: Buffer; mimeType: string },
-  oldPolicyData?: { name: string; buffer: Buffer; mimeType: string },
+  newPolicyData: PolicySource,
+  oldPolicyData?: PolicySource,
   sops?: ({ title: string; text: string } | { title: string; buffer: Buffer; mimeType: string })[],
   regulatorCtx: RegulatorContext = "generic"
 ): Promise<AnalysisResult> {

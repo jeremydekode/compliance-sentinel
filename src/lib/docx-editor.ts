@@ -180,3 +180,24 @@ export function looksLikeDocx(mimeType: string | undefined | null, url: string |
   if (url && /\.docx?($|\?)/i.test(url)) return true;
   return false;
 }
+
+/**
+ * Extract plain text from a DOCX buffer, paragraph by paragraph.
+ * Used to feed DOCX content to LLMs that don't accept DOCX as inline data
+ * (Gemini only accepts PDF/images/audio/video).
+ */
+export function docxToText(buffer: Buffer): string {
+  const zip = new PizZip(buffer);
+  const docFile = zip.file("word/document.xml");
+  if (!docFile) return "";
+  const xml = docFile.asText();
+
+  const paragraphs: string[] = [];
+  const pRegex = /<w:p\b[\s\S]*?<\/w:p>/g;
+  let m: RegExpExecArray | null;
+  while ((m = pRegex.exec(xml)) !== null) {
+    const text = getParagraphText(m[0]);
+    if (text) paragraphs.push(text);
+  }
+  return paragraphs.join("\n\n");
+}

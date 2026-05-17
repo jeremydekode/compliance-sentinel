@@ -30,6 +30,31 @@ async function fetchFile(url: string): Promise<{ buffer: Buffer; mimeType: strin
   return { buffer: Buffer.from(arrayBuffer), mimeType };
 }
 
+/**
+ * Throttled batch embedder — caps concurrent requests to Gemini's embedding API
+ * to avoid the 3,000 req/min rate limit. Defaults to 8 parallel + 200ms gap between batches.
+ */
+async function embedChunksBatched<T extends { content: string }>(
+  chunks: T[],
+  makeRow: (chunk: T, embedding: number[]) => any,
+  concurrency = 8,
+  batchDelayMs = 250
+): Promise<any[]> {
+  const out: any[] = [];
+  for (let i = 0; i < chunks.length; i += concurrency) {
+    const batch = chunks.slice(i, i + concurrency);
+    const rows = await Promise.all(batch.map(async (c) => {
+      const embedding = await generateEmbedding(c.content);
+      return makeRow(c, embedding);
+    }));
+    out.push(...rows);
+    if (i + concurrency < chunks.length) {
+      await new Promise(r => setTimeout(r, batchDelayMs));
+    }
+  }
+  return out;
+}
+
 export const createReport = createServerFn({ method: "POST" })
   .inputValidator(
     z.object({
@@ -701,14 +726,17 @@ export const createSop = createServerFn({ method: "POST" })
           : await chunkDocument({ name: data.title, buffer: file.buffer, mimeType: file.mimeType });
         
         if (chunks.length > 0) {
-          console.log(`Extracted ${chunks.length} semantic chunks. Generating embeddings...`);
-          const chunksWithEmbeddings = await Promise.all(chunks.map(async c => ({
-            sop_id: row.id,
-            content: c.content,
-            chapter_ref: c.chapter_ref || null,
-            page_number: c.page_number || null,
-            embedding: await generateEmbedding(c.content)
-          })));
+          console.log(`Extracted ${chunks.length} semantic chunks. Generating embeddings (throttled)...`);
+          const chunksWithEmbeddings = await embedChunksBatched(
+            chunks,
+            (c: any, embedding) => ({
+              sop_id: row.id,
+              content: c.content,
+              chapter_ref: c.chapter_ref || null,
+              page_number: c.page_number || null,
+              embedding,
+            })
+          );
 
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const { error: chunkErr } = await (supabase as any).from("sop_chunks").insert(chunksWithEmbeddings);
@@ -1181,13 +1209,16 @@ export const reindexSop = createServerFn({ method: "POST" })
       return { chunkCount: 0, message: "No text extracted from the source file" };
     }
 
-    const chunksWithEmbeddings = await Promise.all(chunks.map(async (c: any) => ({
-      sop_id: sop.id,
-      content: c.content,
-      chapter_ref: c.chapter_ref ?? null,
-      page_number: c.page_number ?? null,
-      embedding: await generateEmbedding(c.content),
-    })));
+    const chunksWithEmbeddings = await embedChunksBatched(
+      chunks,
+      (c: any, embedding) => ({
+        sop_id: sop.id,
+        content: c.content,
+        chapter_ref: c.chapter_ref ?? null,
+        page_number: c.page_number ?? null,
+        embedding,
+      })
+    );
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { error: insErr } = await (supabase as any)

@@ -9,13 +9,13 @@ import { applyEditsToDocx, looksLikeDocx, docxToText } from "./docx-editor";
  * Gemini's inline data API doesn't accept DOCX — for DOCX we extract paragraph text
  * and send as text content instead.
  */
-function policySourceFromFile(
+async function policySourceFromFile(
   name: string,
   file: { buffer: Buffer; mimeType: string },
   hintUrl?: string | null
-): { name: string; buffer: Buffer; mimeType: string } | { name: string; text: string } {
+): Promise<{ name: string; buffer: Buffer; mimeType: string } | { name: string; text: string }> {
   if (looksLikeDocx(file.mimeType, hintUrl ?? null)) {
-    const text = docxToText(file.buffer);
+    const text = await docxToText(file.buffer);
     return { name, text };
   }
   return { name, buffer: file.buffer, mimeType: file.mimeType };
@@ -160,9 +160,9 @@ export const createReport = createServerFn({ method: "POST" })
       //    Stage B: for each change, vector-search relevant chunks across all SOPs in workspace,
       //             then ask AI to propose edits anchored ONLY to those real chunks
       console.log(`Starting analysis for ${data.filename}...`);
-      const newPolicySource = policySourceFromFile(data.filename, newPolicy, data.fileUrl);
+      const newPolicySource = await policySourceFromFile(data.filename, newPolicy, data.fileUrl);
       const oldPolicySource = oldPolicy && oldDoc
-        ? policySourceFromFile(oldDoc.title, oldPolicy, oldDoc.file_url)
+        ? await policySourceFromFile(oldDoc.title, oldPolicy, oldDoc.file_url)
         : undefined;
       const extractedChanges = await extractRegulatoryChanges(
         newPolicySource,
@@ -376,7 +376,7 @@ export const rerunReport = createServerFn({ method: "POST" })
           const f = await fetchFile(s.file_url);
           // DOCX → text (Gemini doesn't accept DOCX as inline data)
           if (looksLikeDocx(f.mimeType, s.file_url)) {
-            return { title: s.title, text: docxToText(f.buffer) };
+            return { title: s.title, text: await docxToText(f.buffer) };
           }
           return { title: s.title, buffer: f.buffer, mimeType: f.mimeType };
         } catch { /* fall through */ }
@@ -385,9 +385,9 @@ export const rerunReport = createServerFn({ method: "POST" })
     }));
 
     // 5. Run AI analysis (convert DOCX → text for Gemini compatibility)
-    const newPolicySource = policySourceFromFile(report.policy_name ?? "policy", newPolicy, report.source_file_url);
+    const newPolicySource = await policySourceFromFile(report.policy_name ?? "policy", newPolicy, report.source_file_url);
     const oldPolicySource = oldPolicy && oldDoc
-      ? policySourceFromFile(oldDoc.title, oldPolicy, oldDoc.file_url)
+      ? await policySourceFromFile(oldDoc.title, oldPolicy, oldDoc.file_url)
       : undefined;
     const aiResult = await analyzePolicy(
       newPolicySource,
@@ -722,7 +722,7 @@ export const createSop = createServerFn({ method: "POST" })
         const file = await fetchFile(data.file_url);
         const isDocx = looksLikeDocx(file.mimeType, data.file_url);
         const chunks = isDocx
-          ? chunkDocxText(docxToText(file.buffer))
+          ? chunkDocxText(await docxToText(file.buffer))
           : await chunkDocument({ name: data.title, buffer: file.buffer, mimeType: file.mimeType });
         
         if (chunks.length > 0) {
@@ -1202,7 +1202,7 @@ export const reindexSop = createServerFn({ method: "POST" })
     const file = await fetchFile(sop.file_url);
     const isDocx = looksLikeDocx(file.mimeType, sop.file_url);
     const chunks = isDocx
-      ? chunkDocxText(docxToText(file.buffer))
+      ? chunkDocxText(await docxToText(file.buffer))
       : await chunkDocument({ name: sop.title, buffer: file.buffer, mimeType: file.mimeType });
 
     if (chunks.length === 0) {

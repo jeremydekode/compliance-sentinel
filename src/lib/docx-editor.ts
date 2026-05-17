@@ -185,8 +185,28 @@ export function looksLikeDocx(mimeType: string | undefined | null, url: string |
  * Extract plain text from a DOCX buffer, paragraph by paragraph.
  * Used to feed DOCX content to LLMs that don't accept DOCX as inline data
  * (Gemini only accepts PDF/images/audio/video).
+ *
+ * Now async because we delegate to the `mammoth` library, which handles edge
+ * cases our regex extractor missed (text boxes, SDT content controls,
+ * namespace variations, headers/footers, etc.). Falls back to the regex
+ * extractor if mammoth fails for any reason.
  */
-export function docxToText(buffer: Buffer): string {
+export async function docxToText(buffer: Buffer): Promise<string> {
+  try {
+    // Lazy import — mammoth is a heavy dep we only need server-side
+    const mammoth = await import("mammoth");
+    const result = await mammoth.extractRawText({ buffer });
+    const text = (result.value ?? "").trim();
+    if (text) return text;
+  } catch (e) {
+    console.warn("[docx-editor] mammoth extraction failed, falling back to regex:", (e as Error)?.message);
+  }
+  // Fallback: regex-based extraction
+  return docxToTextFallback(buffer);
+}
+
+/** Synchronous regex-based fallback (less reliable but no deps). */
+export function docxToTextFallback(buffer: Buffer): string {
   const zip = new PizZip(buffer);
   const docFile = zip.file("word/document.xml");
   if (!docFile) return "";

@@ -83,6 +83,10 @@ export interface SopGap {
   find_text: string;
   replace_text: string;
   page: number;
+  /** Short action headline rendered as the card title (e.g. "Plenary date reference — 'June 2025' → 'February 2026'") */
+  action_description?: string;
+  /** Best-effort line range from the SOP (e.g. "~19056" or "~4378–4435") */
+  line_range?: string;
 }
 
 /**
@@ -412,14 +416,40 @@ Use the document title EXACTLY as it appears in the "--- INTERNAL DOCUMENT" head
 
 # OUTPUT FORMAT (JSON Array):
 [{
-  "sop_title": "Exact title of the internal SOP/policy document",
-  "paragraph": "Section heading or paragraph reference within the SOP",
+  "sop_title": "Exact title of the internal SOP/policy document (short code from the document header, e.g. 'R13 GL248')",
+  "paragraph": "Full section reference with name (e.g. 'Section C.14.1.4 · High-risk country customer types')",
+  "action_description": "ONE-LINE imperative headline describing what changes. Examples: 'Plenary date reference — \\'June 2025\\' → \\'February 2026\\'', 'Add 2 new rows; update Myanmar row', 'Add cross-reference note after existing FATF reference clause', 'Myanmar countermeasure note — add after existing Iran / North Korea entry', 'Version bump after all changes applied'. Be specific and action-oriented.",
   "change_type": "find_replace" | "insertion" | "full_rewrite" | "new_section" | "contextual",
   "chapter": "${change.chapter_ref}",
-  "find_text": "VERBATIM current text from the SOP to be replaced (empty string if insertion/new_section)",
-  "replace_text": "New compliant text that should replace or be inserted",
-  "page": <page number in the SOP document where this text appears, or 0 if the document has no page numbers>
+  "find_text": "VERBATIM text from the SOP that anchors this edit. For find_replace: the exact text to be replaced. For insertion: the exact text the new content goes AFTER. If the anchor is a structural location with no concise verbatim text, use a descriptive marker in square brackets: '[end of existing monitoring procedures clause]', '[end of FATF / relevant authorities reference clause — no Feb 2026 note]', '[end of Call for Action prohibition clause referencing Compliance-maintained list]'.",
+  "replace_text": "The full new text content. For find_replace: the replacement. For insertion: the new paragraphs/rows being added.",
+  "page": <page number in the SOP document where this text appears, or 0 if unknown>,
+  "line_range": "Best-effort line reference such as '~19056' (single line) or '~4378-4435' (range), or null if unknown"
 }]
+
+# REFERENCE EXAMPLES OF GOOD OUTPUT (use as a STRUCTURAL template; substitute real values from the attached SOPs):
+[
+  {
+    "sop_title": "R13 GL248",
+    "paragraph": "Section C.14.1.4 · High-risk country customer types",
+    "action_description": "Plenary date reference — 'June 2025' → 'February 2026'",
+    "change_type": "find_replace",
+    "find_text": "Please refer to the FATF country list adjustment updated as June 2025.",
+    "replace_text": "Please refer to the FATF country list adjustment updated as February 2026 (effective 24 March 2026). Note: Myanmar countermeasures enhanced — RHB deadline June 2026. Kuwait and Papua New Guinea newly added to Increased Monitoring. See Section C.14.1.3 for updated classification table. Reference: BNM Notification 26 March 2026; FATF Statement 24 March 2026.",
+    "page": 327,
+    "line_range": "~19056"
+  },
+  {
+    "sop_title": "S08 GL151",
+    "paragraph": "Section C.8.1.8 · Jurisdiction Monitoring Procedures",
+    "action_description": "Add jurisdiction update note after existing FATF reference",
+    "change_type": "insertion",
+    "find_text": "[end of existing monitoring procedures clause for FATF-listed jurisdiction customers]",
+    "replace_text": "Update effective 24 March 2026 (FATF February 2026 Plenary):\\n- Kuwait: newly added to Increased Monitoring. Apply EDD for all new and existing accounts with Kuwait connections. Review within 30 days.\\n- Papua New Guinea: newly added to Increased Monitoring. Same requirements.\\n- Myanmar: countermeasures escalated — deadline June 2026.\\nReference: BNM Notification 26 March 2026. See R13_GL248 Section C.14.1.3.",
+    "page": 0,
+    "line_range": "~2497-2502"
+  }
+]
   `;
 
   const parts: any[] = [{ text: prompt }];

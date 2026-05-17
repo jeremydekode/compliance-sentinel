@@ -514,8 +514,12 @@ export function exportInstructionMemo(report: any, impacts: any[]) {
   const rows = approved.map((i, idx) => `
     <tr>
       <td>${idx + 1}</td>
-      <td>${esc(i.sop_title)}<div class="muted">${esc(i.chapter ?? "")} · p.${i.page ?? "—"} · L${esc(i.line_range ?? "—")}</div></td>
-      <td>${esc(i.change_type)}</td>
+      <td>
+        <strong>${esc(i.sop_title)}</strong>
+        ${i.action_description ? `<div style="color:#0f172a;font-weight:600;margin-top:3px">${esc(i.action_description)}</div>` : ""}
+        <div class="muted">${esc(i.paragraph ?? i.chapter ?? "")}${i.line_range ? ` · Line ${esc(i.line_range)}` : ""}${i.page ? ` · Page ${i.page}` : ""}</div>
+      </td>
+      <td>${esc((i.change_type ?? "").replace(/_/g, " "))}</td>
       <td><pre class="find">${esc(i.find_text ?? "—")}</pre></td>
       <td><pre class="repl">${esc(i.edited_text ?? i.replace_text ?? "—")}</pre></td>
       <td>${esc(i.status)}</td>

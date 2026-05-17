@@ -12,7 +12,8 @@
       "Bash(npm install *)",
       "Bash(node -e ' *)",
       "Bash(node /tmp/index-r13.mjs)",
-      "Bash(node scripts/index-r13.mjs)"
+      "Bash(node scripts/index-r13.mjs)",
+      "Bash(cd \"/Users/jeremyteh/Downloads/Compliance Sentinel\" && grep -n \"function ImpactCard\\\\|imp.paragraph\\\\|imp.page\" 'src/routes/reports.$reportId.tsx' | head -10)"
     ]
   }
 }

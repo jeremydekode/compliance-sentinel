@@ -833,7 +833,8 @@ function ImpactCard({
     <div className={cn("rounded-xl border bg-card overflow-hidden transition-all", statusBorderClass[currentStatus] ?? "")}>
       {/* Card header */}
       <div className="flex items-start justify-between gap-2 px-4 py-3 border-b bg-slate-50/60 dark:bg-slate-900/40">
-        <div className="min-w-0 flex-1">
+        <div className="min-w-0 flex-1 space-y-1">
+          {/* Row 1: doc title + Not in KB badge */}
           <div className="flex items-center gap-2 flex-wrap min-w-0">
             {fileUrl ? (
               <a href={fileUrl} target="_blank" rel="noreferrer"
@@ -850,15 +851,26 @@ function ImpactCard({
               </span>
             )}
           </div>
-          {(imp.paragraph || (imp.page && imp.page > 0)) && (
-            <div className="text-[11px] text-muted-foreground mt-0.5 font-mono flex items-center gap-1.5">
-              {imp.paragraph && <span>{imp.paragraph}</span>}
-              {imp.page > 0 && <span className="text-muted-foreground/60">· p.{imp.page}</span>}
+          {/* Row 2: location (line / page / section) */}
+          {(imp.line_range || imp.paragraph || (imp.page && imp.page > 0)) && (
+            <div className="text-[11px] text-muted-foreground font-mono flex items-center gap-1.5 flex-wrap">
+              {imp.line_range && <span className="text-primary/80">Line {imp.line_range}</span>}
+              {imp.page > 0 && <span className="text-muted-foreground/60">· Page {imp.page}</span>}
+              {imp.paragraph && <span className="text-muted-foreground/70">· {imp.paragraph}</span>}
+            </div>
+          )}
+          {/* Row 3: action description headline (the "what to do" line) */}
+          {imp.action_description && (
+            <div className="text-xs font-semibold text-foreground leading-snug pt-1">
+              {imp.action_description}
             </div>
           )}
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
-          <Badge variant="outline" className="text-[9px] font-bold uppercase tracking-wide">{changeTypeLabel}</Badge>
+          <Badge variant="outline" className={cn(
+            "text-[9px] font-bold uppercase tracking-wide",
+            isInsertion ? "bg-amber-100 text-amber-800 border-amber-200" : ""
+          )}>{changeTypeLabel}</Badge>
           {currentStatus !== "pending" && (
             <Badge variant="outline" className={cn("text-[9px] font-bold capitalize",
               currentStatus === "approved" ? "bg-emerald-100 text-emerald-800 border-emerald-300" :
@@ -1096,12 +1108,13 @@ function GapTable({ impacts, sopById, reportId }: { impacts: any[]; sopById: Map
                         <span className="shrink-0 text-[9px] font-bold text-amber-600 bg-amber-100 px-1 py-0.5 rounded">unmatched</span>
                       )}
                     </div>
-                    {imp.paragraph && (
-                      <div className="text-[10px] font-mono text-muted-foreground mt-0.5 truncate">{imp.paragraph}</div>
+                    {imp.action_description && (
+                      <div className="text-[11px] font-medium text-foreground mt-0.5 truncate">{imp.action_description}</div>
                     )}
-                    {isInsertion && imp.find_text && (
-                      <div className="mt-1 text-[10px] text-muted-foreground italic truncate">
-                        After: "…{imp.find_text.slice(0, 60)}{imp.find_text.length > 60 ? "…" : ""}"
+                    {(imp.line_range || imp.paragraph) && (
+                      <div className="text-[10px] font-mono text-muted-foreground mt-0.5 truncate">
+                        {imp.line_range && <span className="text-primary/70">L{imp.line_range} </span>}
+                        {imp.paragraph}
                       </div>
                     )}
                   </td>

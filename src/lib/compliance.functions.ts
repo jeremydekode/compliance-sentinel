@@ -1,7 +1,8 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { supabase } from "@/integrations/supabase/client";
-import { analyzePolicy, chunkDocument, generateAmendedDocument } from "./gemini";
+import { analyzePolicy, chunkDocument, generateAmendedDocument, extractRegulatoryChanges, mapChangeToSops, generateAnalysisSummary } from "./gemini";
+import { applyEditsToDocx, looksLikeDocx } from "./docx-editor";
 import { generateEmbedding, generateQueryEmbedding } from "./embeddings";
 import { REGULATION_FAMILIES, INTERNAL_DOC_TYPES as INTERNAL_DOC_TYPES_CONST, regulatorContext } from "./auto-detect";
 
@@ -112,32 +113,81 @@ export const createReport = createServerFn({ method: "POST" })
       }
       kbAll = relevantSops;
 
-      // Build SOP context: fetch full PDF files where available
-      const sopsForAi = await Promise.all(relevantSops.map(async s => {
-        if (s.file_url) {
-          try {
-            const file = await fetchFile(s.file_url);
-            return { title: s.title, buffer: file.buffer, mimeType: file.mimeType };
-          } catch (e) {
-            console.error(`Failed to fetch SOP ${s.title}:`, e);
-          }
-        }
-        // Fall back to indexed chunk text
-        const chunksForThisSop = chunks.filter((c: any) => c.sop_id === s.id);
-        const chunkContext = chunksForThisSop.map((c: any) =>
-          `[${c.chapter_ref || "§?"}, p.${c.page_number || "?"}]\n${c.content}`
-        ).join("\n\n---\n\n");
-        return { title: s.title, text: chunkContext || `[No content indexed for ${s.title}]` };
-      }));
-
-      // 4. Run AI Analysis: extract regulatory changes then map each to SOPs
-      console.log(`Starting analysis for ${data.filename} against ${sopsForAi.length} internal SOPs...`);
-      aiResult = await analyzePolicy(
+      // 4. Two-stage analysis with per-change chunk RAG
+      //    Stage A: extract regulatory changes from old vs new policy
+      //    Stage B: for each change, vector-search relevant chunks across all SOPs in workspace,
+      //             then ask AI to propose edits anchored ONLY to those real chunks
+      console.log(`Starting analysis for ${data.filename}...`);
+      const extractedChanges = await extractRegulatoryChanges(
         { name: data.filename, buffer: newPolicy.buffer, mimeType: newPolicy.mimeType },
         oldPolicy ? { name: oldDoc!.title, buffer: oldPolicy.buffer, mimeType: oldPolicy.mimeType } : undefined,
-        sopsForAi,
         regulatorContext(detected?.doc_type)
       );
+      console.log(`Extracted ${extractedChanges.length} regulatory changes. Now mapping each to SOP chunks...`);
+
+      const allImpacts: any[] = [];
+      for (const change of extractedChanges) {
+        try {
+          // Per-change vector search: find the most semantically relevant chunks
+          const changeQuery = `${change.change_summary} ${change.new_requirement ?? ""}`;
+          const changeEmbedding = await generateQueryEmbedding(changeQuery);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const { data: changeChunks } = await (supabase as any).rpc("match_sop_chunks", {
+            query_embedding: changeEmbedding,
+            match_threshold: 0.15,
+            match_count: 40,
+          });
+          const matchedChunks: any[] = (changeChunks ?? []).filter((c: any) =>
+            relevantSops.some(s => s.id === c.sop_id)
+          );
+
+          // Group chunks by SOP
+          const chunksBySop = new Map<string, any[]>();
+          for (const ch of matchedChunks) {
+            if (!chunksBySop.has(ch.sop_id)) chunksBySop.set(ch.sop_id, []);
+            chunksBySop.get(ch.sop_id)!.push(ch);
+          }
+
+          // Per-SOP fairness: for any internal SOP with NO chunks above threshold,
+          // do a per-SOP top-3 fallback search so every SOP gets considered for this change.
+          for (const sop of relevantSops) {
+            if (chunksBySop.has(sop.id)) continue;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const { data: sopFallback } = await (supabase as any).rpc("match_sop_chunks", {
+              query_embedding: changeEmbedding,
+              match_threshold: 0.0,
+              match_count: 50,
+            });
+            const sopOnly = (sopFallback ?? []).filter((c: any) => c.sop_id === sop.id).slice(0, 3);
+            if (sopOnly.length > 0) chunksBySop.set(sop.id, sopOnly);
+          }
+
+          if (chunksBySop.size === 0) {
+            console.log(`  - [${change.chapter_ref}] no SOPs to consider, skipping`);
+            continue;
+          }
+
+          // Build sops-for-change with chunk text contexts
+          const sopsForChange: { title: string; text: string }[] = [];
+          for (const [sopId, sopChunks] of chunksBySop.entries()) {
+            const sop = relevantSops.find(s => s.id === sopId);
+            if (!sop) continue;
+            const text = sopChunks
+              .map((c: any) => `[Section: ${c.chapter_ref || "unspecified"} | Page: ${c.page_number || "?"}]\n${c.content}`)
+              .join("\n\n---\n\n");
+            sopsForChange.push({ title: sop.title, text });
+          }
+
+          const impacts = await mapChangeToSops(change, sopsForChange);
+          console.log(`  - [${change.chapter_ref}] → ${impacts.length} impact(s) across ${chunksBySop.size} SOP(s)`);
+          allImpacts.push(...impacts);
+        } catch (innerErr: any) {
+          console.warn(`Failed to map change [${change.chapter_ref}]:`, innerErr?.message);
+        }
+      }
+
+      const summary = await generateAnalysisSummary(extractedChanges, allImpacts as any[], data.filename);
+      aiResult = { changes: extractedChanges, impacts: allImpacts, summary };
       console.log(`Analysis complete. ${aiResult.changes.length} changes, ${aiResult.impacts.length} SOP impacts.`);
     } catch (e: any) {
       console.error("Intelligence engine encountered an issue during analysis:", e);
@@ -771,6 +821,53 @@ export const generateDocumentPreview = createServerFn({ method: "POST" })
     if (!impacts?.length) throw new Error("No approved edits to apply for this SOP");
 
     const file = await fetchFile(sop.file_url);
+    const isDocx = looksLikeDocx(file.mimeType, sop.file_url);
+    const nextVersion = bumpVersion(sop.version ?? "1.0");
+    const safeTitle = (sop.title ?? "document").replace(/[^A-Za-z0-9._-]+/g, "_");
+
+    if (isDocx) {
+      // ── Full-fidelity DOCX path ──────────────────────────────────────
+      // Apply edits programmatically — every untouched paragraph stays bit-for-bit
+      // identical to the source. Edits are highlighted in yellow.
+      const result = applyEditsToDocx(file.buffer, impacts.map((i: any) => ({
+        change_type: i.change_type ?? "find_replace",
+        find_text: i.find_text,
+        replace_text: i.replace_text,
+        edited_text: i.edited_text,
+        paragraph: i.paragraph,
+      })));
+
+      // Upload preview to Storage so the client can download / show it
+      const previewPath = `amendments/preview/${Date.now()}-${safeTitle}-v${nextVersion}.docx`;
+      const { error: upErr } = await supabase.storage
+        .from("policies")
+        .upload(previewPath, result.buffer, {
+          upsert: false,
+          contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        });
+      if (upErr) throw new Error(`Failed to upload DOCX preview: ${upErr.message}`);
+      const { data: urlData } = supabase.storage.from("policies").getPublicUrl(previewPath);
+
+      return {
+        format: "docx" as const,
+        sopTitle: sop.title,
+        currentVersion: sop.version,
+        nextVersion,
+        editsApplied: result.appliedCount,
+        editsRequested: impacts.length,
+        skippedEdits: result.skipped.map(s => ({
+          reason: s.reason,
+          paragraph: s.edit.paragraph ?? null,
+          find_text: (s.edit.find_text ?? "").slice(0, 200),
+        })),
+        previewUrl: urlData.publicUrl,
+        previewPath,
+        amendedHtml: null,
+      };
+    }
+
+    // ── Lossy PDF path (legacy) ────────────────────────────────────────
+    // For PDFs we can't do faithful editing — fall back to AI-rendered HTML.
     const amendedHtml = await generateAmendedDocument(
       { title: sop.title, buffer: file.buffer, mimeType: file.mimeType },
       impacts.map((i: any) => ({
@@ -784,12 +881,16 @@ export const generateDocumentPreview = createServerFn({ method: "POST" })
     );
 
     return {
+      format: "html" as const,
       sopTitle: sop.title,
       currentVersion: sop.version,
-      nextVersion: bumpVersion(sop.version ?? "1.0"),
+      nextVersion,
       editsApplied: impacts.length,
+      editsRequested: impacts.length,
+      skippedEdits: [],
+      previewUrl: null,
+      previewPath: null,
       amendedHtml,
-      sourceFileMime: file.mimeType,
     };
   });
 
@@ -804,7 +905,11 @@ export const finalizeDocumentAmendment = createServerFn({ method: "POST" })
   .inputValidator(z.object({
     reportId: z.string(),
     sopId: z.string(),
-    amendedHtml: z.string(),
+    // DOCX path: previewUrl points to the preview file in Storage (we re-upload it under the final amendments/ prefix)
+    previewUrl: z.string().nullable().optional(),
+    previewPath: z.string().nullable().optional(),
+    // HTML path: amended HTML body to wrap and save
+    amendedHtml: z.string().nullable().optional(),
   }))
   .handler(async ({ data }) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -815,8 +920,22 @@ export const finalizeDocumentAmendment = createServerFn({ method: "POST" })
     const nextVersion = bumpVersion(oldSop.version ?? "1.0");
     const safeTitle = (oldSop.title ?? "document").replace(/[^A-Za-z0-9._-]+/g, "_");
 
-    // Wrap fragment in a printable HTML shell
-    const fullHtml = `<!doctype html>
+    let newFileUrl: string;
+
+    if (data.previewUrl && data.previewPath) {
+      // ── DOCX path: copy the preview file into a permanent amendments/ path ──
+      const finalPath = `amendments/${Date.now()}-${safeTitle}-v${nextVersion}.docx`;
+      // Move via copy + delete (Supabase Storage doesn't have a single move on JS client)
+      const { error: copyErr } = await supabase.storage
+        .from("policies")
+        .copy(data.previewPath, finalPath);
+      if (copyErr) throw new Error(`Failed to finalise DOCX: ${copyErr.message}`);
+      await supabase.storage.from("policies").remove([data.previewPath]).catch(() => {});
+      const { data: urlData } = supabase.storage.from("policies").getPublicUrl(finalPath);
+      newFileUrl = urlData.publicUrl;
+    } else if (data.amendedHtml) {
+      // ── HTML path: wrap and save the AI-rendered preview ────────────────
+      const fullHtml = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"/>
 <title>${escapeHtml(oldSop.title ?? "Amended Document")} — v${escapeHtml(nextVersion)}</title>
 <style>
@@ -842,15 +961,16 @@ export const finalizeDocumentAmendment = createServerFn({ method: "POST" })
 </div>
 ${data.amendedHtml}
 </body></html>`;
-
-    // Upload to Supabase Storage
-    const path = `amendments/${Date.now()}-${safeTitle}-v${nextVersion}.html`;
-    const { error: upErr } = await supabase.storage
-      .from("policies")
-      .upload(path, new Blob([fullHtml], { type: "text/html" }), { upsert: false, contentType: "text/html" });
-    if (upErr) throw new Error(`Failed to upload amended file: ${upErr.message}`);
-    const { data: urlData } = supabase.storage.from("policies").getPublicUrl(path);
-    const newFileUrl = urlData.publicUrl;
+      const path = `amendments/${Date.now()}-${safeTitle}-v${nextVersion}.html`;
+      const { error: upErr } = await supabase.storage
+        .from("policies")
+        .upload(path, new Blob([fullHtml], { type: "text/html" }), { upsert: false, contentType: "text/html" });
+      if (upErr) throw new Error(`Failed to upload amended file: ${upErr.message}`);
+      const { data: urlData } = supabase.storage.from("policies").getPublicUrl(path);
+      newFileUrl = urlData.publicUrl;
+    } else {
+      throw new Error("Either previewUrl+previewPath (DOCX) or amendedHtml (HTML) must be provided");
+    }
 
     // Insert new sop_documents row (the amended version)
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

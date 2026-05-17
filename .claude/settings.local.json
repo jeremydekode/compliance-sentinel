@@ -8,7 +8,8 @@
       "Bash(git push *)",
       "Bash(ls node_modules/docx)",
       "Bash(ls node_modules/jspdf)",
-      "Bash(git commit *)"
+      "Bash(git commit *)",
+      "Bash(npm install *)"
     ]
   }
 }

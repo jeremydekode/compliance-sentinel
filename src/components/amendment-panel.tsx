@@ -9,9 +9,23 @@ import {
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
-import { FileEdit, Loader2, CheckCircle2, FileText, Sparkles, ExternalLink, AlertTriangle } from "lucide-react";
+import { FileEdit, Loader2, CheckCircle2, FileText, Sparkles, ExternalLink, AlertTriangle, Download, FileCheck2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
+
+type PreviewData = {
+  format: "docx" | "html";
+  sopId: string;
+  sopTitle: string;
+  currentVersion: string;
+  nextVersion: string;
+  editsApplied: number;
+  editsRequested: number;
+  skippedEdits: { reason: string; paragraph: string | null; find_text: string }[];
+  previewUrl: string | null;
+  previewPath: string | null;
+  amendedHtml: string | null;
+};
 
 export function AmendmentPanel({ reportId }: { reportId: string }) {
   const qc = useQueryClient();
@@ -21,14 +35,7 @@ export function AmendmentPanel({ reportId }: { reportId: string }) {
 
   const [previewing, setPreviewing] = useState<string | null>(null);
   const [finalizing, setFinalizing] = useState(false);
-  const [previewData, setPreviewData] = useState<{
-    sopId: string;
-    sopTitle: string;
-    currentVersion: string;
-    nextVersion: string;
-    editsApplied: number;
-    amendedHtml: string;
-  } | null>(null);
+  const [previewData, setPreviewData] = useState<PreviewData | null>(null);
 
   const docs = useQuery({
     queryKey: ["amendable", reportId],
@@ -45,7 +52,7 @@ export function AmendmentPanel({ reportId }: { reportId: string }) {
     setPreviewing(sopId);
     try {
       const r = await preview({ data: { reportId, sopId } });
-      setPreviewData({ sopId, ...r });
+      setPreviewData({ sopId, ...r } as PreviewData);
     } catch (e: any) {
       toast.error("Preview failed", { description: e?.message });
     } finally {
@@ -61,6 +68,8 @@ export function AmendmentPanel({ reportId }: { reportId: string }) {
         data: {
           reportId,
           sopId: previewData.sopId,
+          previewUrl: previewData.previewUrl,
+          previewPath: previewData.previewPath,
           amendedHtml: previewData.amendedHtml,
         },
       });
@@ -126,20 +135,82 @@ export function AmendmentPanel({ reportId }: { reportId: string }) {
                   <Badge variant="outline" className="font-mono">
                     v{previewData.currentVersion} → v{previewData.nextVersion}
                   </Badge>
-                  <Badge className="bg-indigo-100 text-indigo-800 border-indigo-200">
-                    {previewData.editsApplied} edits applied
+                  <Badge className={cn(
+                    "border",
+                    previewData.editsApplied === previewData.editsRequested
+                      ? "bg-emerald-100 text-emerald-800 border-emerald-200"
+                      : "bg-amber-100 text-amber-800 border-amber-200"
+                  )}>
+                    {previewData.editsApplied} / {previewData.editsRequested} edits applied
                   </Badge>
+                  {previewData.format === "docx" && (
+                    <Badge variant="outline" className="bg-blue-100 text-blue-800 border-blue-200">
+                      <FileCheck2 className="size-3 mr-1" /> Full-fidelity DOCX
+                    </Badge>
+                  )}
                 </DialogTitle>
                 <DialogDescription className="text-xs">
-                  Review the amended document below. Highlighted text shows the inserted/replaced sections.
-                  Click <strong>Finalize</strong> to publish as v{previewData.nextVersion} in the Knowledge Base.
+                  {previewData.format === "docx" ? (
+                    <>The full original document with only the amended paragraphs modified (highlighted in yellow). Download to inspect in Word, then click <strong>Finalize</strong> to publish as v{previewData.nextVersion}.</>
+                  ) : (
+                    <>Review the amended document below. Highlighted text shows the inserted/replaced sections. Click <strong>Finalize</strong> to publish as v{previewData.nextVersion}.</>
+                  )}
                 </DialogDescription>
               </DialogHeader>
 
+              {previewData.skippedEdits.length > 0 && (
+                <div className="px-6 py-3 bg-amber-50 dark:bg-amber-950/20 border-b border-amber-200 shrink-0">
+                  <div className="flex items-start gap-2 text-xs">
+                    <AlertTriangle className="size-3.5 text-amber-700 shrink-0 mt-0.5" />
+                    <div>
+                      <div className="font-semibold text-amber-900 dark:text-amber-300">
+                        {previewData.skippedEdits.length} edit{previewData.skippedEdits.length !== 1 ? "s" : ""} could not be located in the document:
+                      </div>
+                      <ul className="mt-1 space-y-0.5 text-amber-900/80 dark:text-amber-400/80">
+                        {previewData.skippedEdits.slice(0, 5).map((s, i) => (
+                          <li key={i} className="text-[11px]">
+                            • <span className="font-mono">{s.paragraph ?? "(no anchor)"}</span> — {s.reason}
+                            {s.find_text && <span className="text-amber-700/60 italic"> · "{s.find_text.slice(0, 80)}…"</span>}
+                          </li>
+                        ))}
+                        {previewData.skippedEdits.length > 5 && (
+                          <li className="text-[11px] italic">+ {previewData.skippedEdits.length - 5} more</li>
+                        )}
+                      </ul>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               <div className="flex-1 overflow-hidden bg-slate-50 dark:bg-slate-900/40">
-                <iframe
-                  title="Amended preview"
-                  srcDoc={`<!doctype html><html><head><meta charset="utf-8"/>
+                {previewData.format === "docx" && previewData.previewUrl ? (
+                  <div className="h-full flex flex-col items-center justify-center gap-4 p-8 text-center">
+                    <div className="size-16 rounded-2xl bg-blue-100 grid place-items-center">
+                      <FileCheck2 className="size-8 text-blue-700" />
+                    </div>
+                    <div className="space-y-2 max-w-md">
+                      <h3 className="font-display font-bold text-lg">Amended DOCX ready for review</h3>
+                      <p className="text-sm text-muted-foreground leading-relaxed">
+                        The complete original document has been preserved. Only the {previewData.editsApplied} amended paragraph{previewData.editsApplied !== 1 ? "s have" : " has"} been modified and highlighted in yellow.
+                      </p>
+                    </div>
+                    <a
+                      href={previewData.previewUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      download
+                      className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-sm transition-colors"
+                    >
+                      <Download className="size-4" /> Download Preview DOCX
+                    </a>
+                    <p className="text-[10px] text-muted-foreground">
+                      Open in Microsoft Word or Google Docs to inspect the highlighted amendments.
+                    </p>
+                  </div>
+                ) : previewData.amendedHtml ? (
+                  <iframe
+                    title="Amended preview"
+                    srcDoc={`<!doctype html><html><head><meta charset="utf-8"/>
 <style>
   body{font-family:Georgia,serif;color:#111;max-width:780px;margin:32px auto;padding:0 28px;line-height:1.55;font-size:13px}
   h1{font-size:20px;margin:0 0 8px} h2{font-size:15px;margin:20px 0 6px}
@@ -150,14 +221,18 @@ export function AmendmentPanel({ reportId }: { reportId: string }) {
   ul,ol{margin:6px 0 8px 22px} li{margin-bottom:2px}
   mark.amended{background:#fffacc;padding:1px 3px;border-radius:2px;border-bottom:2px solid #e0b800}
 </style></head><body>${previewData.amendedHtml}</body></html>`}
-                  className="w-full h-full bg-white"
-                />
+                    className="w-full h-full bg-white"
+                  />
+                ) : null}
               </div>
 
               <DialogFooter className="px-6 py-3 border-t bg-card shrink-0 sm:justify-between gap-2">
-                <div className="flex items-center gap-2 text-[10px] text-amber-700 dark:text-amber-400">
-                  <AlertTriangle className="size-3.5" />
-                  <span>For PDF sources, formatting is re-rendered cleanly — original layout may not be pixel-perfect.</span>
+                <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+                  {previewData.format === "docx" ? (
+                    <><FileCheck2 className="size-3.5 text-emerald-600" /><span>Full original content preserved · only edited paragraphs modified</span></>
+                  ) : (
+                    <><AlertTriangle className="size-3.5 text-amber-700" /><span>PDF source — formatting re-rendered (not pixel-perfect). Upload DOCX for full fidelity.</span></>
+                  )}
                 </div>
                 <div className="flex items-center gap-2">
                   <Button variant="outline" onClick={() => setPreviewData(null)} disabled={finalizing}>

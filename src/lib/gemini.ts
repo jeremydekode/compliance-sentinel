@@ -430,6 +430,39 @@ OUTPUT JSON:
 }
 
 /**
+ * Build just the summary section (used when impacts are computed externally
+ * via per-change chunk search instead of analyzePolicy's all-in-one flow).
+ */
+export async function generateAnalysisSummary(
+  changes: RegulatoryDelta[],
+  allImpacts: SopGap[],
+  policyName: string
+): Promise<AnalysisResult["summary"]> {
+  const summaryPrompt = `
+Generate a concise executive summary JSON for a compliance gap report.
+POLICY: ${policyName}
+CHANGES FOUND: ${changes.length}
+IMPACTS FOUND: ${allImpacts.length}
+CHANGE SUMMARIES: ${changes.map(c => `[${c.chapter_ref}] ${c.change_summary}`).join("; ")}
+
+OUTPUT JSON:
+{
+  "executive": ["4-6 concise bullet points (each 15-30 words) summarising the paradigm shift and key operational impacts. Each bullet must be a complete, standalone thought."],
+  "effective_date": "Come-into-force date of the policy (e.g. '28 February 2026'), NOT a transition deadline. If unknown, 'Refer to policy document'.",
+  "transition_deadline": "Separate future date for migration of a capability, if applicable. Otherwise null.",
+  "before_count": ${changes.length},
+  "after_count": ${changes.length},
+  "structural": { "added": [], "renamed": [], "restructured": [] }
+}
+  `;
+  const response = await generateWithFallback({
+    contents: [{ role: "user", parts: [{ text: summaryPrompt }] }],
+    config: { responseMimeType: "application/json" },
+  });
+  return JSON.parse(response.text ?? "{}") as AnalysisResult["summary"];
+}
+
+/**
  * DOCUMENT AMENDMENT ENGINE
  * Takes a source document + approved edits, returns the full amended document as styled HTML.
  * Used for the "Apply Changes to Source Documents" workflow.

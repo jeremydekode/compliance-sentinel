@@ -20,7 +20,7 @@ async function policySourceFromFile(
   }
   return { name, buffer: file.buffer, mimeType: file.mimeType };
 }
-import { generateEmbedding, generateQueryEmbedding } from "./embeddings";
+import { generateEmbedding, generateQueryEmbedding, generateEmbeddingsBatch } from "./embeddings";
 import { REGULATION_FAMILIES, INTERNAL_DOC_TYPES as INTERNAL_DOC_TYPES_CONST, regulatorContext } from "./auto-detect";
 
 async function fetchFile(url: string): Promise<{ buffer: Buffer; mimeType: string }> {
@@ -31,28 +31,16 @@ async function fetchFile(url: string): Promise<{ buffer: Buffer; mimeType: strin
 }
 
 /**
- * Throttled batch embedder — caps concurrent requests to Gemini's embedding API
- * to avoid the 3,000 req/min rate limit. Defaults to 8 parallel + 200ms gap between batches.
+ * Bulk embedder — uses Gemini's batch API (50 texts per call) for efficient indexing.
+ * 50x fewer API calls than embedding chunks one-by-one. Dodges per-request rate limits.
  */
 async function embedChunksBatched<T extends { content: string }>(
   chunks: T[],
   makeRow: (chunk: T, embedding: number[]) => any,
-  concurrency = 8,
-  batchDelayMs = 250
 ): Promise<any[]> {
-  const out: any[] = [];
-  for (let i = 0; i < chunks.length; i += concurrency) {
-    const batch = chunks.slice(i, i + concurrency);
-    const rows = await Promise.all(batch.map(async (c) => {
-      const embedding = await generateEmbedding(c.content);
-      return makeRow(c, embedding);
-    }));
-    out.push(...rows);
-    if (i + concurrency < chunks.length) {
-      await new Promise(r => setTimeout(r, batchDelayMs));
-    }
-  }
-  return out;
+  if (chunks.length === 0) return [];
+  const vectors = await generateEmbeddingsBatch(chunks.map((c) => c.content));
+  return chunks.map((c, i) => makeRow(c, vectors[i] ?? []));
 }
 
 export const createReport = createServerFn({ method: "POST" })

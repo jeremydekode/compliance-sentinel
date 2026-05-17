@@ -6,7 +6,6 @@ import { supabase } from "@/integrations/supabase/client";
 import { AppShell } from "@/components/app-shell";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { AIAssistant } from "@/components/ai-assistant";
 import { ApprovalWorkflow } from "@/components/approval-workflow";
 import { LegalReviewView } from "@/components/legal-review-view";
 import { useRole } from "@/lib/role";
@@ -171,7 +170,6 @@ function ReportPage() {
             sopById={sopById}
           />
         </div>
-        <AIAssistant reportId={reportId} />
       </AppShell>
     );
   }
@@ -401,8 +399,6 @@ function ReportPage() {
           </div>
         )}
       </div>
-
-      <AIAssistant reportId={reportId} />
     </AppShell>
   );
 }

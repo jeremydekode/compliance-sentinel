@@ -21,7 +21,7 @@ import {
   ArrowRightLeft, CheckCircle2, XCircle, UserCheck,
   Scale, FileText, AlertCircle, Sparkles, ExternalLink,
   ArrowDownToLine, MoveDown, AlertTriangle, LayoutGrid,
-  CircleDot, Circle, RefreshCw, PanelLeftClose, PanelLeftOpen,
+  CircleDot, Circle, RefreshCw, PanelLeftClose, PanelLeftOpen, FileEdit,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -107,9 +107,27 @@ function ReportPage() {
   const newPolicyName: string = report.data.policy_name ?? "Updated policy";
   const s = statusMeta(report.data.status);
 
-  // null selectedId = Summary view; otherwise show the specific change
+  // UC1 (Form Update) reports render document-centric, not rule-centric.
+  // For UC1: left register lists affected DOCS; each tile expands all impacts for that doc.
+  const isFormUpdate: boolean = !!summary?.uc1_form_update;
+  const formFieldChanges: { label: string; oldValue: string; newValue: string }[] = summary?.field_changes ?? [];
+
+  // Group impacts by sop_id for UC1 document-centric view
+  const docGroups = useMemo(() => {
+    if (!isFormUpdate) return [];
+    const map = new Map<string, { sopId: string | null; sopTitle: string; impacts: any[] }>();
+    for (const imp of allImpacts) {
+      const key = imp.sop_id ?? `__nokey_${imp.sop_title}`;
+      if (!map.has(key)) map.set(key, { sopId: imp.sop_id, sopTitle: imp.sop_title, impacts: [] });
+      map.get(key)!.impacts.push(imp);
+    }
+    return Array.from(map.values()).sort((a, b) => b.impacts.length - a.impacts.length);
+  }, [allImpacts, isFormUpdate]);
+
+  // null selectedId = Summary view; otherwise show the specific change/doc
   const showSummary = selectedId === null;
-  const selectedChange = showSummary ? null : (allChanges.find(c => c.id === selectedId) ?? null);
+  const selectedChange = showSummary || isFormUpdate ? null : (allChanges.find(c => c.id === selectedId) ?? null);
+  const selectedDocGroup = isFormUpdate && !showSummary ? docGroups.find((d) => (d.sopId ?? `__nokey_${d.sopTitle}`) === selectedId) : null;
 
   const impactsForChange = (chapter_ref: string) => {
     const target = (chapter_ref ?? "").trim().toLowerCase();
@@ -318,11 +336,61 @@ function ReportPage() {
                     <span className="text-[11px] font-black uppercase tracking-widest text-foreground/90">Summary Overview</span>
                   </div>
                   <p className="text-[10px] text-muted-foreground leading-snug mt-0.5">
-                    All {allChanges.length} changes at a glance · {allImpacts.length} SOP actions
+                    {isFormUpdate
+                      ? `${docGroups.length} affected document${docGroups.length !== 1 ? "s" : ""} · ${allImpacts.length} edits`
+                      : `All ${allChanges.length} changes at a glance · ${allImpacts.length} SOP actions`}
                   </p>
                 </button>
 
-                {allChanges.length === 0 ? (
+                {/* UC1: document-centric register (one tile per affected doc) */}
+                {isFormUpdate ? (
+                  docGroups.length === 0 ? (
+                    <div className="px-4 py-8 text-center text-xs text-muted-foreground italic">No documents affected.</div>
+                  ) : (
+                    docGroups.map((g) => {
+                      const key = g.sopId ?? `__nokey_${g.sopTitle}`;
+                      const isSelected = selectedId === key;
+                      const approvedCount = g.impacts.filter((i: any) => i.status === "approved").length;
+                      const allApproved = approvedCount === g.impacts.length && g.impacts.length > 0;
+                      const cleanTitle = (g.sopTitle ?? "").replace(/\s*\(no matching internal doc(?:\s+found)?\)/gi, "").trim();
+                      return (
+                        <button
+                          key={key}
+                          onClick={() => setSelectedId(key)}
+                          className={cn(
+                            "w-full text-left px-3 py-2.5 border-b border-slate-100 dark:border-slate-800 transition-all",
+                            "hover:bg-white dark:hover:bg-slate-800/60",
+                            isSelected
+                              ? "bg-white dark:bg-slate-800 border-l-[3px] border-l-primary shadow-sm"
+                              : "border-l-[3px] border-l-transparent",
+                            allApproved && !isSelected && "bg-emerald-50/40 dark:bg-emerald-900/10"
+                          )}
+                        >
+                          <div className="flex items-center justify-between gap-2 mb-1">
+                            <span className="font-semibold text-[11px] text-foreground truncate">{cleanTitle}</span>
+                            <span className={cn(
+                              "text-[8px] font-black px-1 py-0.5 rounded inline-flex items-center gap-0.5 shrink-0",
+                              allApproved ? "bg-emerald-100 text-emerald-700" :
+                              approvedCount > 0 ? "bg-blue-100 text-blue-700" :
+                                                  "bg-slate-100 text-slate-600"
+                            )}>
+                              {allApproved ? <CheckCircle2 className="size-2.5" /> : <Circle className="size-2.5" />}
+                              {approvedCount}/{g.impacts.length}
+                            </span>
+                          </div>
+                          <p className="text-[10px] text-muted-foreground leading-snug">
+                            {g.impacts.length} edit{g.impacts.length !== 1 ? "s" : ""} to apply
+                          </p>
+                          {!g.sopId && (
+                            <p className="mt-1 text-[9px] font-semibold text-amber-600 inline-flex items-center gap-1">
+                              <AlertTriangle className="size-2.5" /> Not in KB
+                            </p>
+                          )}
+                        </button>
+                      );
+                    })
+                  )
+                ) : allChanges.length === 0 ? (
                   <div className="px-4 py-8 text-center text-xs text-muted-foreground italic">No changes extracted.</div>
                 ) : (
                   allChanges.map(c => {
@@ -387,7 +455,7 @@ function ReportPage() {
             </div>
             )}
 
-            {/* ── Right: Summary or Change Detail ──────────────────── */}
+            {/* ── Right: Summary or Change/Doc Detail ──────────────────── */}
             <div className="flex-1 overflow-y-auto bg-background">
               {showSummary ? (
                 <SummaryOverview
@@ -400,6 +468,14 @@ function ReportPage() {
                   onSelectChange={(id) => setSelectedId(id)}
                   changeStatusRollup={changeStatusRollup}
                 />
+              ) : isFormUpdate && selectedDocGroup ? (
+                <DocAmendmentPanel
+                  docGroup={selectedDocGroup}
+                  formFieldChanges={formFieldChanges}
+                  sopById={sopById}
+                  reportId={reportId}
+                  formId={summary?.form_id ?? newPolicyName}
+                />
               ) : selectedChange ? (
                 <ChangeDetailPanel
                   change={selectedChange}
@@ -411,7 +487,7 @@ function ReportPage() {
                 />
               ) : (
                 <div className="flex items-center justify-center h-full text-sm text-muted-foreground">
-                  Select a change from the register on the left.
+                  Select {isFormUpdate ? "a document" : "a change"} from the register on the left.
                 </div>
               )}
             </div>
@@ -1002,6 +1078,127 @@ function ImpactCard({
 }
 
 // ── SOP Gap Register table ────────────────────────────────────────────────────
+
+// ── UC1 Document-centric amendment panel ─────────────────────────────────────
+
+function DocAmendmentPanel({
+  docGroup, formFieldChanges, sopById, reportId, formId,
+}: {
+  docGroup: { sopId: string | null; sopTitle: string; impacts: any[] };
+  formFieldChanges: { label: string; oldValue: string; newValue: string }[];
+  sopById: Map<string, any>;
+  reportId: string;
+  formId: string;
+}) {
+  const qc = useQueryClient();
+  const upd = useServerFn(updateImpact);
+  const sopDoc = docGroup.sopId ? sopById.get(docGroup.sopId) : undefined;
+  const cleanTitle = (docGroup.sopTitle ?? "").replace(/\s*\(no matching internal doc(?:\s+found)?\)/gi, "").trim();
+  const fileUrl = sopDoc?.file_url ?? null;
+
+  async function setImpactStatus(id: string, status: "approved" | "rejected" | "routed") {
+    try {
+      await upd({ data: { id, status } });
+      toast.success(`Marked as ${status}`);
+      qc.invalidateQueries({ queryKey: ["impacts", reportId] });
+    } catch (e: any) {
+      toast.error(e?.message ?? "Failed to update");
+    }
+  }
+
+  async function approveAll() {
+    if (!confirm(`Approve all ${docGroup.impacts.length} edits for "${cleanTitle}"?`)) return;
+    try {
+      await Promise.all(
+        docGroup.impacts
+          .filter((i: any) => i.status !== "approved")
+          .map((i: any) => upd({ data: { id: i.id, status: "approved" } }))
+      );
+      toast.success(`Approved all edits for ${cleanTitle}`);
+      qc.invalidateQueries({ queryKey: ["impacts", reportId] });
+    } catch (e: any) {
+      toast.error(e?.message ?? "Bulk approve failed");
+    }
+  }
+
+  const allApproved = docGroup.impacts.every((i: any) => i.status === "approved");
+
+  return (
+    <div className="h-full flex flex-col">
+      {/* ── Header ─────────────────────────────────────────────── */}
+      <div className="shrink-0 px-6 py-4 border-b bg-card flex items-start justify-between gap-4">
+        <div className="min-w-0 space-y-1">
+          <div className="text-[10px] font-black uppercase tracking-widest text-primary">Document amendment plan</div>
+          <div className="flex items-center gap-2 flex-wrap">
+            {fileUrl ? (
+              <a href={fileUrl} target="_blank" rel="noreferrer"
+                className="font-display text-xl font-bold tracking-tight hover:underline inline-flex items-center gap-1.5">
+                {cleanTitle}
+                <ExternalLink className="size-4 opacity-60" />
+              </a>
+            ) : (
+              <h2 className="font-display text-xl font-bold tracking-tight">{cleanTitle}</h2>
+            )}
+            {!docGroup.sopId && (
+              <span className="inline-flex items-center gap-1 text-[10px] font-bold text-amber-700 bg-amber-100 border border-amber-200 px-1.5 py-0.5 rounded">
+                <AlertTriangle className="size-3" /> Not in KB
+              </span>
+            )}
+          </div>
+          <p className="text-xs text-muted-foreground">
+            {docGroup.impacts.length} amendment{docGroup.impacts.length !== 1 ? "s" : ""} required to align with the updated form
+          </p>
+        </div>
+        {!allApproved && (
+          <Button size="sm" onClick={approveAll} className="gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white">
+            <CheckCircle2 className="size-3.5" /> Approve all
+          </Button>
+        )}
+      </div>
+
+      <div className="flex-1 overflow-y-auto">
+        <div className="p-6 space-y-5">
+
+          {/* ── What changed in the form (compact reference) ───── */}
+          {formFieldChanges.length > 0 && (
+            <div className="rounded-xl border border-amber-200 bg-amber-50/40 p-4">
+              <div className="text-[10px] font-black uppercase tracking-widest text-amber-700 mb-2 inline-flex items-center gap-1.5">
+                <FileEdit className="size-3" /> Form metadata changes — {formId}
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-[11px]">
+                {formFieldChanges.map((f, i) => (
+                  <div key={i} className="rounded border bg-white px-2 py-1.5">
+                    <div className="font-bold text-amber-900 uppercase tracking-wide text-[9px]">{f.label}</div>
+                    <div className="font-mono text-foreground/60 line-through text-[10px] truncate" title={f.oldValue}>{f.oldValue}</div>
+                    <div className="font-mono text-emerald-700 font-semibold text-[10px] truncate" title={f.newValue}>↓ {f.newValue}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* ── Impacted Edits (within this single document) ───── */}
+          <div>
+            <div className="flex items-center gap-3 mb-3">
+              <h3 className="text-[10px] font-black uppercase tracking-widest text-muted-foreground">
+                Edits to apply within this document
+              </h3>
+              <div className="h-px flex-1 bg-border" />
+              <span className="text-[10px] font-semibold text-muted-foreground">{docGroup.impacts.length} edit{docGroup.impacts.length !== 1 ? "s" : ""}</span>
+            </div>
+
+            <div className="space-y-3">
+              {docGroup.impacts.map((imp: any) => (
+                <ImpactCard key={imp.id} imp={imp} sopDoc={sopDoc} onSetStatus={setImpactStatus} />
+              ))}
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function GapTable({ impacts, sopById, reportId }: { impacts: any[]; sopById: Map<string, any>; reportId: string }) {
   const qc = useQueryClient();

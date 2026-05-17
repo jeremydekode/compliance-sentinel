@@ -14,7 +14,10 @@
       "Bash(node /tmp/index-r13.mjs)",
       "Bash(node scripts/index-r13.mjs)",
       "Bash(cd \"/Users/jeremyteh/Downloads/Compliance Sentinel\" && grep -n \"function ImpactCard\\\\|imp.paragraph\\\\|imp.page\" 'src/routes/reports.$reportId.tsx' | head -10)",
-      "Bash(node scripts/index-docx.mjs \"/Users/jeremyteh/Downloads/RHB Use Case 1,2,3/Use Case 1 Manual - Docx/S16_SM373_MY.docx\" forms \"S16_SM373_MY\")"
+      "Bash(node scripts/index-docx.mjs \"/Users/jeremyteh/Downloads/RHB Use Case 1,2,3/Use Case 1 Manual - Docx/S16_SM373_MY.docx\" forms \"S16_SM373_MY\")",
+      "Bash(cd \"/Users/jeremyteh/Downloads/Compliance Sentinel\" && grep -n \"isFormUpdate\\\\|uc1_form_update\\\\|allChanges.map\\\\|selectedId === c.id\" 'src/routes/reports.$reportId.tsx' | head -10)",
+      "Bash(cd \"/Users/jeremyteh/Downloads/Compliance Sentinel\" && grep -n \"^function ChangeDetailPanel\\\\|^function ImpactCard\\\\|^function GapTable\" 'src/routes/reports.$reportId.tsx' | head -5)",
+      "Bash(cd \"/Users/jeremyteh/Downloads/Compliance Sentinel\" && grep -n \"import.*useMemo\\\\|FileEdit\" 'src/routes/reports.$reportId.tsx' | head -5)"
     ]
   }
 }

@@ -1119,3 +1119,81 @@ function escapeHtml(s: string): string {
     c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : c === '"' ? "&quot;" : "&#39;"
   );
 }
+
+// ── KB chunk maintenance ─────────────────────────────────────────────────────
+
+/**
+ * Returns chunk counts keyed by sop_id, scoped to the given workspace.
+ * Used to show indexing health in the KB list ("X chunks" or "Not indexed").
+ */
+export const getChunkCounts = createServerFn({ method: "GET" })
+  .inputValidator(z.object({ workspace: z.enum(["rmit", "fatf"]).default("rmit") }))
+  .handler(async ({ data }) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: sops } = await (supabase as any)
+      .from("sop_documents")
+      .select("id")
+      .eq("workspace_id", data.workspace);
+    if (!sops?.length) return { counts: {} as Record<string, number> };
+
+    const sopIds = sops.map((s: any) => s.id);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: chunks } = await (supabase as any)
+      .from("sop_chunks")
+      .select("sop_id")
+      .in("sop_id", sopIds);
+    const counts: Record<string, number> = {};
+    for (const id of sopIds) counts[id] = 0;
+    for (const c of chunks ?? []) {
+      counts[c.sop_id] = (counts[c.sop_id] ?? 0) + 1;
+    }
+    return { counts };
+  });
+
+/**
+ * Re-runs chunking + embedding for an existing SOP.
+ * Deletes any existing chunks for that SOP first, then re-indexes.
+ */
+export const reindexSop = createServerFn({ method: "POST" })
+  .inputValidator(z.object({ id: z.string() }))
+  .handler(async ({ data }) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: sop, error: sopErr } = await (supabase as any)
+      .from("sop_documents")
+      .select("*")
+      .eq("id", data.id)
+      .single();
+    if (sopErr || !sop) throw new Error("SOP not found");
+    if (!sop.file_url) throw new Error("SOP has no source file — cannot re-index");
+
+    // Wipe existing chunks
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase as any).from("sop_chunks").delete().eq("sop_id", sop.id);
+
+    // Re-fetch source and chunk
+    const file = await fetchFile(sop.file_url);
+    const isDocx = looksLikeDocx(file.mimeType, sop.file_url);
+    const chunks = isDocx
+      ? chunkDocxText(docxToText(file.buffer))
+      : await chunkDocument({ name: sop.title, buffer: file.buffer, mimeType: file.mimeType });
+
+    if (chunks.length === 0) {
+      return { chunkCount: 0, message: "No text extracted from the source file" };
+    }
+
+    const chunksWithEmbeddings = await Promise.all(chunks.map(async (c: any) => ({
+      sop_id: sop.id,
+      content: c.content,
+      chapter_ref: c.chapter_ref ?? null,
+      page_number: c.page_number ?? null,
+      embedding: await generateEmbedding(c.content),
+    })));
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { error: insErr } = await (supabase as any)
+      .from("sop_chunks")
+      .insert(chunksWithEmbeddings);
+    if (insErr) throw new Error(`Failed to insert chunks: ${insErr.message}`);
+
+    return { chunkCount: chunks.length, message: `Indexed ${chunks.length} chunks` };
+  });

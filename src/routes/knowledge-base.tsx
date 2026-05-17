@@ -26,9 +26,9 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { supabase } from "@/integrations/supabase/client";
-import { ExternalLink, Eye, FileText, LayoutGrid, List, Loader2, Pencil, Plus, Trash2, Upload } from "lucide-react";
+import { ExternalLink, Eye, FileText, LayoutGrid, List, Loader2, Pencil, Plus, Trash2, Upload, RefreshCw, AlertTriangle, CheckCircle2 } from "lucide-react";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { createSop, deleteSop, updateSop } from "@/lib/compliance.functions";
+import { createSop, deleteSop, updateSop, reindexSop, getChunkCounts } from "@/lib/compliance.functions";
 import { useWorkspace, WORKSPACES } from "@/lib/workspace";
 import { autoDetectDocMeta, DOC_TYPE_LABEL, type DetectedDocType, type DetectedMeta } from "@/lib/auto-detect";
 import { toast } from "sonner";
@@ -56,10 +56,13 @@ function KB() {
   const create = useServerFn(createSop);
   const remove = useServerFn(deleteSop);
   const update = useServerFn(updateSop);
+  const reindex = useServerFn(reindexSop);
+  const chunkCountsFn = useServerFn(getChunkCounts);
   const [open, setOpen] = useState(false);
   const [previewDoc, setPreviewDoc] = useState<any | null>(null);
   const [editDoc, setEditDoc] = useState<any | null>(null);
   const [view, setView] = useState<"cards" | "table">("table");
+  const [reindexing, setReindexing] = useState<string | null>(null);
 
   const [workspace] = useWorkspace();
 
@@ -75,6 +78,31 @@ function KB() {
       return data ?? [];
     },
   });
+
+  const chunkCounts = useQuery({
+    queryKey: ["sop_chunk_counts", workspace],
+    queryFn: async () => {
+      const r = await chunkCountsFn({ data: { workspace } });
+      return r.counts;
+    },
+  });
+
+  async function handleReindex(id: string, title: string) {
+    setReindexing(id);
+    try {
+      const r = await reindex({ data: { id } });
+      if (r.chunkCount === 0) {
+        toast.warning(`No content extracted from ${title}`);
+      } else {
+        toast.success(`${title} re-indexed`, { description: r.message });
+      }
+      qc.invalidateQueries({ queryKey: ["sop_chunk_counts", workspace] });
+    } catch (e: any) {
+      toast.error("Re-index failed", { description: e?.message });
+    } finally {
+      setReindexing(null);
+    }
+  }
 
   async function handleDelete(id: string) {
     if (!confirm("Remove this SOP from the Knowledge Base?")) return;
@@ -208,8 +236,9 @@ function KB() {
                   <TableHead className="w-[160px]">Type</TableHead>
                   <TableHead className="w-[70px]">Version</TableHead>
                   <TableHead>Tags</TableHead>
+                  <TableHead className="w-[110px]">Index</TableHead>
                   <TableHead>Summary</TableHead>
-                  <TableHead className="w-[140px] text-right">Actions</TableHead>
+                  <TableHead className="w-[160px] text-right">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -231,11 +260,39 @@ function KB() {
                         ))}
                       </div>
                     </TableCell>
+                    <TableCell>
+                      {(() => {
+                        const count = chunkCounts.data?.[s.id] ?? 0;
+                        if (chunkCounts.isLoading) return <Loader2 className="size-3 animate-spin text-muted-foreground" />;
+                        if (count === 0) {
+                          return (
+                            <span className="inline-flex items-center gap-1 text-[10px] font-bold text-amber-700 bg-amber-100 border border-amber-200 px-1.5 py-0.5 rounded">
+                              <AlertTriangle className="size-2.5" /> Not indexed
+                            </span>
+                          );
+                        }
+                        return (
+                          <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 rounded">
+                            <CheckCircle2 className="size-2.5" /> {count} chunks
+                          </span>
+                        );
+                      })()}
+                    </TableCell>
                     <TableCell className="text-xs text-muted-foreground max-w-xs truncate">
                       {s.summary ?? "—"}
                     </TableCell>
                     <TableCell>
                       <div className="flex items-center justify-end gap-1">
+                        <Button
+                          size="icon"
+                          variant="ghost"
+                          className="size-8"
+                          title="Re-index (re-chunk + re-embed)"
+                          disabled={!s.file_url || reindexing === s.id}
+                          onClick={() => handleReindex(s.id, s.title)}
+                        >
+                          {reindexing === s.id ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
+                        </Button>
                         <Button size="icon" variant="ghost" className="size-8" disabled={!s.file_url} onClick={() => setPreviewDoc(s)}>
                           <Eye className="size-3.5" />
                         </Button>

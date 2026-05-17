@@ -349,6 +349,10 @@ export const rerunReport = createServerFn({ method: "POST" })
       if (s.file_url) {
         try {
           const f = await fetchFile(s.file_url);
+          // DOCX → text (Gemini doesn't accept DOCX as inline data)
+          if (looksLikeDocx(f.mimeType, s.file_url)) {
+            return { title: s.title, text: docxToText(f.buffer) };
+          }
           return { title: s.title, buffer: f.buffer, mimeType: f.mimeType };
         } catch { /* fall through */ }
       }
@@ -691,7 +695,10 @@ export const createSop = createServerFn({ method: "POST" })
       try {
         console.log(`Starting full-text indexing for ${data.title}...`);
         const file = await fetchFile(data.file_url);
-        const chunks = await chunkDocument({ name: data.title, buffer: file.buffer, mimeType: file.mimeType });
+        const isDocx = looksLikeDocx(file.mimeType, data.file_url);
+        const chunks = isDocx
+          ? chunkDocxText(docxToText(file.buffer))
+          : await chunkDocument({ name: data.title, buffer: file.buffer, mimeType: file.mimeType });
         
         if (chunks.length > 0) {
           console.log(`Extracted ${chunks.length} semantic chunks. Generating embeddings...`);
@@ -1074,6 +1081,37 @@ function matchSopByTitle(aiTitle: string | null | undefined, sops: any[]): any |
 
 function normalizeCode(code: string): string {
   return code.toLowerCase().replace(/[\s_.\-]+/g, "");
+}
+
+/**
+ * Local DOCX chunker — splits extracted text into ~600-char chunks, trying to break on paragraph boundaries.
+ * Avoids an AI call for DOCX (since Gemini can't read DOCX inline) and is deterministic.
+ */
+function chunkDocxText(fullText: string): Array<{ content: string; chapter_ref?: string; page_number?: number }> {
+  if (!fullText.trim()) return [];
+  const paragraphs = fullText.split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
+  const chunks: { content: string; chapter_ref?: string }[] = [];
+  let buffer: string[] = [];
+  let bufferLen = 0;
+  let currentSection: string | undefined = undefined;
+  const headingRegex = /^(?:(?:[A-Z]\.\s*)?\d+(?:\.\d+)*\.?\s+[A-Z]|Section\s+\d|Chapter\s+\d|Appendix\s+[IVX0-9]|Article\s+\d|Part\s+[IVX0-9])/i;
+
+  for (const p of paragraphs) {
+    if (p.length < 120 && headingRegex.test(p)) {
+      currentSection = p.slice(0, 80);
+    }
+    if (bufferLen + p.length > 600 && buffer.length > 0) {
+      chunks.push({ content: buffer.join("\n\n"), chapter_ref: currentSection });
+      buffer = [];
+      bufferLen = 0;
+    }
+    buffer.push(p);
+    bufferLen += p.length;
+  }
+  if (buffer.length > 0) {
+    chunks.push({ content: buffer.join("\n\n"), chapter_ref: currentSection });
+  }
+  return chunks;
 }
 
 function escapeHtml(s: string): string {

@@ -111,8 +111,19 @@ function ReportPage() {
   const showSummary = selectedId === null;
   const selectedChange = showSummary ? null : (allChanges.find(c => c.id === selectedId) ?? null);
 
-  const impactsForChange = (chapter_ref: string) =>
-    allImpacts.filter(i => (i.chapter ?? "").trim().toLowerCase() === (chapter_ref ?? "").trim().toLowerCase());
+  const impactsForChange = (chapter_ref: string) => {
+    const target = (chapter_ref ?? "").trim().toLowerCase();
+    if (!target) return [];
+    return allImpacts.filter((i) => {
+      const ic = (i.chapter ?? "").trim().toLowerCase();
+      if (!ic) return false;
+      // Exact match, or one is a prefix/substring of the other.
+      // Handles e.g. UC1 where impact.chapter="FGROP 037/2016" and
+      // change.chapter_ref="FGROP 037/2016 · Name", and UC3 where
+      // impact.chapter="10.31" and change.chapter_ref="10.31(a)".
+      return ic === target || target.includes(ic) || ic.includes(target);
+    });
+  };
 
   // Approval rollup per change — used for status pill on each register tile
   function changeStatusRollup(chapter_ref: string) {

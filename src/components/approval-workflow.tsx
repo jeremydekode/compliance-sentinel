@@ -81,7 +81,7 @@ export function ApprovalWorkflow({ report }: { report: any }) {
         <div className="px-4 py-2 flex items-center gap-3 flex-wrap">
           <ShieldCheck className="size-4 text-blue-700 shrink-0" />
           <div className="text-xs font-bold text-blue-900 dark:text-blue-300 whitespace-nowrap">
-            Phase A · Compliance Review
+            Compliance Review
           </div>
           <div className="h-4 w-px bg-blue-300/50" />
           <div className="flex items-center gap-1.5 text-[11px] flex-wrap">
@@ -171,7 +171,7 @@ export function ApprovalWorkflow({ report }: { report: any }) {
         <div className="px-4 py-2 flex items-center gap-3 flex-wrap">
           <Scale className="size-4 text-violet-700 shrink-0" />
           <div className="text-xs font-bold text-violet-900 dark:text-violet-300 whitespace-nowrap">
-            Phase B · Awaiting Legal Sign-Off
+            Awaiting Legal Sign-Off
           </div>
           <div className="h-4 w-px bg-violet-300/50" />
           <div className="text-[11px] text-violet-900/80 dark:text-violet-300/80">
@@ -200,7 +200,7 @@ export function ApprovalWorkflow({ report }: { report: any }) {
         <div className="px-4 py-2 flex items-center gap-3 flex-wrap">
           <Rocket className="size-4 text-emerald-700 shrink-0" />
           <div className="text-xs font-bold text-emerald-900 dark:text-emerald-300 whitespace-nowrap">
-            Step 8 · Execute &amp; Publish
+            Execute &amp; Publish
           </div>
           <div className="h-4 w-px bg-emerald-300/50" />
           <div className="text-[11px] text-emerald-900/80 dark:text-emerald-300/80">

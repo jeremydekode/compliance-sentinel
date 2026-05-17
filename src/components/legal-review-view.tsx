@@ -446,7 +446,7 @@ export function LegalReviewView({
                 <div className="font-display font-bold text-violet-900 dark:text-violet-300">Ready to sign off?</div>
                 <p className="text-xs text-violet-900/70 dark:text-violet-400/70 max-w-xl">
                   Signing off releases the full batch to Operations for execution.
-                  The Instruction Memo with verbatim Find/Replace blocks will be issuable in Step 8.
+                  The Instruction Memo with verbatim Find/Replace blocks will be issuable in the Execute &amp; Publish stage.
                 </p>
               </div>
               <Button

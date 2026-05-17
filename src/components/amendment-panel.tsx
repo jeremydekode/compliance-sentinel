@@ -91,7 +91,7 @@ export function AmendmentPanel({ reportId }: { reportId: string }) {
       <div className="px-4 py-2.5 flex items-start gap-3 flex-wrap">
         <FileEdit className="size-4 text-indigo-700 shrink-0 mt-0.5" />
         <div className="text-xs font-bold text-indigo-900 dark:text-indigo-300 whitespace-nowrap mt-0.5">
-          Step 9 · Apply Amendments
+          Apply Amendments
         </div>
         <div className="h-4 w-px bg-indigo-300/50 mt-1" />
         <div className="text-[11px] text-indigo-900/80 dark:text-indigo-300/80 mt-0.5">

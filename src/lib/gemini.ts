@@ -105,11 +105,57 @@ This document is from Bank Negara Malaysia's RMiT family. Apply these BNM-specif
     return `
 # REGULATOR CONTEXT: FATF (AML/CFT)
 This document is from the Financial Action Task Force AML/CFT framework. Apply these FATF-specific rules:
-- FATF uses these structural references: **R.X** = Recommendation, **INR.X** = Interpretive Note to Recommendation, **IO.X** = Immediate Outcome (Mutual Evaluation Methodology). Use the actual reference type in chapter_ref (e.g. "R.15", "INR.10", "IO.4").
+
+## Structural references
+- FATF uses **R.X** = Recommendation, **INR.X** = Interpretive Note, **IO.X** = Immediate Outcome (for Mutual Evaluation Methodology). Use the actual reference type in chapter_ref (e.g. "R.15", "INR.10", "IO.4").
+- For FATF **Plenary Statements** (quarterly updates), use references like "Call for Action statement — Iran", "Increased Monitoring list — Kuwait", "Increased Monitoring list — Papua New Guinea".
 - "Recommendations" are mandatory standards. "Interpretive Notes" explain HOW to implement them. Changes to INRs typically tighten the implementation bar even when the underlying Recommendation text is unchanged — flag these as material.
-- Watch for these AML/CFT-specific patterns: beneficial ownership transparency, PEP (politically exposed person) screening, virtual asset service providers (VASPs), travel rule, NPO oversight, sanctions evasion, correspondent banking, wire-transfer information, customer due diligence (CDD) tiering, EDD triggers, suspicious transaction reporting (STR/SAR) thresholds, record-retention periods, beneficial-ownership registry obligations.
-- Material changes typically live in: Recommendations (R.1-R.40), Interpretive Notes (INR.X), Glossary updates (new defined terms expand scope), and Best Practices / Guidance papers.
-- A typical FATF revision (Recommendations update or thematic guidance) contains 5-15 material changes.`;
+
+## Topic patterns to watch for
+beneficial ownership transparency · PEP screening · virtual asset service providers (VASPs) · travel rule · NPO oversight · sanctions evasion · correspondent banking · wire-transfer information · customer due diligence (CDD) tiering · EDD triggers · suspicious transaction reporting (STR/SAR) thresholds · record-retention periods · beneficial-ownership registry obligations · **High-Risk Jurisdictions subject to a Call for Action** · **Jurisdictions under Increased Monitoring (Grey List)**.
+
+## FATF PLENARY STATEMENT — REFERENCE TEMPLATE (use as a structural example only)
+When analysing a Plenary Statement (which updates Call-for-Action and Increased-Monitoring lists), expect changes of these forms:
+
+  ┌──────────────────────────────────────────────────────────────────────────────┐
+  │ EXAMPLE 1 — Country ADDED to Increased Monitoring                            │
+  │   chapter_ref: "FATF Increased Monitoring list — [Country] (added)"          │
+  │   title: "[Country] added to Increased Monitoring"                           │
+  │   tone_shift: "Scope expansion — new jurisdiction subject to EDD"            │
+  │   Internal SOP impact: country lists / risk-rating tables / EDD trigger     │
+  │   sections must include the new jurisdiction.                                │
+  │                                                                              │
+  │ EXAMPLE 2 — Country REMOVED from Increased Monitoring                        │
+  │   chapter_ref: "FATF Increased Monitoring list — [Country] (removed)"        │
+  │   title: "[Country] removed from Increased Monitoring"                       │
+  │   tone_shift: "Scope contraction — jurisdiction no longer requires EDD"      │
+  │   Internal SOP impact: same country lists / EDD triggers — country exits.   │
+  │                                                                              │
+  │ EXAMPLE 3 — Countermeasures ESCALATED for Call-for-Action jurisdiction       │
+  │   chapter_ref: "FATF Call for Action — [Country] (countermeasures enhanced)" │
+  │   title: "Enhanced countermeasures for [Country]"                            │
+  │   tone_shift: "Mandate strengthened — additional countermeasures required"   │
+  │   Internal SOP impact: restricted-customer lists, prohibited-account rules. │
+  │                                                                              │
+  │ EXAMPLE 4 — Plenary date / list version reference                            │
+  │   chapter_ref: "Plenary date reference"                                      │
+  │   title: "Update plenary date reference"                                     │
+  │   tone_shift: "Administrative — reference date refresh"                      │
+  │   Internal SOP impact: any "Refer to FATF [Month Year] statement" lines.   │
+  └──────────────────────────────────────────────────────────────────────────────┘
+
+  These are EXAMPLES of the structural form. Your output must use the ACTUAL country names, dates, and references from the attached documents — not these placeholders.
+
+## Common internal SOP sections that need updating after a Plenary Statement
+For AML/CFT internal policies (e.g. Group AML/CFT/CPF Guidelines, Group AML/CFT/CPF Policy, division-level AML/CFT Guidelines), expect impacts in sections like:
+- "High-risk country customer types" / "Restricted Customers" / "Prohibited Customers"
+- "Jurisdiction Risk Table" / "EDD Trigger" / "Enhanced Due Diligence"
+- "Jurisdiction Monitoring Procedures" / "Compliance-maintained list"
+- "Document Header" / "Cover Page" version-bump on the SOP itself
+Consolidate multi-country list updates into ONE impact per affected SOP section (e.g. one impact "update FATF risk-country list" rather than four separate per-country edits).
+
+## Completeness
+A typical FATF Plenary Statement update produces 4-8 distinct regulatory changes and touches 2-5 internal SOP sections. Re-scan the document if your output is materially smaller than that.`;
   }
   if (ctx === "circular") {
     return `

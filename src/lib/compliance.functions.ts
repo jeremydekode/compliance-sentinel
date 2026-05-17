@@ -3,6 +3,7 @@ import { z } from "zod";
 import { supabase } from "@/integrations/supabase/client";
 import { analyzePolicy, chunkDocument } from "./gemini";
 import { generateEmbedding, generateQueryEmbedding } from "./embeddings";
+import { REGULATION_FAMILIES, INTERNAL_DOC_TYPES as INTERNAL_DOC_TYPES_CONST, regulatorContext } from "./auto-detect";
 
 async function fetchFile(url: string): Promise<{ buffer: Buffer; mimeType: string }> {
   const resp = await fetch(url);
@@ -37,11 +38,11 @@ export const createReport = createServerFn({ method: "POST" })
     const newPolicy = await fetchFile(data.fileUrl);
 
     // 2. Try to find the old version of this policy in the KB.
-    // rmit_reg and rmit are the same policy family — check both so the June 2023 legacy
-    // doc (stored as "rmit") is found when the new policy is detected as "rmit_reg".
-    const oldDocTypes =
-      detected?.doc_type === "rmit_reg" ? ["rmit_reg", "rmit"] :
-      detected?.doc_type ? [detected.doc_type] : ["__none__"];
+    // Use REGULATION_FAMILIES so e.g. uploading new RMiT (rmit_reg) finds legacy "rmit"
+    // tagged docs, FATF finds FATF, etc.
+    const oldDocTypes = detected?.doc_type
+      ? (REGULATION_FAMILIES[detected.doc_type] ?? [detected.doc_type])
+      : ["__none__"];
     const { data: oldDocs } = await supabase
       .from("sop_documents")
       .select("*")
@@ -83,8 +84,8 @@ export const createReport = createServerFn({ method: "POST" })
       const chunks: any[] = matchedChunks ?? [];
       const sopIds = Array.from(new Set(chunks.map((c: any) => c.sop_id as string)));
 
-      // Internal-only doc types (regulatory benchmarks must never appear as amendment targets)
-      const INTERNAL_DOC_TYPES = ["sop", "it_policy", "policy"];
+      // Internal-only doc types — sourced from shared constant
+      const INTERNAL_DOC_TYPES = INTERNAL_DOC_TYPES_CONST as readonly string[];
 
       if (sopIds.length > 0) {
         const { data: sopDocs } = await supabase
@@ -129,7 +130,8 @@ export const createReport = createServerFn({ method: "POST" })
       aiResult = await analyzePolicy(
         { name: data.filename, buffer: newPolicy.buffer, mimeType: newPolicy.mimeType },
         oldPolicy ? { name: oldDoc!.title, buffer: oldPolicy.buffer, mimeType: oldPolicy.mimeType } : undefined,
-        sopsForAi
+        sopsForAi,
+        regulatorContext(detected?.doc_type)
       );
       console.log(`Analysis complete. ${aiResult.changes.length} changes, ${aiResult.impacts.length} SOP impacts.`);
     } catch (e: any) {
@@ -223,9 +225,9 @@ export const rerunReport = createServerFn({ method: "POST" })
     const newPolicy = await fetchFile(report.source_file_url);
 
     // 3. Find the old policy in KB (same logic as createReport)
-    const oldDocTypes =
-      detected?.doc_type === "rmit_reg" ? ["rmit_reg", "rmit"] :
-      detected?.doc_type ? [detected.doc_type] : ["__none__"];
+    const oldDocTypes = detected?.doc_type
+      ? (REGULATION_FAMILIES[detected.doc_type] ?? [detected.doc_type])
+      : ["__none__"];
     const { data: oldDocs } = await supabase
       .from("sop_documents").select("*")
       .in("doc_type", oldDocTypes)
@@ -239,7 +241,7 @@ export const rerunReport = createServerFn({ method: "POST" })
     }
 
     // 4. Find relevant internal SOPs (same logic as createReport)
-    const INTERNAL_DOC_TYPES = ["sop", "it_policy", "policy"];
+    const INTERNAL_DOC_TYPES = INTERNAL_DOC_TYPES_CONST as readonly string[];
     let relevantSops: any[] = [];
     try {
       const queryText = `${report.policy_name} ${detected?.summary || ""} ${detected?.tags?.join(" ") || ""}`;
@@ -278,7 +280,8 @@ export const rerunReport = createServerFn({ method: "POST" })
     const aiResult = await analyzePolicy(
       { name: report.policy_name ?? "policy", buffer: newPolicy.buffer, mimeType: newPolicy.mimeType },
       oldPolicy ? { name: oldDoc!.title, buffer: oldPolicy.buffer, mimeType: oldPolicy.mimeType } : undefined,
-      sopsForAi
+      sopsForAi,
+      regulatorContext(detected?.doc_type)
     );
 
     // 6. Wipe old changes/impacts for this report and re-insert

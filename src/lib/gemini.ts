@@ -89,14 +89,49 @@ export interface SopGap {
  * STAGE 1: TWO-POLICY FORENSIC DELTA EXTRACTION
  * Compares old vs new policy directly to extract all material regulatory changes.
  */
+export type RegulatorContext = "rmit" | "fatf" | "circular" | "generic";
+
+function regulatorGuidance(ctx: RegulatorContext): string {
+  if (ctx === "rmit") {
+    return `
+# REGULATOR CONTEXT: BNM RMiT (Risk Management in Technology)
+This document is from Bank Negara Malaysia's RMiT family. Apply these BNM-specific rules:
+- BNM uses an explicit classifier prefix in every paragraph: **S** = Standard (MANDATORY), **G** = Guidance (NON-MANDATORY, "may consider"/"is encouraged to"), **P** = neutral Paragraph. PRESERVE this distinction in your tone_shift field — never call a "G" clause a mandate.
+- Watch for these RMiT-specific patterns: kill switch, stand-in processing, out-of-band communications, SBOM (Software Bill of Materials), API security, cloud exit strategy, public uptime disclosure, emerging-technology governance, MFA hardening, OTP transaction binding.
+- Material changes typically live in: main paragraphs (8.x, 10.x, 11.x, 12.x), Appendices (3, 5, 9, 10, 11), and the "Definitions" / "Applicability" sections.
+- A typical RMiT revision contains 10-25 material changes. Sweep all appendices before finalising.`;
+  }
+  if (ctx === "fatf") {
+    return `
+# REGULATOR CONTEXT: FATF (AML/CFT)
+This document is from the Financial Action Task Force AML/CFT framework. Apply these FATF-specific rules:
+- FATF uses these structural references: **R.X** = Recommendation, **INR.X** = Interpretive Note to Recommendation, **IO.X** = Immediate Outcome (Mutual Evaluation Methodology). Use the actual reference type in chapter_ref (e.g. "R.15", "INR.10", "IO.4").
+- "Recommendations" are mandatory standards. "Interpretive Notes" explain HOW to implement them. Changes to INRs typically tighten the implementation bar even when the underlying Recommendation text is unchanged — flag these as material.
+- Watch for these AML/CFT-specific patterns: beneficial ownership transparency, PEP (politically exposed person) screening, virtual asset service providers (VASPs), travel rule, NPO oversight, sanctions evasion, correspondent banking, wire-transfer information, customer due diligence (CDD) tiering, EDD triggers, suspicious transaction reporting (STR/SAR) thresholds, record-retention periods, beneficial-ownership registry obligations.
+- Material changes typically live in: Recommendations (R.1-R.40), Interpretive Notes (INR.X), Glossary updates (new defined terms expand scope), and Best Practices / Guidance papers.
+- A typical FATF revision (Recommendations update or thematic guidance) contains 5-15 material changes.`;
+  }
+  if (ctx === "circular") {
+    return `
+# REGULATOR CONTEXT: Regulator Circular
+This document is a supervisory circular communicating clarifications, thematic findings, or updated expectations. Most circulars introduce a small number of focused changes (1-8) rather than a full framework revision. Map each clarified expectation against existing operating procedures.`;
+  }
+  return `
+# REGULATOR CONTEXT: Generic Compliance Document
+No specific regulator-family hints available. Apply general compliance-officer judgement.`;
+}
+
 export async function extractRegulatoryChanges(
   newPolicy: { name: string; buffer: Buffer; mimeType: string },
-  oldPolicy?: { name: string; buffer: Buffer; mimeType: string }
+  oldPolicy?: { name: string; buffer: Buffer; mimeType: string },
+  regulatorCtx: RegulatorContext = "generic"
 ): Promise<RegulatoryDelta[]> {
   const prompt = `
 # ROLE: CHIEF COMPLIANCE OFFICER — FORENSIC POLICY CHANGE DETECTOR
 
 You are performing a forensic comparison of two versions of a regulatory document. Your mandate is to identify EVERY policy change that requires an organisation to update its internal procedures, SOPs, or controls.
+
+${regulatorGuidance(regulatorCtx)}
 
 ${oldPolicy ? `# DOCUMENTS PROVIDED:
 - DOCUMENT A (NEW/UPDATED POLICY): First attachment
@@ -152,13 +187,8 @@ Compare Document A against Document B section by section.` : `# DOCUMENT PROVIDE
 ## Rule 1 — Verbatim verification
 Before claiming a change exists, you MUST extract the verbatim text of the old requirement AND the verbatim text of the new requirement, side by side. If the substantive wording is identical (only the paragraph number changed, e.g. 10.38 → 10.42), this is NOT a delta. Do NOT include it. Renumbering alone is not a material change.
 
-## Rule 2 — Respect the S / G mandate classifier
-BNM regulatory documents use a strict classifier system. ALWAYS preserve it in your output:
-- "S X.X" (Standard) = MANDATORY obligation
-- "G X.X" (Guidance) = NON-MANDATORY recommendation ("may consider", "should consider", "is encouraged to")
-- "P X.X" (Paragraph) = neutral paragraph
-
-If the new clause is prefixed "G" (Guidance), you MUST NOT describe it as a "mandate", "shall", "must", or "mandatory" — even if the topic sounds important. For example, "G 10.15(a) — A financial institution may consider adopting an SBOM" is GUIDANCE, not a mandate. Your title/tone_shift must reflect this faithfully (e.g. "tone_shift": "New guidance — encouraged adoption").
+## Rule 2 — Respect any mandate-strength classifier the regulator uses
+If the regulator uses a classifier prefix (BNM uses S/G/P; FATF distinguishes Recommendations from Guidance/Best Practices), preserve that distinction faithfully. NEVER call a clause a "mandate" if the regulator labels it as Guidance, Recommendation only (without INR), or "may consider"/"is encouraged to" language. Read the actual modal verb: "shall"/"must" = mandate; "should"/"may"/"is encouraged" = non-mandate. Your tone_shift field must reflect the actual strength.
 
 ## Rule 3 — Effective date vs transition deadline
 - "Effective date" = when the policy comes into force (the regulator's stated come-into-effect date, e.g. "28 November 2025").
@@ -172,7 +202,7 @@ Do NOT conflate these. The summary's effective_date field must be the policy's c
 If YES to all → extract it. If text is identical but renumbered → SKIP. If unsure on substance → extract it (false positives are easy to filter; missing a real change is a compliance risk).
 
 # COMPLETENESS REQUIREMENT:
-Sweep the ENTIRE document including all appendices before finalising. A typical major policy revision contains 10–25 material changes. If your output has fewer than 10 entries on a major policy, re-scan for missed items in: (a) new appendices, (b) new sub-paragraphs, (c) softly-worded new obligations, (d) anything introduced as a "kill switch", "stand-in", "out-of-band", "SBOM", "API security", "cloud exit", "public disclosure", or "emerging technology" requirement.
+Sweep the ENTIRE document including ALL appendices, interpretive notes, glossary entries, and best-practice annexes before finalising. Re-scan specifically for: (a) new appendices, (b) new sub-paragraphs and sub-sub-paragraphs, (c) softly-worded new obligations the AI tends to skip, (d) regulator-specific patterns listed in the REGULATOR CONTEXT block above. Refer to the typical revision-size estimate in that block — if your output is materially smaller than that range, do another pass.
 
 # OUTPUT FORMAT (JSON Array):
 [{
@@ -347,9 +377,10 @@ You have one specific REGULATORY CHANGE. Your task is to find the EXACT location
 export async function analyzePolicy(
   newPolicyData: { name: string; buffer: Buffer; mimeType: string },
   oldPolicyData?: { name: string; buffer: Buffer; mimeType: string },
-  sops?: ({ title: string; text: string } | { title: string; buffer: Buffer; mimeType: string })[]
+  sops?: ({ title: string; text: string } | { title: string; buffer: Buffer; mimeType: string })[],
+  regulatorCtx: RegulatorContext = "generic"
 ): Promise<AnalysisResult> {
-  const changes = await extractRegulatoryChanges(newPolicyData, oldPolicyData);
+  const changes = await extractRegulatoryChanges(newPolicyData, oldPolicyData, regulatorCtx);
 
   let allImpacts: SopGap[] = [];
   if (sops && sops.length > 0) {

@@ -232,10 +232,22 @@ function ReportsList() {
                           onChange={(e) => setOverrideDocType(e.target.value)}
                           className="w-full text-sm font-medium px-3 py-2 rounded-lg border bg-card focus:outline-none focus:ring-1 focus:ring-primary"
                         >
-                          {(Object.entries(DOC_TYPE_LABEL) as [string, string][]).map(([k, label]) => (
-                            <option key={k} value={k}>{label}</option>
-                          ))}
+                          <optgroup label="External regulations (compared against old version)">
+                            <option value="rmit_reg">RMiT / Tech Regulation (BNM)</option>
+                            <option value="fatf">FATF / AML</option>
+                            <option value="circular">Regulator Circular</option>
+                          </optgroup>
+                          <optgroup label="Internal documents (amended to comply)">
+                            <option value="sop">Internal SOP</option>
+                            <option value="it_policy">IT Policy</option>
+                            <option value="policy">Policy</option>
+                          </optgroup>
                         </select>
+                        <p className="text-[10px] text-muted-foreground mt-1">
+                          {(["rmit_reg", "fatf", "circular"].includes(overrideDocType))
+                            ? "→ This is a regulation. The system will look for an older version in KB and map changes to your internal SOPs."
+                            : "→ This is an internal document. It will be indexed in KB as an amendment target."}
+                        </p>
                       </div>
 
                       {/* Version (read-only auto-detected) */}

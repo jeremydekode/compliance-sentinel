@@ -105,3 +105,31 @@ export const DOC_TYPE_LABEL: Record<DetectedDocType, string> = {
   policy: "Policy",
   sop: "Internal SOP",
 };
+
+// ─── Document role classification ────────────────────────────────────────────
+// External regulations (these get COMPARED — old vs new — not amended)
+export const REGULATION_DOC_TYPES = ["rmit_reg", "rmit", "fatf", "circular"] as const;
+
+// Internal documents (these get AMENDED to comply with regulation changes)
+export const INTERNAL_DOC_TYPES = ["sop", "it_policy", "policy"] as const;
+
+// When a new regulation is uploaded, which doc_types should be searched in KB
+// to find the previous version to compare against? (Handles legacy tag drift.)
+export const REGULATION_FAMILIES: Record<string, string[]> = {
+  rmit_reg: ["rmit_reg", "rmit"],   // BNM RMiT family
+  rmit:     ["rmit_reg", "rmit"],
+  fatf:     ["fatf"],                // FATF AML/CFT
+  circular: ["circular"],            // Generic regulator circulars
+};
+
+export function isRegulation(docType: string | undefined | null): boolean {
+  return !!docType && (REGULATION_DOC_TYPES as readonly string[]).includes(docType);
+}
+
+// Friendly regulator label (used in AI prompt for context-specific guidance)
+export function regulatorContext(docType: string | undefined | null): "rmit" | "fatf" | "circular" | "generic" {
+  if (docType === "rmit_reg" || docType === "rmit") return "rmit";
+  if (docType === "fatf") return "fatf";
+  if (docType === "circular") return "circular";
+  return "generic";
+}

@@ -92,11 +92,14 @@ function KB() {
     try {
       const r = await reindex({ data: { id } });
       if (r.chunkCount === 0) {
-        toast.warning(`No content extracted from ${title}`);
+        toast.warning(`No content extracted from ${title}`, {
+          description: "The source file may be image-based or use unsupported formatting. Check the source file directly.",
+        });
       } else {
         toast.success(`${title} re-indexed`, { description: r.message });
       }
-      qc.invalidateQueries({ queryKey: ["sop_chunk_counts", workspace] });
+      // Force-refetch (invalidate alone doesn't always trigger immediate refetch in some TQ states)
+      await qc.refetchQueries({ queryKey: ["sop_chunk_counts", workspace] });
     } catch (e: any) {
       toast.error("Re-index failed", { description: e?.message });
     } finally {

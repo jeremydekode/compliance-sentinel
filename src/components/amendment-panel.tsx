@@ -48,7 +48,23 @@ export function AmendmentPanel({ reportId }: { reportId: string }) {
   const remaining = (docs.data ?? []).filter((d: any) => d.is_active);
   if (!docs.isLoading && remaining.length === 0) return null;
 
+  // Static-preview overrides: when an SOP has a hand-authored HTML template
+  // that's known to render the post-amendment form faithfully, skip the AI
+  // generator and open the template in a new tab. Faster + more accurate
+  // than the LLM-rendered approximation.
+  const STATIC_PREVIEW_OVERRIDES: Array<{ match: RegExp; url: string }> = [
+    { match: /FGROP\s*037[\s_/-]*2016/i, url: "/forms/fgrop-037-2016-v11.html" },
+  ];
+
   async function handlePreview(sopId: string) {
+    const doc = (docs.data ?? []).find((d: any) => d.sop_id === sopId);
+    const title = String(doc?.title ?? "");
+    const staticOverride = STATIC_PREVIEW_OVERRIDES.find((o) => o.match.test(title));
+    if (staticOverride) {
+      window.open(staticOverride.url, "_blank", "noopener,noreferrer");
+      return;
+    }
+
     setPreviewing(sopId);
     try {
       const r = await preview({ data: { reportId, sopId } });

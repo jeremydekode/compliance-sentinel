@@ -289,11 +289,21 @@ export function ApprovalWorkflow({ report }: { report: any }) {
   if (status === "published") {
     return (
       <div className="border-b border-emerald-300 bg-emerald-100/50 dark:bg-emerald-950/30">
-        <div className="px-4 py-2 flex items-center gap-3">
+        <div className="px-4 py-2 flex items-center gap-3 flex-wrap">
           <CheckCircle2 className="size-4 text-emerald-700" />
           <div className="text-xs font-bold text-emerald-900 dark:text-emerald-300">Published to Knowledge Base</div>
           <div className="h-4 w-px bg-emerald-400/50" />
           <div className="text-[11px] text-emerald-900/80 dark:text-emerald-300/80">All approved changes applied · SOPs versioned</div>
+          <div className="ml-auto shrink-0">
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 text-xs gap-1.5 border-emerald-300 bg-white hover:bg-emerald-50"
+              onClick={() => exportInstructionMemo(report, impacts.data ?? [])}
+            >
+              <FileText className="size-3" /> View Instruction Memo
+            </Button>
+          </div>
         </div>
       </div>
     );
@@ -309,7 +319,15 @@ export function ApprovalWorkflow({ report }: { report: any }) {
           <div className="text-[11px] text-amber-900/80 dark:text-amber-300/80">
             Instruction Memo issued · awaiting team to apply changes in source documents
           </div>
-          <div className="ml-auto shrink-0">
+          <div className="ml-auto shrink-0 flex items-center gap-1.5">
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 text-xs gap-1.5 border-amber-300 bg-white hover:bg-amber-50"
+              onClick={() => exportInstructionMemo(report, impacts.data ?? [])}
+            >
+              <FileText className="size-3" /> View Memo
+            </Button>
             <Button
               size="sm"
               className="h-7 text-xs gap-1.5"

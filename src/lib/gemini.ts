@@ -285,6 +285,17 @@ If YES to all → extract it. If text is identical but renumbered → SKIP. If u
 # COMPLETENESS REQUIREMENT:
 Sweep the ENTIRE document including ALL appendices, interpretive notes, glossary entries, and best-practice annexes before finalising. Re-scan specifically for: (a) new appendices, (b) new sub-paragraphs and sub-sub-paragraphs, (c) softly-worded new obligations the AI tends to skip, (d) regulator-specific patterns listed in the REGULATOR CONTEXT block above. Refer to the typical revision-size estimate in that block — if your output is materially smaller than that range, do another pass.
 
+# STRUCTURED COMPARISON DOCUMENTS — STRICT RULE:
+If the NEW POLICY document is itself a comparison table or change-log that already enumerates the changes (rows beginning "1.", "2.", … "N.", or columns like "Impacted Item / Old Policy / New Policy / Explanation"), then this is a pre-digested map — your job is to extract EVERY numbered row, not to re-analyse from scratch:
+- Output ONE change entry per numbered row. If the document lists 12 numbered rows, your output array MUST contain 12 entries. Never consolidate or drop rows in this case.
+- Use the row's "Impacted Item" / heading text as the title.
+- Copy the "Old Policy" cell verbatim into old_requirement (or "N/A - new requirement" if empty).
+- Copy the "New Policy" cell verbatim into new_requirement.
+- Use the chapter/paragraph reference stated in the row (e.g. "Paragraph 5.2", "Paragraph 12.8", "Appendix 5, Part E") as chapter_ref.
+- Use the row's "Explanation" or "Changes Summary" text as change_summary.
+- impact: infer from the explanation tone (mandate/scope expansion/new control = high; quantitative tightening = medium; clarification = low).
+- Do this even if the document is short (3 pages, 12 rows) — the row count is the ground truth.
+
 # OUTPUT FORMAT (JSON Array):
 [{
   "title": "Short 3-6 word headline naming the change (e.g. 'Digital Fraud Kill Switch', 'Public Uptime Disclosure', 'Stricter MFA & OTP Rules', 'Cloud Exit Strategy')",
@@ -415,7 +426,7 @@ You have one specific REGULATORY CHANGE. Your task is to find the EXACT location
 - Tone Shift: ${change.tone_shift}
 
 # MAPPING INSTRUCTIONS:
-1. Scan ALL provided internal SOPs and policies.
+1. The SOPs below have been PRE-FILTERED by semantic search — they are the chunks most likely to be relevant to this specific regulatory change. Treat them as your candidate pool, not arbitrary documents.
 2. Find sections, paragraphs, or clauses that:
    a) Reference the old requirement directly (use exact text matching where possible), OR
    b) Cover the same topic/process that is now affected by the new requirement, OR
@@ -424,9 +435,26 @@ You have one specific REGULATORY CHANGE. Your task is to find the EXACT location
    - Identify the EXACT current text that needs to change.
    - Propose precise replacement text that satisfies the new regulatory requirement.
    - Be specific — use the same professional regulatory tone as the original SOP.
-4. If no SOP is affected by this change, return an empty array [].
-5. Prefer "find_replace" when you can identify exact text. Use "insertion" for new clauses. Use "new_section" only if an entirely new section must be created.
-6. There is NO upper limit on the number of impacts you may return. If a single regulatory change affects 7 different internal SOPs (or 7 different paragraphs in the same SOP), return all 7 entries. Do NOT consolidate distinct affected paragraphs into a single entry.
+4. Prefer "find_replace" when you can identify exact text. Use "insertion" for new clauses. Use "contextual" when the SOP topically owns this area but no precise anchor text exists. Use "new_section" only if an entirely new section must be created.
+5. There is NO upper limit on the number of impacts you may return. If a single regulatory change affects 7 different internal SOPs (or 7 different paragraphs in the same SOP), return all 7 entries. Do NOT consolidate distinct affected paragraphs into a single entry.
+
+# EVERY CHANGE SHOULD FIND AN OWNER (when candidates were pre-filtered):
+The SOP chunks below were ranked by semantic similarity to this change. At least one of them is almost certainly the owning document for this control.
+- BEFORE returning an empty array, re-read each candidate SOP once more and ask: "if a regulator audited us, which of these SOPs is the closest match for owning this new requirement?"
+- If you find a thematic owner but no exact anchor text, return ONE entry with change_type="contextual", find_text="[end of {nearest existing section heading}]", and replace_text containing the new requirement framed in SOP language. This is BETTER than returning nothing.
+- Only return [] when none of the candidate SOPs is even tangentially related to the topic of this change (which is rare — semantic search rarely surfaces totally unrelated chunks).
+
+# TOPIC MATCHING — match by intent, not just keyword overlap:
+Examples of topic alignment that should trigger an impact:
+- Change about "kill switch" / "customer-initiated freeze" → SOP sections on account suspension, fraud freeze, customer lockdown, incident response
+- Change about "API security controls" / "API token lifecycle" → SOP sections on API gateway, OAuth, token management, authentication
+- Change about "stand-in processing" / "service continuity" → SOP sections on disaster recovery, failover, business continuity, transaction switch
+- Change about "MFA" / "OTP binding" → SOP sections on authentication, multi-factor, second-channel, transaction signing
+- Change about "VAPT" / "vulnerability assessment" → SOP sections on penetration testing, security testing, vulnerability scans, red team
+- Change about "kill chain" / "monthly threat report" → SOP sections on SOC operations, threat intel, security monitoring
+- Change about "cryptographic standards" / "algorithm review" → SOP sections on encryption, key management, cipher suites
+- Change about "SBOM" / "third-party software inventory" → SOP sections on vendor management, supplier risk, third-party security
+- Change about "uptime disclosure" → SOP sections on service availability, customer communications, public reporting
 
 # CRITICAL: For find_text, provide VERBATIM text from the SOP (at least 20 words of context) so it can be found programmatically. Do not paraphrase or shorten.
 
@@ -436,7 +464,7 @@ You have one specific REGULATORY CHANGE. Your task is to find the EXACT location
 The "Old Requirement" and "New Requirement" fields above contain REGULATION text. They are PROVIDED FOR CONTEXT ONLY — to help you understand what change to look for.
 You MUST NOT copy text from "Old Requirement" or "New Requirement" into the find_text field.
 The find_text field is a verbatim quote from the BANK'S INTERNAL SOP PDF that you can see attached below — NOT from the regulation.
-If the SOP does not contain matching anchor text, do NOT invent it from the regulation. Use change_type "insertion" with an empty find_text and the SOP's section heading as the paragraph reference.
+If the SOP does not contain matching anchor text, do NOT invent it from the regulation. Use change_type "insertion" with find_text="[end of {nearest existing section heading}]" pointing at the right SOP section, OR change_type "contextual" if the SOP topically owns the area but no precise insertion point exists.
 
 ## Rule B — Consolidate related edits
 If a single regulatory change affects multiple closely-related items in the SAME SECTION of an SOP (e.g. "add Kuwait, Papua New Guinea, and update Myanmar" all in the same risk-country table), return ONE consolidated impact entry that updates the whole list/table at once, NOT one impact per item. Do not split a list update into N separate find/replace entries.

@@ -6,7 +6,7 @@ import { MD } from "@/components/md";
 import { impactClasses } from "@/lib/format";
 import { Printer } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { sortChangesByPriority, diffWords, deriveSuggestedAction } from "@/lib/change-utils";
+import { sortChangesByPriority, diffWords, deriveSuggestedAction, autoBoldExecBullet } from "@/lib/change-utils";
 
 export const Route = createFileRoute("/reports/$reportId/present")({
   component: Present,
@@ -89,7 +89,7 @@ function Present() {
                   ? s.executive.split(/(?<=[.!?])\s+(?=[A-Z])/).filter((x: string) => x.trim())
                   : [];
               return bullets.length > 0
-                ? <ul className="list-disc pl-6 space-y-2 text-base leading-relaxed marker:text-primary">{bullets.map((b, i) => <li key={i}>{b.trim()}</li>)}</ul>
+                ? <ul className="list-disc pl-6 space-y-2 text-base leading-relaxed marker:text-primary">{bullets.map((b, i) => <li key={i}><MD>{autoBoldExecBullet(b.trim())}</MD></li>)}</ul>
                 : <MD>{(s.executive as any) ?? ""}</MD>;
             })()}
           </div>

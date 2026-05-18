@@ -5,7 +5,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { MD } from "@/components/md";
 import { impactClasses } from "@/lib/format";
 import { cn } from "@/lib/utils";
-import { sortChangesByPriority, diffWords, deriveSuggestedAction } from "@/lib/change-utils";
+import { sortChangesByPriority, diffWords, deriveSuggestedAction, autoBoldExecBullet } from "@/lib/change-utils";
 import {
   FileText, ShieldCheck, Calendar, Activity,
   LayoutGrid, ListTree, ArrowRight, AlertCircle,
@@ -85,7 +85,16 @@ export function OverviewTab({ report, changes, impacts = [], view }: Props) {
               </div>
             </div>
             <div className="text-sm leading-relaxed font-medium text-foreground/90">
-              <MD>{summary.executive ?? ""}</MD>
+              {(() => {
+                const bullets: string[] = Array.isArray(summary.executive)
+                  ? summary.executive.filter((b: any) => typeof b === "string" && b.trim())
+                  : typeof summary.executive === "string" && summary.executive.trim()
+                    ? summary.executive.split(/(?<=[.!?])\s+(?=[A-Z])/).filter((x: string) => x.trim())
+                    : [];
+                return bullets.length > 0
+                  ? <ul className="list-disc pl-5 space-y-2 marker:text-primary">{bullets.map((b, i) => <li key={i}><MD>{autoBoldExecBullet(b.trim())}</MD></li>)}</ul>
+                  : <MD>{(summary.executive as any) ?? ""}</MD>;
+              })()}
             </div>
           </Card>
 

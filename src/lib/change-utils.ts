@@ -122,6 +122,37 @@ const ACTION_PATTERNS: Array<{ match: RegExp; action: (txt: string) => string }>
   { match: /threat.*report|threat assessment|monthly.*report/i, action: () => "Expand monthly threat reporting scope to all entities" },
 ];
 
+// Auto-bold known compliance phrases in an exec-summary bullet. Used as a
+// client-side fallback for existing reports whose bullets were generated
+// before the prompt was updated to emit bold markup. No-op if the bullet
+// already contains markdown bold.
+const AUTOBOLD_TERMS = [
+  "kill switch", "stand-in processing", "SBOM", "software bill of materials",
+  "API security controls", "out-of-band communication", "out-of-band",
+  "merchant acquirers", "intermediary remittance institutions", "IRIs",
+  "self-service account suspension", "self-service kill switch",
+  "early warning systems?", "stand-?in processing arrangements?",
+  "public uptime disclosure", "quarterly uptime", "cyber insurance",
+  "cryptographic standards?", "annual review", "annually", "every three years",
+  "unencrypted SMS", "transaction-bound", "MFA", "OTP",
+  "non-bank financial entities", "e-money issuers", "investment-related institutions",
+  "Cloud Services and Emerging Technology", "emerging technology",
+  "board-level governance", "cyber-liquidity", "operational disruption",
+  "cyber insurance policies?", "automated early warning",
+  "Family Office", "FGROP",
+];
+
+export function autoBoldExecBullet(text: string): string {
+  if (!text) return text;
+  if (text.includes("**")) return text; // Already has bold markup
+  let out = text;
+  for (const term of AUTOBOLD_TERMS) {
+    const re = new RegExp(`\\b(${term})\\b`, "gi");
+    out = out.replace(re, "**$1**");
+  }
+  return out;
+}
+
 export function deriveSuggestedAction(change: {
   chapter_ref?: string | null;
   change_summary?: string | null;

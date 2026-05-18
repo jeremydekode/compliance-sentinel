@@ -623,7 +623,7 @@ CHANGE SUMMARIES: ${changes.map(c => `[${c.chapter_ref}] ${c.change_summary}`).j
 
 OUTPUT JSON:
 {
-  "executive": ["4-6 concise bullet points (each 15-30 words) summarising the paradigm shift and key operational impacts. Each bullet must be a complete, standalone thought. Avoid invented numbers — do NOT cite specific paragraph numbers, downtime caps, or dates unless they were quoted verbatim in the extracted changes above."],
+  "executive": ["4-6 concise bullet points (each 15-30 words) summarising the paradigm shift and key operational impacts. Each bullet must be a complete, standalone thought. Avoid invented numbers — do NOT cite specific paragraph numbers, downtime caps, or dates unless they were quoted verbatim in the extracted changes above. **Wrap the 1-3 most important phrases per bullet in markdown bold** (e.g. control names like **kill switch**, **stand-in processing**, **SBOM**; scope additions like **merchant acquirers and IRIs**; quantitative shifts like **annually instead of every three years**; named obligations like **public quarterly uptime disclosure**) so the reader's eye lands on what matters."],
   "effective_date": "The come-into-force date of the policy itself (e.g. '28 November 2025'), NOT a transition deadline for any specific capability. If unknown, use 'Refer to policy document'.",
   "transition_deadline": "If the policy specifies a separate future date by which institutions must complete migration of a capability (e.g. '30 September 2027' for stand-in processing), record it here. Otherwise omit or use null.",
   "before_count": ${changes.length},
@@ -660,7 +660,7 @@ CHANGE SUMMARIES: ${changes.map(c => `[${c.chapter_ref}] ${c.change_summary}`).j
 
 OUTPUT JSON:
 {
-  "executive": ["4-6 concise bullet points (each 15-30 words) summarising the paradigm shift and key operational impacts. Each bullet must be a complete, standalone thought."],
+  "executive": ["4-6 concise bullet points (each 15-30 words) summarising the paradigm shift and key operational impacts. Each bullet must be a complete, standalone thought. **Wrap the 1-3 most important phrases per bullet in markdown bold** (control names, scope additions, quantitative shifts, named obligations) so the reader's eye lands on what matters."],
   "effective_date": "Come-into-force date of the policy (e.g. '28 February 2026'), NOT a transition deadline. If unknown, 'Refer to policy document'.",
   "transition_deadline": "Separate future date for migration of a capability, if applicable. Otherwise null.",
   "before_count": ${changes.length},

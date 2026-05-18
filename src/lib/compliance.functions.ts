@@ -1237,10 +1237,13 @@ export const reindexSop = createServerFn({ method: "POST" })
 // ── UC1: Form Metadata Extraction ────────────────────────────────────────────
 // Extracts form name, number, and updated date from an uploaded PDF/DOCX.
 // Used to auto-populate the Form Update dialog before the user fills in changes.
+//
+// The client uploads the file to Supabase storage first and passes the public URL.
+// We deliberately do NOT accept base64 over the wire — Vercel serverless functions
+// cap request bodies at ~4.5 MB and a typical multi-page form blows past that.
 export const extractFormMetadata = createServerFn({ method: "POST" })
   .inputValidator(z.object({
-    fileBase64: z.string(),
-    mimeType: z.string().default("application/pdf"),
+    fileUrl: z.string().url(),
     fileName: z.string().optional(),
   }))
   .handler(async ({ data }) => {
@@ -1256,18 +1259,22 @@ Return ONLY valid JSON: {"form_name": "...", "form_number": "...", "updated_date
 Use null for any field you cannot find.`;
 
     try {
-      const isDocx = looksLikeDocx(data.mimeType, data.fileName ?? null);
+      const fetched = await fetchFile(data.fileUrl);
+      const isDocx = looksLikeDocx(fetched.mimeType, data.fileUrl);
 
       // Gemini's inline data API can't read DOCX, so extract text first and send as text.
       // PDFs go through inline data as before.
       let contentPart: any;
       if (isDocx) {
-        const buf = Buffer.from(data.fileBase64, "base64");
-        const text = await docxToText(buf);
-        // Only the first ~6000 chars are needed — header fields live up top.
+        const text = await docxToText(fetched.buffer);
         contentPart = { text: `--- FORM DOCUMENT TEXT ---\n${text.slice(0, 6000)}\n--- END ---` };
       } else {
-        contentPart = { inlineData: { data: data.fileBase64, mimeType: data.mimeType } };
+        contentPart = {
+          inlineData: {
+            data: fetched.buffer.toString("base64"),
+            mimeType: fetched.mimeType || "application/pdf",
+          },
+        };
       }
 
       const resp = await generateWithFallback({

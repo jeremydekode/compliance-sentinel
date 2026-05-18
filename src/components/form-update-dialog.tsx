@@ -66,6 +66,7 @@ export function FormUpdateDialog({
   const [customTitle, setCustomTitle] = useState("");
   const [notes, setNotes] = useState("");
   const [file, setFile] = useState<File | null>(null);
+  const [uploadedFileUrl, setUploadedFileUrl] = useState<string | null>(null);
   const [extracting, setExtracting] = useState(false);
 
   const [fields, setFields] = useState<FieldChange[]>([
@@ -89,6 +90,7 @@ export function FormUpdateDialog({
     setCustomTitle("");
     setNotes("");
     setFile(null);
+    setUploadedFileUrl(null);
     setExtracting(false);
     setFocusedOldIdx(null);
     setFields([
@@ -110,6 +112,7 @@ export function FormUpdateDialog({
 
   async function handleFileChange(picked: File | null) {
     setFile(picked);
+    setUploadedFileUrl(null);
     if (!picked) return;
 
     const lower = picked.name.toLowerCase();
@@ -120,11 +123,18 @@ export function FormUpdateDialog({
 
     setExtracting(true);
     try {
-      const base64 = await readFileAsBase64(picked);
-      const mimeType = isPdf
-        ? "application/pdf"
-        : "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-      const meta = await extractFn({ data: { fileBase64: base64, mimeType, fileName: picked.name } });
+      // Upload to Supabase storage first so we pass a URL to the server function
+      // (Vercel serverless functions cap POST bodies at ~4.5 MB — base64 PDFs blow past that).
+      const path = `forms/${Date.now()}-${picked.name}`;
+      const up = await supabase.storage.from("policies").upload(path, picked, {
+        upsert: false,
+        contentType: picked.type || (isPdf ? "application/pdf" : "application/octet-stream"),
+      });
+      if (up.error) throw up.error;
+      const { data: pub } = supabase.storage.from("policies").getPublicUrl(path);
+      setUploadedFileUrl(pub.publicUrl);
+
+      const meta = await extractFn({ data: { fileUrl: pub.publicUrl, fileName: picked.name } });
 
       // Derive base formId by stripping version suffix: "FGROP 037/2016_v10" → "FGROP 037/2016"
       if (meta.formNumber && !formId) {
@@ -172,8 +182,10 @@ export function FormUpdateDialog({
     if (!canSubmit || busy) return;
     setBusy(true);
     try {
-      let newFileUrl: string | null = null;
-      if (file) {
+      // The file was already uploaded during extraction (handleFileChange).
+      // Only upload here if extraction didn't happen (unsupported type, or extraction failed before storing the URL).
+      let newFileUrl: string | null = uploadedFileUrl;
+      if (file && !newFileUrl) {
         const path = `forms/${Date.now()}-${file.name}`;
         const up = await supabase.storage.from("policies").upload(path, file, {
           upsert: false,

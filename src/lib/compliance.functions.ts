@@ -1355,6 +1355,17 @@ function pickOverridePage(
   return hasVersionInfo ? Math.max(...pages) : pages[0];
 }
 
+// Derive a "core" form name by stripping variant qualifiers after the first
+// separator (dash, en/em-dash, slash, open paren). Used as a broader search term
+// so chunks that mention just the form name (no version, no variant) still get
+// found — e.g. "ACCOUNT OPENING APPLICATION FORM" matches references that lack
+// the trailing "– COMMERCIAL / CORPORATE" or "/ Family Office" qualifier.
+function deriveCoreFormName(friendlyName: string | null | undefined): string | null {
+  if (!friendlyName) return null;
+  const core = friendlyName.split(/[-–—/(]/)[0].trim();
+  return core.length >= 15 ? core : null;
+}
+
 function applyPageOverrides(formId: string, impacts: any[]): any[] {
   return impacts.map((imp) => {
     const overridden = pickOverridePage(formId, imp.sop_title ?? "", imp.find_text, imp.page);
@@ -1396,12 +1407,20 @@ export const createFormUpdateReport = createServerFn({ method: "POST" })
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const chunkHits: Map<string, any[]> = new Map();
 
-    // Search terms: the form ID itself (highest signal) + each non-trivial OLD value
+    // Search terms: form ID (highest signal) + each non-trivial OLD value +
+    // the friendly name + a derived "core" form name. The core name catches
+    // bare references that don't include the version or variant qualifier
+    // (e.g. an SOP table row that just lists the form title).
+    const coreFormName = deriveCoreFormName(data.friendlyName);
     const searchTerms: string[] = [data.formId];
+    if (data.friendlyName && data.friendlyName.trim().length >= 15) {
+      searchTerms.push(data.friendlyName.trim().slice(0, 100));
+    }
+    if (coreFormName && !searchTerms.some((t) => t.toLowerCase() === coreFormName.toLowerCase())) {
+      searchTerms.push(coreFormName);
+    }
     for (const c of data.fieldChanges) {
       const v = c.oldValue.trim();
-      // Skip values too short to be discriminating (e.g. "v10") OR include them
-      // as a secondary anchor; we'll let them through but cap at 100 chars
       if (v.length >= 4) searchTerms.push(v.slice(0, 100));
     }
 
@@ -1575,10 +1594,16 @@ Return ONLY the JSON array. No commentary.
               console.log(`  - [${sop.title}] discarded AI excuse impact: "${ft.slice(0, 60)}"`);
               continue;
             }
+            // Accept impact if find_text contains: any OLD value verbatim,
+            // OR the form ID, OR the friendly name / core form name.
+            // The friendly-name allowance lets us keep impacts on bare form-title
+            // references (e.g. Forms Tables) that don't carry the version code.
             const containsAnOld = data.fieldChanges.some((c) =>
-              ft.includes(c.oldValue.toLowerCase().trim()) ||
-              ft.includes(data.formId.toLowerCase())
-            );
+              ft.includes(c.oldValue.toLowerCase().trim())
+            )
+              || ft.includes(data.formId.toLowerCase())
+              || (!!data.friendlyName && ft.includes(data.friendlyName.toLowerCase()))
+              || (!!coreFormName && ft.includes(coreFormName.toLowerCase()));
             if (!containsAnOld) {
               console.log(`  - [${sop.title}] discarded impact with no OLD value in find_text`);
               continue;
@@ -1615,6 +1640,7 @@ Return ONLY the JSON array. No commentary.
           old_policy_name: `${data.formId} (previous version)`,
           uc1_form_update: true,
           form_id: data.formId,
+          friendly_name: data.friendlyName ?? null,
           field_changes: data.fieldChanges,
         },
       })
@@ -1672,6 +1698,7 @@ export const rerunFormUpdateReport = createServerFn({ method: "POST" })
       throw new Error("This report is not a Form Update — use the regular Re-run instead.");
     }
     const formId: string = summary.form_id ?? report.policy_name;
+    const friendlyName: string | null = summary.friendly_name ?? null;
     const fieldChanges: { label: string; oldValue: string; newValue: string }[] = summary.field_changes ?? [];
     if (!formId || fieldChanges.length === 0) {
       throw new Error("Original form-update parameters missing from this report — cannot rerun.");
@@ -1686,7 +1713,14 @@ export const rerunFormUpdateReport = createServerFn({ method: "POST" })
     const INTERNAL_DOC_TYPES = INTERNAL_DOC_TYPES_CONST as readonly string[];
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const chunkHits: Map<string, any[]> = new Map();
+    const coreFormName = deriveCoreFormName(friendlyName);
     const searchTerms: string[] = [formId];
+    if (friendlyName && friendlyName.trim().length >= 15) {
+      searchTerms.push(friendlyName.trim().slice(0, 100));
+    }
+    if (coreFormName && !searchTerms.some((t) => t.toLowerCase() === coreFormName.toLowerCase())) {
+      searchTerms.push(coreFormName);
+    }
     for (const c of fieldChanges) {
       const v = c.oldValue.trim();
       if (v.length >= 4) searchTerms.push(v.slice(0, 100));
@@ -1782,8 +1816,11 @@ Example C — TABLE OF CONTENTS:
             if (!ft.trim()) continue;
             if (/none.*old.*values|not found|no occurrences|could not (find|locate)/i.test(ft)) continue;
             const containsAnOld = fieldChanges.some((c) =>
-              ft.includes(c.oldValue.toLowerCase().trim()) || ft.includes(formId.toLowerCase())
-            );
+              ft.includes(c.oldValue.toLowerCase().trim())
+            )
+              || ft.includes(formId.toLowerCase())
+              || (!!friendlyName && ft.includes(friendlyName.toLowerCase()))
+              || (!!coreFormName && ft.includes(coreFormName.toLowerCase()));
             if (!containsAnOld) continue;
             allImpacts.push({ ...imp, sop_id: sop.id, sop_title: sop.title });
           }

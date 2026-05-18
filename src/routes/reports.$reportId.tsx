@@ -86,6 +86,25 @@ function ReportPage() {
     return m;
   }, [sopsQuery.data]);
 
+  // ALL hooks must be called above any conditional early-return.
+  // Compute UC1 derived state before the loading guard.
+  const allChanges = changes.data ?? [];
+  const allImpacts = impacts.data ?? [];
+  const summary = ((report.data?.summary_json) ?? {}) as any;
+  const isFormUpdate: boolean = !!summary?.uc1_form_update;
+
+  const docGroups = useMemo(() => {
+    if (!isFormUpdate) return [];
+    const map = new Map<string, { sopId: string | null; sopTitle: string; impacts: any[] }>();
+    for (const imp of allImpacts) {
+      const key = imp.sop_id ?? `__nokey_${imp.sop_title}`;
+      if (!map.has(key)) map.set(key, { sopId: imp.sop_id, sopTitle: imp.sop_title, impacts: [] });
+      map.get(key)!.impacts.push(imp);
+    }
+    return Array.from(map.values()).sort((a, b) => b.impacts.length - a.impacts.length);
+  }, [allImpacts, isFormUpdate]);
+
+  // Conditional early returns are safe BELOW this line — no hooks after this.
   if (report.isLoading) return (
     <AppShell>
       <div className="p-8 space-y-4 animate-pulse">
@@ -100,29 +119,11 @@ function ReportPage() {
   );
   if (!report.data) throw notFound();
 
-  const allChanges = changes.data ?? [];
-  const allImpacts = impacts.data ?? [];
-  const summary = (report.data.summary_json ?? {}) as any;
   const oldPolicyName: string = summary.old_policy_name ?? "Previous version";
   const newPolicyName: string = report.data.policy_name ?? "Updated policy";
   const s = statusMeta(report.data.status);
 
-  // UC1 (Form Update) reports render document-centric, not rule-centric.
-  // For UC1: left register lists affected DOCS; each tile expands all impacts for that doc.
-  const isFormUpdate: boolean = !!summary?.uc1_form_update;
   const formFieldChanges: { label: string; oldValue: string; newValue: string }[] = summary?.field_changes ?? [];
-
-  // Group impacts by sop_id for UC1 document-centric view
-  const docGroups = useMemo(() => {
-    if (!isFormUpdate) return [];
-    const map = new Map<string, { sopId: string | null; sopTitle: string; impacts: any[] }>();
-    for (const imp of allImpacts) {
-      const key = imp.sop_id ?? `__nokey_${imp.sop_title}`;
-      if (!map.has(key)) map.set(key, { sopId: imp.sop_id, sopTitle: imp.sop_title, impacts: [] });
-      map.get(key)!.impacts.push(imp);
-    }
-    return Array.from(map.values()).sort((a, b) => b.impacts.length - a.impacts.length);
-  }, [allImpacts, isFormUpdate]);
 
   // null selectedId = Summary view; otherwise show the specific change/doc
   const showSummary = selectedId === null;

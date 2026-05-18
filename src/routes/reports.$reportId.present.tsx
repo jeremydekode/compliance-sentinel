@@ -6,6 +6,7 @@ import { MD } from "@/components/md";
 import { impactClasses } from "@/lib/format";
 import { Printer } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { sortChangesByPriority, diffWords, deriveSuggestedAction } from "@/lib/change-utils";
 
 export const Route = createFileRoute("/reports/$reportId/present")({
   component: Present,
@@ -44,7 +45,7 @@ function Present() {
   if (!report.data) throw notFound();
   const r: any = report.data;
   const s: any = r.summary_json ?? {};
-  const c = changes.data ?? [];
+  const rawChanges = changes.data ?? [];
   const impacts = impactsQ.data ?? [];
   const impactsByChapter = new Map<string, any[]>();
   for (const imp of impacts) {
@@ -56,6 +57,8 @@ function Present() {
   }
   const impactsForChapter = (ref: string) =>
     impactsByChapter.get(String(ref ?? "").trim().toLowerCase()) ?? [];
+  // Sort: matched first, then HIGH → MED → LOW, then by SOP count desc
+  const c = sortChangesByPriority(rawChanges, impactsForChapter);
   const counts = {
     high: c.filter((x) => x.impact === "high").length,
     medium: c.filter((x) => x.impact === "medium").length,
@@ -94,24 +97,39 @@ function Present() {
 
         <SlideBox n={2} title="Key Changes & Tone Shift">
           <div className="grid grid-cols-2 gap-5">
-            {c.slice(0, 4).map((ch) => {
+            {c.map((ch) => {
               const labels = diffLabels(ch, r.policy_name);
               const affected = impactsForChapter(ch.chapter_ref);
+              const suggested = deriveSuggestedAction(ch);
+              const showDiff = labels.showBefore && !!ch.old_requirement && !!ch.new_requirement;
               return (
-                <div key={ch.id} className="p-5 border rounded-xl bg-card">
+                <div key={ch.id} className="p-5 border rounded-xl bg-card break-inside-avoid">
                   <div className="flex justify-between items-center mb-3">
                     <div className="font-display font-semibold">{ch.chapter_ref}</div>
                     <Badge variant="outline" className={impactClasses(ch.impact)}>{ch.impact.toUpperCase()}</Badge>
                   </div>
-                  {labels.showBefore && (
+
+                  {/* Suggested action — verb-led, derived from change content */}
+                  <div className="mb-3 flex items-start gap-2 rounded-md border border-emerald-200 bg-emerald-50 dark:bg-emerald-950/20 dark:border-emerald-800 px-3 py-2">
+                    <span className="text-[10px] font-bold uppercase tracking-wide text-emerald-700 dark:text-emerald-300 shrink-0 mt-0.5">Action</span>
+                    <span className="text-[12px] text-emerald-900 dark:text-emerald-100 leading-snug">{suggested}</span>
+                  </div>
+
+                  {showDiff ? (
                     <>
-                      <div className="text-xs text-muted-foreground mb-1">{labels.beforeLabel}</div>
-                      <div className="text-sm bg-muted p-3 rounded mb-3">{ch.old_requirement}</div>
+                      <div className="text-xs text-muted-foreground mb-1">What changed ({labels.beforeLabel} → {labels.afterLabel})</div>
+                      <div className="text-sm bg-muted/40 border p-3 rounded mb-3 leading-relaxed font-mono whitespace-pre-wrap">
+                        <DiffInline oldText={ch.old_requirement ?? ""} newText={ch.new_requirement ?? ""} />
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="text-xs text-muted-foreground mb-1">{labels.afterLabel}</div>
+                      <div className="text-sm bg-primary/5 border border-primary/20 p-3 rounded mb-3"><MD>{ch.new_requirement ?? ""}</MD></div>
                     </>
                   )}
-                  <div className="text-xs text-muted-foreground mb-1">{labels.afterLabel}</div>
-                  <div className="text-sm bg-primary/5 border border-primary/20 p-3 rounded"><MD>{ch.new_requirement ?? ""}</MD></div>
-                  <div className="mt-3 text-[11px] text-muted-foreground rounded border bg-muted/30 px-2.5 py-1.5 leading-snug">
+
+                  <div className="text-[11px] text-muted-foreground rounded border bg-muted/30 px-2.5 py-1.5 leading-snug">
                     {labels.footer}
                     {labels.kind === "kb" && labels.comparedAgainst.length > 0 && (
                       <div className="mt-1">
@@ -122,7 +140,7 @@ function Present() {
                   </div>
                   <div className="mt-3 pt-3 border-t border-dashed">
                     <div className="text-[10px] uppercase tracking-wide text-muted-foreground font-medium mb-1.5">
-                      Affected SOP file(s)
+                      Affected SOP file(s) {affected.length > 0 && <span className="text-muted-foreground/60">({affected.length})</span>}
                     </div>
                     {affected.length === 0 ? (
                       <div className="text-[11px] text-muted-foreground italic">No matching SOP found in your Knowledge Base.</div>
@@ -214,6 +232,19 @@ function Present() {
         </SlideBox>
       </div>
     </div>
+  );
+}
+
+function DiffInline({ oldText, newText }: { oldText: string; newText: string }) {
+  const segs = diffWords(oldText ?? "", newText ?? "");
+  return (
+    <span>
+      {segs.map((s, i) => {
+        if (s.type === "eq") return <span key={i}>{s.text}</span>;
+        if (s.type === "del") return <span key={i} className="bg-rose-100 dark:bg-rose-950/50 text-rose-700 dark:text-rose-300 line-through decoration-rose-400 rounded px-0.5">{s.text}</span>;
+        return <span key={i} className="bg-emerald-100 dark:bg-emerald-950/50 text-emerald-800 dark:text-emerald-300 font-semibold rounded px-0.5">{s.text}</span>;
+      })}
+    </span>
   );
 }
 

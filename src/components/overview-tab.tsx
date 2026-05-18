@@ -5,6 +5,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { MD } from "@/components/md";
 import { impactClasses } from "@/lib/format";
 import { cn } from "@/lib/utils";
+import { sortChangesByPriority, diffWords, deriveSuggestedAction } from "@/lib/change-utils";
 import {
   FileText, ShieldCheck, Calendar, Activity,
   LayoutGrid, ListTree, ArrowRight, AlertCircle,
@@ -40,7 +41,10 @@ export function OverviewTab({ report, changes, impacts = [], view }: Props) {
     return impactsByChapter.get(k) ?? [];
   };
 
-  if (view === "table") return <TableView changes={changes} impactsForChange={impactsForChange} />;
+  // Sort: matched first, then HIGH → MED → LOW, then by SOP count desc
+  const sortedChanges = sortChangesByPriority(changes, impactsForChange);
+
+  if (view === "table") return <TableView changes={sortedChanges} impactsForChange={impactsForChange} />;
   
   const isSimulated = summary.is_simulated;
 
@@ -106,11 +110,12 @@ export function OverviewTab({ report, changes, impacts = [], view }: Props) {
 
       <Slide id="s2" title="Key Changes & Tone Shift" icon={Activity}>
         <div className="space-y-4">
-          {changes.map((c) => {
+          {sortedChanges.map((c) => {
             const affected = impactsForChange(c.chapter_ref);
             const oldPolicyName = (summary as any)?.old_policy_name ?? undefined;
             const labels = diffLabels(c, report?.policy_name, oldPolicyName);
             const isNew = labels.kind === "new";
+            const suggested = deriveSuggestedAction(c);
             return (
               <Card key={c.id} className="p-0 glass-card overflow-hidden border-primary/10">
                 {/* Card header */}
@@ -142,6 +147,15 @@ export function OverviewTab({ report, changes, impacts = [], view }: Props) {
                 <div className="p-5 space-y-4">
                   <ChangeMeta change={c} />
 
+                  {/* Suggested action — verb-led, scannable */}
+                  <div className="flex items-start gap-3 rounded-lg border border-emerald-200 bg-emerald-50/70 dark:bg-emerald-950/20 dark:border-emerald-800 px-4 py-3">
+                    <Sparkles className="size-4 text-emerald-600 dark:text-emerald-400 shrink-0 mt-0.5" />
+                    <div className="min-w-0">
+                      <div className="text-[10px] uppercase tracking-widest font-black text-emerald-700 dark:text-emerald-300 mb-0.5">Suggested action</div>
+                      <div className="text-sm text-emerald-900 dark:text-emerald-100 font-medium leading-snug">{suggested}</div>
+                    </div>
+                  </div>
+
                   {/* Before / After panels */}
                   {isNew ? (
                     <div className="rounded-xl border border-emerald-200 dark:border-emerald-800 bg-emerald-50/60 dark:bg-emerald-950/20 overflow-hidden">
@@ -156,40 +170,18 @@ export function OverviewTab({ report, changes, impacts = [], view }: Props) {
                       </div>
                     </div>
                   ) : (
-                    <div className="grid grid-cols-1 md:grid-cols-[1fr_auto_1fr] gap-0 rounded-xl overflow-hidden border border-slate-200 dark:border-slate-700">
-                      {/* BEFORE panel */}
-                      <div className="bg-rose-50/60 dark:bg-rose-950/20 border-b md:border-b-0 md:border-r border-slate-200 dark:border-slate-700">
-                        <div className="flex items-center gap-2 px-4 py-2.5 bg-rose-100/80 dark:bg-rose-900/30 border-b border-rose-200 dark:border-rose-800">
-                          <div className="size-4 rounded-full bg-rose-500 grid place-items-center shrink-0">
-                            <span className="text-[8px] font-black text-white leading-none">OLD</span>
-                          </div>
-                          <span className="text-[10px] uppercase tracking-widest font-black text-rose-800 dark:text-rose-300 truncate">
-                            {labels.beforeLabel}
-                          </span>
-                        </div>
-                        <div className="p-4 text-sm leading-relaxed text-foreground/80">
-                          {c.old_requirement}
-                        </div>
+                    <div className="rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden">
+                      <div className="flex items-center justify-between gap-2 px-4 py-2.5 bg-slate-100/80 dark:bg-slate-800/40 border-b border-slate-200 dark:border-slate-700">
+                        <span className="text-[10px] uppercase tracking-widest font-black text-slate-700 dark:text-slate-300">
+                          What changed — {labels.beforeLabel} → {labels.afterLabel}
+                        </span>
+                        <span className="text-[9px] text-muted-foreground inline-flex items-center gap-1">
+                          <span className="inline-block size-2 rounded-sm bg-rose-200 dark:bg-rose-900/50 border border-rose-300" /> removed
+                          <span className="inline-block size-2 rounded-sm bg-emerald-200 dark:bg-emerald-900/50 border border-emerald-300 ml-1.5" /> added
+                        </span>
                       </div>
-
-                      {/* Divider arrow */}
-                      <div className="hidden md:flex items-center justify-center px-2 bg-slate-100/60 dark:bg-slate-800/40">
-                        <ArrowRight className="size-4 text-muted-foreground/40" />
-                      </div>
-
-                      {/* AFTER panel */}
-                      <div className="bg-blue-50/60 dark:bg-blue-950/20">
-                        <div className="flex items-center gap-2 px-4 py-2.5 bg-blue-100/80 dark:bg-blue-900/30 border-b border-blue-200 dark:border-blue-800">
-                          <div className="size-4 rounded-full bg-blue-600 grid place-items-center shrink-0">
-                            <span className="text-[8px] font-black text-white leading-none">NEW</span>
-                          </div>
-                          <span className="text-[10px] uppercase tracking-widest font-black text-blue-800 dark:text-blue-300 truncate">
-                            {labels.afterLabel}
-                          </span>
-                        </div>
-                        <div className="p-4 text-sm leading-relaxed text-foreground/90 font-medium">
-                          <MD>{c.new_requirement}</MD>
-                        </div>
+                      <div className="p-4 text-sm leading-relaxed font-mono whitespace-pre-wrap">
+                        <DiffInline oldText={c.old_requirement ?? ""} newText={c.new_requirement ?? ""} />
                       </div>
                     </div>
                   )}
@@ -333,6 +325,19 @@ function diffLabels(c: any, newPolicyName?: string, oldPolicyName?: string) {
       : `Diff extracted from ${newDoc}.`,
     comparedAgainst: oldPolicyName ? [oldDoc] : [],
   };
+}
+
+function DiffInline({ oldText, newText }: { oldText: string; newText: string }) {
+  const segs = diffWords(oldText ?? "", newText ?? "");
+  return (
+    <span>
+      {segs.map((s, i) => {
+        if (s.type === "eq") return <span key={i}>{s.text}</span>;
+        if (s.type === "del") return <span key={i} className="bg-rose-100 dark:bg-rose-950/50 text-rose-700 dark:text-rose-300 line-through decoration-rose-400 decoration-2 rounded px-0.5">{s.text}</span>;
+        return <span key={i} className="bg-emerald-100 dark:bg-emerald-950/50 text-emerald-800 dark:text-emerald-300 font-semibold rounded px-0.5">{s.text}</span>;
+      })}
+    </span>
+  );
 }
 
 function DiffSourceFooter({ labels }: { labels: ReturnType<typeof diffLabels> }) {

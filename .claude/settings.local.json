@@ -17,7 +17,11 @@
       "Bash(node scripts/index-docx.mjs \"/Users/jeremyteh/Downloads/RHB Use Case 1,2,3/Use Case 1 Manual - Docx/S16_SM373_MY.docx\" forms \"S16_SM373_MY\")",
       "Bash(cd \"/Users/jeremyteh/Downloads/Compliance Sentinel\" && grep -n \"isFormUpdate\\\\|uc1_form_update\\\\|allChanges.map\\\\|selectedId === c.id\" 'src/routes/reports.$reportId.tsx' | head -10)",
       "Bash(cd \"/Users/jeremyteh/Downloads/Compliance Sentinel\" && grep -n \"^function ChangeDetailPanel\\\\|^function ImpactCard\\\\|^function GapTable\" 'src/routes/reports.$reportId.tsx' | head -5)",
-      "Bash(cd \"/Users/jeremyteh/Downloads/Compliance Sentinel\" && grep -n \"import.*useMemo\\\\|FileEdit\" 'src/routes/reports.$reportId.tsx' | head -5)"
+      "Bash(cd \"/Users/jeremyteh/Downloads/Compliance Sentinel\" && grep -n \"import.*useMemo\\\\|FileEdit\" 'src/routes/reports.$reportId.tsx' | head -5)",
+      "Bash(npx eslint *)",
+      "Bash(cd \"/Users/jeremyteh/Downloads/Compliance Sentinel\" && grep -n \"Re-run\\\\|handleRerun\\\\|rerunReport\" 'src/routes/reports.$reportId.tsx' | head -10)",
+      "Bash(cd \"/Users/jeremyteh/Downloads/Compliance Sentinel\" && grep -n \"SOP Gap Register\\\\|isFormUpdate\" 'src/routes/reports.$reportId.tsx' | head -10)",
+      "Bash(cd \"/Users/jeremyteh/Downloads/Compliance Sentinel\" && grep -n \"workspace_id\\\\|workspace ===\\\\|useWorkspace\" src/routes/reports.index.tsx src/routes/knowledge-base.tsx 'src/routes/reports.$reportId.tsx' src/components/legal-review-view.tsx src/components/form-update-dialog.tsx 2>&1 | head -25)"
     ]
   }
 }

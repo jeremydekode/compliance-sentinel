@@ -1,7 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { supabase } from "@/integrations/supabase/client";
-import { analyzePolicy, chunkDocument, generateAmendedDocument, extractRegulatoryChanges, mapChangeToSops, generateAnalysisSummary } from "./gemini";
+import { analyzePolicy, chunkDocument, generateAmendedDocument, extractRegulatoryChanges, mapChangeToSops, generateAnalysisSummary, generateWithFallback } from "./gemini";
 import { applyEditsToDocx, looksLikeDocx, docxToText } from "./docx-editor";
 
 /**
@@ -782,17 +782,34 @@ export const clearWorkspace = createServerFn({ method: "POST" })
   .inputValidator(
     z.object({
       scope: z.enum(["analyses", "kb", "all"]),
+      workspace: z.enum(["rmit", "fatf", "forms"]).default("rmit"),
     })
   )
   .handler(async ({ data }) => {
+    // Scope all deletions to the specified workspace ONLY — never wipe across workspaces.
     if (data.scope === "analyses" || data.scope === "all") {
-      await supabase.from("chat_messages").delete().neq("id", "00000000-0000-0000-0000-000000000000");
-      await supabase.from("sop_impacts").delete().neq("id", "00000000-0000-0000-0000-000000000000");
-      await supabase.from("regulatory_changes").delete().neq("id", "00000000-0000-0000-0000-000000000000");
-      await supabase.from("analysis_reports").delete().neq("id", "00000000-0000-0000-0000-000000000000");
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: reports } = await (supabase as any)
+        .from("analysis_reports").select("id").eq("workspace_id", data.workspace);
+      const reportIds = (reports ?? []).map((r: any) => r.id);
+      if (reportIds.length > 0) {
+        await supabase.from("sop_impacts").delete().in("report_id", reportIds);
+        await supabase.from("regulatory_changes").delete().in("report_id", reportIds);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        await (supabase as any).from("analysis_reports").delete().eq("workspace_id", data.workspace);
+      }
     }
     if (data.scope === "kb" || data.scope === "all") {
-      await supabase.from("sop_documents").delete().neq("id", "00000000-0000-0000-0000-000000000000");
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: docs } = await (supabase as any)
+        .from("sop_documents").select("id").eq("workspace_id", data.workspace);
+      const docIds = (docs ?? []).map((d: any) => d.id);
+      if (docIds.length > 0) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        await (supabase as any).from("sop_chunks").delete().in("sop_id", docIds);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        await (supabase as any).from("sop_documents").delete().eq("workspace_id", data.workspace);
+      }
     }
     return { ok: true };
   });
@@ -1220,9 +1237,6 @@ export const reindexSop = createServerFn({ method: "POST" })
 // ── UC1: Form/Template Update Flow ───────────────────────────────────────────
 // Propagates form metadata changes (name, version, date, etc.) across all
 // downstream documents in the KB that reference the form.
-
-import { generateWithFallback as _gwf } from "./gemini";
-
 export const createFormUpdateReport = createServerFn({ method: "POST" })
   .inputValidator(z.object({
     workspace: z.enum(["rmit", "fatf", "forms"]).default("forms"),
@@ -1289,10 +1303,6 @@ export const createFormUpdateReport = createServerFn({ method: "POST" })
     for (const s of sops ?? []) sopsById.set(s.id, s);
 
     // 3. For each affected doc, ONE small AI call to produce find/replace impacts
-    const ai = new (await import("@google/genai")).GoogleGenAI({
-      apiKey: process.env.GOOGLE_GENERATIVE_AI_API_KEY || "",
-    });
-
     const allImpacts: any[] = [];
 
     for (const [sopId, chunks] of chunkHits.entries()) {
@@ -1350,7 +1360,7 @@ Return ONLY the JSON array. No commentary.
       `;
 
       try {
-        const resp = await _gwf({
+        const resp = await generateWithFallback({
           contents: [{ role: "user", parts: [{ text: prompt }] }],
           config: { responseMimeType: "application/json", maxOutputTokens: 16384 },
         });
@@ -1361,8 +1371,6 @@ Return ONLY the JSON array. No commentary.
             allImpacts.push({ ...imp, sop_id: sop.id, sop_title: sop.title });
           }
         }
-        // Mark variable as used in TS
-        void ai;
       } catch (e: any) {
         console.warn(`UC1: mapping failed for ${sop.title}:`, e?.message);
       }

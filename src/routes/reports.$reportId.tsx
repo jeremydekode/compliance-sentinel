@@ -226,13 +226,17 @@ function ReportPage() {
             </div>
           </div>
           <div className="flex items-center gap-1.5 shrink-0">
-            <Button variant="outline" size="sm" disabled={rerunning} className="h-7 text-xs gap-1.5"
-              onClick={handleRerun}
-              title="Re-run AI analysis on this report (replaces current changes)">
-              {rerunning ? <Loader2 className="size-3 animate-spin" /> : <RefreshCw className="size-3" />}
-              <span className="hidden sm:inline">{rerunning ? "Re-analysing…" : "Re-run"}</span>
-            </Button>
-            <div className="h-4 w-px bg-border mx-0.5" />
+            {!isFormUpdate && (
+              <>
+                <Button variant="outline" size="sm" disabled={rerunning} className="h-7 text-xs gap-1.5"
+                  onClick={handleRerun}
+                  title="Re-run AI analysis on this report (replaces current changes)">
+                  {rerunning ? <Loader2 className="size-3 animate-spin" /> : <RefreshCw className="size-3" />}
+                  <span className="hidden sm:inline">{rerunning ? "Re-analysing…" : "Re-run"}</span>
+                </Button>
+                <div className="h-4 w-px bg-border mx-0.5" />
+              </>
+            )}
             <Button variant="outline" size="sm" disabled={!!exporting} className="h-7 text-xs gap-1.5"
               onClick={() => runExport("html", () => exportHtmlPresentation(report.data, allChanges, allImpacts))}>
               {exporting === "html" ? <Loader2 className="size-3 animate-spin" /> : <Presentation className="size-3" />}
@@ -271,7 +275,9 @@ function ReportPage() {
                   : "border-transparent text-muted-foreground hover:text-foreground"
               )}
             >
-              {tab === "analysis" ? `Change Analysis (${allChanges.length})` : `SOP Gap Register (${allImpacts.length})`}
+              {tab === "analysis"
+                ? (isFormUpdate ? `Documents (${docGroups.length})` : `Change Analysis (${allChanges.length})`)
+                : (isFormUpdate ? `All Edits (${allImpacts.length})` : `SOP Gap Register (${allImpacts.length})`)}
             </button>
           ))}
         </div>

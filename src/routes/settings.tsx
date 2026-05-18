@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { supabase } from "@/integrations/supabase/client";
 import { AlertTriangle, Trash2 } from "lucide-react";
 import { clearWorkspace } from "@/lib/compliance.functions";
+import { useWorkspace, WORKSPACES } from "@/lib/workspace";
 import { toast } from "sonner";
 
 export const Route = createFileRoute("/settings")({
@@ -19,24 +20,27 @@ function SettingsPage() {
   const qc = useQueryClient();
   const clear = useServerFn(clearWorkspace);
   const [busy, setBusy] = useState<string | null>(null);
+  const [workspace] = useWorkspace();
+  const wsName = WORKSPACES[workspace].name;
 
   const counts = useQuery({
-    queryKey: ["counts"],
+    queryKey: ["counts", workspace],
     queryFn: async () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const [sops, reports] = await Promise.all([
-        supabase.from("sop_documents").select("id", { count: "exact", head: true }),
-        supabase.from("analysis_reports").select("id", { count: "exact", head: true }),
+        (supabase as any).from("sop_documents").select("id", { count: "exact", head: true }).eq("workspace_id", workspace),
+        (supabase as any).from("analysis_reports").select("id", { count: "exact", head: true }).eq("workspace_id", workspace),
       ]);
       return { sops: sops.count ?? 0, reports: reports.count ?? 0 };
     },
   });
 
   async function run(scope: "kb" | "analyses" | "all", label: string) {
-    if (!confirm(`This will permanently delete ${label}. Continue?`)) return;
+    if (!confirm(`This will permanently delete ${label} in the "${wsName}" workspace only.\n\nOther workspaces will be unaffected. Continue?`)) return;
     setBusy(scope);
     try {
-      await clear({ data: { scope } });
-      toast.success(`${label} cleared`);
+      await clear({ data: { scope, workspace } });
+      toast.success(`${label} cleared in ${wsName}`);
       qc.invalidateQueries();
     } catch (e: any) {
       toast.error(e?.message ?? "Failed");
@@ -51,7 +55,8 @@ function SettingsPage() {
         <div>
           <h1 className="text-3xl font-semibold">Settings</h1>
           <p className="text-muted-foreground mt-1">
-            Manage your workspace data.
+            Manage data in the <span className="font-semibold text-foreground">{wsName}</span> workspace.
+            Other workspaces are unaffected.
           </p>
         </div>
 

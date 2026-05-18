@@ -112,13 +112,19 @@ export function FormUpdateDialog({
     setFile(picked);
     if (!picked) return;
 
-    const isPdf = picked.type === "application/pdf" || picked.name.toLowerCase().endsWith(".pdf");
-    if (!isPdf) return; // Only extract from PDFs
+    const lower = picked.name.toLowerCase();
+    const isPdf = picked.type === "application/pdf" || lower.endsWith(".pdf");
+    const isDocx = lower.endsWith(".docx") || lower.endsWith(".doc") ||
+      picked.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    if (!isPdf && !isDocx) return; // Only PDF / DOCX supported
 
     setExtracting(true);
     try {
       const base64 = await readFileAsBase64(picked);
-      const meta = await extractFn({ data: { fileBase64: base64, mimeType: "application/pdf" } });
+      const mimeType = isPdf
+        ? "application/pdf"
+        : "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+      const meta = await extractFn({ data: { fileBase64: base64, mimeType, fileName: picked.name } });
 
       // Derive base formId by stripping version suffix: "FGROP 037/2016_v10" → "FGROP 037/2016"
       if (meta.formNumber && !formId) {

@@ -1241,9 +1241,10 @@ export const extractFormMetadata = createServerFn({ method: "POST" })
   .inputValidator(z.object({
     fileBase64: z.string(),
     mimeType: z.string().default("application/pdf"),
+    fileName: z.string().optional(),
   }))
   .handler(async ({ data }) => {
-    const prompt = `You are extracting specific header fields from a bank form PDF.
+    const prompt = `You are extracting specific header fields from a bank form document.
 Look in the top-right corner header area and the main title area of the document.
 
 Extract these three fields exactly as they appear:
@@ -1255,13 +1256,24 @@ Return ONLY valid JSON: {"form_name": "...", "form_number": "...", "updated_date
 Use null for any field you cannot find.`;
 
     try {
+      const isDocx = looksLikeDocx(data.mimeType, data.fileName ?? null);
+
+      // Gemini's inline data API can't read DOCX, so extract text first and send as text.
+      // PDFs go through inline data as before.
+      let contentPart: any;
+      if (isDocx) {
+        const buf = Buffer.from(data.fileBase64, "base64");
+        const text = await docxToText(buf);
+        // Only the first ~6000 chars are needed — header fields live up top.
+        contentPart = { text: `--- FORM DOCUMENT TEXT ---\n${text.slice(0, 6000)}\n--- END ---` };
+      } else {
+        contentPart = { inlineData: { data: data.fileBase64, mimeType: data.mimeType } };
+      }
+
       const resp = await generateWithFallback({
         contents: [{
           role: "user",
-          parts: [
-            { inlineData: { data: data.fileBase64, mimeType: data.mimeType } },
-            { text: prompt },
-          ],
+          parts: [contentPart, { text: prompt }],
         }],
         config: { responseMimeType: "application/json", maxOutputTokens: 512 },
       });
@@ -1271,7 +1283,8 @@ Use null for any field you cannot find.`;
         formNumber: (parsed.form_number as string) ?? null,
         updatedDate: (parsed.updated_date as string) ?? null,
       };
-    } catch {
+    } catch (e) {
+      console.warn("extractFormMetadata failed:", (e as Error)?.message);
       return { formName: null, formNumber: null, updatedDate: null };
     }
   });

@@ -109,18 +109,18 @@ function KB() {
   }
 
   async function handleReindexAllPdfs() {
-    const pdfs = (sops.data ?? []).filter((s: any) => s.file_url && /\.pdf(\?|$)/i.test(s.file_url));
-    if (pdfs.length === 0) {
-      toast.info("No PDF documents to re-index in this workspace");
+    const docs = (sops.data ?? []).filter((s: any) => !!s.file_url);
+    if (docs.length === 0) {
+      toast.info("No documents with source files to re-index in this workspace");
       return;
     }
-    if (!confirm(`Re-index ${pdfs.length} PDF document${pdfs.length > 1 ? "s" : ""} with the new page-aware chunker? This may take a few minutes.`)) return;
+    if (!confirm(`Re-index ${docs.length} document${docs.length > 1 ? "s" : ""} with the latest chunker? This may take a few minutes.`)) return;
 
-    setBulkReindex({ done: 0, total: pdfs.length });
+    setBulkReindex({ done: 0, total: docs.length });
     let success = 0;
     let failed = 0;
-    for (let i = 0; i < pdfs.length; i++) {
-      const s = pdfs[i];
+    for (let i = 0; i < docs.length; i++) {
+      const s = docs[i];
       try {
         await reindex({ data: { id: s.id } });
         success++;
@@ -128,14 +128,14 @@ function KB() {
         failed++;
         console.warn(`Re-index failed for ${s.title}:`, e?.message);
       }
-      setBulkReindex({ done: i + 1, total: pdfs.length });
+      setBulkReindex({ done: i + 1, total: docs.length });
     }
     setBulkReindex(null);
     await qc.refetchQueries({ queryKey: ["sop_chunk_counts", workspace] });
     if (failed === 0) {
-      toast.success(`Re-indexed ${success} PDF${success > 1 ? "s" : ""}`);
+      toast.success(`Re-indexed ${success} document${success > 1 ? "s" : ""}`);
     } else {
-      toast.warning(`Re-indexed ${success} of ${pdfs.length} PDFs · ${failed} failed (see console)`);
+      toast.warning(`Re-indexed ${success} of ${docs.length} documents · ${failed} failed (see console)`);
     }
   }
 
@@ -181,12 +181,12 @@ function KB() {
               className="gap-2"
               onClick={handleReindexAllPdfs}
               disabled={!!bulkReindex || !!reindexing}
-              title="Re-chunk every PDF in this workspace using the page-aware extractor"
+              title="Re-chunk every document in this workspace (PDFs use the page-aware extractor; DOCX uses the deterministic text splitter)"
             >
               {bulkReindex ? (
                 <><Loader2 className="size-4 animate-spin" /> Re-indexing {bulkReindex.done}/{bulkReindex.total}…</>
               ) : (
-                <><RefreshCw className="size-4" /> Re-index all PDFs</>
+                <><RefreshCw className="size-4" /> Re-index all</>
               )}
             </Button>
             <Dialog open={open} onOpenChange={setOpen}>

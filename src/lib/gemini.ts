@@ -116,9 +116,41 @@ function regulatorGuidance(ctx: RegulatorContext): string {
 # REGULATOR CONTEXT: BNM RMiT (Risk Management in Technology)
 This document is from Bank Negara Malaysia's RMiT family. Apply these BNM-specific rules:
 - BNM uses an explicit classifier prefix in every paragraph: **S** = Standard (MANDATORY), **G** = Guidance (NON-MANDATORY, "may consider"/"is encouraged to"), **P** = neutral Paragraph. PRESERVE this distinction in your tone_shift field — never call a "G" clause a mandate.
-- Watch for these RMiT-specific patterns: kill switch, stand-in processing, out-of-band communications, SBOM (Software Bill of Materials), API security, cloud exit strategy, public uptime disclosure, emerging-technology governance, MFA hardening, OTP transaction binding.
-- Material changes typically live in: main paragraphs (8.x, 10.x, 11.x, 12.x), Appendices (3, 5, 9, 10, 11), and the "Definitions" / "Applicability" sections.
-- A typical RMiT revision contains 10-25 material changes. Sweep all appendices before finalising.`;
+- A typical RMiT revision (2023 → 2025) contains 10–15 material changes. If your output is under 10, you have almost certainly missed something — re-sweep.
+
+## RMiT — DO NOT MISS THESE CATEGORIES
+Past extractions have systematically under-reported the following. Inspect each one by name before finalising:
+
+1. **Scope / Applicability expansion (Paragraph 5.x)** — additions of new covered institutions (e.g. Registered Merchant Acquirers, Intermediary Remittance Institutions, payment system operators). A two-line addition to ¶5.2 IS a material change. Title it "Expanded Applicability — [new institution types]".
+
+2. **Board / Governance obligations (Paragraph 8.x)** — new topics the board must discuss (liquidity risks tied to cyber, operational disruption impact). Even when the wording change is short, it expands director duties. Title it "Board Oversight — [new topic]".
+
+3. **Authentication mandates (Appendix 3)** — RMiT 2025 explicitly disfavours unencrypted SMS OTPs and mandates transaction-bound dynamic OTPs. ANY change to Appendix 3 paragraphs is material. Open Appendix 3 by name and compare.
+
+4. **Emerging Tech Governance (Section 17 / Appendix 9)** — section was renamed from "Cloud Services" (§15) to "Cloud Services and Emerging Technology" (§17) and Appendix 9 was expanded. The rename + expansion together IS a substantive change — extract it as "Emerging Technologies Governance". Do NOT dismiss this as renumbering only.
+
+5. **Cloud Exit Strategy (Appendix 10, Item 7)** — moved from a vague mention of "termination capabilities" to a mandated, tested exit plan with alternative provider identification. Appendix 10 must be opened and compared in full.
+
+6. **Out-of-Band Communications & Cyber Insurance (Paragraphs 11.15 + 11.17)** — these are TWO distinct paired changes within the Cyber Incident Response chapter. Out-of-band comms infrastructure mandate (¶11.15) and cyber insurance review obligation (¶11.17) should each produce their own change entry — do NOT consolidate them into one "incident response" change.
+
+7. **Stricter quantitative thresholds** — vulnerability assessment frequency, threat report cadence, downtime caps, transition deadlines. These are often single-number changes that read as cosmetic but are operationally material.
+
+## RMiT — STRUCTURAL SWEEP CHECKLIST (run this before finalising):
+For RMiT specifically, you MUST examine each of these sections by name and compare old vs new even if your initial pass found nothing there:
+- Paragraph 5.x (Applicability)
+- Paragraph 8.x (Governance & board)
+- Paragraphs 10.15, 10.20, 10.31, 10.35, 10.41, 10.67, 10.71 (technology risk core)
+- Paragraph 12.8 (digital fraud)
+- Paragraphs 11.15, 11.17, 11.23 (incident response)
+- Section 17 (Emerging Technology — renamed from §15)
+- Appendix 3 (Authentication / MFA / OTP)
+- Appendix 5, Parts D + E (Vulnerability assessment + API security)
+- Appendix 9 (Emerging Technology assurance)
+- Appendix 10 (Cloud Services — exit strategy in Item 7)
+- Appendix 11 (Threat assessment reporting)
+
+## RMiT — Renumbering rule clarification
+The general "renumbering alone is not a change" rule still holds, BUT: when a section is BOTH renumbered AND substantively expanded/restructured (e.g. §15 "Cloud Services" → §17 "Cloud Services and Emerging Technology"), the substantive part IS a material change. Do not let the renumbering trip you into skipping it. Quote both old and new to prove the substantive delta.`;
   }
   if (ctx === "fatf") {
     return `

@@ -1480,3 +1480,170 @@ Return ONLY the JSON array. No commentary.
       affectedDocs: chunkHits.size,
     };
   });
+
+/**
+ * Re-runs a UC1 form-update analysis using the form_id + field_changes stored
+ * in the original report's summary_json. Wipes and replaces all changes/impacts
+ * but keeps the same report row (so the URL stays stable).
+ */
+export const rerunFormUpdateReport = createServerFn({ method: "POST" })
+  .inputValidator(z.object({ reportId: z.string() }))
+  .handler(async ({ data }) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report, error } = await (supabase as any)
+      .from("analysis_reports").select("*").eq("id", data.reportId).single();
+    if (error || !report) throw new Error("Report not found");
+
+    const summary = (report.summary_json ?? {}) as any;
+    if (!summary.uc1_form_update) {
+      throw new Error("This report is not a Form Update — use the regular Re-run instead.");
+    }
+    const formId: string = summary.form_id ?? report.policy_name;
+    const fieldChanges: { label: string; oldValue: string; newValue: string }[] = summary.field_changes ?? [];
+    if (!formId || fieldChanges.length === 0) {
+      throw new Error("Original form-update parameters missing from this report — cannot rerun.");
+    }
+    const workspace = (report.workspace_id as "rmit" | "fatf" | "forms") ?? "forms";
+
+    // Wipe existing changes + impacts
+    await supabase.from("sop_impacts").delete().eq("report_id", report.id);
+    await supabase.from("regulatory_changes").delete().eq("report_id", report.id);
+
+    // Re-run the same engine inline (mirrors createFormUpdateReport logic)
+    const INTERNAL_DOC_TYPES = INTERNAL_DOC_TYPES_CONST as readonly string[];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const chunkHits: Map<string, any[]> = new Map();
+    const searchTerms: string[] = [formId];
+    for (const c of fieldChanges) {
+      const v = c.oldValue.trim();
+      if (v.length >= 4) searchTerms.push(v.slice(0, 100));
+    }
+    for (const term of searchTerms) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const { data: literalHits } = await (supabase as any)
+          .from("sop_chunks")
+          .select("id, sop_id, content, chapter_ref, page_number")
+          .ilike("content", `%${term.replace(/[%_]/g, "")}%`)
+          .limit(200);
+        for (const h of literalHits ?? []) {
+          if (!chunkHits.has(h.sop_id)) chunkHits.set(h.sop_id, []);
+          if (!chunkHits.get(h.sop_id)!.some((x) => x.id === h.id)) chunkHits.get(h.sop_id)!.push(h);
+        }
+      } catch (e: any) {
+        console.warn(`UC1 rerun: literal search failed for "${term.slice(0, 40)}":`, e?.message);
+      }
+    }
+
+    const candidateIds = Array.from(chunkHits.keys());
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: sops } = candidateIds.length > 0 ? await (supabase as any)
+      .from("sop_documents").select("*")
+      .eq("workspace_id", workspace)
+      .in("id", candidateIds)
+      .in("doc_type", INTERNAL_DOC_TYPES)
+      : { data: [] };
+    const sopsById = new Map<string, any>();
+    for (const s of sops ?? []) sopsById.set(s.id, s);
+
+    const allImpacts: any[] = [];
+    for (const [sopId, chunks] of chunkHits.entries()) {
+      const sop = sopsById.get(sopId);
+      if (!sop) continue;
+      const chunkText = chunks.slice(0, 8)
+        .map((c: any) => `[Section: ${c.chapter_ref || "?"} | Page: ${c.page_number || "?"}]\n${c.content}`)
+        .join("\n\n---\n\n");
+
+      const prompt = `
+# ROLE: FORM REFERENCE PROPAGATION ENGINE
+
+A bank form has been updated. Find every occurrence of the OLD values in the SOP chunks below and produce a precise find/replace impact for each.
+
+# FORM: ${formId}
+
+# FIELD CHANGES:
+${fieldChanges.map((c, i) => `Change ${i + 1} — ${c.label}\n  OLD: "${c.oldValue}"\n  NEW: "${c.newValue}"`).join("\n")}
+
+# SOP DOCUMENT: "${sop.title}"
+${chunkText}
+
+# RULES:
+1. For each occurrence: ONE impact with find_text (verbatim surrounding context including OLD value) and replace_text (same context with OLD→NEW).
+2. If multiple OLD values appear in the SAME row/cell: ONE consolidated impact.
+3. If no OLD value found, return [].
+4. NEVER write find_text like "None of the OLD values were found" — that is invalid.
+5. sop_title MUST be exactly "${sop.title}".
+
+# OUTPUT JSON:
+[{ "sop_title": "${sop.title}", "paragraph": "Section ref", "action_description": "headline",
+   "change_type": "find_replace", "chapter": "${formId}",
+   "find_text": "verbatim with OLD value", "replace_text": "same with NEW value",
+   "page": <num or 0>, "line_range": "<estimate or null>" }]
+`;
+      try {
+        const resp = await generateWithFallback({
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          config: { responseMimeType: "application/json", maxOutputTokens: 16384 },
+        });
+        const impacts = JSON.parse(resp.text ?? "[]");
+        if (Array.isArray(impacts)) {
+          for (const imp of impacts) {
+            const ft = String(imp.find_text ?? "").toLowerCase();
+            if (!ft.trim()) continue;
+            if (/none.*old.*values|not found|no occurrences|could not (find|locate)/i.test(ft)) continue;
+            const containsAnOld = fieldChanges.some((c) =>
+              ft.includes(c.oldValue.toLowerCase().trim()) || ft.includes(formId.toLowerCase())
+            );
+            if (!containsAnOld) continue;
+            allImpacts.push({ ...imp, sop_id: sop.id, sop_title: sop.title });
+          }
+        }
+      } catch (e: any) {
+        console.warn(`UC1 rerun: mapping failed for ${sop.title}:`, e?.message);
+      }
+    }
+
+    // Update summary, re-insert changes + impacts
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase as any).from("analysis_reports").update({
+      summary_json: {
+        ...summary,
+        executive: [
+          `Form ${formId} updated with ${fieldChanges.length} field change(s).`,
+          `Found ${allImpacts.length} references across ${chunkHits.size} downstream document(s) requiring update.`,
+          `All edits are mechanical find/replace — no regulatory interpretation needed.`,
+          `Last re-run: ${new Date().toISOString()}`,
+        ],
+        last_rerun_at: new Date().toISOString(),
+      },
+    }).eq("id", report.id);
+
+    await supabase.from("regulatory_changes").insert(
+      fieldChanges.map((c, i) => ({
+        chapter_ref: `${formId} · ${c.label}`,
+        old_requirement: c.oldValue,
+        new_requirement: c.newValue,
+        change_summary: `${c.label} update: "${c.oldValue}" → "${c.newValue}"`,
+        impact: "medium",
+        tone_shift: "Form metadata update — mechanical propagation",
+        pages: "",
+        legal_refs: [],
+        related_instruments: [formId],
+        report_id: report.id,
+        position: i,
+      }))
+    );
+
+    if (allImpacts.length > 0) {
+      await supabase.from("sop_impacts").insert(
+        allImpacts.map((m: any, i: number) => ({ ...m, report_id: report.id, position: i }))
+      );
+    }
+
+    return {
+      reportId: report.id as string,
+      changesCount: fieldChanges.length,
+      impactCount: allImpacts.length,
+      affectedDocs: chunkHits.size,
+    };
+  });

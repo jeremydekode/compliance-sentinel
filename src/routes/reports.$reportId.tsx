@@ -13,7 +13,7 @@ import { useRole } from "@/lib/role";
 import { MD } from "@/components/md";
 import { exportExcel, exportHtmlPresentation } from "@/lib/exports";
 import { impactClasses, formatDate, statusMeta, changeTypeMeta } from "@/lib/format";
-import { updateImpact, rerunReport } from "@/lib/compliance.functions";
+import { updateImpact, rerunReport, rerunFormUpdateReport } from "@/lib/compliance.functions";
 import { cn } from "@/lib/utils";
 import { diffOld, diffNew } from "@/lib/text-diff";
 import {
@@ -45,6 +45,7 @@ function ReportPage() {
   const [rerunning, setRerunning] = useState(false);
   const [registerCollapsed, setRegisterCollapsed] = useState(false);
   const rerun = useServerFn(rerunReport);
+  const rerunForm = useServerFn(rerunFormUpdateReport);
   const qc = useQueryClient();
 
   const report = useQuery({
@@ -181,8 +182,10 @@ function ReportPage() {
     if (!confirm("Re-run the AI analysis on this report?\n\nThis will replace all current changes and SOP impacts with a fresh analysis using the latest prompts and KB documents. Approval decisions on existing impacts will be lost.")) return;
     setRerunning(true);
     try {
-      const result = await rerun({ data: { reportId } });
-      toast.success(`Re-analysis complete: ${result.changesCount} changes, ${result.impactCount} SOP impacts`);
+      const result = isFormUpdate
+        ? await rerunForm({ data: { reportId } })
+        : await rerun({ data: { reportId } });
+      toast.success(`Re-analysis complete: ${result.changesCount} change${result.changesCount !== 1 ? "s" : ""}, ${result.impactCount} edit${result.impactCount !== 1 ? "s" : ""}`);
       qc.invalidateQueries({ queryKey: ["report", reportId] });
       qc.invalidateQueries({ queryKey: ["changes", reportId] });
       qc.invalidateQueries({ queryKey: ["impacts", reportId] });
@@ -227,17 +230,13 @@ function ReportPage() {
             </div>
           </div>
           <div className="flex items-center gap-1.5 shrink-0">
-            {!isFormUpdate && (
-              <>
-                <Button variant="outline" size="sm" disabled={rerunning} className="h-7 text-xs gap-1.5"
-                  onClick={handleRerun}
-                  title="Re-run AI analysis on this report (replaces current changes)">
-                  {rerunning ? <Loader2 className="size-3 animate-spin" /> : <RefreshCw className="size-3" />}
-                  <span className="hidden sm:inline">{rerunning ? "Re-analysing…" : "Re-run"}</span>
-                </Button>
-                <div className="h-4 w-px bg-border mx-0.5" />
-              </>
-            )}
+            <Button variant="outline" size="sm" disabled={rerunning} className="h-7 text-xs gap-1.5"
+              onClick={handleRerun}
+              title={isFormUpdate ? "Re-run form propagation with the latest engine" : "Re-run AI analysis on this report (replaces current changes)"}>
+              {rerunning ? <Loader2 className="size-3 animate-spin" /> : <RefreshCw className="size-3" />}
+              <span className="hidden sm:inline">{rerunning ? "Re-analysing…" : "Re-run"}</span>
+            </Button>
+            <div className="h-4 w-px bg-border mx-0.5" />
             <Button variant="outline" size="sm" disabled={!!exporting} className="h-7 text-xs gap-1.5"
               onClick={() => runExport("html", () => exportHtmlPresentation(report.data, allChanges, allImpacts))}>
               {exporting === "html" ? <Loader2 className="size-3 animate-spin" /> : <Presentation className="size-3" />}

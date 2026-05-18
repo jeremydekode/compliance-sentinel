@@ -13,7 +13,7 @@ import { useRole } from "@/lib/role";
 import { MD } from "@/components/md";
 import { exportExcel, exportHtmlPresentation } from "@/lib/exports";
 import { impactClasses, formatDate, statusMeta, changeTypeMeta } from "@/lib/format";
-import { sortChangesByPriority } from "@/lib/change-utils";
+import { sortChangesByPriority, autoBoldExecBullet } from "@/lib/change-utils";
 import { updateImpact, rerunReport, rerunFormUpdateReport } from "@/lib/compliance.functions";
 import { cn } from "@/lib/utils";
 import { diffOld, diffNew } from "@/lib/text-diff";
@@ -530,7 +530,9 @@ export function ExecutiveSummary({ value }: { value: any }) {
   return (
     <ul className="space-y-1.5 list-disc pl-5 marker:text-primary/60">
       {bullets.map((b, i) => (
-        <li key={i} className="text-sm leading-relaxed">{b.trim()}</li>
+        <li key={i} className="text-sm leading-relaxed">
+          <MD>{autoBoldExecBullet(b.trim())}</MD>
+        </li>
       ))}
     </ul>
   );

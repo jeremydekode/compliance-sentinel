@@ -1257,35 +1257,60 @@ export const createFormUpdateReport = createServerFn({ method: "POST" })
       (data.customTitle ?? "").trim() ||
       `${data.formId} update — ${data.fieldChanges[0].oldValue.slice(0, 20)} → ${data.fieldChanges[0].newValue.slice(0, 20)}`;
 
-    // 1. Vector search for each old value in the workspace KB
+    // 1. Literal text search across KB chunks for the form ID and each OLD value.
+    //    For UC1 (form propagation), we know exactly what strings to look for —
+    //    literal LIKE search is much more reliable than vector embeddings, which
+    //    can miss form references buried in appendix tables.
     const INTERNAL_DOC_TYPES = INTERNAL_DOC_TYPES_CONST as readonly string[];
-
-    // Build query embeddings (one per field change + one combined for the form ID)
-    const queryStrings = [
-      ...data.fieldChanges.map((c) => `${data.formId} ${c.oldValue}`),
-      `${data.formId} ${data.friendlyName ?? ""}`,
-    ];
-
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const chunkHits: Map<string, any[]> = new Map();
-    for (const qs of queryStrings) {
+
+    // Search terms: the form ID itself (highest signal) + each non-trivial OLD value
+    const searchTerms: string[] = [data.formId];
+    for (const c of data.fieldChanges) {
+      const v = c.oldValue.trim();
+      // Skip values too short to be discriminating (e.g. "v10") OR include them
+      // as a secondary anchor; we'll let them through but cap at 100 chars
+      if (v.length >= 4) searchTerms.push(v.slice(0, 100));
+    }
+
+    for (const term of searchTerms) {
       try {
-        const emb = await generateQueryEmbedding(qs);
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const { data: hits } = await (supabase as any).rpc("match_sop_chunks", {
-          query_embedding: emb,
-          match_threshold: 0.15,
-          match_count: 40,
-        });
-        for (const h of hits ?? []) {
+        const { data: literalHits } = await (supabase as any)
+          .from("sop_chunks")
+          .select("id, sop_id, content, chapter_ref, page_number")
+          .ilike("content", `%${term.replace(/[%_]/g, "")}%`)
+          .limit(200);
+        for (const h of literalHits ?? []) {
           if (!chunkHits.has(h.sop_id)) chunkHits.set(h.sop_id, []);
-          // De-dupe by chunk id
           if (!chunkHits.get(h.sop_id)!.some((x) => x.id === h.id)) {
             chunkHits.get(h.sop_id)!.push(h);
           }
         }
       } catch (e: any) {
-        console.warn("UC1 vector search failed:", e?.message);
+        console.warn(`UC1 literal search for "${term.slice(0, 40)}" failed:`, e?.message);
+      }
+    }
+
+    // Secondary fallback: vector search (in case the form is referenced by paraphrase rather than literal ID)
+    if (chunkHits.size === 0) {
+      try {
+        const emb = await generateQueryEmbedding(`${data.formId} ${data.friendlyName ?? ""}`);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const { data: vecHits } = await (supabase as any).rpc("match_sop_chunks", {
+          query_embedding: emb,
+          match_threshold: 0.15,
+          match_count: 40,
+        });
+        for (const h of vecHits ?? []) {
+          if (!chunkHits.has(h.sop_id)) chunkHits.set(h.sop_id, []);
+          if (!chunkHits.get(h.sop_id)!.some((x) => x.id === h.id)) {
+            chunkHits.get(h.sop_id)!.push(h);
+          }
+        }
+      } catch (e: any) {
+        console.warn("UC1 vector fallback failed:", e?.message);
       }
     }
 
@@ -1334,14 +1359,15 @@ The relevant text chunks (from vector search) are below. Find every occurrence o
 
 ${chunkText}
 
-# RULES:
+# ❗ CRITICAL RULES (read every one):
 1. For each occurrence: produce ONE impact entry with find_text containing 1-3 lines of verbatim surrounding context including the OLD value, and replace_text containing the same context with the OLD value swapped for the NEW value.
 2. If multiple OLD values appear in the SAME paragraph/cell/row, produce ONE consolidated impact for that row — not separate impacts per field. Update all OLD→NEW in one find_text/replace_text pair.
 3. Use the chunk's "Section" and "Page" metadata for paragraph and page fields.
-4. The action_description should be a concise headline like "Update form reference in [section context]" or "Update Form Name + Version + Date in Forms Reference Table".
+4. The action_description should be a concise headline like "Update form reference in Forms Appendix Table" or "Update form ID + version in Forms Reference Table".
 5. change_type = "find_replace" for all UC1 impacts (we are NEVER inserting new content, only swapping references).
 6. sop_title MUST be exactly "${sop.title}".
-7. Do NOT invent edits — only propose them where you can clearly see the OLD value in the chunks.
+7. **If no OLD value is clearly present in any chunk, return an empty array \`[]\`. Do NOT invent placeholder impacts. Do NOT write find_text values like "None of the OLD values were found" — that is NEVER a valid impact, return [] instead.**
+8. find_text must contain at least one of the OLD values verbatim. If it doesn't, omit that impact entirely.
 
 # OUTPUT JSON ARRAY of impacts (same schema as regulatory analysis):
 [{
@@ -1368,6 +1394,23 @@ Return ONLY the JSON array. No commentary.
         const impacts = JSON.parse(text);
         if (Array.isArray(impacts)) {
           for (const imp of impacts) {
+            // Validate: find_text must contain at least one OLD value verbatim.
+            // Otherwise the AI hallucinated — discard.
+            const ft = String(imp.find_text ?? "").toLowerCase();
+            if (!ft.trim()) continue;
+            // Reject obvious AI excuses
+            if (/none.*old.*values|not found|no occurrences|could not (find|locate)/i.test(ft)) {
+              console.log(`  - [${sop.title}] discarded AI excuse impact: "${ft.slice(0, 60)}"`);
+              continue;
+            }
+            const containsAnOld = data.fieldChanges.some((c) =>
+              ft.includes(c.oldValue.toLowerCase().trim()) ||
+              ft.includes(data.formId.toLowerCase())
+            );
+            if (!containsAnOld) {
+              console.log(`  - [${sop.title}] discarded impact with no OLD value in find_text`);
+              continue;
+            }
             allImpacts.push({ ...imp, sop_id: sop.id, sop_title: sop.title });
           }
         }

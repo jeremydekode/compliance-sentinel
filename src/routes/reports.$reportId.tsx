@@ -13,6 +13,7 @@ import { useRole } from "@/lib/role";
 import { MD } from "@/components/md";
 import { exportExcel, exportHtmlPresentation } from "@/lib/exports";
 import { impactClasses, formatDate, statusMeta, changeTypeMeta } from "@/lib/format";
+import { sortChangesByPriority } from "@/lib/change-utils";
 import { updateImpact, rerunReport, rerunFormUpdateReport } from "@/lib/compliance.functions";
 import { cn } from "@/lib/utils";
 import { diffOld, diffNew } from "@/lib/text-diff";
@@ -144,6 +145,9 @@ function ReportPage() {
       return ic === target || target.includes(ic) || ic.includes(target);
     });
   };
+
+  // Priority-sorted change list used by the side panel
+  const sortedChanges = sortChangesByPriority(allChanges, impactsForChange);
 
   // Approval rollup per change — used for status pill on each register tile
   function changeStatusRollup(chapter_ref: string) {
@@ -399,7 +403,7 @@ function ReportPage() {
                 ) : allChanges.length === 0 ? (
                   <div className="px-4 py-8 text-center text-xs text-muted-foreground italic">No changes extracted.</div>
                 ) : (
-                  allChanges.map(c => {
+                  sortedChanges.map(c => {
                     const isSelected = selectedId === c.id;
                     const isNew = !c.old_requirement || (c.old_requirement as string).toLowerCase().startsWith("n/a");
                     const roll = changeStatusRollup(c.chapter_ref);

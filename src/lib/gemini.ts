@@ -1,4 +1,5 @@
 import { GoogleGenAI } from "@google/genai";
+import { extractPdfPages, pagesToMarkedText } from "./pdf-pages";
 
 const ai = new GoogleGenAI({ apiKey: process.env.GOOGLE_GENERATIVE_AI_API_KEY || "" });
 
@@ -316,6 +317,22 @@ There is NO upper limit on the number of changes you may return. List every mate
 export async function chunkDocument(
   doc: { name: string; buffer: Buffer; mimeType: string }
 ): Promise<Array<{ content: string; chapter_ref?: string; page_number?: number }>> {
+  const isPdf = doc.mimeType === "application/pdf" || /\.pdf$/i.test(doc.name);
+
+  // For PDFs: extract real page boundaries first so the chunker can use them as
+  // ground truth instead of guessing page numbers from layout cues.
+  let pdfPagesText: string | null = null;
+  if (isPdf) {
+    try {
+      const pages = await extractPdfPages(doc.buffer);
+      if (pages.length > 0 && pages.some((p) => p.text.length > 0)) {
+        pdfPagesText = pagesToMarkedText(pages);
+      }
+    } catch (e) {
+      console.warn(`PDF page extraction failed for ${doc.name}, falling back to AI page guessing:`, (e as Error)?.message);
+    }
+  }
+
   const prompt = `
 # ROLE: DOCUMENT PARSER & SEMANTIC CHUNKER
 
@@ -327,6 +344,9 @@ Extract the FULL text of this compliance document and split it into semantic chu
 - Preserve the exact Chapter/Section reference and Page Number for every chunk.
 - Include the complete text of each unit — do not truncate or summarise.
 
+${pdfPagesText ? `# PAGE NUMBERS — STRICT RULE:
+The document text below has been pre-segmented with explicit page markers of the form "=== PAGE N ===". These markers are the GROUND TRUTH for page numbers. For every chunk, page_number MUST be the number from the most recent "=== PAGE N ===" marker that precedes the chunk's text. Do NOT guess — use the markers verbatim. If a chunk spans a page boundary, use the page where it starts.` : ""}
+
 # OUTPUT FORMAT (JSON Array):
 [{
   "content": "Full verbatim text of the chunk",
@@ -335,14 +355,15 @@ Extract the FULL text of this compliance document and split it into semantic chu
 }]
   `;
 
+  const parts: any[] = [{ text: prompt }];
+  if (pdfPagesText) {
+    parts.push({ text: `\n--- DOCUMENT TEXT (page-tagged) ---\n${pdfPagesText}\n--- END DOCUMENT ---` });
+  } else {
+    parts.push({ inlineData: { data: doc.buffer.toString("base64"), mimeType: doc.mimeType } });
+  }
+
   const response = await generateWithFallback({
-    contents: [{
-      role: "user",
-      parts: [
-        { text: prompt },
-        { inlineData: { data: doc.buffer.toString("base64"), mimeType: doc.mimeType } },
-      ],
-    }],
+    contents: [{ role: "user", parts }],
     config: { responseMimeType: "application/json" },
   });
 

@@ -4,28 +4,50 @@ type ImpactLevel = "high" | "medium" | "low" | string;
 
 /**
  * Sort changes for the report views:
- *   1. Matched (≥1 affected SOP) first, unmatched last
- *   2. Within each group: HIGH → MEDIUM → LOW
- *   3. Within each tier: most affected SOPs first
- *
- * Stable within ties so the AI-emitted position order acts as the final tiebreak.
+ *   1. Has matched SOP in KB first, unmatched last (deprioritise no-SOP cards)
+ *   2. Within matched: modifications (has old text) before new obligations
+ *      (the user-asked "prioritise non-NEW tags first")
+ *   3. Within each of those groups: HIGH → MEDIUM → LOW
+ *   4. Within each tier: most affected SOPs first
+ *   5. Final stable tiebreak: original AI position
  */
-export function sortChangesByPriority<T extends { chapter_ref?: string | null; impact?: ImpactLevel }>(
+function isNewObligation(oldText?: string | null): boolean {
+  const s = (oldText ?? "").trim().toLowerCase();
+  return !s || s.includes("n/a") || s.includes("new requirement") || s.includes("no prior") || s === "none";
+}
+
+export function sortChangesByPriority<T extends {
+  chapter_ref?: string | null;
+  impact?: ImpactLevel;
+  old_requirement?: string | null;
+}>(
   changes: T[],
   impactsForChapter: (ref: string) => unknown[]
 ): T[] {
   const tier = (i?: ImpactLevel): number =>
     i === "high" ? 0 : i === "medium" ? 1 : i === "low" ? 2 : 3;
   return [...changes]
-    .map((c, i) => ({ c, i, count: impactsForChapter(c.chapter_ref ?? "").length }))
+    .map((c, i) => ({
+      c, i,
+      count: impactsForChapter(c.chapter_ref ?? "").length,
+      isNew: isNewObligation(c.old_requirement),
+    }))
     .sort((a, b) => {
+      // 1. Matched-SOP first
       const aMatched = a.count > 0 ? 0 : 1;
       const bMatched = b.count > 0 ? 0 : 1;
       if (aMatched !== bMatched) return aMatched - bMatched;
+      // 2. Modifications before new obligations
+      const aNew = a.isNew ? 1 : 0;
+      const bNew = b.isNew ? 1 : 0;
+      if (aNew !== bNew) return aNew - bNew;
+      // 3. Impact tier
       const t = tier(a.c.impact) - tier(b.c.impact);
       if (t !== 0) return t;
+      // 4. SOP count desc
       const cnt = b.count - a.count;
       if (cnt !== 0) return cnt;
+      // 5. Original position
       return a.i - b.i;
     })
     .map((x) => x.c);

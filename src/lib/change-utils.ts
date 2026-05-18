@@ -26,14 +26,19 @@ export function sortChangesByPriority<T extends {
 ): T[] {
   const tier = (i?: ImpactLevel): number =>
     i === "high" ? 0 : i === "medium" ? 1 : i === "low" ? 2 : 3;
+  // Only impacts that actually reference a KB document (sop_id present) count
+  // as "matched" — impacts with sop_id=null are placeholders for "no SOP found"
+  // and should NOT promote the card into the matched tier.
+  const matchedCount = (ref: string): number =>
+    impactsForChapter(ref).filter((imp: any) => !!imp?.sop_id).length;
   return [...changes]
     .map((c, i) => ({
       c, i,
-      count: impactsForChapter(c.chapter_ref ?? "").length,
+      count: matchedCount(c.chapter_ref ?? ""),
       isNew: isNewObligation(c.old_requirement),
     }))
     .sort((a, b) => {
-      // 1. Matched-SOP first
+      // 1. Matched-SOP first (sop_id must be non-null)
       const aMatched = a.count > 0 ? 0 : 1;
       const bMatched = b.count > 0 ? 0 : 1;
       if (aMatched !== bMatched) return aMatched - bMatched;

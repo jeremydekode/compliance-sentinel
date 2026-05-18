@@ -3,21 +3,32 @@ import { extractPdfPages, pagesToMarkedText } from "./pdf-pages";
 
 const ai = new GoogleGenAI({ apiKey: process.env.GOOGLE_GENERATIVE_AI_API_KEY || "" });
 
-// Fallback chain: try each model in order until one succeeds.
-// Pro-primary for higher accuracy on UC1 find/replace + RMiT/FATF analysis.
-// Falls back to flash-lite (fast) then older flash variants on quota/capacity errors.
-const MODEL_FALLBACKS = [
-  "gemini-3.1-pro",
-  "gemini-3.1-flash-lite",
-  "gemini-2.5-flash",
-  "gemini-2.0-flash",
-];
+// Two fallback chains keyed by call tier.
+//
+//  - "quality" (default): Pro-primary. Use for high-stakes reasoning:
+//    UC1 find/replace, RMiT/FATF regulatory delta extraction + SOP mapping,
+//    amended-document HTML generation.
+//  - "fast": flash-lite-primary. Use for high-volume / low-stakes work:
+//    chunking every doc at indexing time, extracting form header fields,
+//    one-liner summaries.
+//
+// Both chains fall through older flash variants on quota / capacity errors.
+const FALLBACK_CHAINS = {
+  quality: ["gemini-3.1-pro", "gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash"],
+  fast:    ["gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash"],
+} as const;
+
+export type ModelTier = keyof typeof FALLBACK_CHAINS;
 
 type GenerateParams = Omit<Parameters<typeof ai.models.generateContent>[0], "model">;
 
-export async function generateWithFallback(params: GenerateParams): Promise<Awaited<ReturnType<typeof ai.models.generateContent>>> {
+export async function generateWithFallback(
+  params: GenerateParams,
+  opts?: { tier?: ModelTier }
+): Promise<Awaited<ReturnType<typeof ai.models.generateContent>>> {
+  const models = FALLBACK_CHAINS[opts?.tier ?? "quality"];
   let lastError: unknown;
-  for (const model of MODEL_FALLBACKS) {
+  for (const model of models) {
     try {
       return await ai.models.generateContent({ ...params, model });
     } catch (e: any) {
@@ -365,10 +376,11 @@ The document text below has been pre-segmented with explicit page markers of the
     parts.push({ inlineData: { data: doc.buffer.toString("base64"), mimeType: doc.mimeType } });
   }
 
+  // chunkDocument: high-volume / low-stakes parsing — use the fast tier.
   const response = await generateWithFallback({
     contents: [{ role: "user", parts }],
     config: { responseMimeType: "application/json" },
-  });
+  }, { tier: "fast" });
 
   const text = response.text ?? "";
   try {
@@ -560,10 +572,11 @@ OUTPUT JSON:
 }
   `;
 
+  // Exec summary bullets — fast tier is plenty.
   const summaryResponse = await generateWithFallback({
     contents: [{ role: "user", parts: [{ text: summaryPrompt }] }],
     config: { responseMimeType: "application/json" },
-  });
+  }, { tier: "fast" });
 
   const summary = JSON.parse(summaryResponse.text ?? "{}");
   return { changes, impacts: allImpacts, summary };
@@ -595,10 +608,11 @@ OUTPUT JSON:
   "structural": { "added": [], "renamed": [], "restructured": [] }
 }
   `;
+  // Standalone summary generator — fast tier.
   const response = await generateWithFallback({
     contents: [{ role: "user", parts: [{ text: summaryPrompt }] }],
     config: { responseMimeType: "application/json" },
-  });
+  }, { tier: "fast" });
   return JSON.parse(response.text ?? "{}") as AnalysisResult["summary"];
 }
 

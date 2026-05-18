@@ -1277,13 +1277,14 @@ Use null for any field you cannot find.`;
         };
       }
 
+      // Header-field extraction is a simple parse — fast tier is plenty.
       const resp = await generateWithFallback({
         contents: [{
           role: "user",
           parts: [contentPart, { text: prompt }],
         }],
         config: { responseMimeType: "application/json", maxOutputTokens: 512 },
-      });
+      }, { tier: "fast" });
       const parsed = JSON.parse(resp.text ?? "{}");
       return {
         formName: (parsed.form_name as string) ?? null,

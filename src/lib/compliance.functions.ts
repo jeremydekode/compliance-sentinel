@@ -1234,6 +1234,48 @@ export const reindexSop = createServerFn({ method: "POST" })
     return { chunkCount: chunks.length, message: `Indexed ${chunks.length} chunks` };
   });
 
+// ── UC1: Form Metadata Extraction ────────────────────────────────────────────
+// Extracts form name, number, and updated date from an uploaded PDF/DOCX.
+// Used to auto-populate the Form Update dialog before the user fills in changes.
+export const extractFormMetadata = createServerFn({ method: "POST" })
+  .inputValidator(z.object({
+    fileBase64: z.string(),
+    mimeType: z.string().default("application/pdf"),
+  }))
+  .handler(async ({ data }) => {
+    const prompt = `You are extracting specific header fields from a bank form PDF.
+Look in the top-right corner header area and the main title area of the document.
+
+Extract these three fields exactly as they appear:
+1. form_name — the main form title in UPPERCASE (e.g. "ACCOUNT OPENING APPLICATION FORM – COMMERCIAL / CORPORATE")
+2. form_number — full reference number with version suffix (e.g. "FGROP 037/2016_v10")
+3. updated_date — the updated/effective date string verbatim (e.g. "Updated on 27.02.2025")
+
+Return ONLY valid JSON: {"form_name": "...", "form_number": "...", "updated_date": "..."}
+Use null for any field you cannot find.`;
+
+    try {
+      const resp = await generateWithFallback({
+        contents: [{
+          role: "user",
+          parts: [
+            { inlineData: { data: data.fileBase64, mimeType: data.mimeType } },
+            { text: prompt },
+          ],
+        }],
+        config: { responseMimeType: "application/json", maxOutputTokens: 512 },
+      });
+      const parsed = JSON.parse(resp.text ?? "{}");
+      return {
+        formName: (parsed.form_name as string) ?? null,
+        formNumber: (parsed.form_number as string) ?? null,
+        updatedDate: (parsed.updated_date as string) ?? null,
+      };
+    } catch {
+      return { formName: null, formNumber: null, updatedDate: null };
+    }
+  });
+
 // ── UC1: Form/Template Update Flow ───────────────────────────────────────────
 // Propagates form metadata changes (name, version, date, etc.) across all
 // downstream documents in the KB that reference the form.
@@ -1362,24 +1404,65 @@ ${chunkText}
 # ❗ CRITICAL RULES (read every one):
 1. For each occurrence: produce ONE impact entry with find_text containing 1-3 lines of verbatim surrounding context including the OLD value, and replace_text containing the same context with the OLD value swapped for the NEW value.
 2. If multiple OLD values appear in the SAME paragraph/cell/row, produce ONE consolidated impact for that row — not separate impacts per field. Update all OLD→NEW in one find_text/replace_text pair.
-3. Use the chunk's "Section" and "Page" metadata for paragraph and page fields.
-4. The action_description should be a concise headline like "Update form reference in Forms Appendix Table" or "Update form ID + version in Forms Reference Table".
-5. change_type = "find_replace" for all UC1 impacts (we are NEVER inserting new content, only swapping references).
-6. sop_title MUST be exactly "${sop.title}".
-7. **If no OLD value is clearly present in any chunk, return an empty array \`[]\`. Do NOT invent placeholder impacts. Do NOT write find_text values like "None of the OLD values were found" — that is NEVER a valid impact, return [] instead.**
-8. find_text must contain at least one of the OLD values verbatim. If it doesn't, omit that impact entirely.
+3. change_type = "find_replace" for all UC1 impacts (we are NEVER inserting new content, only swapping references).
+4. sop_title MUST be exactly "${sop.title}".
+5. **If no OLD value is clearly present in any chunk, return an empty array \`[]\`. Do NOT invent placeholder impacts. Do NOT write find_text values like "None of the OLD values were found" — that is NEVER a valid impact, return [] instead.**
+6. find_text must contain at least one of the OLD values verbatim. If it doesn't, omit that impact entirely.
 
-# OUTPUT JSON ARRAY of impacts (same schema as regulatory analysis):
+# FIELD INSTRUCTIONS — fill these precisely for every impact:
+- paragraph: The table or section TYPE verbatim, e.g. "Forms Reference Table", "Forms Appendix Table", "Forms / Templates Table", "TABLE OF CONTENTS · Chapter 12", "Section 12.2 Body Text · Purpose paragraph". Use the chunk's Section metadata as the primary source.
+- action_description: The specific cell or column being changed, e.g. "Form name + version cell", "Row 10 — Form name + ref columns", "TOC entry for section 12.2", "Section heading title". Be specific.
+- line_range: Estimate from the chunk content. Format "~N" (single line) or "~N–M" (range). Use the chunk's position in the document to estimate. Never null if the chunk gives positional context.
+- page: Page number from the chunk's Page metadata. Use 0 if not available.
+- warning: Set ONLY when the version found in find_text is two or more versions behind the new value being applied (version skip). Explain the skip, e.g. "Doc is on v9.0 — was on FGROP v9 (missed the v9→v10 cycle). Apply v9→v11 in one go." Otherwise set to null.
+
+# GROUNDING EXAMPLES — outputs must match this format and level of detail:
+
+Example A — Forms Reference Table (version skip):
+{
+  "paragraph": "Forms Reference Table",
+  "action_description": "Form name + version cell",
+  "line_range": "~3723–3724",
+  "page": 186,
+  "warning": "Doc is on v9.0 — was on FGROP v9 (missed the v9→v10 cycle). Apply v9→v11 in one go.",
+  "find_text": "Account Opening Application Form\\n– Commercial /Corporate        FGROP 037/2016\\n                               (Version 9.0 Updated\\n                               08.06.2023)",
+  "replace_text": "Account Opening Application Form\\n– Commercial /Corporate/\\n  Family Office (Dummy Form)     FGROP 037/2016\\n                               (Version 11.0 Updated\\n                               27.05.2026)"
+}
+
+Example B — Forms Appendix Table (no version skip):
+{
+  "paragraph": "Forms Appendix Table",
+  "action_description": "Row 10 — Form name + ref columns",
+  "line_range": "~1948–1950",
+  "page": 98,
+  "warning": null,
+  "find_text": "Account Opening Application    Form – FGROP 037/2016\\nCommercial / Corporate                (Version 10, updated\\n                               27.02.2025)",
+  "replace_text": "Account Opening Application    Form – FGROP 037/2016\\nCommercial / Corporate/               (Version 11, updated\\nFamily Office (Dummy Form)     27.05.2026)"
+}
+
+Example C — TABLE OF CONTENTS entry:
+{
+  "paragraph": "TABLE OF CONTENTS · Chapter 12",
+  "action_description": "TOC entry for section 12.2",
+  "line_range": "~16638",
+  "page": 3,
+  "warning": null,
+  "find_text": "12.2. ACCOUNT OPENING APPLICATION FORM – PERSONAL / COMMERCIAL/CORPORATE . 12-2",
+  "replace_text": "12.2. ACCOUNT OPENING APPLICATION FORM – PERSONAL / COMMERCIAL/CORPORATE/ FAMILY OFFICE (DUMMY FORM) . 12-2"
+}
+
+# OUTPUT JSON ARRAY of impacts:
 [{
   "sop_title": "${sop.title}",
-  "paragraph": "Section reference from the chunk metadata",
-  "action_description": "One-line headline describing the edit",
+  "paragraph": "<table or section type>",
+  "action_description": "<specific cell/column description>",
   "change_type": "find_replace",
   "chapter": "${data.formId}",
   "find_text": "Verbatim text containing OLD value(s) with 1-3 lines of context",
   "replace_text": "Same context with OLD value(s) swapped for NEW",
   "page": <page number from chunk metadata or 0>,
-  "line_range": "<line range estimate or null>"
+  "line_range": "<~N or ~N–M estimate>",
+  "warning": "<version skip explanation or null>"
 }]
 
 Return ONLY the JSON array. No commentary.
@@ -1574,11 +1657,28 @@ ${chunkText}
 4. NEVER write find_text like "None of the OLD values were found" — that is invalid.
 5. sop_title MUST be exactly "${sop.title}".
 
+# FIELD INSTRUCTIONS:
+- paragraph: Table or section TYPE, e.g. "Forms Reference Table", "Forms Appendix Table", "TABLE OF CONTENTS · Chapter 12". Use the chunk's Section metadata.
+- action_description: Specific cell/column, e.g. "Form name + version cell", "Row 10 — Form name + ref columns", "TOC entry for section 12.2".
+- line_range: Estimate from chunk position. Format "~N" or "~N–M". Never null if position is derivable.
+- page: From chunk Page metadata, or 0.
+- warning: Set only if the version in find_text is two or more versions behind the new value (version skip). Explain the skip explicitly. Otherwise null.
+
+# GROUNDING EXAMPLES:
+Example A — Forms Reference Table (version skip):
+{ "paragraph": "Forms Reference Table", "action_description": "Form name + version cell", "line_range": "~3723–3724", "page": 186, "warning": "Doc is on v9.0 — was on FGROP v9 (missed the v9→v10 cycle). Apply v9→v11 in one go." }
+
+Example B — Forms Appendix Table:
+{ "paragraph": "Forms Appendix Table", "action_description": "Row 10 — Form name + ref columns", "line_range": "~1948–1950", "page": 98, "warning": null }
+
+Example C — TABLE OF CONTENTS:
+{ "paragraph": "TABLE OF CONTENTS · Chapter 12", "action_description": "TOC entry for section 12.2", "line_range": "~16638", "page": 3, "warning": null }
+
 # OUTPUT JSON:
-[{ "sop_title": "${sop.title}", "paragraph": "Section ref", "action_description": "headline",
+[{ "sop_title": "${sop.title}", "paragraph": "<table/section type>", "action_description": "<cell/column description>",
    "change_type": "find_replace", "chapter": "${formId}",
    "find_text": "verbatim with OLD value", "replace_text": "same with NEW value",
-   "page": <num or 0>, "line_range": "<estimate or null>" }]
+   "page": <num or 0>, "line_range": "<~N or ~N–M>", "warning": "<version skip explanation or null>" }]
 `;
       try {
         const resp = await generateWithFallback({

@@ -944,18 +944,36 @@ function ImpactCard({
               </span>
             )}
           </div>
-          {/* Row 2: location (line / page / section) */}
-          {(imp.line_range || imp.paragraph || (imp.page && imp.page > 0)) && (
-            <div className="text-[11px] text-muted-foreground font-mono flex items-center gap-1.5 flex-wrap">
-              {imp.line_range && <span className="text-primary/80">Line {imp.line_range}</span>}
-              {imp.page > 0 && <span className="text-muted-foreground/60">· Page {imp.page}</span>}
-              {imp.paragraph && <span className="text-muted-foreground/70">· {imp.paragraph}</span>}
+          {/* Row 2: location badges (line / page / section / cell description) */}
+          {(imp.line_range || imp.page > 0 || imp.paragraph || imp.action_description) && (
+            <div className="flex items-center gap-1.5 flex-wrap">
+              {imp.line_range && (
+                <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-mono font-medium bg-primary/10 text-primary border border-primary/20">
+                  Line {imp.line_range}
+                </span>
+              )}
+              {imp.page > 0 && (
+                <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium bg-muted text-muted-foreground border border-border">
+                  Page {imp.page}
+                </span>
+              )}
+              {imp.paragraph && (
+                <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium bg-muted text-muted-foreground border border-border">
+                  {imp.paragraph}
+                </span>
+              )}
+              {imp.action_description && (
+                <span className="text-[10px] text-muted-foreground/70">
+                  {imp.action_description}
+                </span>
+              )}
             </div>
           )}
-          {/* Row 3: action description headline (the "what to do" line) */}
-          {imp.action_description && (
-            <div className="text-xs font-semibold text-foreground leading-snug pt-1">
-              {imp.action_description}
+          {/* Row 3: version-skip or other warning */}
+          {imp.warning && (
+            <div className="flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 px-3 py-2 text-[11px] text-amber-800 dark:text-amber-300">
+              <span className="mt-0.5 shrink-0">⚠</span>
+              <span>{imp.warning}</span>
             </div>
           )}
         </div>
@@ -1193,6 +1211,20 @@ function DocAmendmentPanel({
               <span className="text-[10px] font-semibold text-muted-foreground">{docGroup.impacts.length} edit{docGroup.impacts.length !== 1 ? "s" : ""}</span>
             </div>
 
+            {docGroup.impacts.length > 1 && (() => {
+              const hasToc = docGroup.impacts.some(
+                (i: any) => i.paragraph?.includes("TABLE OF CONTENTS") || i.action_description?.toLowerCase().includes("toc")
+              );
+              return (
+                <div className="flex items-start gap-2 rounded-md border border-blue-200 bg-blue-50 dark:bg-blue-950/20 dark:border-blue-800 px-3 py-2 text-[11px] text-blue-800 dark:text-blue-300 mb-3">
+                  <span className="mt-0.5 shrink-0">ℹ</span>
+                  <span>
+                    This document has {docGroup.impacts.length} separate change points.
+                    {hasToc && " Locations including TOC and section heading entries are content/TOC page changes — confirm all are updated."}
+                  </span>
+                </div>
+              );
+            })()}
             <div className="space-y-3">
               {docGroup.impacts.map((imp: any) => (
                 <ImpactCard key={imp.id} imp={imp} sopDoc={sopDoc} onSetStatus={setImpactStatus} />

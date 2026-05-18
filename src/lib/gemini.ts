@@ -474,13 +474,40 @@ Use the document title EXACTLY as it appears in the "--- INTERNAL DOCUMENT" head
   `;
 
   const parts: any[] = [{ text: prompt }];
+  let anyPdfWithPageMarkers = false;
   for (const sop of sops) {
     if ("buffer" in sop) {
-      parts.push({ text: `\n--- INTERNAL DOCUMENT: "${sop.title}" ---` });
-      parts.push({ inlineData: { data: sop.buffer.toString("base64"), mimeType: sop.mimeType } });
+      const isPdf = sop.mimeType === "application/pdf" || /\.pdf$/i.test(sop.title);
+      // For PDFs: try to send page-tagged text (pdf-parse) so the model has
+      // ground-truth page numbers. Fall back to binary inline data if extraction
+      // fails — analysis must not regress.
+      let pageTagged: string | null = null;
+      if (isPdf) {
+        try {
+          const pages = await extractPdfPages(sop.buffer);
+          if (pages.length > 0 && pages.some((p) => p.text.length > 0)) {
+            pageTagged = pagesToMarkedText(pages);
+          }
+        } catch (e) {
+          console.warn(`[mapChangeToSops] page extraction failed for ${sop.title}, falling back to binary:`, (e as Error)?.message);
+        }
+      }
+      if (pageTagged) {
+        anyPdfWithPageMarkers = true;
+        parts.push({ text: `\n--- INTERNAL DOCUMENT: "${sop.title}" (page-tagged text) ---\n${pageTagged}\n--- END ---` });
+      } else {
+        parts.push({ text: `\n--- INTERNAL DOCUMENT: "${sop.title}" ---` });
+        parts.push({ inlineData: { data: sop.buffer.toString("base64"), mimeType: sop.mimeType } });
+      }
     } else {
       parts.push({ text: `\n--- INTERNAL DOCUMENT: "${sop.title}" ---\n${sop.text}` });
     }
+  }
+
+  if (anyPdfWithPageMarkers) {
+    parts.unshift({
+      text: `\n# PAGE NUMBER RULE (PDF documents below):\nFor any internal document marked "(page-tagged text)", the lines "=== PAGE N ===" are GROUND TRUTH page boundaries. When emitting an impact's "page" field, you MUST use the number from the most recent "=== PAGE N ===" marker that precedes the find_text. Do NOT guess — use the markers.`,
+    });
   }
 
   const response = await generateWithFallback({

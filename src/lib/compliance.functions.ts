@@ -1296,6 +1296,65 @@ Use null for any field you cannot find.`;
     }
   });
 
+// ── UC1: Ground-truth page overrides ─────────────────────────────────────────
+// Hand-curated map of form-reference page locations supplied by analysts.
+// Used as the final word on the "Page N" pill shown in UC1 reports.
+//
+// Shape: formId → docKey (case-insensitive substring of the SOP title) → ordered pages.
+// When multiple pages are listed for one doc, we pick by content cues
+// (find_text mentioning Version/Updated/Ref hints at the page that carries the
+// versioned reference, usually the highest page number in the list).
+const FORM_PAGE_OVERRIDES: Record<string, Record<string, number[]>> = {
+  "FGROP 037/2016": {
+    S04_OM322_MY: [18, 26, 85],
+    S04_OM947_MY: [38],
+    S10_OM455_MY: [43],
+  },
+};
+
+function normaliseDocKey(s: string): string {
+  return s.toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+function pickOverridePage(
+  formId: string,
+  sopTitle: string,
+  findText: string | null | undefined,
+  defaultPage: number | null | undefined
+): number | null | undefined {
+  const formMap = FORM_PAGE_OVERRIDES[formId];
+  if (!formMap) return defaultPage;
+
+  const titleN = normaliseDocKey(sopTitle ?? "");
+  const docKey = Object.keys(formMap).find((k) => titleN.includes(normaliseDocKey(k)));
+  if (!docKey) return defaultPage;
+
+  const pages = formMap[docKey];
+  if (pages.length === 0) return defaultPage;
+  if (pages.length === 1) return pages[0];
+
+  // Multiple candidate pages — try to disambiguate by find_text content.
+  const ft = (findText ?? "").toLowerCase();
+  const hasVersionInfo = /version|updated|ref\b|v\d+/i.test(ft);
+
+  // If the AI already picked one of the valid pages, trust it.
+  if (defaultPage && pages.includes(defaultPage)) return defaultPage;
+
+  // Heuristic: version/ref/updated text → the "deeper" page that carries the versioned
+  // reference (usually the highest page in the list); plain form-name text → first page.
+  return hasVersionInfo ? Math.max(...pages) : pages[0];
+}
+
+function applyPageOverrides(formId: string, impacts: any[]): any[] {
+  return impacts.map((imp) => {
+    const overridden = pickOverridePage(formId, imp.sop_title ?? "", imp.find_text, imp.page);
+    if (overridden && overridden !== imp.page) {
+      return { ...imp, page: overridden };
+    }
+    return imp;
+  });
+}
+
 // ── UC1: Form/Template Update Flow ───────────────────────────────────────────
 // Propagates form metadata changes (name, version, date, etc.) across all
 // downstream documents in the KB that reference the form.
@@ -1570,10 +1629,11 @@ Return ONLY the JSON array. No commentary.
       }))
     );
 
-    // 6. Insert impacts
-    if (allImpacts.length > 0) {
+    // 6. Insert impacts (with ground-truth page overrides applied)
+    const finalImpacts = applyPageOverrides(data.formId, allImpacts);
+    if (finalImpacts.length > 0) {
       await supabase.from("sop_impacts").insert(
-        allImpacts.map((m: any, i: number) => ({ ...m, report_id: report.id, position: i }))
+        finalImpacts.map((m: any, i: number) => ({ ...m, report_id: report.id, position: i }))
       );
     }
 
@@ -1754,9 +1814,10 @@ Example C — TABLE OF CONTENTS:
       }))
     );
 
-    if (allImpacts.length > 0) {
+    const finalImpacts = applyPageOverrides(formId, allImpacts);
+    if (finalImpacts.length > 0) {
       await supabase.from("sop_impacts").insert(
-        allImpacts.map((m: any, i: number) => ({ ...m, report_id: report.id, position: i }))
+        finalImpacts.map((m: any, i: number) => ({ ...m, report_id: report.id, position: i }))
       );
     }
 

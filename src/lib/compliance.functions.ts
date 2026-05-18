@@ -1309,6 +1309,9 @@ const FORM_PAGE_OVERRIDES: Record<string, Record<string, number[]>> = {
     S04_OM322_MY: [18, 26, 85],
     S04_OM947_MY: [38],
     S10_OM455_MY: [43],
+    S10_OM537_MY: [93],
+    S16_OM821_MY: [86],
+    S16_SM373_MY: [55, 453, 454],
   },
 };
 
@@ -1333,15 +1336,22 @@ function pickOverridePage(
   if (pages.length === 0) return defaultPage;
   if (pages.length === 1) return pages[0];
 
-  // Multiple candidate pages — try to disambiguate by find_text content.
-  const ft = (findText ?? "").toLowerCase();
-  const hasVersionInfo = /version|updated|ref\b|v\d+/i.test(ft);
+  // Multiple candidate pages — try to disambiguate.
 
-  // If the AI already picked one of the valid pages, trust it.
+  // 1. If the AI already picked one of the valid pages, trust it.
   if (defaultPage && pages.includes(defaultPage)) return defaultPage;
 
-  // Heuristic: version/ref/updated text → the "deeper" page that carries the versioned
-  // reference (usually the highest page in the list); plain form-name text → first page.
+  // 2. If the AI's guess is within ±10 of any valid page, snap to the closest one.
+  //    This exploits the chunker's positional sense even when its page number is off by a few.
+  if (defaultPage && defaultPage > 0) {
+    const closest = pages.reduce((best, p) =>
+      Math.abs(p - defaultPage) < Math.abs(best - defaultPage) ? p : best
+    );
+    if (Math.abs(closest - defaultPage) <= 10) return closest;
+  }
+
+  // 3. Fallback by content cue: versioned reference text → highest page; plain form-name text → first page.
+  const hasVersionInfo = /version|updated|ref\b|v\d+/i.test(findText ?? "");
   return hasVersionInfo ? Math.max(...pages) : pages[0];
 }
 

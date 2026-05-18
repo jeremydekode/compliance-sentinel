@@ -53,7 +53,8 @@ export function AmendmentPanel({ reportId }: { reportId: string }) {
   // generator and open the template in a new tab. Faster + more accurate
   // than the LLM-rendered approximation.
   const STATIC_PREVIEW_OVERRIDES: Array<{ match: RegExp; url: string }> = [
-    { match: /FGROP\s*037[\s_/-]*2016/i, url: "/forms/fgrop-037-2016-v11.html" },
+    // Serve the actual updated PDF as the preview — pixel-perfect (logo, fonts, layout)
+    { match: /FGROP\s*037[\s_/-]*2016/i, url: "/forms/fgrop-037-2016-v11.pdf" },
   ];
 
   async function handlePreview(sopId: string) {

@@ -51,16 +51,19 @@ function SettingsPage() {
     enabled: !!googleConn.data?.connected,
     queryFn: async () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const { data: rows } = await (supabase as any)
+      const { data: rows, error } = await (supabase as any)
         .from("sop_documents")
-        .select("id, title, drive_mime_type, drive_modified_time, last_sync_error, updated_at")
+        .select("id, title, drive_mime_type, drive_modified_time, last_sync_error, created_at")
         .eq("workspace_id", workspace)
         .not("drive_file_id", "is", null)
-        .order("updated_at", { ascending: false });
+        .order("created_at", { ascending: false });
+      if (error) console.warn("driveIndex query failed:", error.message);
       const list = (rows ?? []) as any[];
       const total = list.length;
       const withError = list.filter((r) => !!r.last_sync_error).length;
-      const lastSyncedAt = list[0]?.updated_at ?? null;
+      // Use the freshest signal we have — drive_modified_time falls back to created_at
+      const lastSyncedAt =
+        list.map((r) => r.drive_modified_time || r.created_at).filter(Boolean).sort().pop() ?? null;
       return { total, withError, lastSyncedAt, list };
     },
   });

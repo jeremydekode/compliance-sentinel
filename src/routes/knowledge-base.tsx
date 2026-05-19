@@ -229,11 +229,23 @@ function KB() {
                     <FileText className="size-5 text-accent-foreground" />
                   </div>
                   <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 flex-wrap">
                       <Badge variant="outline" className={`text-[10px] ${typeMeta(s.doc_type).classes}`}>
                         {typeMeta(s.doc_type).label}
                       </Badge>
                       <span className="text-[10px] text-muted-foreground">v{s.version}</span>
+                      {s.drive_file_id && (
+                        <span
+                          title={s.last_sync_error ? `Drive sync error: ${s.last_sync_error}` : "Synced from Google Drive"}
+                          className={`inline-flex items-center text-[9px] font-semibold uppercase tracking-wide rounded px-1.5 py-0.5 border ${
+                            s.last_sync_error
+                              ? "bg-amber-100 text-amber-800 border-amber-200"
+                              : "bg-blue-100 text-blue-800 border-blue-200"
+                          }`}
+                        >
+                          {s.last_sync_error ? "Drive · error" : "Drive"}
+                        </span>
+                      )}
                     </div>
                     <h3 className="font-semibold mt-1.5 leading-snug">{s.title}</h3>
                     {s.summary && (
@@ -293,7 +305,23 @@ function KB() {
               <TableBody>
                 {sops.data?.map((s: any) => (
                   <TableRow key={s.id} className="align-middle">
-                    <TableCell className="font-medium">{s.title}</TableCell>
+                    <TableCell className="font-medium">
+                      <span className="inline-flex items-center gap-1.5 flex-wrap">
+                        {s.title}
+                        {s.drive_file_id && (
+                          <span
+                            title={s.last_sync_error ? `Drive sync error: ${s.last_sync_error}` : "Synced from Google Drive"}
+                            className={`inline-flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wide rounded px-1.5 py-0.5 border ${
+                              s.last_sync_error
+                                ? "bg-amber-100 text-amber-800 border-amber-200"
+                                : "bg-blue-100 text-blue-800 border-blue-200"
+                            }`}
+                          >
+                            {s.last_sync_error ? "Drive · error" : "Drive"}
+                          </span>
+                        )}
+                      </span>
+                    </TableCell>
                     <TableCell>
                       <Badge variant="outline" className={`text-[10px] ${typeMeta(s.doc_type).classes}`}>
                         {typeMeta(s.doc_type).label}

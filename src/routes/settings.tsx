@@ -45,6 +45,26 @@ function SettingsPage() {
     queryFn: async () => await getStatus({ data: { workspace } }),
   });
 
+  /** Persistent "what's currently indexed from Drive" tally — survives across reloads. */
+  const driveIndex = useQuery({
+    queryKey: ["drive_indexed", workspace],
+    enabled: !!googleConn.data?.connected,
+    queryFn: async () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: rows } = await (supabase as any)
+        .from("sop_documents")
+        .select("id, title, drive_mime_type, drive_modified_time, last_sync_error, updated_at")
+        .eq("workspace_id", workspace)
+        .not("drive_file_id", "is", null)
+        .order("updated_at", { ascending: false });
+      const list = (rows ?? []) as any[];
+      const total = list.length;
+      const withError = list.filter((r) => !!r.last_sync_error).length;
+      const lastSyncedAt = list[0]?.updated_at ?? null;
+      return { total, withError, lastSyncedAt, list };
+    },
+  });
+
   async function connectGoogle() {
     setBusy("connect");
     try {
@@ -102,6 +122,7 @@ function SettingsPage() {
       qc.invalidateQueries({ queryKey: ["counts", workspace] });
       qc.invalidateQueries({ queryKey: ["sops"] });
       qc.invalidateQueries({ queryKey: ["sop_chunk_counts", workspace] });
+      qc.invalidateQueries({ queryKey: ["drive_indexed", workspace] });
       setForceResync(false); // reset after every run so it's an explicit opt-in
     } catch (e: any) {
       toast.error("Sync failed", { description: e?.message });
@@ -185,15 +206,26 @@ function SettingsPage() {
                 </div>
               )}
               {googleConn.data?.connected && (
-                <div className="mt-3 rounded-md border bg-emerald-50/40 dark:bg-emerald-950/20 border-emerald-200 dark:border-emerald-800 px-3 py-2 text-xs">
+                <div className="mt-3 rounded-md border bg-emerald-50/40 dark:bg-emerald-950/20 border-emerald-200 dark:border-emerald-800 px-3 py-2 text-xs space-y-1">
                   <div className="font-semibold text-emerald-900 dark:text-emerald-200">
                     {googleConn.data.email}
                   </div>
-                  <div className="text-emerald-800/70 dark:text-emerald-300/70 mt-0.5">
+                  <div className="text-emerald-800/70 dark:text-emerald-300/70">
                     {googleConn.data.driveFolderName
                       ? <>KB folder: <span className="font-medium">{googleConn.data.driveFolderName}</span></>
                       : <>No KB folder configured yet. Paste a Drive folder URL below.</>}
                   </div>
+                  {googleConn.data.driveFolderName && driveIndex.data && (
+                    <div className="pt-1.5 mt-1.5 border-t border-emerald-200/60 dark:border-emerald-800/60 text-emerald-800/80 dark:text-emerald-300/80 flex flex-wrap gap-x-3 gap-y-0.5">
+                      <span><span className="font-semibold">{driveIndex.data.total}</span> doc{driveIndex.data.total === 1 ? "" : "s"} indexed from Drive</span>
+                      {driveIndex.data.withError > 0 && (
+                        <span className="text-amber-700 dark:text-amber-400">{driveIndex.data.withError} with sync error{driveIndex.data.withError === 1 ? "" : "s"}</span>
+                      )}
+                      {driveIndex.data.lastSyncedAt && (
+                        <span className="opacity-80">Last sync: {timeAgo(driveIndex.data.lastSyncedAt)}</span>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -399,4 +431,19 @@ function DangerRow({
       </Button>
     </div>
   );
+}
+
+/** Human-friendly relative time for the "Last sync: 3min ago" display. */
+function timeAgo(iso: string): string {
+  const ms = Date.now() - new Date(iso).getTime();
+  if (Number.isNaN(ms) || ms < 0) return "just now";
+  const s = Math.floor(ms / 1000);
+  if (s < 45) return "just now";
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m} min ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h} hr ago`;
+  const d = Math.floor(h / 24);
+  if (d < 30) return `${d} day${d === 1 ? "" : "s"} ago`;
+  return new Date(iso).toLocaleDateString();
 }

@@ -23,6 +23,33 @@ const RULES: Array<{
   tags: string[];
   summary: string;
 }> = [
+  // INTERNAL markers — checked FIRST so filenames like
+  // "rmit_clean_demo_docs_MCB_Cyber_Resilience_Framework.pdf" don't get
+  // misclassified as the regulator just because the workspace name leaks
+  // into the filename. Order matters: most-specific internal markers first.
+  {
+    test: /\bSOP\b/i,
+    doc_type: "sop",
+    tags: ["SOP"],
+    summary: "Internal Standard Operating Procedure.",
+  },
+  {
+    test: /\b(MCB|internal_policy|internal[\s_-]*doc|company[\s_-]*policy)\b/i,
+    doc_type: "sop",
+    tags: ["Internal", "Policy"],
+    summary: "Internal company policy or SOP.",
+  },
+  {
+    test: /\b(it[\s_-]*policy|itp|information[\s_-]*technology|infosec|cybersec)\b/i,
+    doc_type: "it_policy",
+    tags: ["Tech", "IT", "InfoSec"],
+    summary:
+      "Internal IT / information-security policy covering systems governance and operational controls.",
+  },
+
+  // EXTERNAL regulator markers — checked AFTER internal so files like
+  // "PD-RMiT-June2023.pdf" or "FATF-Plenary-Feb-2026.pdf" still get tagged
+  // as the right regulator family.
   {
     test: /\b(rmit|bnm|kill\s*switch|cyber\s*resilience)\b/i,
     doc_type: "rmit_reg",
@@ -43,19 +70,6 @@ const RULES: Array<{
     tags: ["Circular", "Regulator"],
     summary:
       "Regulator circular communicating clarifications, supervisory expectations, or thematic findings.",
-  },
-  {
-    test: /\b(it[\s_-]*policy|itp|information\s*technology|infosec|cybersec)\b/i,
-    doc_type: "it_policy",
-    tags: ["Tech", "IT", "InfoSec"],
-    summary:
-      "Internal IT / information-security policy covering systems governance and operational controls.",
-  },
-  {
-    test: /\bsop\b/i,
-    doc_type: "sop",
-    tags: ["SOP"],
-    summary: "Internal Standard Operating Procedure.",
   },
 ];
 

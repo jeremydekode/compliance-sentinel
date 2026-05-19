@@ -12,6 +12,15 @@ import {
   getConnection,
   deleteConnection,
 } from "./google-oauth";
+import {
+  parseDriveId,
+  getFileMetadata,
+  listFolderFiles,
+  isIndexableMimeType,
+  downloadFile,
+  exportGoogleDocAsText,
+  driveViewerUrl,
+} from "./google-drive";
 
 /**
  * Wrap a fetched file as a PolicySource for Gemini.
@@ -1950,4 +1959,143 @@ export const disconnectGoogle = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     await deleteConnection(data.workspace);
     return { ok: true };
+  });
+
+// ── Stage 2: Drive folder configuration + KB sync ────────────────────────────
+
+/** Save the KB folder for this workspace. Validates the ID exists + is a folder. */
+export const setDriveFolder = createServerFn({ method: "POST" })
+  .inputValidator(z.object({
+    workspace: workspaceSchema,
+    folderUrlOrId: z.string().min(1),
+  }))
+  .handler(async ({ data }) => {
+    const folderId = parseDriveId(data.folderUrlOrId);
+    if (!folderId) throw new Error("Could not parse a Drive folder ID from that input. Paste the URL or just the folder ID.");
+    const meta = await getFileMetadata(data.workspace, folderId);
+    if (meta.mimeType !== "application/vnd.google-apps.folder") {
+      throw new Error(`That Drive ID is a ${meta.mimeType.replace("application/vnd.google-apps.", "")}, not a folder.`);
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { error } = await (supabase as any)
+      .from("workspace_google_connections")
+      .update({ drive_folder_id: folderId, drive_folder_name: meta.name })
+      .eq("workspace_id", data.workspace);
+    if (error) throw new Error(error.message);
+    return { folderId, folderName: meta.name };
+  });
+
+/**
+ * Pull every indexable file from the configured Drive folder and run each
+ * through the existing chunking + embedding pipeline. Re-running is idempotent —
+ * sop_documents rows are upserted on (workspace_id, drive_file_id) and chunks
+ * are wiped + reinserted per doc.
+ *
+ * Returns counts so the UI can show what happened.
+ */
+export const syncDriveFolder = createServerFn({ method: "POST" })
+  .inputValidator(z.object({ workspace: workspaceSchema }))
+  .handler(async ({ data }) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: conn, error: connErr } = await (supabase as any)
+      .from("workspace_google_connections")
+      .select("drive_folder_id, drive_folder_name")
+      .eq("workspace_id", data.workspace)
+      .single();
+    if (connErr || !conn?.drive_folder_id) {
+      throw new Error("No Drive folder configured. Set one first in Settings.");
+    }
+    const folderId = conn.drive_folder_id as string;
+
+    const files = await listFolderFiles(data.workspace, folderId);
+    const indexable = files.filter((f) => isIndexableMimeType(f.mimeType));
+    const skipped = files.filter((f) => !isIndexableMimeType(f.mimeType));
+
+    let succeeded = 0;
+    const failures: Array<{ name: string; reason: string }> = [];
+
+    for (const f of indexable) {
+      try {
+        // 1. Pull text / chunks based on file type
+        let chunks: Array<{ content: string; chapter_ref?: string; page_number?: number }>;
+        if (f.mimeType === "application/vnd.google-apps.document") {
+          const text = await exportGoogleDocAsText(data.workspace, f.id);
+          chunks = chunkDocxText(text);
+        } else if (f.mimeType === "application/pdf") {
+          const buffer = await downloadFile(data.workspace, f.id);
+          chunks = await chunkDocument({ name: f.name, buffer, mimeType: f.mimeType });
+        } else {
+          // .docx / .doc
+          const buffer = await downloadFile(data.workspace, f.id);
+          const text = await docxToText(buffer);
+          chunks = chunkDocxText(text);
+        }
+
+        // 2. Upsert sop_documents row keyed on (workspace_id, drive_file_id)
+        const cleanTitle = f.name.replace(/\.(pdf|docx?|gdoc)$/i, "");
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const { data: existing } = await (supabase as any)
+          .from("sop_documents")
+          .select("id")
+          .eq("workspace_id", data.workspace)
+          .eq("drive_file_id", f.id)
+          .maybeSingle();
+
+        let sopId: string;
+        const sopRow = {
+          workspace_id: data.workspace,
+          title: cleanTitle,
+          doc_type: "policy",
+          version: "1.0",
+          is_active: true,
+          file_url: driveViewerUrl(f.id, f.mimeType),
+          drive_file_id: f.id,
+          drive_mime_type: f.mimeType,
+        };
+        if (existing?.id) {
+          sopId = existing.id;
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          await (supabase as any).from("sop_documents").update(sopRow).eq("id", sopId);
+        } else {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const { data: row, error } = await (supabase as any).from("sop_documents").insert(sopRow).select("id").single();
+          if (error) throw error;
+          sopId = row.id;
+        }
+
+        // 3. Wipe + re-insert chunks for this doc
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        await (supabase as any).from("sop_chunks").delete().eq("sop_id", sopId);
+        if (chunks.length > 0) {
+          const chunksWithEmbeddings = await embedChunksBatched(
+            chunks,
+            (c: any, embedding: number[]) => ({
+              sop_id: sopId,
+              content: c.content,
+              chapter_ref: c.chapter_ref ?? null,
+              page_number: c.page_number ?? null,
+              embedding,
+            }),
+          );
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const { error: insErr } = await (supabase as any).from("sop_chunks").insert(chunksWithEmbeddings);
+          if (insErr) throw insErr;
+        }
+
+        succeeded++;
+      } catch (e: any) {
+        failures.push({ name: f.name, reason: e?.message ?? "unknown" });
+      }
+    }
+
+    return {
+      folderName: conn.drive_folder_name ?? folderId,
+      total: files.length,
+      indexable: indexable.length,
+      succeeded,
+      failedCount: failures.length,
+      skippedCount: skipped.length,
+      failures: failures.slice(0, 10),
+      skipped: skipped.slice(0, 10).map((f) => ({ name: f.name, mimeType: f.mimeType })),
+    };
   });

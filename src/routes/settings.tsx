@@ -12,7 +12,11 @@ import {
   getGoogleAuthUrl,
   getGoogleConnectionStatus,
   disconnectGoogle,
+  setDriveFolder,
+  syncDriveFolder,
 } from "@/lib/compliance.functions";
+import { Input } from "@/components/ui/input";
+import { FolderOpen, RefreshCw } from "lucide-react";
 import { useWorkspace, WORKSPACES } from "@/lib/workspace";
 import { toast } from "sonner";
 
@@ -27,9 +31,13 @@ function SettingsPage() {
   const getAuthUrl = useServerFn(getGoogleAuthUrl);
   const getStatus = useServerFn(getGoogleConnectionStatus);
   const disconnect = useServerFn(disconnectGoogle);
+  const setFolder = useServerFn(setDriveFolder);
+  const sync = useServerFn(syncDriveFolder);
   const [busy, setBusy] = useState<string | null>(null);
   const [workspace] = useWorkspace();
   const wsName = WORKSPACES[workspace].name;
+  const [folderInput, setFolderInput] = useState("");
+  const [syncResult, setSyncResult] = useState<any | null>(null);
 
   const googleConn = useQuery({
     queryKey: ["google_connection", workspace],
@@ -53,8 +61,43 @@ function SettingsPage() {
       await disconnect({ data: { workspace } });
       toast.success(`Disconnected Google Drive from ${wsName}`);
       qc.invalidateQueries({ queryKey: ["google_connection", workspace] });
+      setSyncResult(null);
     } catch (e: any) {
       toast.error("Disconnect failed", { description: e?.message });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function saveDriveFolder() {
+    if (!folderInput.trim()) return;
+    setBusy("folder");
+    try {
+      const r = await setFolder({ data: { workspace, folderUrlOrId: folderInput.trim() } });
+      toast.success(`KB folder set: ${r.folderName}`);
+      setFolderInput("");
+      qc.invalidateQueries({ queryKey: ["google_connection", workspace] });
+    } catch (e: any) {
+      toast.error("Could not set folder", { description: e?.message });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function syncNow() {
+    setBusy("sync");
+    setSyncResult(null);
+    try {
+      const r = await sync({ data: { workspace } });
+      setSyncResult(r);
+      const msg = `${r.succeeded} of ${r.indexable} indexed${r.failedCount ? ` · ${r.failedCount} failed` : ""}${r.skippedCount ? ` · ${r.skippedCount} skipped (unsupported)` : ""}`;
+      if (r.failedCount > 0) toast.warning(`Sync finished with errors`, { description: msg });
+      else toast.success(`Synced from "${r.folderName}"`, { description: msg });
+      qc.invalidateQueries({ queryKey: ["counts", workspace] });
+      qc.invalidateQueries({ queryKey: ["sops"] });
+      qc.invalidateQueries({ queryKey: ["sop_chunk_counts", workspace] });
+    } catch (e: any) {
+      toast.error("Sync failed", { description: e?.message });
     } finally {
       setBusy(null);
     }
@@ -142,8 +185,89 @@ function SettingsPage() {
                   <div className="text-emerald-800/70 dark:text-emerald-300/70 mt-0.5">
                     {googleConn.data.driveFolderName
                       ? <>KB folder: <span className="font-medium">{googleConn.data.driveFolderName}</span></>
-                      : <>No KB folder configured yet — coming in the next stage.</>}
+                      : <>No KB folder configured yet. Paste a Drive folder URL below.</>}
                   </div>
+                </div>
+              )}
+
+              {/* Folder configuration + Sync — only visible when connected */}
+              {googleConn.data?.connected && (
+                <div className="mt-4 space-y-3">
+                  <div>
+                    <label className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                      {googleConn.data.driveFolderName ? "Change KB folder" : "Set KB folder"}
+                    </label>
+                    <div className="mt-1 flex gap-2">
+                      <Input
+                        placeholder="Paste Drive folder URL or ID"
+                        value={folderInput}
+                        onChange={(e) => setFolderInput(e.target.value)}
+                        disabled={busy === "folder"}
+                        className="text-xs"
+                      />
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={saveDriveFolder}
+                        disabled={busy === "folder" || !folderInput.trim()}
+                        className="gap-1.5"
+                      >
+                        {busy === "folder" ? <Loader2 className="size-3.5 animate-spin" /> : <FolderOpen className="size-3.5" />}
+                        {googleConn.data.driveFolderName ? "Change" : "Save"}
+                      </Button>
+                    </div>
+                    <p className="text-[10px] text-muted-foreground mt-1">
+                      Example: <code>https://drive.google.com/drive/folders/1AbC...</code> — folder must be shared with the connected Google account.
+                    </p>
+                  </div>
+
+                  {googleConn.data.driveFolderName && (
+                    <div className="flex items-center gap-2">
+                      <Button
+                        size="sm"
+                        onClick={syncNow}
+                        disabled={busy === "sync"}
+                        className="gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white"
+                      >
+                        {busy === "sync" ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
+                        Sync KB from Drive
+                      </Button>
+                      <span className="text-[10px] text-muted-foreground">
+                        Pulls every PDF, DOCX, and Google Doc in the folder into the {wsName} KB.
+                      </span>
+                    </div>
+                  )}
+
+                  {syncResult && (
+                    <div className="rounded-md border bg-card p-3 text-[11px] space-y-1.5">
+                      <div className="font-semibold">
+                        Sync from "<span className="text-primary">{syncResult.folderName}</span>" complete
+                      </div>
+                      <ul className="text-muted-foreground space-y-0.5">
+                        <li>{syncResult.indexable} indexable file{syncResult.indexable === 1 ? "" : "s"} found · {syncResult.succeeded} succeeded · {syncResult.failedCount} failed · {syncResult.skippedCount} skipped (unsupported)</li>
+                      </ul>
+                      {syncResult.failures?.length > 0 && (
+                        <div className="mt-2">
+                          <div className="text-[10px] font-semibold uppercase text-amber-700">Failures</div>
+                          <ul className="text-[11px] mt-0.5">
+                            {syncResult.failures.map((f: any, i: number) => (
+                              <li key={i} className="text-amber-800/90">• <span className="font-medium">{f.name}</span> — {f.reason}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                      {syncResult.skipped?.length > 0 && (
+                        <div className="mt-2">
+                          <div className="text-[10px] font-semibold uppercase text-muted-foreground">Skipped (unsupported file types)</div>
+                          <ul className="text-[11px] mt-0.5">
+                            {syncResult.skipped.map((f: any, i: number) => (
+                              <li key={i} className="text-muted-foreground">• {f.name} <span className="opacity-60">({f.mimeType})</span></li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
               {googleConn.data && !googleConn.data.connected && (

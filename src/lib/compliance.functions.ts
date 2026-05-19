@@ -40,7 +40,7 @@ async function policySourceFromFile(
   return { name, buffer: file.buffer, mimeType: file.mimeType };
 }
 import { generateEmbedding, generateQueryEmbedding, generateEmbeddingsBatch } from "./embeddings";
-import { REGULATION_FAMILIES, INTERNAL_DOC_TYPES as INTERNAL_DOC_TYPES_CONST, regulatorContext } from "./auto-detect";
+import { REGULATION_FAMILIES, INTERNAL_DOC_TYPES as INTERNAL_DOC_TYPES_CONST, regulatorContext, autoDetectDocMeta } from "./auto-detect";
 
 async function fetchFile(url: string): Promise<{ buffer: Buffer; mimeType: string }> {
   const resp = await fetch(url);
@@ -2060,13 +2060,19 @@ export const syncDriveFolder = createServerFn({ method: "POST" })
           chunks = chunkDocxText(text);
         }
 
-        // 2. Upsert sop_documents row keyed on (workspace_id, drive_file_id)
+        // 2. Upsert sop_documents row keyed on (workspace_id, drive_file_id).
+        // Run the same filename-based detector that local uploads use so docs
+        // like "PD-RMiT-June2023.pdf" get doc_type=rmit (not the generic
+        // "policy" default), which matters for the regulator-vs-SOP split in
+        // the analysis pipeline.
         const cleanTitle = f.name.replace(/\.(pdf|docx?|gdoc)$/i, "");
+        const detected = autoDetectDocMeta(f.name);
         const sopRow: any = {
           workspace_id: data.workspace,
           title: cleanTitle,
-          doc_type: "policy",
-          version: "1.0",
+          doc_type: detected?.doc_type ?? "policy",
+          version: detected?.version ?? "1.0",
+          tags: detected?.tags ?? [],
           is_active: true,
           file_url: driveViewerUrl(f.id, f.mimeType),
           drive_file_id: f.id,

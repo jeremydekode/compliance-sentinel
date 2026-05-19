@@ -2291,3 +2291,164 @@ export const insertImpactAsDriveComment = createServerFn({ method: "POST" })
 
     return { commentId: r.id, alreadyInserted: false };
   });
+
+// ── Stage 5: open-ended form-diff detection ──────────────────────────────────
+// Compares a newly uploaded form against the matching version already in the
+// Internal Forms KB and returns every substantive change (not just 3 fields).
+
+/** Pull plain text from a file URL — handles PDF and DOCX. */
+async function fetchAndExtractText(fileUrl: string): Promise<{ text: string; mimeType: string }> {
+  const file = await fetchFile(fileUrl);
+  const isDocx = looksLikeDocx(file.mimeType, fileUrl);
+  if (isDocx) {
+    const text = await docxToText(file.buffer);
+    return { text, mimeType: file.mimeType };
+  }
+  // PDF
+  const { extractPdfPages } = await import("./pdf-pages");
+  const pages = await extractPdfPages(file.buffer);
+  const text = pages.map((p) => p.text).join("\n\n");
+  return { text, mimeType: file.mimeType };
+}
+
+/** Strip the version suffix from a form number to get the canonical base ID. */
+function deriveBaseFormId(formNumber: string): string {
+  return formNumber.replace(/_v\d+$/i, "").trim();
+}
+
+export const detectFormChanges = createServerFn({ method: "POST" })
+  .inputValidator(z.object({
+    newFileUrl: z.string().url(),
+    oldFormSopId: z.string().optional(),
+  }))
+  .handler(async ({ data }) => {
+    // 1. Extract metadata from the new file using existing helper
+    const newFetched = await fetchFile(data.newFileUrl);
+    const newMeta = await (async () => {
+      const isDocx = looksLikeDocx(newFetched.mimeType, data.newFileUrl);
+      const prompt = `Extract these three fields from this bank form (look at the header / top of page 1):
+1. form_name - the main form title in uppercase
+2. form_number - full reference number with version suffix (e.g. "FGROP 037/2016_v11")
+3. updated_date - the updated/effective date string verbatim
+Return ONLY JSON: {"form_name":"...","form_number":"...","updated_date":"..."}. null for fields you can't find.`;
+      let part: any;
+      if (isDocx) {
+        const text = await docxToText(newFetched.buffer);
+        part = { text: `--- FORM DOCUMENT TEXT ---\n${text.slice(0, 6000)}\n--- END ---` };
+      } else {
+        part = { inlineData: { data: newFetched.buffer.toString("base64"), mimeType: newFetched.mimeType } };
+      }
+      const r = await generateWithFallback({
+        contents: [{ role: "user", parts: [part, { text: prompt }] }],
+        config: { responseMimeType: "application/json", maxOutputTokens: 512 },
+      }, { tier: "fast" });
+      try { return JSON.parse(r.text ?? "{}"); } catch { return {}; }
+    })();
+    const newFormNumber: string | null = newMeta.form_number ?? null;
+    const newFormName: string | null = newMeta.form_name ?? null;
+    const newUpdatedDate: string | null = newMeta.updated_date ?? null;
+
+    // 2. Find the matching old form in the Internal Forms KB
+    const baseFormId = newFormNumber ? deriveBaseFormId(newFormNumber) : null;
+    let oldForm: any = null;
+    if (data.oldFormSopId) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: r } = await (supabase as any)
+        .from("sop_documents")
+        .select("id, title, file_url, doc_type, workspace_id")
+        .eq("id", data.oldFormSopId)
+        .maybeSingle();
+      oldForm = r;
+    } else if (baseFormId) {
+      // Try a relaxed title match — handle "FGROP 037/2016" vs "FGROP_037_2016"
+      // by trimming separators and matching the alpha-num core.
+      const flat = baseFormId.replace(/[^A-Za-z0-9]/g, "");
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: candidates } = await (supabase as any)
+        .from("sop_documents")
+        .select("id, title, file_url, doc_type, workspace_id")
+        .eq("workspace_id", "forms")
+        .order("created_at", { ascending: false });
+      oldForm = (candidates ?? []).find((c: any) => {
+        const flatTitle = (c.title ?? "").replace(/[^A-Za-z0-9]/g, "");
+        return flatTitle.toUpperCase().includes(flat.toUpperCase());
+      }) ?? null;
+    }
+
+    if (!oldForm) {
+      return {
+        oldForm: null,
+        newForm: { form_number: newFormNumber, form_name: newFormName, updated_date: newUpdatedDate, base_form_id: baseFormId },
+        detectedChanges: [],
+        message: baseFormId
+          ? `No existing version of "${baseFormId}" found in the Internal Forms KB. You can register this as a new form.`
+          : "Couldn't extract a form number from the uploaded file. Try a different file or use manual entry.",
+      };
+    }
+
+    // 3. Pull text from both files
+    if (!oldForm.file_url) {
+      throw new Error(`Old form "${oldForm.title}" has no source file in KB to compare against.`);
+    }
+    const oldExtracted = await fetchAndExtractText(oldForm.file_url);
+    const newExtracted = await fetchAndExtractText(data.newFileUrl);
+
+    // 4. Open-ended diff via Gemini
+    const diffPrompt = `# ROLE: BANK FORM DIFF ANALYST
+
+Compare two versions of an internal bank form and list every substantive change.
+
+# WHAT TO LOOK FOR:
+- Header fields: form name/title, form reference number, version, updated/effective date
+- Structural changes: new/removed/renamed section, new/removed/relabeled checkbox or field, signature block changes
+- Instruction / disclosure / note changes: modified clause text, new mandatory note, changed footer text
+
+# WHAT TO IGNORE:
+- Pure whitespace / line-wrap differences
+- Page numbers and page headers/footers repeating on every page
+- Formatting-only changes (capitalisation that doesn't change meaning, font hints in source)
+- The page-by-page header repetition of "FGROP 037/2016_v11 (Updated on 27.05.2026)" — count it ONCE as a header change, not per page
+
+# OUTPUT — JSON array, each entry:
+{
+  "label": "short name e.g. 'Form version', 'Account Type — Family Office checkbox', 'E-Invoice disclosure clause'",
+  "oldValue": "verbatim text from OLD (null if newly added)",
+  "newValue": "verbatim text in NEW (null if removed)",
+  "category": "header" | "structure" | "instruction",
+  "propagatable": true | false,
+  "explanation": "one sentence — why this change does or doesn't cascade to downstream SOPs that reference this form"
+}
+
+Set propagatable=true when downstream SOPs that NAME this form would need updating:
+  - Header fields (form name, number, date) — almost always propagatable
+  - Renamed section that's referenced by name in SOPs — propagatable
+  - New/removed sections — usually NOT propagatable (SOPs don't enumerate sections)
+  - Internal disclosure text — NOT propagatable
+  - New checkbox label — NOT propagatable unless it changes a section name SOPs reference
+
+# OLD FORM CONTENT:
+${oldExtracted.text.slice(0, 30000)}
+
+# NEW FORM CONTENT:
+${newExtracted.text.slice(0, 30000)}
+
+Return ONLY the JSON array. No commentary, no markdown fences.`;
+
+    const r = await generateWithFallback({
+      contents: [{ role: "user", parts: [{ text: diffPrompt }] }],
+      config: { responseMimeType: "application/json", maxOutputTokens: 8192 },
+    });
+    let detectedChanges: any[] = [];
+    try {
+      const parsed = JSON.parse(r.text ?? "[]");
+      detectedChanges = Array.isArray(parsed) ? parsed : (parsed.changes ?? []);
+    } catch (e: any) {
+      console.warn("Form diff parse failed:", e?.message);
+    }
+
+    return {
+      oldForm: { id: oldForm.id, title: oldForm.title },
+      newForm: { form_number: newFormNumber, form_name: newFormName, updated_date: newUpdatedDate, base_form_id: baseFormId },
+      detectedChanges,
+    };
+  });

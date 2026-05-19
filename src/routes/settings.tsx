@@ -38,6 +38,7 @@ function SettingsPage() {
   const wsName = WORKSPACES[workspace].name;
   const [folderInput, setFolderInput] = useState("");
   const [syncResult, setSyncResult] = useState<any | null>(null);
+  const [forceResync, setForceResync] = useState(false);
 
   const googleConn = useQuery({
     queryKey: ["google_connection", workspace],
@@ -88,14 +89,20 @@ function SettingsPage() {
     setBusy("sync");
     setSyncResult(null);
     try {
-      const r = await sync({ data: { workspace } });
+      const r = await sync({ data: { workspace, force: forceResync } });
       setSyncResult(r);
-      const msg = `${r.succeeded} of ${r.indexable} indexed${r.failedCount ? ` · ${r.failedCount} failed` : ""}${r.skippedCount ? ` · ${r.skippedCount} skipped (unsupported)` : ""}`;
+      const parts: string[] = [];
+      parts.push(`${r.succeeded} indexed`);
+      if (r.unchanged) parts.push(`${r.unchanged} unchanged (skipped)`);
+      if (r.failedCount) parts.push(`${r.failedCount} failed`);
+      if (r.skippedCount) parts.push(`${r.skippedCount} unsupported`);
+      const msg = parts.join(" · ");
       if (r.failedCount > 0) toast.warning(`Sync finished with errors`, { description: msg });
       else toast.success(`Synced from "${r.folderName}"`, { description: msg });
       qc.invalidateQueries({ queryKey: ["counts", workspace] });
       qc.invalidateQueries({ queryKey: ["sops"] });
       qc.invalidateQueries({ queryKey: ["sop_chunk_counts", workspace] });
+      setForceResync(false); // reset after every run so it's an explicit opt-in
     } catch (e: any) {
       toast.error("Sync failed", { description: e?.message });
     } finally {
@@ -222,19 +229,31 @@ function SettingsPage() {
                   </div>
 
                   {googleConn.data.driveFolderName && (
-                    <div className="flex items-center gap-2">
-                      <Button
-                        size="sm"
-                        onClick={syncNow}
-                        disabled={busy === "sync"}
-                        className="gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white"
-                      >
-                        {busy === "sync" ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
-                        Sync KB from Drive
-                      </Button>
-                      <span className="text-[10px] text-muted-foreground">
-                        Pulls every PDF, DOCX, and Google Doc in the folder into the {wsName} KB.
-                      </span>
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-2">
+                        <Button
+                          size="sm"
+                          onClick={syncNow}
+                          disabled={busy === "sync"}
+                          className="gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white"
+                        >
+                          {busy === "sync" ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
+                          Sync KB from Drive
+                        </Button>
+                        <span className="text-[10px] text-muted-foreground">
+                          Skips files unchanged since last successful sync · retries previously failed files automatically.
+                        </span>
+                      </div>
+                      <label className="inline-flex items-center gap-2 text-[11px] text-muted-foreground cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={forceResync}
+                          onChange={(e) => setForceResync(e.target.checked)}
+                          disabled={busy === "sync"}
+                          className="size-3.5 accent-emerald-600"
+                        />
+                        Force full re-sync (re-process every file, ignore last-sync state)
+                      </label>
                     </div>
                   )}
 
@@ -244,7 +263,13 @@ function SettingsPage() {
                         Sync from "<span className="text-primary">{syncResult.folderName}</span>" complete
                       </div>
                       <ul className="text-muted-foreground space-y-0.5">
-                        <li>{syncResult.indexable} indexable file{syncResult.indexable === 1 ? "" : "s"} found · {syncResult.succeeded} succeeded · {syncResult.failedCount} failed · {syncResult.skippedCount} skipped (unsupported)</li>
+                        <li>
+                          {syncResult.indexable} indexable file{syncResult.indexable === 1 ? "" : "s"} found
+                          · <span className="text-emerald-700 font-medium">{syncResult.succeeded} succeeded</span>
+                          {syncResult.unchanged ? <> · <span className="text-slate-700">{syncResult.unchanged} unchanged (skipped)</span></> : null}
+                          {syncResult.failedCount ? <> · <span className="text-amber-700">{syncResult.failedCount} failed</span></> : null}
+                          {syncResult.skippedCount ? <> · {syncResult.skippedCount} unsupported</> : null}
+                        </li>
                       </ul>
                       {syncResult.failures?.length > 0 && (
                         <div className="mt-2">

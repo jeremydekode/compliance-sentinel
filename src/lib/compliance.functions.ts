@@ -1994,7 +1994,11 @@ export const setDriveFolder = createServerFn({ method: "POST" })
  * Returns counts so the UI can show what happened.
  */
 export const syncDriveFolder = createServerFn({ method: "POST" })
-  .inputValidator(z.object({ workspace: workspaceSchema }))
+  .inputValidator(z.object({
+    workspace: workspaceSchema,
+    /** Re-process every file regardless of modifiedTime / last_sync_error. */
+    force: z.boolean().optional().default(false),
+  }))
   .handler(async ({ data }) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: conn, error: connErr } = await (supabase as any)
@@ -2011,10 +2015,34 @@ export const syncDriveFolder = createServerFn({ method: "POST" })
     const indexable = files.filter((f) => isIndexableMimeType(f.mimeType));
     const skipped = files.filter((f) => !isIndexableMimeType(f.mimeType));
 
+    // Preload existing sop_documents rows for these Drive files (one query, not N)
+    const driveIds = indexable.map((f) => f.id);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: existingRows } = driveIds.length > 0 ? await (supabase as any)
+      .from("sop_documents")
+      .select("id, drive_file_id, drive_modified_time, last_sync_error")
+      .eq("workspace_id", data.workspace)
+      .in("drive_file_id", driveIds) : { data: [] };
+    const existingByFileId = new Map<string, any>();
+    for (const r of existingRows ?? []) existingByFileId.set(r.drive_file_id, r);
+
     let succeeded = 0;
+    let unchanged = 0;
     const failures: Array<{ name: string; reason: string }> = [];
 
     for (const f of indexable) {
+      const existing = existingByFileId.get(f.id);
+
+      // Skip when not forced AND we have a successful prior sync for the same modifiedTime
+      if (!data.force && existing && !existing.last_sync_error && existing.drive_modified_time && f.modifiedTime) {
+        const lastSynced = new Date(existing.drive_modified_time).getTime();
+        const driveMtime = new Date(f.modifiedTime).getTime();
+        if (driveMtime <= lastSynced) {
+          unchanged++;
+          continue;
+        }
+      }
+
       try {
         // 1. Pull text / chunks based on file type
         let chunks: Array<{ content: string; chapter_ref?: string; page_number?: number }>;
@@ -2033,16 +2061,7 @@ export const syncDriveFolder = createServerFn({ method: "POST" })
 
         // 2. Upsert sop_documents row keyed on (workspace_id, drive_file_id)
         const cleanTitle = f.name.replace(/\.(pdf|docx?|gdoc)$/i, "");
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const { data: existing } = await (supabase as any)
-          .from("sop_documents")
-          .select("id")
-          .eq("workspace_id", data.workspace)
-          .eq("drive_file_id", f.id)
-          .maybeSingle();
-
-        let sopId: string;
-        const sopRow = {
+        const sopRow: any = {
           workspace_id: data.workspace,
           title: cleanTitle,
           doc_type: "policy",
@@ -2051,7 +2070,10 @@ export const syncDriveFolder = createServerFn({ method: "POST" })
           file_url: driveViewerUrl(f.id, f.mimeType),
           drive_file_id: f.id,
           drive_mime_type: f.mimeType,
+          drive_modified_time: f.modifiedTime ?? null,
+          last_sync_error: null,
         };
+        let sopId: string;
         if (existing?.id) {
           sopId = existing.id;
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -2084,7 +2106,15 @@ export const syncDriveFolder = createServerFn({ method: "POST" })
 
         succeeded++;
       } catch (e: any) {
-        failures.push({ name: f.name, reason: e?.message ?? "unknown" });
+        const reason = e?.message ?? "unknown";
+        failures.push({ name: f.name, reason });
+        // Record the failure on the SOP row so the next sync retries this file
+        if (existing?.id) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          await (supabase as any).from("sop_documents")
+            .update({ last_sync_error: reason.slice(0, 500) })
+            .eq("id", existing.id);
+        }
       }
     }
 
@@ -2093,6 +2123,7 @@ export const syncDriveFolder = createServerFn({ method: "POST" })
       total: files.length,
       indexable: indexable.length,
       succeeded,
+      unchanged,
       failedCount: failures.length,
       skippedCount: skipped.length,
       failures: failures.slice(0, 10),

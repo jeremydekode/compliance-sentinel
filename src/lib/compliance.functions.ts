@@ -43,9 +43,29 @@ import { generateEmbedding, generateQueryEmbedding, generateEmbeddingsBatch } fr
 import { REGULATION_FAMILIES, INTERNAL_DOC_TYPES as INTERNAL_DOC_TYPES_CONST, regulatorContext, autoDetectDocMeta } from "./auto-detect";
 
 async function fetchFile(url: string): Promise<{ buffer: Buffer; mimeType: string }> {
+  // Reject Drive viewer URLs straight away — they return HTML, not the file.
+  // (Drive-synced SOPs should now store a Supabase storage URL as file_url,
+  // but legacy rows from earlier syncs may still hold the viewer URL.)
+  if (/drive\.google\.com\/file\/d\//i.test(url) || /docs\.google\.com\/document\/d\//i.test(url)) {
+    throw new Error(
+      `file_url points at a Google Drive viewer page, not a downloadable file. ` +
+      `Re-sync the source document with "Force full re-sync" in Settings → Google Drive ` +
+      `to mirror it into Supabase storage.`
+    );
+  }
   const resp = await fetch(url);
-  const arrayBuffer = await resp.arrayBuffer();
+  if (!resp.ok) {
+    throw new Error(`Failed to fetch file at ${url}: HTTP ${resp.status} ${resp.statusText}`);
+  }
   const mimeType = resp.headers.get("content-type") || "application/pdf";
+  // Catch silent error pages — storage 403/404 redirected to an HTML page would
+  // otherwise slip through and get sent to Gemini as application/pdf.
+  if (/^text\/html/i.test(mimeType)) {
+    throw new Error(
+      `File URL returned HTML (mimeType="${mimeType}") — the storage object may have been deleted or is inaccessible. Re-upload or re-sync the file.`
+    );
+  }
+  const arrayBuffer = await resp.arrayBuffer();
   return { buffer: Buffer.from(arrayBuffer), mimeType };
 }
 
@@ -2045,22 +2065,57 @@ export const syncDriveFolder = createServerFn({ method: "POST" })
       }
 
       try {
-        // 1. Pull text / chunks based on file type
+        // 1. Pull binary representation + chunks for this file. We need a real
+        //    downloadable buffer (not just text) because we mirror the file
+        //    into Supabase storage and use THAT as file_url. Drive's viewer
+        //    URLs return HTML, which breaks downstream Gemini calls.
+        let fileBuffer: Buffer;
+        let storageContentType: string;
+        let storageFilename: string;
         let chunks: Array<{ content: string; chapter_ref?: string; page_number?: number }>;
+
         if (f.mimeType === "application/vnd.google-apps.document") {
-          const text = await exportGoogleDocAsText(data.workspace, f.id);
+          // Export Google Docs to DOCX so we can both chunk it and mirror it.
+          const token = await (await import("./google-oauth")).refreshAccessToken(data.workspace);
+          const r = await fetch(
+            `https://www.googleapis.com/drive/v3/files/${f.id}/export?mimeType=application/vnd.openxmlformats-officedocument.wordprocessingml.document&supportsAllDrives=true`,
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
+          if (!r.ok) throw new Error(`Drive export failed: ${r.status}`);
+          fileBuffer = Buffer.from(await r.arrayBuffer());
+          storageContentType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+          storageFilename = `${f.name.replace(/\.(pdf|docx?|gdoc)$/i, "")}.docx`;
+          const text = await docxToText(fileBuffer);
           chunks = chunkDocxText(text);
         } else if (f.mimeType === "application/pdf") {
-          const buffer = await downloadFile(data.workspace, f.id);
-          chunks = await chunkDocument({ name: f.name, buffer, mimeType: f.mimeType });
+          fileBuffer = await downloadFile(data.workspace, f.id);
+          storageContentType = f.mimeType;
+          storageFilename = f.name;
+          chunks = await chunkDocument({ name: f.name, buffer: fileBuffer, mimeType: f.mimeType });
         } else {
           // .docx / .doc
-          const buffer = await downloadFile(data.workspace, f.id);
-          const text = await docxToText(buffer);
+          fileBuffer = await downloadFile(data.workspace, f.id);
+          storageContentType = f.mimeType;
+          storageFilename = f.name;
+          const text = await docxToText(fileBuffer);
           chunks = chunkDocxText(text);
         }
 
-        // 2. Upsert sop_documents row keyed on (workspace_id, drive_file_id).
+        // 2. Mirror the file into Supabase storage so file_url is a real
+        //    downloadable URL (not Drive's HTML viewer page). This unifies the
+        //    file-fetch path for local-upload and Drive-synced SOPs.
+        const safeName = storageFilename.replace(/[^A-Za-z0-9._-]+/g, "_");
+        const storagePath = `kb/${Date.now()}-${safeName}`;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const { error: upErr } = await (supabase as any).storage
+          .from("policies")
+          .upload(storagePath, fileBuffer, { upsert: false, contentType: storageContentType });
+        if (upErr) throw new Error(`Storage mirror failed: ${upErr.message}`);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const { data: pub } = (supabase as any).storage.from("policies").getPublicUrl(storagePath);
+        const mirroredUrl = pub.publicUrl as string;
+
+        // 3. Upsert sop_documents row keyed on (workspace_id, drive_file_id).
         // Run the same filename-based detector that local uploads use so docs
         // like "PD-RMiT-June2023.pdf" get doc_type=rmit (not the generic
         // "policy" default), which matters for the regulator-vs-SOP split in
@@ -2074,7 +2129,11 @@ export const syncDriveFolder = createServerFn({ method: "POST" })
           version: detected?.version ?? "1.0",
           tags: detected?.tags ?? [],
           is_active: true,
-          file_url: driveViewerUrl(f.id, f.mimeType),
+          // file_url = the mirrored Supabase storage URL (used by every
+          // downstream fetchFile call). drive_view_url kept separately on the
+          // row so the KB UI can still link out to Drive for editing.
+          file_url: mirroredUrl,
+          drive_view_url: driveViewerUrl(f.id, f.mimeType),
           drive_file_id: f.id,
           drive_mime_type: f.mimeType,
           drive_modified_time: f.modifiedTime ?? null,

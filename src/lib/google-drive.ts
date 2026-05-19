@@ -102,3 +102,38 @@ export function driveViewerUrl(fileId: string, mimeType: string): string {
   }
   return `https://drive.google.com/file/d/${fileId}/view`;
 }
+
+/**
+ * Post a comment on a Drive file. Works uniformly across Google Docs, PDFs,
+ * and DOCX uploaded to Drive — anchoring fidelity differs by file type:
+ *   - Google Doc: anchored to the quoted text range
+ *   - PDF: anchored if the PDF has selectable text; otherwise file-level
+ *   - DOCX / other: file-level with quoted-text snippet
+ *
+ * Returns the created comment's ID so the caller can record it.
+ */
+export async function createDriveComment(opts: {
+  workspaceId: string;
+  fileId: string;
+  content: string;
+  quotedText?: string;
+}): Promise<{ id: string; htmlContent?: string }> {
+  const token = await refreshAccessToken(opts.workspaceId);
+  const body: Record<string, unknown> = { content: opts.content };
+  if (opts.quotedText) {
+    // Drive trims comment quotes to a few hundred chars; clip defensively.
+    body.quotedFileContent = { value: opts.quotedText.slice(0, 1500) };
+  }
+  const r = await fetch(`${DRIVE_API}/files/${opts.fileId}/comments?fields=id,htmlContent&supportsAllDrives=true`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    throw new Error(`Drive comment create failed: ${r.status} ${await r.text()}`);
+  }
+  return r.json();
+}

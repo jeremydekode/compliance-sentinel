@@ -14,7 +14,7 @@ import { MD } from "@/components/md";
 import { exportExcel, exportHtmlPresentation } from "@/lib/exports";
 import { impactClasses, formatDate, statusMeta, changeTypeMeta } from "@/lib/format";
 import { sortChangesByPriority, autoBoldExecBullet } from "@/lib/change-utils";
-import { updateImpact, rerunReport, rerunFormUpdateReport } from "@/lib/compliance.functions";
+import { updateImpact, rerunReport, rerunFormUpdateReport, insertImpactAsDriveComment } from "@/lib/compliance.functions";
 import { cn } from "@/lib/utils";
 import { diffOld, diffNew } from "@/lib/text-diff";
 import {
@@ -23,6 +23,7 @@ import {
   Scale, FileText, AlertCircle, Sparkles, ExternalLink,
   ArrowDownToLine, MoveDown, AlertTriangle, LayoutGrid,
   CircleDot, Circle, RefreshCw, PanelLeftClose, PanelLeftOpen, FileEdit,
+  MessageSquarePlus,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -77,7 +78,7 @@ function ReportPage() {
     queryFn: async () => {
       const ws = (report.data as any)?.workspace_id ?? "rmit";
       const { data } = await (supabase as any).from("sop_documents")
-        .select("id,title,doc_type,version,file_url")
+        .select("id,title,doc_type,version,file_url,drive_file_id,drive_mime_type")
         .eq("workspace_id", ws);
       return data ?? [];
     },
@@ -895,13 +896,31 @@ function ImpactCard({
   imp, sopDoc, onSetStatus,
 }: {
   imp: any;
-  sopDoc?: { title?: string; file_url?: string | null; doc_type?: string; version?: string };
+  sopDoc?: { title?: string; file_url?: string | null; doc_type?: string; version?: string; drive_file_id?: string | null; drive_mime_type?: string | null };
   onSetStatus: (id: string, s: "approved" | "rejected" | "routed") => void;
 }) {
   const [editMode, setEditMode] = useState(false);
   const qc = useQueryClient();
   const upd = useServerFn(updateImpact);
+  const insertComment = useServerFn(insertImpactAsDriveComment);
   const [editedText, setEditedText] = useState(imp.edited_text ?? imp.replace_text ?? "");
+  const [inserting, setInserting] = useState(false);
+  const isFromDrive = !!sopDoc?.drive_file_id;
+  const alreadyInserted = !!imp.inserted_at || !!imp.drive_comment_id;
+
+  async function insertIntoSource() {
+    if (!isFromDrive || alreadyInserted) return;
+    setInserting(true);
+    try {
+      const r = await insertComment({ data: { impactId: imp.id } });
+      toast.success(r.alreadyInserted ? "Comment already exists in Doc" : "Comment inserted in source document");
+      qc.invalidateQueries({ queryKey: ["impacts"] });
+    } catch (e: any) {
+      toast.error("Insert failed", { description: e?.message });
+    } finally {
+      setInserting(false);
+    }
+  }
 
   async function saveEdit() {
     try {
@@ -1092,9 +1111,27 @@ function ImpactCard({
               className={cn("h-7 text-xs gap-1", currentStatus === "approved" && "text-emerald-700 bg-emerald-50 dark:bg-emerald-900/20")}>
               <CheckCircle2 className="size-3" /> Approve
             </Button>
-            <Button size="sm" variant="ghost" onClick={() => onSetStatus(imp.id, "routed")}
-              className={cn("h-7 text-xs gap-1", currentStatus === "routed" && "text-amber-700 bg-amber-50 dark:bg-amber-900/20")}>
-              <UserCheck className="size-3" /> Route
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={insertIntoSource}
+              disabled={!isFromDrive || alreadyInserted || inserting}
+              title={
+                alreadyInserted
+                  ? "A comment has already been inserted in the source document"
+                  : !isFromDrive
+                    ? "This SOP isn't synced from Drive — re-add it through the Drive folder to enable commenting"
+                    : "Insert this change as a comment in the source Google Doc / PDF / DOCX"
+              }
+              className={cn(
+                "h-7 text-xs gap-1",
+                alreadyInserted && "text-blue-700 bg-blue-50 dark:bg-blue-900/20",
+              )}
+            >
+              {inserting
+                ? <Loader2 className="size-3 animate-spin" />
+                : alreadyInserted ? <CheckCircle2 className="size-3" /> : <MessageSquarePlus className="size-3" />}
+              {alreadyInserted ? "Inserted" : "Insert"}
             </Button>
             <Button size="sm" variant="ghost" onClick={() => onSetStatus(imp.id, "rejected")}
               className={cn("h-7 text-xs gap-1 text-muted-foreground", currentStatus === "rejected" && "text-slate-500 bg-slate-100 dark:bg-slate-800")}>
@@ -1247,7 +1284,22 @@ function DocAmendmentPanel({
 function GapTable({ impacts, sopById, reportId }: { impacts: any[]; sopById: Map<string, any>; reportId: string }) {
   const qc = useQueryClient();
   const upd = useServerFn(updateImpact);
+  const insertComment = useServerFn(insertImpactAsDriveComment);
   const [filter, setFilter] = useState<"all" | "pending" | "approved" | "routed" | "rejected">("all");
+  const [insertingId, setInsertingId] = useState<string | null>(null);
+
+  async function insertIntoSource(impactId: string) {
+    setInsertingId(impactId);
+    try {
+      const r = await insertComment({ data: { impactId } });
+      toast.success(r.alreadyInserted ? "Comment already exists in Doc" : "Comment inserted in source document");
+      qc.invalidateQueries({ queryKey: ["impacts", reportId] });
+    } catch (e: any) {
+      toast.error("Insert failed", { description: e?.message });
+    } finally {
+      setInsertingId(null);
+    }
+  }
 
   async function setStatus(id: string, status: "approved" | "rejected" | "routed") {
     await upd({ data: { id, status } });
@@ -1414,15 +1466,33 @@ function GapTable({ impacts, sopById, reportId }: { impacts: any[]; sopById: Map
                         )}>
                         <CheckCircle2 className="size-3.5" />
                       </button>
-                      <button onClick={() => setStatus(imp.id, "routed")}
-                        title="Route to Legal"
-                        className={cn("p-1.5 rounded transition-colors",
-                          currentStatus === "routed"
-                            ? "text-amber-600 bg-amber-100"
-                            : "text-muted-foreground hover:text-amber-600 hover:bg-amber-50"
-                        )}>
-                        <UserCheck className="size-3.5" />
-                      </button>
+                      {(() => {
+                        const sop = imp.sop_id ? sopById.get(imp.sop_id) : undefined;
+                        const fromDrive = !!sop?.drive_file_id;
+                        const inserted = !!imp.inserted_at || !!imp.drive_comment_id;
+                        return (
+                          <button
+                            onClick={() => fromDrive && !inserted && insertIntoSource(imp.id)}
+                            disabled={!fromDrive || inserted || insertingId === imp.id}
+                            title={
+                              inserted ? "Already inserted as a comment in source doc"
+                              : !fromDrive ? "Source SOP isn't synced from Drive"
+                              : "Insert as comment in source doc"
+                            }
+                            className={cn("p-1.5 rounded transition-colors",
+                              inserted
+                                ? "text-blue-600 bg-blue-100"
+                                : !fromDrive
+                                  ? "text-muted-foreground/40 cursor-not-allowed"
+                                  : "text-muted-foreground hover:text-blue-600 hover:bg-blue-50"
+                            )}
+                          >
+                            {insertingId === imp.id
+                              ? <Loader2 className="size-3.5 animate-spin" />
+                              : <MessageSquarePlus className="size-3.5" />}
+                          </button>
+                        );
+                      })()}
                       <button onClick={() => setStatus(imp.id, "rejected")}
                         title="Reject"
                         className={cn("p-1.5 rounded transition-colors",

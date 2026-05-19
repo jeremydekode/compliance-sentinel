@@ -20,6 +20,7 @@ import {
   downloadFile,
   exportGoogleDocAsText,
   driveViewerUrl,
+  createDriveComment,
 } from "./google-drive";
 
 /**
@@ -2213,4 +2214,74 @@ export const importDriveFileForAnalysis = createServerFn({ method: "POST" })
       fileUrl: pub.publicUrl as string,
       driveMimeType: meta.mimeType,
     };
+  });
+
+// ── Stage 4: insert an approved impact as a Drive comment on the source ──────
+
+/**
+ * Push an approved impact back to the source Drive file as a comment.
+ * Works on Google Docs (anchored to quoted text), PDFs (anchored if text-
+ * selectable, else file-level), and DOCX (file-level quoted comment).
+ *
+ * Idempotent: if drive_comment_id is already set on the impact, returns it.
+ */
+export const insertImpactAsDriveComment = createServerFn({ method: "POST" })
+  .inputValidator(z.object({ impactId: z.string().min(1) }))
+  .handler(async ({ data }) => {
+    // 1. Load the impact + its source SOP
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: imp, error: impErr } = await (supabase as any)
+      .from("sop_impacts")
+      .select("id, sop_id, chapter, paragraph, change_type, find_text, replace_text, edited_text, drive_comment_id, status")
+      .eq("id", data.impactId)
+      .single();
+    if (impErr || !imp) throw new Error("Impact not found");
+
+    // Already inserted — return the existing comment ID instead of duplicating
+    if (imp.drive_comment_id) {
+      return { commentId: imp.drive_comment_id as string, alreadyInserted: true };
+    }
+    if (!imp.sop_id) throw new Error("This impact is not linked to a KB document.");
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: sop, error: sopErr } = await (supabase as any)
+      .from("sop_documents")
+      .select("workspace_id, title, drive_file_id, drive_mime_type")
+      .eq("id", imp.sop_id)
+      .single();
+    if (sopErr || !sop) throw new Error("Source SOP not found");
+    if (!sop.drive_file_id) {
+      throw new Error("This SOP wasn't synced from Drive — there's no source file to comment on. Re-add the doc through the Drive folder if you want comments to flow back.");
+    }
+
+    // 2. Build the comment body
+    const isInsertion = imp.change_type === "insertion" || imp.change_type === "new_section";
+    const newText = (imp.edited_text ?? imp.replace_text ?? "").trim();
+    const headline = isInsertion
+      ? "Compliance Sentinel — Insert new content"
+      : "Compliance Sentinel — Suggested change";
+    const lines: string[] = [headline];
+    if (imp.paragraph) lines.push(`Section: ${imp.paragraph}`);
+    if (imp.chapter) lines.push(`Regulator ref: ${imp.chapter}`);
+    if (!isInsertion && imp.find_text) {
+      lines.push("", "Replace:", `"${String(imp.find_text).slice(0, 600)}"`);
+    }
+    lines.push("", isInsertion ? "Insert:" : "With:", `"${newText.slice(0, 1500)}"`);
+
+    // 3. Post the comment via Drive API
+    const r = await createDriveComment({
+      workspaceId: sop.workspace_id,
+      fileId: sop.drive_file_id,
+      content: lines.join("\n"),
+      quotedText: imp.find_text || imp.paragraph || undefined,
+    });
+
+    // 4. Record it on the impact so the UI shows "Inserted" + re-clicks are no-ops
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase as any).from("sop_impacts").update({
+      drive_comment_id: r.id,
+      inserted_at: new Date().toISOString(),
+    }).eq("id", imp.id);
+
+    return { commentId: r.id, alreadyInserted: false };
   });

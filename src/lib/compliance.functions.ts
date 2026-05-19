@@ -3,6 +3,15 @@ import { z } from "zod";
 import { supabase } from "@/integrations/supabase/client";
 import { analyzePolicy, chunkDocument, generateAmendedDocument, extractRegulatoryChanges, mapChangeToSops, generateAnalysisSummary, generateWithFallback } from "./gemini";
 import { applyEditsToDocx, looksLikeDocx, docxToText } from "./docx-editor";
+import {
+  buildAuthUrl,
+  buildRedirectUri,
+  exchangeCodeForTokens,
+  fetchUserInfo,
+  storeConnection,
+  getConnection,
+  deleteConnection,
+} from "./google-oauth";
 
 /**
  * Wrap a fetched file as a PolicySource for Gemini.
@@ -1875,4 +1884,70 @@ Example C — TABLE OF CONTENTS:
       impactCount: allImpacts.length,
       affectedDocs: chunkHits.size,
     };
+  });
+
+// ── Google Drive OAuth + connection management ────────────────────────────────
+
+const workspaceSchema = z.enum(["rmit", "fatf", "forms"]);
+
+/** Build the consent URL the browser navigates to when Connect is clicked. */
+export const getGoogleAuthUrl = createServerFn({ method: "POST" })
+  .inputValidator(z.object({
+    workspace: workspaceSchema,
+    origin: z.string().url(),
+  }))
+  .handler(async ({ data }) => {
+    const host = new URL(data.origin).host;
+    const proto = data.origin.startsWith("https") ? "https" : "http";
+    const redirectUri = buildRedirectUri(host, proto);
+    const url = buildAuthUrl({
+      workspace: data.workspace,
+      redirectUri,
+      state: data.workspace, // MVP: workspace doubles as state; nonce/CSRF in a later pass
+    });
+    return { url };
+  });
+
+/** Handle the OAuth callback: exchange code, fetch email, persist tokens. */
+export const handleGoogleCallback = createServerFn({ method: "POST" })
+  .inputValidator(z.object({
+    code: z.string().min(1),
+    state: z.string().min(1),
+    origin: z.string().url(),
+  }))
+  .handler(async ({ data }) => {
+    const workspace = workspaceSchema.parse(data.state);
+    const host = new URL(data.origin).host;
+    const proto = data.origin.startsWith("https") ? "https" : "http";
+    const redirectUri = buildRedirectUri(host, proto);
+
+    const tokens = await exchangeCodeForTokens(data.code, redirectUri);
+    if (!tokens.refresh_token) {
+      throw new Error("Google did not return a refresh_token — try Disconnect first then reconnect");
+    }
+    const { email } = await fetchUserInfo(tokens.access_token);
+    await storeConnection({
+      workspace,
+      email,
+      refreshToken: tokens.refresh_token,
+      accessToken: tokens.access_token,
+      expiresIn: tokens.expires_in,
+      scope: tokens.scope,
+    });
+    return { email, workspace };
+  });
+
+/** Read connection status for the Settings UI. */
+export const getGoogleConnectionStatus = createServerFn({ method: "POST" })
+  .inputValidator(z.object({ workspace: workspaceSchema }))
+  .handler(async ({ data }) => {
+    return await getConnection(data.workspace);
+  });
+
+/** Disconnect Google for a workspace. */
+export const disconnectGoogle = createServerFn({ method: "POST" })
+  .inputValidator(z.object({ workspace: workspaceSchema }))
+  .handler(async ({ data }) => {
+    await deleteConnection(data.workspace);
+    return { ok: true };
   });

@@ -6,8 +6,13 @@ import { AppShell } from "@/components/app-shell";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { supabase } from "@/integrations/supabase/client";
-import { AlertTriangle, Trash2 } from "lucide-react";
-import { clearWorkspace } from "@/lib/compliance.functions";
+import { AlertTriangle, Trash2, CheckCircle2, Loader2, Plug, Unplug } from "lucide-react";
+import {
+  clearWorkspace,
+  getGoogleAuthUrl,
+  getGoogleConnectionStatus,
+  disconnectGoogle,
+} from "@/lib/compliance.functions";
 import { useWorkspace, WORKSPACES } from "@/lib/workspace";
 import { toast } from "sonner";
 
@@ -19,9 +24,41 @@ export const Route = createFileRoute("/settings")({
 function SettingsPage() {
   const qc = useQueryClient();
   const clear = useServerFn(clearWorkspace);
+  const getAuthUrl = useServerFn(getGoogleAuthUrl);
+  const getStatus = useServerFn(getGoogleConnectionStatus);
+  const disconnect = useServerFn(disconnectGoogle);
   const [busy, setBusy] = useState<string | null>(null);
   const [workspace] = useWorkspace();
   const wsName = WORKSPACES[workspace].name;
+
+  const googleConn = useQuery({
+    queryKey: ["google_connection", workspace],
+    queryFn: async () => await getStatus({ data: { workspace } }),
+  });
+
+  async function connectGoogle() {
+    setBusy("connect");
+    try {
+      const { url } = await getAuthUrl({ data: { workspace, origin: window.location.origin } });
+      window.location.href = url;
+    } catch (e: any) {
+      toast.error("Could not start Google connection", { description: e?.message });
+      setBusy(null);
+    }
+  }
+  async function disconnectGoogleNow() {
+    if (!confirm(`Disconnect Google Drive from the ${wsName} workspace?`)) return;
+    setBusy("disconnect");
+    try {
+      await disconnect({ data: { workspace } });
+      toast.success(`Disconnected Google Drive from ${wsName}`);
+      qc.invalidateQueries({ queryKey: ["google_connection", workspace] });
+    } catch (e: any) {
+      toast.error("Disconnect failed", { description: e?.message });
+    } finally {
+      setBusy(null);
+    }
+  }
 
   const counts = useQuery({
     queryKey: ["counts", workspace],
@@ -74,6 +111,70 @@ function SettingsPage() {
                 {counts.data?.reports ?? "—"}
               </div>
               <div className="text-xs text-muted-foreground">Analysis reports</div>
+            </div>
+          </div>
+        </Card>
+
+        <Card className="p-6">
+          <div className="flex items-start justify-between gap-4">
+            <div className="min-w-0">
+              <h2 className="font-display text-lg font-semibold inline-flex items-center gap-2">
+                Google Drive
+                {googleConn.data?.connected && (
+                  <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-200 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide">
+                    <CheckCircle2 className="size-3" /> Connected
+                  </span>
+                )}
+              </h2>
+              <p className="text-sm text-muted-foreground mt-1">
+                Connect a Google account to use a Drive folder as the {wsName} Knowledge Base, pick policy docs from Drive for analysis, and write comments back into source Docs.
+              </p>
+              {googleConn.isLoading && (
+                <div className="mt-3 text-xs text-muted-foreground inline-flex items-center gap-2">
+                  <Loader2 className="size-3 animate-spin" /> Checking connection…
+                </div>
+              )}
+              {googleConn.data?.connected && (
+                <div className="mt-3 rounded-md border bg-emerald-50/40 dark:bg-emerald-950/20 border-emerald-200 dark:border-emerald-800 px-3 py-2 text-xs">
+                  <div className="font-semibold text-emerald-900 dark:text-emerald-200">
+                    {googleConn.data.email}
+                  </div>
+                  <div className="text-emerald-800/70 dark:text-emerald-300/70 mt-0.5">
+                    {googleConn.data.driveFolderName
+                      ? <>KB folder: <span className="font-medium">{googleConn.data.driveFolderName}</span></>
+                      : <>No KB folder configured yet — coming in the next stage.</>}
+                  </div>
+                </div>
+              )}
+              {googleConn.data && !googleConn.data.connected && (
+                <div className="mt-3 rounded-md border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+                  Not connected. Click Connect to start the Google consent flow.
+                </div>
+              )}
+            </div>
+            <div className="shrink-0">
+              {googleConn.data?.connected ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={disconnectGoogleNow}
+                  disabled={busy === "disconnect"}
+                  className="gap-2"
+                >
+                  {busy === "disconnect" ? <Loader2 className="size-4 animate-spin" /> : <Unplug className="size-4" />}
+                  Disconnect
+                </Button>
+              ) : (
+                <Button
+                  size="sm"
+                  onClick={connectGoogle}
+                  disabled={busy === "connect" || googleConn.isLoading}
+                  className="gap-2"
+                >
+                  {busy === "connect" ? <Loader2 className="size-4 animate-spin" /> : <Plug className="size-4" />}
+                  Connect Google Drive
+                </Button>
+              )}
             </div>
           </div>
         </Card>

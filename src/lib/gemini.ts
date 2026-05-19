@@ -14,8 +14,8 @@ const ai = new GoogleGenAI({ apiKey: process.env.GOOGLE_GENERATIVE_AI_API_KEY ||
 //
 // Both chains fall through older flash variants on quota / capacity errors.
 const FALLBACK_CHAINS = {
-  quality: ["gemini-3.1-pro", "gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash"],
-  fast:    ["gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash"],
+  quality: ["gemini-3.1-pro", "gemini-3.1-flash-lite", "gemini-3.0-flash", "gemini-2.5-flash"],
+  fast:    ["gemini-3.1-flash-lite", "gemini-3.0-flash", "gemini-2.5-flash"],
 } as const;
 
 export type ModelTier = keyof typeof FALLBACK_CHAINS;

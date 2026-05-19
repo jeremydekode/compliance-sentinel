@@ -7,10 +7,10 @@ import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { supabase } from "@/integrations/supabase/client";
-import { 
-  ArrowRight, 
-  Trash2, 
-  Upload, 
+import {
+  ArrowRight,
+  Trash2,
+  Upload,
   CheckCircle2,
   Loader2,
   Sparkles,
@@ -18,10 +18,19 @@ import {
   X,
   FileSearch,
   FileEdit,
+  HardDrive,
+  FileText,
+  RefreshCw,
 } from "lucide-react";
 import { FormUpdateDialog } from "@/components/form-update-dialog";
 import { formatDate, statusMeta } from "@/lib/format";
-import { deleteReport, createReport } from "@/lib/compliance.functions";
+import {
+  deleteReport,
+  createReport,
+  listWorkspaceDriveFiles,
+  importDriveFileForAnalysis,
+  getGoogleConnectionStatus,
+} from "@/lib/compliance.functions";
 import { autoDetectDocMeta, DOC_TYPE_LABEL, type DetectedMeta } from "@/lib/auto-detect";
 import { useWorkspace, WORKSPACES } from "@/lib/workspace";
 import { PIPELINE_STEPS } from "@/lib/mock-pipeline";
@@ -37,11 +46,16 @@ function ReportsList() {
   const qc = useQueryClient();
   const remove = useServerFn(deleteReport);
   const create = useServerFn(createReport);
+  const listDrive = useServerFn(listWorkspaceDriveFiles);
+  const importDrive = useServerFn(importDriveFileForAnalysis);
+  const getGoogleStatus = useServerFn(getGoogleConnectionStatus);
   const nav = useNavigate();
-  
+
   const [showUpload, setShowUpload] = useState(false);
   const [showFormUpdate, setShowFormUpdate] = useState(false);
+  const [source, setSource] = useState<"local" | "drive">("local");
   const [file, setFile] = useState<File | null>(null);
+  const [driveFile, setDriveFile] = useState<{ id: string; name: string; mimeType: string } | null>(null);
   const [detected, setDetected] = useState<DetectedMeta | null>(null);
   const [analysisName, setAnalysisName] = useState("");
   const [overrideDocType, setOverrideDocType] = useState<string>("");
@@ -49,6 +63,29 @@ function ReportsList() {
   const [running, setRunning] = useState(false);
   const [stepIdx, setStepIdx] = useState(-1);
   const [workspace] = useWorkspace();
+
+  // Google connection status — drives whether the "Pick from Drive" tab is usable
+  const googleConn = useQuery({
+    queryKey: ["google_connection", workspace],
+    queryFn: async () => await getGoogleStatus({ data: { workspace } }),
+  });
+
+  // Drive file listing — lazy, only fetched when user opens the Drive tab
+  const driveFiles = useQuery({
+    queryKey: ["drive_files_for_analysis", workspace],
+    enabled: showUpload && source === "drive" && !!googleConn.data?.connected && !!googleConn.data?.driveFolderName,
+    queryFn: async () => await listDrive({ data: { workspace } }),
+  });
+
+  function pickDriveFile(f: { id: string; name: string; mimeType: string }) {
+    setDriveFile(f);
+    setFile(null); // mutually exclusive
+    const meta = autoDetectDocMeta(f.name);
+    setDetected(meta);
+    setAnalysisName(f.name.replace(/\.[^.]+$/, ""));
+    setOverrideDocType(meta?.doc_type ?? "");
+    setNotes("");
+  }
 
   const reports = useQuery({
     queryKey: ["reports", "all", workspace],
@@ -63,23 +100,39 @@ function ReportsList() {
   });
 
   async function startAnalysis() {
-    if (!file) return;
+    if (!file && !driveFile) return;
     setRunning(true);
     setStepIdx(0);
 
     let fileUrl: string | null = null;
+    let filename: string = "";
+
     try {
-      const path = `${Date.now()}-${file.name}`;
-      const up = await supabase.storage.from("policies").upload(path, file, {
-        upsert: false,
-        contentType: file.type,
-      });
-      if (!up.error) {
-        const { data } = supabase.storage.from("policies").getPublicUrl(path);
-        fileUrl = data.publicUrl;
+      if (driveFile) {
+        // Drive path — server fetches via stored token, uploads to Supabase storage,
+        // returns a usable public fileUrl. Same downstream pipeline as a local upload.
+        const r = await importDrive({ data: { workspace, driveFileId: driveFile.id } });
+        fileUrl = r.fileUrl;
+        filename = r.filename;
+      } else if (file) {
+        // Local path — upload from browser straight to Supabase storage.
+        const path = `${Date.now()}-${file.name}`;
+        const up = await supabase.storage.from("policies").upload(path, file, {
+          upsert: false,
+          contentType: file.type,
+        });
+        if (!up.error) {
+          const { data } = supabase.storage.from("policies").getPublicUrl(path);
+          fileUrl = data.publicUrl;
+        }
+        filename = file.name;
       }
-    } catch (e) {
-      console.error("Upload failed:", e);
+    } catch (e: any) {
+      console.error("Upload/import failed:", e);
+      toast.error("Could not prepare file for analysis", { description: e?.message });
+      setRunning(false);
+      setStepIdx(-1);
+      return;
     }
 
     // Progress simulation for UI
@@ -97,7 +150,7 @@ function ReportsList() {
       } : undefined;
       const res = await create({
         data: {
-          filename: file.name,
+          filename,
           fileUrl,
           workspace,
           detected: detectedWithOverrides,
@@ -115,6 +168,8 @@ function ReportsList() {
       // Close upload and reset
       setShowUpload(false);
       setFile(null);
+      setDriveFile(null);
+      setSource("local");
       setDetected(null);
       setAnalysisName("");
       setOverrideDocType("");
@@ -192,36 +247,152 @@ function ReportsList() {
                   <h2 className="text-xl font-bold italic tracking-tight">Intelligent Data Ingestion</h2>
                 </div>
                 
-                <label
-                  className={cn(
-                    "block border-2 border-dashed rounded-2xl p-12 text-center cursor-pointer transition-all duration-300",
-                    file ? "border-primary bg-primary/5 shadow-inner" : "border-muted-foreground/20 hover:border-primary/50 hover:bg-muted/30"
-                  )}
-                >
-                  <input
-                    type="file"
-                    accept=".pdf,.doc,.docx"
-                    className="hidden"
-                    onChange={(e) => {
-                      const f = e.target.files?.[0] ?? null;
-                      setFile(f);
-                      const meta = f ? autoDetectDocMeta(f.name) : null;
-                      setDetected(meta);
-                      setAnalysisName(f ? f.name.replace(/\.[^.]+$/, "") : "");
-                      setOverrideDocType(meta?.doc_type ?? "");
-                      setNotes("");
-                    }}
-                  />
-                  <div className={cn("size-16 mx-auto rounded-full grid place-items-center mb-4 transition-transform duration-300", file ? "bg-primary text-white scale-110" : "bg-muted text-muted-foreground")}>
-                    <Upload className="size-8" />
+                {/* Source tabs — local upload vs pick from Drive */}
+                <div className="flex items-center gap-1 p-1 rounded-xl border bg-muted/30 w-fit">
+                  <button
+                    type="button"
+                    onClick={() => { setSource("local"); setDriveFile(null); }}
+                    className={cn(
+                      "px-4 py-2 rounded-lg text-xs font-bold uppercase tracking-wider transition-colors inline-flex items-center gap-2",
+                      source === "local" ? "bg-card shadow-sm text-foreground" : "text-muted-foreground hover:text-foreground"
+                    )}
+                  >
+                    <Upload className="size-3.5" /> Upload local file
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setSource("drive"); setFile(null); }}
+                    className={cn(
+                      "px-4 py-2 rounded-lg text-xs font-bold uppercase tracking-wider transition-colors inline-flex items-center gap-2",
+                      source === "drive" ? "bg-card shadow-sm text-foreground" : "text-muted-foreground hover:text-foreground"
+                    )}
+                  >
+                    <HardDrive className="size-3.5" /> Pick from Drive
+                  </button>
+                </div>
+
+                {source === "local" && (
+                  <label
+                    className={cn(
+                      "block border-2 border-dashed rounded-2xl p-12 text-center cursor-pointer transition-all duration-300",
+                      file ? "border-primary bg-primary/5 shadow-inner" : "border-muted-foreground/20 hover:border-primary/50 hover:bg-muted/30"
+                    )}
+                  >
+                    <input
+                      type="file"
+                      accept=".pdf,.doc,.docx"
+                      className="hidden"
+                      onChange={(e) => {
+                        const f = e.target.files?.[0] ?? null;
+                        setFile(f);
+                        setDriveFile(null);
+                        const meta = f ? autoDetectDocMeta(f.name) : null;
+                        setDetected(meta);
+                        setAnalysisName(f ? f.name.replace(/\.[^.]+$/, "") : "");
+                        setOverrideDocType(meta?.doc_type ?? "");
+                        setNotes("");
+                      }}
+                    />
+                    <div className={cn("size-16 mx-auto rounded-full grid place-items-center mb-4 transition-transform duration-300", file ? "bg-primary text-white scale-110" : "bg-muted text-muted-foreground")}>
+                      <Upload className="size-8" />
+                    </div>
+                    <div className="font-bold text-lg">
+                      {file ? file.name : "Drop policy document or click to browse"}
+                    </div>
+                    <p className="text-xs text-muted-foreground mt-2 font-medium">
+                      Supports PDF, DOCX up to 25MB. AI-ready parsing active.
+                    </p>
+                  </label>
+                )}
+
+                {source === "drive" && (
+                  <div className="border rounded-2xl bg-muted/20 overflow-hidden">
+                    {!googleConn.data?.connected ? (
+                      <div className="p-8 text-center">
+                        <HardDrive className="size-10 mx-auto mb-3 text-muted-foreground/60" />
+                        <div className="font-semibold text-sm">Google Drive isn't connected for this workspace</div>
+                        <p className="text-xs text-muted-foreground mt-1 max-w-md mx-auto">
+                          Go to <Link to="/settings" className="text-primary underline">Settings</Link> → Google Drive → Connect, then set a KB folder, then come back here.
+                        </p>
+                      </div>
+                    ) : !googleConn.data?.driveFolderName ? (
+                      <div className="p-8 text-center">
+                        <HardDrive className="size-10 mx-auto mb-3 text-muted-foreground/60" />
+                        <div className="font-semibold text-sm">No KB folder configured</div>
+                        <p className="text-xs text-muted-foreground mt-1 max-w-md mx-auto">
+                          Connected as <span className="font-medium">{googleConn.data.email}</span>. Open <Link to="/settings" className="text-primary underline">Settings</Link> to set a Drive folder, then come back.
+                        </p>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="px-4 py-3 border-b bg-card flex items-center justify-between">
+                          <div className="text-xs">
+                            <span className="text-muted-foreground">Folder:</span>{" "}
+                            <span className="font-semibold">{googleConn.data.driveFolderName}</span>
+                            {driveFiles.data && (
+                              <span className="text-muted-foreground ml-2">· {driveFiles.data.files.length} file{driveFiles.data.files.length === 1 ? "" : "s"}</span>
+                            )}
+                          </div>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => qc.invalidateQueries({ queryKey: ["drive_files_for_analysis", workspace] })}
+                            disabled={driveFiles.isFetching}
+                            className="gap-1.5 h-7 text-xs"
+                          >
+                            {driveFiles.isFetching ? <Loader2 className="size-3 animate-spin" /> : <RefreshCw className="size-3" />}
+                            Refresh
+                          </Button>
+                        </div>
+
+                        {driveFiles.isLoading ? (
+                          <div className="p-8 text-center text-muted-foreground">
+                            <Loader2 className="size-5 mx-auto animate-spin mb-2" />
+                            <div className="text-xs">Listing folder contents…</div>
+                          </div>
+                        ) : driveFiles.isError ? (
+                          <div className="p-6 text-center text-sm text-rose-700">
+                            Could not list folder: {(driveFiles.error as any)?.message ?? "unknown error"}
+                          </div>
+                        ) : driveFiles.data?.files?.length === 0 ? (
+                          <div className="p-8 text-center text-sm text-muted-foreground">
+                            Folder is empty.
+                          </div>
+                        ) : (
+                          <div className="max-h-72 overflow-y-auto divide-y">
+                            {driveFiles.data?.files.map((f) => {
+                              const isPicked = driveFile?.id === f.id;
+                              return (
+                                <button
+                                  key={f.id}
+                                  type="button"
+                                  disabled={!f.indexable}
+                                  onClick={() => f.indexable && pickDriveFile(f)}
+                                  className={cn(
+                                    "w-full text-left px-4 py-2.5 transition-colors flex items-center gap-3",
+                                    !f.indexable && "opacity-50 cursor-not-allowed",
+                                    isPicked ? "bg-primary/10" : "hover:bg-muted/40"
+                                  )}
+                                >
+                                  <FileText className={cn("size-4 shrink-0", isPicked ? "text-primary" : "text-muted-foreground")} />
+                                  <div className="min-w-0 flex-1">
+                                    <div className={cn("text-sm truncate", isPicked && "font-semibold")}>{f.name}</div>
+                                    <div className="text-[10px] text-muted-foreground truncate">
+                                      {f.mimeType.replace("application/vnd.google-apps.", "Google ").replace("application/", "")}
+                                      {f.modifiedTime && <> · modified {new Date(f.modifiedTime).toLocaleDateString()}</>}
+                                      {!f.indexable && <> · unsupported</>}
+                                    </div>
+                                  </div>
+                                  {isPicked && <CheckCircle2 className="size-4 text-primary shrink-0" />}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </>
+                    )}
                   </div>
-                  <div className="font-bold text-lg">
-                    {file ? file.name : "Drop policy document or click to browse"}
-                  </div>
-                  <p className="text-xs text-muted-foreground mt-2 font-medium">
-                    Supports PDF, DOCX up to 25MB. AI-ready parsing active.
-                  </p>
-                </label>
+                )}
 
                 {detected && (
                   <div className="rounded-2xl border border-primary/10 bg-white/50 dark:bg-slate-900/50 p-6 shadow-sm space-y-5">
@@ -311,10 +482,10 @@ function ReportsList() {
                 )}
 
                 <div className="flex justify-end pt-4 border-t border-primary/5">
-                  <Button 
-                    size="lg" 
-                    disabled={!file} 
-                    onClick={startAnalysis} 
+                  <Button
+                    size="lg"
+                    disabled={!file && !driveFile}
+                    onClick={startAnalysis}
                     className="gap-2 h-12 px-10 rounded-xl font-black uppercase tracking-widest text-[10px] shadow-xl shadow-primary/20 active:scale-95"
                   >
                     Run Intelligent Analysis

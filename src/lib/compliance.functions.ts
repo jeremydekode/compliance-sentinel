@@ -2130,3 +2130,87 @@ export const syncDriveFolder = createServerFn({ method: "POST" })
       skipped: skipped.slice(0, 10).map((f) => ({ name: f.name, mimeType: f.mimeType })),
     };
   });
+
+// ── Stage 3: Pick a policy doc from Drive to feed into a New Analysis ────────
+
+/** List files in the workspace's configured Drive folder, for the picker UI. */
+export const listWorkspaceDriveFiles = createServerFn({ method: "POST" })
+  .inputValidator(z.object({ workspace: workspaceSchema }))
+  .handler(async ({ data }) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: conn } = await (supabase as any)
+      .from("workspace_google_connections")
+      .select("drive_folder_id, drive_folder_name")
+      .eq("workspace_id", data.workspace)
+      .maybeSingle();
+    if (!conn?.drive_folder_id) {
+      throw new Error("No Drive folder configured. Connect Google and set a folder in Settings first.");
+    }
+    const files = await listFolderFiles(data.workspace, conn.drive_folder_id);
+    return {
+      folderName: conn.drive_folder_name ?? "(unnamed folder)",
+      files: files.map((f) => ({
+        id: f.id,
+        name: f.name,
+        mimeType: f.mimeType,
+        modifiedTime: f.modifiedTime ?? null,
+        sizeBytes: f.size ? Number(f.size) : null,
+        indexable: isIndexableMimeType(f.mimeType),
+      })),
+    };
+  });
+
+/**
+ * Pull a Drive file into Supabase storage so the existing analysis pipeline
+ * (which expects a public fileUrl) can run as if the file were uploaded locally.
+ * Returns { filename, fileUrl } ready to pass into createReport.
+ */
+export const importDriveFileForAnalysis = createServerFn({ method: "POST" })
+  .inputValidator(z.object({
+    workspace: workspaceSchema,
+    driveFileId: z.string().min(1),
+  }))
+  .handler(async ({ data }) => {
+    const meta = await getFileMetadata(data.workspace, data.driveFileId);
+    if (!isIndexableMimeType(meta.mimeType)) {
+      throw new Error(`Unsupported file type: ${meta.mimeType}`);
+    }
+
+    // Google Docs need export; everything else is a straight download.
+    let buffer: Buffer;
+    let storageContentType: string;
+    let storageFilename: string;
+    if (meta.mimeType === "application/vnd.google-apps.document") {
+      // Export Google Docs as DOCX so chunkers + docxToText work as-is downstream.
+      // (alt=media doesn't work on Google Docs; have to use export endpoint.)
+      const docsAccessToken = await (await import("./google-oauth")).refreshAccessToken(data.workspace);
+      const r = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${data.driveFileId}/export?mimeType=application/vnd.openxmlformats-officedocument.wordprocessingml.document&supportsAllDrives=true`,
+        { headers: { Authorization: `Bearer ${docsAccessToken}` } }
+      );
+      if (!r.ok) throw new Error(`Drive export failed: ${r.status}`);
+      buffer = Buffer.from(await r.arrayBuffer());
+      storageContentType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+      storageFilename = `${meta.name.replace(/\.(pdf|docx?|gdoc)$/i, "")}.docx`;
+    } else {
+      buffer = await downloadFile(data.workspace, data.driveFileId);
+      storageContentType = meta.mimeType;
+      storageFilename = meta.name;
+    }
+
+    // Upload into the same bucket existing analyses use.
+    const path = `${Date.now()}-${storageFilename.replace(/[^A-Za-z0-9._-]+/g, "_")}`;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { error: upErr } = await (supabase as any).storage
+      .from("policies")
+      .upload(path, buffer, { upsert: false, contentType: storageContentType });
+    if (upErr) throw new Error(`Storage upload failed: ${upErr.message}`);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: pub } = (supabase as any).storage.from("policies").getPublicUrl(path);
+
+    return {
+      filename: storageFilename,
+      fileUrl: pub.publicUrl as string,
+      driveMimeType: meta.mimeType,
+    };
+  });

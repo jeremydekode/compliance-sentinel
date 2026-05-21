@@ -170,10 +170,16 @@ A Plenary Statement updates the Call-for-Action and Increased-Monitoring lists. 
 
 - ONE change entry for ALL countries ADDED to Increased Monitoring this plenary.
     chapter_ref: "FATF Increased Monitoring list — additions"
-    title lists every added country; old_requirement/new_requirement state the full before/after list.
+    title lists every added country.
+    old_requirement = the COMPLETE prior Increased Monitoring list, every country enumerated verbatim.
+    new_requirement = that SAME list reproduced verbatim, with ONLY the newly-added countries appended — same lead-in words, same order, same punctuation.
 - ONE change entry for ALL countries REMOVED from Increased Monitoring this plenary.
     chapter_ref: "FATF Increased Monitoring list — removals"
     title lists every removed country.
+    old_requirement = the COMPLETE prior list, every country enumerated verbatim.
+    new_requirement = that SAME list reproduced verbatim with ONLY the removed countries deleted — everything else identical.
+
+❗❗ old_requirement and new_requirement MUST BE PARALLEL — the full list on BOTH sides, in the SAME enumerated form. The UI word-diffs these two fields against each other. If new_requirement is a SUMMARY (e.g. "now includes: Kuwait and PNG (in addition to existing jurisdictions)") instead of the full updated list, every country absent from that summary is rendered STRUCK-THROUGH as if it were removed — which is false and alarming. The ONLY words that may differ between old_requirement and new_requirement are the actual countries added (additions entry) or the actual countries removed (removals entry). Never summarise, never paraphrase, never abbreviate one side.
 - ONE change entry PER country whose Call-for-Action status escalated (countermeasures enhanced) — these are individually material, so keep them separate.
     chapter_ref: "FATF Call for Action — <Country>"
 - ONE change entry for the plenary date-reference refresh.
@@ -320,7 +326,7 @@ If the NEW POLICY document is itself a comparison table or change-log that alrea
   "related_instruments": ["Related guidelines or instruments mentioned"],
   "impact": "high" | "medium" | "low",
   "old_requirement": "The previous obligation verbatim from the legacy doc, or 'N/A - new requirement'",
-  "new_requirement": "The new/changed obligation verbatim from the updated doc",
+  "new_requirement": "The new/changed obligation verbatim from the updated doc. The UI word-diffs this against old_requirement — keep them PARALLEL. If the change adds or removes items within a list, reproduce the FULL list on both sides (same wording/order) so only the genuinely added/removed items differ; never summarise one side, or unchanged items will wrongly show as struck-through.",
   "change_summary": "One sentence: what operationally changed",
   "tone_shift": "e.g. 'Guidance → Mandate', 'Relaxed → Prescriptive', 'New requirement'"
 }]

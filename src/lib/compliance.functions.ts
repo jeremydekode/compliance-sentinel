@@ -139,6 +139,11 @@ export const createReport = createServerFn({ method: "POST" })
     let aiResult: any;
     let relevantSops: any[] = [];
     let kbAll: any[] = [];
+    // Shared across the analysis: each SOP's full text (fetched once, reused by
+    // the topic-index build and the find_text verification pass) and its
+    // structural index (governance tier + topic map) used for routing.
+    const sopTextCache = new Map<string, string | null>();
+    const sopIndex = new Map<string, { tier: string | null; topicMap: Record<string, string[]> | null }>();
 
     try {
       // 3. Vector search for relevant SOP chunks using the uploaded policy as the query
@@ -201,6 +206,28 @@ export const createReport = createServerFn({ method: "POST" })
       );
       console.log(`Extracted ${extractedChanges.length} regulatory changes. Now mapping each to SOP chunks...`);
 
+      // Build (or load cached) the structural topic index for each candidate
+      // SOP, so the per-change mapping below routes to real clauses instead of
+      // guessing. Bounded by a deadline — any SOP not indexed in time simply
+      // maps the old way; its index is built and cached on a later run.
+      const idxDeadline = Date.now() + 180_000;
+      for (const sop of relevantSops) {
+        let topicMap: Record<string, string[]> | null = (sop.topic_map as any) ?? null;
+        if ((!topicMap || Object.keys(topicMap).length === 0) && Date.now() < idxDeadline) {
+          const text = await fetchSopText(sop, workspace);
+          sopTextCache.set(sop.id, text);
+          if (text && text.trim()) {
+            try {
+              topicMap = await buildAndVerifyTopicMap(sop.id, sop.title, text);
+              console.log(`[createReport] "${sop.title}" — topic index: ${Object.keys(topicMap).length} topic(s)`);
+            } catch (e: any) {
+              console.warn(`[createReport] topic-map build failed for "${sop.title}":`, e?.message);
+            }
+          }
+        }
+        sopIndex.set(sop.id, { tier: sop.governance_tier ?? null, topicMap });
+      }
+
       const allImpacts: any[] = [];
       for (const change of extractedChanges) {
         try {
@@ -243,15 +270,17 @@ export const createReport = createServerFn({ method: "POST" })
             continue;
           }
 
-          // Build sops-for-change with chunk text contexts
-          const sopsForChange: { title: string; text: string }[] = [];
+          // Build sops-for-change with chunk text contexts + the SOP's
+          // structural index, so the mapping routes to real clauses.
+          const sopsForChange: { title: string; text: string; governanceTier?: string | null; topicMap?: Record<string, string[]> | null }[] = [];
           for (const [sopId, sopChunks] of chunksBySop.entries()) {
             const sop = relevantSops.find(s => s.id === sopId);
             if (!sop) continue;
             const text = sopChunks
               .map((c: any) => `[Section: ${c.chapter_ref || "unspecified"} | Page: ${c.page_number || "?"}]\n${c.content}`)
               .join("\n\n---\n\n");
-            sopsForChange.push({ title: sop.title, text });
+            const idx = sopIndex.get(sopId);
+            sopsForChange.push({ title: sop.title, text, governanceTier: idx?.tier ?? null, topicMap: idx?.topicMap ?? null });
           }
 
           const impacts = await mapChangeToSops(change, sopsForChange);
@@ -324,28 +353,12 @@ export const createReport = createServerFn({ method: "POST" })
     // analysis can't surface a find_text the document doesn't contain.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const verifiedImpacts: any[] = [];
-    const sopTextCache = new Map<string, string | null>();
     for (const m of matchedImpacts) {
       if (!m.sop_id) { verifiedImpacts.push(m); continue; }
       if (!sopTextCache.has(m.sop_id)) {
-        let text: string | null = null;
-        try {
-          const sopDoc = relevantSops.find((s) => s.id === m.sop_id);
-          if (sopDoc?.drive_mime_type === "application/vnd.google-apps.document" && sopDoc.drive_file_id) {
-            text = (await exportGoogleDocAsText(sopDoc.workspace_id, sopDoc.drive_file_id)).replace(/\r\n?/g, "\n");
-          } else if (sopDoc?.file_url) {
-            const f = await fetchFile(sopDoc.file_url);
-            if (looksLikeDocx(f.mimeType, sopDoc.file_url)) {
-              text = await docxToText(f.buffer);
-            } else if (f.mimeType === "application/pdf") {
-              const { extractPdfPages } = await import("./pdf-pages");
-              text = (await extractPdfPages(f.buffer)).map((p: any) => p.text).join("\n");
-            }
-          }
-        } catch (e: any) {
-          console.warn(`createReport verify: text fetch failed for sop ${m.sop_id}:`, e?.message);
-        }
-        sopTextCache.set(m.sop_id, text);
+        // Reuses any text already fetched during the topic-index build above.
+        const sopDoc = relevantSops.find((s) => s.id === m.sop_id);
+        sopTextCache.set(m.sop_id, sopDoc ? await fetchSopText(sopDoc, workspace) : null);
       }
       const srcText = sopTextCache.get(m.sop_id);
       if (!srcText) { verifiedImpacts.push(m); continue; } // couldn't fetch — don't drop
@@ -471,6 +484,60 @@ function verifyParagraph(sourceText: string, paragraph: string): string {
 }
 
 /**
+ * Extracts an SOP document's full plain text — Google Docs via Drive export,
+ * otherwise the mirrored file (docx / pdf / plain). Newlines are normalized to
+ * LF. Returns null when the document cannot be read.
+ */
+async function fetchSopText(
+  sopDoc: { title?: string; drive_mime_type?: string | null; drive_file_id?: string | null; file_url?: string | null },
+  workspaceId: string,
+): Promise<string | null> {
+  try {
+    let text = "";
+    if (sopDoc.drive_mime_type === "application/vnd.google-apps.document" && sopDoc.drive_file_id) {
+      text = await exportGoogleDocAsText(workspaceId, sopDoc.drive_file_id);
+    } else if (sopDoc.file_url) {
+      const f = await fetchFile(sopDoc.file_url);
+      if (looksLikeDocx(f.mimeType, sopDoc.file_url)) {
+        text = await docxToText(f.buffer);
+      } else if (f.mimeType === "application/pdf") {
+        const { extractPdfPages } = await import("./pdf-pages");
+        text = (await extractPdfPages(f.buffer)).map((p: any) => p.text).join("\n");
+      } else {
+        text = f.buffer.toString("utf-8");
+      }
+    }
+    return text.replace(/\r\n?/g, "\n");
+  } catch (e: any) {
+    console.warn(`fetchSopText failed for "${sopDoc.title ?? "?"}":`, e?.message?.slice(0, 100));
+    return null;
+  }
+}
+
+/**
+ * Builds the { topic -> [clause refs] } structural index for one SOP, keeps
+ * only refs that genuinely appear in the document text, caches the result on
+ * the sop_documents row, and returns it.
+ */
+async function buildAndVerifyTopicMap(
+  sopId: string, title: string, fullText: string,
+): Promise<Record<string, string[]>> {
+  const raw = await buildSopTopicMap({ title, text: fullText });
+  const verified: Record<string, string[]> = {};
+  for (const [topic, refs] of Object.entries(raw)) {
+    const good = (refs as string[]).filter((r) => {
+      if (fullText.includes(r)) return true;
+      const tok = (r.match(/\b[A-Za-z]?\.?\d+(?:\.\d+)+\b/) ?? [])[0];
+      return !!tok && fullText.includes(tok);
+    });
+    if (good.length > 0) verified[topic] = good;
+  }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  await (supabase as any).from("sop_documents").update({ topic_map: verified }).eq("id", sopId);
+  return verified;
+}
+
+/**
  * Phase 1 of the regulatory re-run. Extracts the regulatory changes (new vs old
  * policy), stores them, and returns the internal SOPs to analyze. The heavy
  * mapping runs per-SOP via analyzeRegulatorySop so no single call can time out.
@@ -584,57 +651,23 @@ export const analyzeRegulatorySop = createServerFn({ method: "POST" })
       .from("sop_documents").select("id, title, file_url, drive_file_id, drive_mime_type, governance_tier, topic_map").eq("id", data.sopId).single();
     if (!sop || !sop.file_url) return { sopId: data.sopId, title: sop?.title ?? "?", impactCount: 0 };
 
-    // Extract the SOP's full text. For Google Docs read Google's OWN text export —
-    // it is the exact representation the in-doc find/replace later matches against,
-    // so the find_text the AI produces will be applicable verbatim.
+    // Extract the SOP's full text. For Google Docs this reads Google's OWN text
+    // export — the exact representation the in-doc find/replace later matches.
     const workspaceId = (report.workspace_id as string) ?? "rmit";
-    let fullText = "";
-    try {
-      if (sop.drive_mime_type === "application/vnd.google-apps.document" && sop.drive_file_id) {
-        fullText = await exportGoogleDocAsText(workspaceId, sop.drive_file_id);
-      } else {
-        const file = await fetchFile(sop.file_url);
-        if (looksLikeDocx(file.mimeType, sop.file_url)) {
-          fullText = await docxToText(file.buffer);
-        } else if (file.mimeType === "application/pdf") {
-          const { extractPdfPages } = await import("./pdf-pages");
-          const pages = await extractPdfPages(file.buffer);
-          fullText = pages.map((p: any) => p.text).join("\n");
-        } else {
-          fullText = file.buffer.toString("utf-8");
-        }
-      }
-    } catch (e: any) {
-      console.warn(`analyzeRegulatorySop: extract failed for "${sop.title}":`, e?.message?.slice(0, 100));
+    const fullText = await fetchSopText(sop, workspaceId);
+    if (!fullText || !fullText.trim()) {
+      console.warn(`analyzeRegulatorySop: could not read "${sop.title}"`);
       return { sopId: sop.id, title: sop.title, impactCount: 0 };
     }
-    // Drive's text export uses CRLF; the live Google Doc uses LF. Normalize so a
-    // multi-line find_text the AI produces still matches the doc at write time.
-    fullText = fullText.replace(/\r\n?/g, "\n");
-    if (!fullText.trim()) return { sopId: sop.id, title: sop.title, impactCount: 0 };
 
     // Structural topic index — built once per document and cached on the row,
     // so the mapping below routes changes to real clauses instead of guessing.
-    // Clause refs are kept only if they (or their clause number) appear in the
-    // document text — a fabricated ref never enters the index.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let topicMap: Record<string, string[]> | null = (sop.topic_map as any) ?? null;
     if (!topicMap || Object.keys(topicMap).length === 0) {
       try {
-        const raw = await buildSopTopicMap({ title: sop.title, text: fullText });
-        const verified: Record<string, string[]> = {};
-        for (const [topic, refs] of Object.entries(raw)) {
-          const good = (refs as string[]).filter((r) => {
-            if (fullText.includes(r)) return true;
-            const tok = (r.match(/\b[A-Za-z]?\.?\d+(?:\.\d+)+\b/) ?? [])[0];
-            return !!tok && fullText.includes(tok);
-          });
-          if (good.length > 0) verified[topic] = good;
-        }
-        topicMap = verified;
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        await (supabase as any).from("sop_documents").update({ topic_map: verified }).eq("id", sop.id);
-        console.log(`[regulatory] "${sop.title}" — topic index: ${Object.keys(verified).length} topic(s)`);
+        topicMap = await buildAndVerifyTopicMap(sop.id, sop.title, fullText);
+        console.log(`[regulatory] "${sop.title}" — topic index: ${Object.keys(topicMap).length} topic(s)`);
       } catch (e: any) {
         console.warn(`[regulatory] topic-map build failed for "${sop.title}":`, e?.message);
         topicMap = null;

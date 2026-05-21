@@ -525,7 +525,10 @@ The document text below has been pre-segmented with explicit page markers of the
  */
 export async function mapChangeToSops(
   change: RegulatoryDelta,
-  sops: ({ title: string; text: string } | { title: string; buffer: Buffer; mimeType: string })[]
+  sops: (
+    | { title: string; text: string; governanceTier?: string | null; topicMap?: Record<string, string[]> | null }
+    | { title: string; buffer: Buffer; mimeType: string }
+  )[]
 ): Promise<SopGap[]> {
   const prompt = `
 # ROLE: COMPLIANCE GAP ANALYST — PRECISION SOP MAPPER
@@ -710,7 +713,8 @@ FATF / AML changes require Compliance Officer + Legal interpretation. Treat ever
         parts.push({ inlineData: { data: sop.buffer.toString("base64"), mimeType: sop.mimeType } });
       }
     } else {
-      parts.push({ text: `\n--- INTERNAL DOCUMENT: "${sop.title}" ---\n${sop.text}` });
+      const roleBlock = buildSopRoleBlock(sop.governanceTier, sop.topicMap);
+      parts.push({ text: `\n--- INTERNAL DOCUMENT: "${sop.title}" ---${roleBlock}\n${sop.text}` });
     }
   }
 

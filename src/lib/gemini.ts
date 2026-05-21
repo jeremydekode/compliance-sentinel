@@ -223,10 +223,27 @@ function policyToParts(label: string, src: PolicySource): any[] {
   ];
 }
 
+/**
+ * Wraps the compliance team's editable analysis guidance as a prompt section.
+ * It is ADDITIVE — it refines approach/emphasis and never overrides the JSON
+ * output contract or the find_text / verification rules.
+ */
+function guidanceBlock(guidance?: string | null): string {
+  const g = (guidance ?? "").trim();
+  if (!g) return "";
+  return `
+# ⚙️ ANALYST GUIDANCE — configured by the compliance team (apply throughout):
+The guidance below refines your APPROACH, FOCUS and EMPHASIS. It does NOT change the required JSON output format, the find_text rules, or the verification rules in this prompt — those remain authoritative. Where the guidance conflicts with the output contract, follow the output contract.
+
+${g}
+`;
+}
+
 export async function extractRegulatoryChanges(
   newPolicy: PolicySource,
   oldPolicy?: PolicySource,
-  regulatorCtx: RegulatorContext = "generic"
+  regulatorCtx: RegulatorContext = "generic",
+  guidance?: string | null
 ): Promise<RegulatoryDelta[]> {
   const prompt = `
 # ROLE: CHIEF COMPLIANCE OFFICER — FORENSIC POLICY CHANGE DETECTOR
@@ -234,6 +251,7 @@ export async function extractRegulatoryChanges(
 You are performing a forensic comparison of two versions of a regulatory document. Your mandate is to identify EVERY policy change that requires an organisation to update its internal procedures, SOPs, or controls.
 
 ${regulatorGuidance(regulatorCtx)}
+${guidanceBlock(guidance)}
 
 ${oldPolicy ? `# DOCUMENTS PROVIDED:
 - DOCUMENT A (NEW/UPDATED POLICY): First attachment
@@ -528,12 +546,14 @@ export async function mapChangeToSops(
   sops: (
     | { title: string; text: string; governanceTier?: string | null; topicMap?: Record<string, string[]> | null }
     | { title: string; buffer: Buffer; mimeType: string }
-  )[]
+  )[],
+  guidance?: string | null
 ): Promise<SopGap[]> {
   const prompt = `
 # ROLE: COMPLIANCE GAP ANALYST — PRECISION SOP MAPPER
 
 You have one specific REGULATORY CHANGE. Your task is to find the EXACT location(s) in our internal SOPs that need to be updated to comply with this change.
+${guidanceBlock(guidance)}
 
 # REASONING STEP — do this SILENTLY first, inside a <thinking></thinking> block:
 1. DEFINE — what exactly did this regulatory change add, remove, reclassify, or re-deadline?
@@ -773,6 +793,7 @@ function buildSopRoleBlock(governanceTier?: string | null, topicMap?: Record<str
 export async function mapChangesToSop(
   changes: RegulatoryDelta[],
   sop: { title: string; text: string; governanceTier?: string | null; topicMap?: Record<string, string[]> | null },
+  guidance?: string | null,
 ): Promise<SopGap[]> {
   const prompt = `
 # ROLE: COMPLIANCE GAP ANALYST — PRECISION SOP MAPPER
@@ -780,6 +801,7 @@ export async function mapChangesToSop(
 You are given a LIST of regulatory changes and the FULL TEXT of ONE internal SOP document.
 Your task: find EVERY location in this SOP that must be updated for ANY of these changes.
 ${buildSopRoleBlock(sop.governanceTier, sop.topicMap)}
+${guidanceBlock(guidance)}
 
 # REASONING STEP — do this SILENTLY first, inside a <thinking></thinking> block:
 1. DEFINE — for each regulatory change, what exactly did it add, remove, reclassify, or re-deadline?

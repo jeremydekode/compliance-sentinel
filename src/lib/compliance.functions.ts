@@ -199,10 +199,12 @@ export const createReport = createServerFn({ method: "POST" })
       const oldPolicySource = oldPolicy && oldDoc
         ? await policySourceFromFile(oldDoc.title, oldPolicy, oldDoc.file_url)
         : undefined;
+      const analysisGuidance = await fetchAnalysisGuidance(workspace);
       const extractedChanges = await extractRegulatoryChanges(
         newPolicySource,
         oldPolicySource,
-        regulatorContext(detected?.doc_type)
+        regulatorContext(detected?.doc_type),
+        analysisGuidance
       );
       console.log(`Extracted ${extractedChanges.length} regulatory changes. Now mapping each to SOP chunks...`);
 
@@ -283,7 +285,7 @@ export const createReport = createServerFn({ method: "POST" })
             sopsForChange.push({ title: sop.title, text, governanceTier: idx?.tier ?? null, topicMap: idx?.topicMap ?? null });
           }
 
-          const impacts = await mapChangeToSops(change, sopsForChange);
+          const impacts = await mapChangeToSops(change, sopsForChange, analysisGuidance);
           console.log(`  - [${change.chapter_ref}] → ${impacts.length} impact(s) across ${chunksBySop.size} SOP(s)`);
           allImpacts.push(...impacts);
         } catch (innerErr: any) {
@@ -579,6 +581,7 @@ export const startRegulatoryRerun = createServerFn({ method: "POST" })
 
     const changes = await extractRegulatoryChanges(
       newPolicySource, oldPolicySource, regulatorContext(detected?.doc_type),
+      await fetchAnalysisGuidance(workspace),
     );
     console.log(`[regulatory rerun ${report.id}] extracted ${changes.length} regulatory change(s)`);
 
@@ -686,6 +689,7 @@ export const analyzeRegulatorySop = createServerFn({ method: "POST" })
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const allImpacts: any[] = [];
+    const analysisGuidance = await fetchAnalysisGuidance(workspaceId);
     const deadline = Date.now() + 250_000;
     for (const seg of segments) {
       if (Date.now() > deadline) { console.warn(`[regulatory] "${sop.title}" time budget reached`); break; }
@@ -694,7 +698,7 @@ export const analyzeRegulatorySop = createServerFn({ method: "POST" })
           title: sop.title, text: seg,
           governanceTier: sop.governance_tier ?? null,
           topicMap,
-        });
+        }, analysisGuidance);
         allImpacts.push(...impacts);
       } catch (e: any) {
         console.warn(`[regulatory] mapping failed for "${sop.title}":`, e?.message);
@@ -2250,6 +2254,41 @@ Return ONLY the JSON array. No commentary.
 // ── Google Drive OAuth + connection management ────────────────────────────────
 
 const workspaceSchema = z.enum(["rmit", "fatf", "forms"]);
+
+// ── Analysis guidance — user-editable instruction injected into the prompts ───
+
+/** Reads the saved analysis guidance for a workspace (empty string if none). */
+async function fetchAnalysisGuidance(workspace: string): Promise<string> {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: row } = await (supabase as any)
+      .from("analysis_guidance").select("guidance").eq("workspace_id", workspace).maybeSingle();
+    return (row?.guidance as string)?.trim() ?? "";
+  } catch {
+    return "";
+  }
+}
+
+/** Settings — read the current analysis guidance for a workspace. */
+export const getAnalysisGuidance = createServerFn({ method: "GET" })
+  .inputValidator(z.object({ workspace: workspaceSchema }))
+  .handler(async ({ data }) => {
+    return { guidance: await fetchAnalysisGuidance(data.workspace) };
+  });
+
+/** Settings — save the analysis guidance for a workspace. */
+export const saveAnalysisGuidance = createServerFn({ method: "POST" })
+  .inputValidator(z.object({ workspace: workspaceSchema, guidance: z.string().max(20000) }))
+  .handler(async ({ data }) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { error } = await (supabase as any).from("analysis_guidance").upsert({
+      workspace_id: data.workspace,
+      guidance: data.guidance,
+      updated_at: new Date().toISOString(),
+    });
+    if (error) throw new Error(`Failed to save guidance: ${error.message}`);
+    return { ok: true };
+  });
 
 /** Build the consent URL the browser navigates to when Connect is clicked. */
 export const getGoogleAuthUrl = createServerFn({ method: "POST" })

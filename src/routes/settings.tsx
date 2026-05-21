@@ -1,7 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { AppShell } from "@/components/app-shell";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -16,6 +16,8 @@ import {
   listDriveFilesToSync,
   mirrorDriveFile,
   reindexSop,
+  getAnalysisGuidance,
+  saveAnalysisGuidance,
 } from "@/lib/compliance.functions";
 import { Input } from "@/components/ui/input";
 import { FolderOpen, RefreshCw } from "lucide-react";
@@ -37,7 +39,11 @@ function SettingsPage() {
   const listFiles = useServerFn(listDriveFilesToSync);
   const mirrorFile = useServerFn(mirrorDriveFile);
   const reindex = useServerFn(reindexSop);
+  const getGuidance = useServerFn(getAnalysisGuidance);
+  const saveGuidance = useServerFn(saveAnalysisGuidance);
   const [busy, setBusy] = useState<string | null>(null);
+  const [guidanceText, setGuidanceText] = useState("");
+  const [guidanceSaving, setGuidanceSaving] = useState(false);
   const [indexProgress, setIndexProgress] = useState<{ done: number; total: number } | null>(null);
   const [syncPhase, setSyncPhase] = useState<"mirror" | "index" | null>(null);
   const [workspace] = useWorkspace();
@@ -73,6 +79,28 @@ function SettingsPage() {
       return { total, withError, lastSyncedAt, list };
     },
   });
+
+  // Analysis guidance — the editable instruction injected into the AI prompts.
+  const guidanceQuery = useQuery({
+    queryKey: ["analysis_guidance", workspace],
+    queryFn: async () => await getGuidance({ data: { workspace } }),
+  });
+  useEffect(() => {
+    if (guidanceQuery.data) setGuidanceText(guidanceQuery.data.guidance ?? "");
+  }, [guidanceQuery.data]);
+
+  async function saveGuidanceNow() {
+    setGuidanceSaving(true);
+    try {
+      await saveGuidance({ data: { workspace, guidance: guidanceText } });
+      qc.invalidateQueries({ queryKey: ["analysis_guidance", workspace] });
+      toast.success("Analysis guidance saved", { description: "It applies to the next analysis run." });
+    } catch (e: any) {
+      toast.error("Could not save guidance", { description: e?.message });
+    } finally {
+      setGuidanceSaving(false);
+    }
+  }
 
   async function connectGoogle() {
     setBusy("connect");
@@ -234,6 +262,29 @@ function SettingsPage() {
               </div>
               <div className="text-xs text-muted-foreground">Analysis reports</div>
             </div>
+          </div>
+        </Card>
+
+        <Card className="p-6">
+          <h2 className="font-display text-lg font-semibold">Analysis Guidance</h2>
+          <p className="text-sm text-muted-foreground mt-1">
+            Extra instruction added to the AI&apos;s regulatory analysis for the{" "}
+            <span className="font-semibold text-foreground">{wsName}</span> workspace. It refines focus and
+            emphasis — the output format and verification rules stay fixed.
+          </p>
+          <textarea
+            className="mt-4 w-full min-h-[220px] text-xs font-mono p-3 rounded-lg border bg-muted/30 leading-relaxed resize-y focus:outline-none focus:ring-1 focus:ring-primary"
+            placeholder="e.g. Focus on virtual-asset / VASP scope changes. Always flag stale date references. Treat tone-hardening (should → shall) as high impact."
+            value={guidanceText}
+            onChange={(e) => setGuidanceText(e.target.value)}
+            disabled={guidanceQuery.isLoading}
+          />
+          <div className="mt-3 flex items-center gap-3">
+            <Button onClick={saveGuidanceNow} disabled={guidanceSaving || guidanceQuery.isLoading}>
+              {guidanceSaving ? <Loader2 className="size-4 animate-spin" /> : <CheckCircle2 className="size-4" />}
+              Save guidance
+            </Button>
+            <span className="text-xs text-muted-foreground">Applies to the next analysis run.</span>
           </div>
         </Card>
 

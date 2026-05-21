@@ -14,7 +14,7 @@ import { MD } from "@/components/md";
 import { exportExcel, exportHtmlPresentation } from "@/lib/exports";
 import { impactClasses, formatDate, statusMeta, changeTypeMeta } from "@/lib/format";
 import { sortChangesByPriority, autoBoldExecBullet } from "@/lib/change-utils";
-import { updateImpact, rerunReport, rerunFormUpdateReport, insertImpactAsDriveComment } from "@/lib/compliance.functions";
+import { updateImpact, bulkApproveReady, generateAmendedDraft, startRegulatoryRerun, analyzeRegulatorySop, finalizeRegulatoryReport, rerunFormUpdateReport, analyzeDocForForm, finalizeFormUpdateReport, writeImpactToDoc } from "@/lib/compliance.functions";
 import { cn } from "@/lib/utils";
 import { diffOld, diffNew } from "@/lib/text-diff";
 import {
@@ -23,7 +23,7 @@ import {
   Scale, FileText, AlertCircle, Sparkles, ExternalLink,
   ArrowDownToLine, MoveDown, AlertTriangle, LayoutGrid,
   CircleDot, Circle, RefreshCw, PanelLeftClose, PanelLeftOpen, FileEdit,
-  MessageSquarePlus,
+  MessageSquarePlus, FilePlus2, Replace,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -45,9 +45,17 @@ function ReportPage() {
   const [activeTab, setActiveTab] = useState<"analysis" | "gaps">("analysis");
   const [exporting, setExporting] = useState<null | "xlsx" | "html">(null);
   const [rerunning, setRerunning] = useState(false);
+  const [approvingReady, setApprovingReady] = useState(false);
+  const [generatingDraft, setGeneratingDraft] = useState(false);
   const [registerCollapsed, setRegisterCollapsed] = useState(false);
-  const rerun = useServerFn(rerunReport);
+  const bulkApprove = useServerFn(bulkApproveReady);
+  const genDraft = useServerFn(generateAmendedDraft);
+  const startRegRerun = useServerFn(startRegulatoryRerun);
+  const analyzeSop = useServerFn(analyzeRegulatorySop);
+  const finalizeReg = useServerFn(finalizeRegulatoryReport);
   const rerunForm = useServerFn(rerunFormUpdateReport);
+  const analyzeDocFn = useServerFn(analyzeDocForForm);
+  const finalizeFn = useServerFn(finalizeFormUpdateReport);
   const qc = useQueryClient();
 
   const report = useQuery({
@@ -78,7 +86,7 @@ function ReportPage() {
     queryFn: async () => {
       const ws = (report.data as any)?.workspace_id ?? "rmit";
       const { data } = await (supabase as any).from("sop_documents")
-        .select("id,title,doc_type,version,file_url,drive_file_id,drive_mime_type")
+        .select("id,title,doc_type,version,file_url,drive_view_url,drive_file_id,drive_mime_type")
         .eq("workspace_id", ws);
       return data ?? [];
     },
@@ -93,7 +101,12 @@ function ReportPage() {
   // Compute UC1 derived state before the loading guard.
   const allChanges = changes.data ?? [];
   const allImpacts = impacts.data ?? [];
+  const readyCount = allImpacts.filter(
+    (i: any) => typeof i.confidence === "number" && i.confidence >= 90 && (i.status ?? "pending") === "pending",
+  ).length;
+  const approvedCount = allImpacts.filter((i: any) => (i.status ?? "pending") === "approved").length;
   const summary = ((report.data?.summary_json) ?? {}) as any;
+  const amendedDrafts: any[] = Array.isArray(summary.amended_drafts) ? summary.amended_drafts : [];
   const isFormUpdate: boolean = !!summary?.uc1_form_update;
 
   const docGroups = useMemo(() => {
@@ -187,9 +200,36 @@ function ReportPage() {
     if (!confirm("Re-run the AI analysis on this report?\n\nThis will replace all current changes and SOP impacts with a fresh analysis using the latest prompts and KB documents. Approval decisions on existing impacts will be lost.")) return;
     setRerunning(true);
     try {
-      const result = isFormUpdate
-        ? await rerunForm({ data: { reportId } })
-        : await rerun({ data: { reportId } });
+      let result: { changesCount: number; impactCount: number };
+      if (isFormUpdate) {
+        // Per-document re-analysis — each doc is its own call so none can time out.
+        const { reportId: rid, docsToAnalyze } = await rerunForm({ data: { reportId } });
+        for (let i = 0; i < docsToAnalyze.length; i++) {
+          const d = docsToAnalyze[i];
+          toast.message(`Re-analysing ${i + 1}/${docsToAnalyze.length}: ${d.title}…`, { id: "uc1-rerun", duration: 60000 });
+          try {
+            await analyzeDocFn({ data: { reportId: rid, docId: d.docId } });
+          } catch (err: any) {
+            console.warn(`Re-analysis failed for ${d.title}:`, err?.message);
+          }
+        }
+        toast.dismiss("uc1-rerun");
+        result = await finalizeFn({ data: { reportId: rid } });
+      } else {
+        // Regulatory analysis — phased: extract changes, then one call per SOP
+        // (full-document, no chunking).
+        const { reportId: rid, sops } = await startRegRerun({ data: { reportId } });
+        for (let i = 0; i < sops.length; i++) {
+          toast.message(`Analysing ${i + 1}/${sops.length}: ${sops[i].title}…`, { id: "reg-rerun", duration: 60000 });
+          try {
+            await analyzeSop({ data: { reportId: rid, sopId: sops[i].id } });
+          } catch (err: any) {
+            console.warn(`Analysis failed for ${sops[i].title}:`, err?.message);
+          }
+        }
+        toast.dismiss("reg-rerun");
+        result = await finalizeReg({ data: { reportId: rid } });
+      }
       toast.success(`Re-analysis complete: ${result.changesCount} change${result.changesCount !== 1 ? "s" : ""}, ${result.impactCount} edit${result.impactCount !== 1 ? "s" : ""}`);
       qc.invalidateQueries({ queryKey: ["report", reportId] });
       qc.invalidateQueries({ queryKey: ["changes", reportId] });
@@ -201,17 +241,66 @@ function ReportPage() {
     }
   }
 
+  async function handleGenerateDraft() {
+    if (generatingDraft) return;
+    const approved = allImpacts.filter((i: any) => (i.status ?? "pending") === "approved").length;
+    if (approved === 0) { toast.message("Approve impacts first, then generate the amended draft."); return; }
+    if (!confirm(`Generate an amended draft copy for ${approved} approved impact${approved === 1 ? "" : "s"}?\n\nThis copies each affected SOP and applies the changes to the COPY — the live documents are not touched.`)) return;
+    setGeneratingDraft(true);
+    try {
+      const r = await genDraft({ data: { reportId } });
+      const made = r.drafts.length;
+      toast.success(
+        made > 0
+          ? `Amended draft ready — ${made} document${made === 1 ? "" : "s"} copied and edited`
+          : "No drafts generated",
+        { description: r.skipped.length ? `${r.skipped.length} skipped` : undefined },
+      );
+      qc.invalidateQueries({ queryKey: ["report", reportId] });
+    } catch (e: any) {
+      toast.error("Draft generation failed", { description: e?.message });
+    } finally {
+      setGeneratingDraft(false);
+    }
+  }
+
+  async function handleApproveReady() {
+    if (approvingReady) return;
+    const ready = allImpacts.filter(
+      (i: any) => typeof i.confidence === "number" && i.confidence >= 90 && (i.status ?? "pending") === "pending",
+    ).length;
+    if (ready === 0) { toast.message("No pending high-confidence impacts to fast-track."); return; }
+    if (!confirm(`Fast-track approve ${ready} high-confidence impact${ready === 1 ? "" : "s"} (≥90%)?\n\nThe lower-confidence impacts stay for individual review.`)) return;
+    setApprovingReady(true);
+    try {
+      const r = await bulkApprove({ data: { reportId, minConfidence: 90 } });
+      toast.success(`Approved ${r.approved} high-confidence impact${r.approved === 1 ? "" : "s"}`);
+      qc.invalidateQueries({ queryKey: ["impacts", reportId] });
+    } catch (e: any) {
+      toast.error("Bulk approve failed", { description: e?.message });
+    } finally {
+      setApprovingReady(false);
+    }
+  }
+
   // ── Head of Legal view ────────────────────────────────────────
   if (role === "legal") {
     return (
       <AppShell>
-        <div style={{ height: "calc(100vh - 3.5rem)" }}>
-          <LegalReviewView
-            report={report.data}
-            changes={allChanges}
-            impacts={allImpacts}
-            sopById={sopById}
-          />
+        <div className="flex flex-col overflow-hidden" style={{ height: "calc(100vh - 3.5rem)" }}>
+          {amendedDrafts.length > 0 && (
+            <div className="shrink-0 px-4 sm:px-6 py-2 border-b bg-card">
+              <AmendedDraftPanel drafts={amendedDrafts} />
+            </div>
+          )}
+          <div className="flex-1 min-h-0">
+            <LegalReviewView
+              report={report.data}
+              changes={allChanges}
+              impacts={allImpacts}
+              sopById={sopById}
+            />
+          </div>
         </div>
       </AppShell>
     );
@@ -241,6 +330,24 @@ function ReportPage() {
               {rerunning ? <Loader2 className="size-3 animate-spin" /> : <RefreshCw className="size-3" />}
               <span className="hidden sm:inline">{rerunning ? "Re-analysing…" : "Re-run"}</span>
             </Button>
+            {readyCount > 0 && (
+              <Button size="sm" disabled={approvingReady}
+                className="h-7 text-xs gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white"
+                onClick={handleApproveReady}
+                title="Fast-track: approve every pending impact with ≥90% confidence in one click">
+                {approvingReady ? <Loader2 className="size-3 animate-spin" /> : <CheckCircle2 className="size-3" />}
+                <span>Approve {readyCount} ready</span>
+              </Button>
+            )}
+            {approvedCount > 0 && (
+              <Button size="sm" variant="outline" disabled={generatingDraft}
+                className="h-7 text-xs gap-1.5"
+                onClick={handleGenerateDraft}
+                title="Copy each affected SOP and apply the approved changes to the copy — the live documents are never touched">
+                {generatingDraft ? <Loader2 className="size-3 animate-spin" /> : <FileEdit className="size-3" />}
+                <span className="hidden sm:inline">Generate amended draft</span>
+              </Button>
+            )}
             <div className="h-4 w-px bg-border mx-0.5" />
             <Button variant="outline" size="sm" disabled={!!exporting} className="h-7 text-xs gap-1.5"
               onClick={() => runExport("html", () => exportHtmlPresentation(report.data, allChanges, allImpacts))}>
@@ -259,6 +366,13 @@ function ReportPage() {
         <div className="shrink-0">
           <ApprovalWorkflow report={report.data} />
         </div>
+
+        {/* ── Amended draft copies (versioned — live docs untouched) ──── */}
+        {amendedDrafts.length > 0 && (
+          <div className="shrink-0 px-4 sm:px-6 pt-2">
+            <AmendedDraftPanel drafts={amendedDrafts} />
+          </div>
+        )}
 
         {/* ── Step 9 · Apply amendments to source docs ──────────────── */}
         {(report.data.status === "signed_off" || report.data.status === "pending_manual" || report.data.status === "published") && (
@@ -892,33 +1006,81 @@ function ChangeDetailPanel({
   );
 }
 
+/** Versioned amended-draft copies — links to the original and the draft for side-by-side review. */
+function AmendedDraftPanel({ drafts }: { drafts: any[] }) {
+  if (!drafts || drafts.length === 0) return null;
+  return (
+    <div className="rounded-lg border border-violet-200 bg-violet-50/60 dark:bg-violet-950/20 dark:border-violet-900 px-4 py-3">
+      <div className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider text-violet-800 dark:text-violet-300">
+        <FileEdit className="size-3.5" /> Amended draft copies
+        <span className="font-normal normal-case text-violet-700/70 dark:text-violet-400/70">
+          · compare against the original, then sign off — the live SOPs are untouched
+        </span>
+      </div>
+      <div className="mt-2 space-y-1.5">
+        {drafts.map((d: any, i: number) => (
+          <div key={i} className="flex items-center justify-between gap-3 rounded-md border bg-card px-3 py-2 text-xs">
+            <span className="font-medium truncate min-w-0">{cleanSopTitle(d.sopTitle)}</span>
+            <div className="flex items-center gap-3 shrink-0">
+              <span className="text-[10px] text-muted-foreground">
+                {d.applied}/{d.impactCount} change{d.impactCount === 1 ? "" : "s"} applied
+              </span>
+              {d.originalUrl && (
+                <a href={d.originalUrl} target="_blank" rel="noreferrer"
+                  className="inline-flex items-center gap-1 text-muted-foreground hover:text-foreground hover:underline underline-offset-2">
+                  <ExternalLink className="size-3 opacity-60" /> Original
+                </a>
+              )}
+              <a href={d.draftUrl} target="_blank" rel="noreferrer"
+                className="inline-flex items-center gap-1 font-semibold text-violet-700 dark:text-violet-300 hover:underline underline-offset-2">
+                <ExternalLink className="size-3 opacity-70" /> Amended draft
+              </a>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function ImpactCard({
   imp, sopDoc, onSetStatus,
 }: {
   imp: any;
-  sopDoc?: { title?: string; file_url?: string | null; doc_type?: string; version?: string; drive_file_id?: string | null; drive_mime_type?: string | null };
+  sopDoc?: { title?: string; file_url?: string | null; drive_view_url?: string | null; doc_type?: string; version?: string; drive_file_id?: string | null; drive_mime_type?: string | null };
   onSetStatus: (id: string, s: "approved" | "rejected" | "routed") => void;
 }) {
   const [editMode, setEditMode] = useState(false);
   const qc = useQueryClient();
   const upd = useServerFn(updateImpact);
-  const insertComment = useServerFn(insertImpactAsDriveComment);
+  const writeToDoc = useServerFn(writeImpactToDoc);
   const [editedText, setEditedText] = useState(imp.edited_text ?? imp.replace_text ?? "");
-  const [inserting, setInserting] = useState(false);
+  const [applying, setApplying] = useState<null | "comment" | "insert" | "replace">(null);
   const isFromDrive = !!sopDoc?.drive_file_id;
   const alreadyInserted = !!imp.inserted_at || !!imp.drive_comment_id;
 
-  async function insertIntoSource() {
-    if (!isFromDrive || alreadyInserted) return;
-    setInserting(true);
+  async function applyToSource(mode: "comment" | "insert" | "replace") {
+    if (!isFromDrive || alreadyInserted || applying) return;
+    setApplying(mode);
     try {
-      const r = await insertComment({ data: { impactId: imp.id } });
-      toast.success(r.alreadyInserted ? "Comment already exists in Doc" : "Comment inserted in source document");
+      const r = await writeToDoc({ data: { impactId: imp.id, mode } });
+      const hl = "highlighted" in r && r.highlighted ? " — highlighted in yellow" : "";
+      const occ = "occurrences" in r && typeof r.occurrences === "number" && r.occurrences > 1
+        ? ` (${r.occurrences} locations)` : "";
+      toast.success(
+        r.alreadyApplied
+          ? "Already applied to the source document"
+          : r.method === "comment"
+            ? "Comment added to the source document"
+            : r.method === "replace"
+              ? `Text replaced in the Google Doc${occ}${hl}`
+              : `Amendment inserted into the Google Doc${occ}${hl}`,
+      );
       qc.invalidateQueries({ queryKey: ["impacts"] });
     } catch (e: any) {
-      toast.error("Insert failed", { description: e?.message });
+      toast.error(`${mode[0].toUpperCase()}${mode.slice(1)} failed`, { description: e?.message });
     } finally {
-      setInserting(false);
+      setApplying(null);
     }
   }
 
@@ -933,10 +1095,10 @@ function ImpactCard({
     }
   }
 
-  const isInsertion = imp.change_type === "insertion" || imp.change_type === "new_section";
+  const isInsertion = imp.change_type === "insertion" || imp.change_type === "new_section" || imp.change_type === "contextual";
   const changeTypeLabel = (imp.change_type as string ?? "review").replace(/_/g, " ");
   const currentStatus: string = imp.status ?? "pending";
-  const fileUrl = sopDoc?.file_url ?? null;
+  const fileUrl = sopDoc?.drive_view_url ?? sopDoc?.file_url ?? null;
   const docTitle = cleanSopTitle(sopDoc?.title ?? imp.sop_title);
   const isUnmatched = !imp.sop_id;
 
@@ -1003,6 +1165,16 @@ function ImpactCard({
           )}
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
+          {typeof imp.confidence === "number" && (
+            <Badge variant="outline" className={cn(
+              "text-[9px] font-bold tabular-nums",
+              imp.confidence >= 90 ? "bg-emerald-100 text-emerald-800 border-emerald-300" :
+              imp.confidence >= 70 ? "bg-amber-100 text-amber-800 border-amber-300" :
+              "bg-rose-100 text-rose-800 border-rose-300"
+            )} title={imp.confidence >= 90 ? "High confidence — eligible for fast-track approval" : "Needs review"}>
+              {imp.confidence}% conf
+            </Badge>
+          )}
           <Badge variant="outline" className={cn(
             "text-[9px] font-bold uppercase tracking-wide",
             isInsertion ? "bg-amber-100 text-amber-800 border-amber-200" : ""
@@ -1032,12 +1204,12 @@ function ImpactCard({
                 <MoveDown className="size-3.5 text-slate-400 shrink-0 mt-0.5" />
                 <div className="min-w-0">
                   <div className="text-[11px] font-mono font-semibold text-foreground/70">{imp.paragraph || "End of section"}</div>
-                  {imp.find_text ? (
+                  {imp.find_text && !imp.find_text.startsWith("[") ? (
                     <div className="mt-1.5 text-[11px] text-muted-foreground leading-relaxed italic line-clamp-2">
                       "…{imp.find_text.slice(0, 120)}{imp.find_text.length > 120 ? "…" : ""}"
                     </div>
                   ) : (
-                    <div className="mt-1 text-[10px] text-muted-foreground">Insert after the paragraph above</div>
+                    <div className="mt-1 text-[10px] text-muted-foreground">No exact anchor — inserted at the section heading above (highlighted)</div>
                   )}
                 </div>
               </div>
@@ -1111,28 +1283,39 @@ function ImpactCard({
               className={cn("h-7 text-xs gap-1", currentStatus === "approved" && "text-emerald-700 bg-emerald-50 dark:bg-emerald-900/20")}>
               <CheckCircle2 className="size-3" /> Approve
             </Button>
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={insertIntoSource}
-              disabled={!isFromDrive || alreadyInserted || inserting}
-              title={
-                alreadyInserted
-                  ? "A comment has already been inserted in the source document"
-                  : !isFromDrive
-                    ? "This SOP isn't synced from Drive — re-add it through the Drive folder to enable commenting"
-                    : "Insert this change as a comment in the source Google Doc / PDF / DOCX"
-              }
-              className={cn(
-                "h-7 text-xs gap-1",
-                alreadyInserted && "text-blue-700 bg-blue-50 dark:bg-blue-900/20",
-              )}
-            >
-              {inserting
-                ? <Loader2 className="size-3 animate-spin" />
-                : alreadyInserted ? <CheckCircle2 className="size-3" /> : <MessageSquarePlus className="size-3" />}
-              {alreadyInserted ? "Inserted" : "Insert"}
-            </Button>
+            {alreadyInserted ? (
+              <Button size="sm" variant="ghost" disabled
+                className="h-7 text-xs gap-1 text-blue-700 bg-blue-50 dark:bg-blue-900/20">
+                <CheckCircle2 className="size-3" /> Applied
+              </Button>
+            ) : (
+              <>
+                <Button size="sm" variant="ghost"
+                  onClick={() => applyToSource("comment")}
+                  disabled={!isFromDrive || !!applying}
+                  title={isFromDrive ? "Add this amendment as a comment in the source document" : "This SOP isn't synced from Drive"}
+                  className="h-7 text-xs gap-1">
+                  {applying === "comment" ? <Loader2 className="size-3 animate-spin" /> : <MessageSquarePlus className="size-3" />}
+                  Comment
+                </Button>
+                <Button size="sm" variant="ghost"
+                  onClick={() => applyToSource("insert")}
+                  disabled={!isFromDrive || !!applying}
+                  title={isFromDrive ? "Insert the amended text into the Google Doc, right after the found statement (highlighted)" : "This SOP isn't synced from Drive"}
+                  className="h-7 text-xs gap-1">
+                  {applying === "insert" ? <Loader2 className="size-3 animate-spin" /> : <FilePlus2 className="size-3" />}
+                  Insert
+                </Button>
+                <Button size="sm" variant="ghost"
+                  onClick={() => applyToSource("replace")}
+                  disabled={!isFromDrive || !!applying}
+                  title={isFromDrive ? "Replace the found text in the Google Doc with the amended text (highlighted)" : "This SOP isn't synced from Drive"}
+                  className="h-7 text-xs gap-1">
+                  {applying === "replace" ? <Loader2 className="size-3 animate-spin" /> : <Replace className="size-3" />}
+                  Replace
+                </Button>
+              </>
+            )}
             <Button size="sm" variant="ghost" onClick={() => onSetStatus(imp.id, "rejected")}
               className={cn("h-7 text-xs gap-1 text-muted-foreground", currentStatus === "rejected" && "text-slate-500 bg-slate-100 dark:bg-slate-800")}>
               <XCircle className="size-3" /> Reject
@@ -1161,7 +1344,7 @@ function DocAmendmentPanel({
   const upd = useServerFn(updateImpact);
   const sopDoc = docGroup.sopId ? sopById.get(docGroup.sopId) : undefined;
   const cleanTitle = (docGroup.sopTitle ?? "").replace(/\s*\(no matching internal doc(?:\s+found)?\)/gi, "").trim();
-  const fileUrl = sopDoc?.file_url ?? null;
+  const fileUrl = sopDoc?.drive_view_url ?? sopDoc?.file_url ?? null;
 
   async function setImpactStatus(id: string, status: "approved" | "rejected" | "routed") {
     try {
@@ -1284,18 +1467,22 @@ function DocAmendmentPanel({
 function GapTable({ impacts, sopById, reportId }: { impacts: any[]; sopById: Map<string, any>; reportId: string }) {
   const qc = useQueryClient();
   const upd = useServerFn(updateImpact);
-  const insertComment = useServerFn(insertImpactAsDriveComment);
+  const writeToDoc = useServerFn(writeImpactToDoc);
   const [filter, setFilter] = useState<"all" | "pending" | "approved" | "routed" | "rejected">("all");
   const [insertingId, setInsertingId] = useState<string | null>(null);
 
   async function insertIntoSource(impactId: string) {
     setInsertingId(impactId);
     try {
-      const r = await insertComment({ data: { impactId } });
-      toast.success(r.alreadyInserted ? "Comment already exists in Doc" : "Comment inserted in source document");
+      const r = await writeToDoc({ data: { impactId, mode: "comment" } });
+      toast.success(
+        r.alreadyApplied
+          ? "Already applied to the source document"
+          : "Comment added to the source document",
+      );
       qc.invalidateQueries({ queryKey: ["impacts", reportId] });
     } catch (e: any) {
-      toast.error("Insert failed", { description: e?.message });
+      toast.error("Comment failed", { description: e?.message });
     } finally {
       setInsertingId(null);
     }
@@ -1380,10 +1567,10 @@ function GapTable({ impacts, sopById, reportId }: { impacts: any[]; sopById: Map
             ) : filtered.map((imp, idx) => {
               const sopDoc = imp.sop_id ? sopById.get(imp.sop_id) : undefined;
               const docTitle = cleanSopTitle(sopDoc?.title ?? imp.sop_title) || "—";
-              const fileUrl = sopDoc?.file_url ?? null;
+              const fileUrl = sopDoc?.drive_view_url ?? sopDoc?.file_url ?? null;
               const currentStatus: string = imp.status ?? "pending";
               const meta = changeTypeMeta(imp.change_type);
-              const isInsertion = imp.change_type === "insertion" || imp.change_type === "new_section";
+              const isInsertion = imp.change_type === "insertion" || imp.change_type === "new_section" || imp.change_type === "contextual";
 
               return (
                 <tr key={imp.id}

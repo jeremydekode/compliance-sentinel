@@ -7,7 +7,8 @@ export type DetectedDocType =
   | "circular"   // Regulator circular
   | "it_policy"  // Internal IT policy
   | "policy"     // Generic
-  | "sop";       // Internal SOP
+  | "sop"        // Internal SOP
+  | "form";      // Internal form / fillable template
 
 export interface DetectedMeta {
   title: string;
@@ -27,6 +28,12 @@ const RULES: Array<{
   // "rmit_clean_demo_docs_MCB_Cyber_Resilience_Framework.pdf" don't get
   // misclassified as the regulator just because the workspace name leaks
   // into the filename. Order matters: most-specific internal markers first.
+  {
+    test: /\b(FGROP|BNM[\s_-]*form|KYC[\s_-]*form)\b/i,
+    doc_type: "form",
+    tags: ["Form", "Internal"],
+    summary: "Internal fillable form or template.",
+  },
   {
     test: /\bSOP\b/i,
     doc_type: "sop",
@@ -118,6 +125,7 @@ export const DOC_TYPE_LABEL: Record<DetectedDocType, string> = {
   it_policy: "IT Policy",
   policy: "Policy",
   sop: "Internal SOP",
+  form: "Internal Form",
 };
 
 // ─── Document role classification ────────────────────────────────────────────
@@ -125,7 +133,7 @@ export const DOC_TYPE_LABEL: Record<DetectedDocType, string> = {
 export const REGULATION_DOC_TYPES = ["rmit_reg", "rmit", "fatf", "circular"] as const;
 
 // Internal documents (these get AMENDED to comply with regulation changes)
-export const INTERNAL_DOC_TYPES = ["sop", "it_policy", "policy"] as const;
+export const INTERNAL_DOC_TYPES = ["sop", "it_policy", "policy", "form"] as const;
 
 // When a new regulation is uploaded, which doc_types should be searched in KB
 // to find the previous version to compare against? (Handles legacy tag drift.)

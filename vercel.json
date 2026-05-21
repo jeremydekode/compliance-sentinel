@@ -4,5 +4,8 @@
   "outputDirectory": "dist/client",
   "rewrites": [
     { "source": "/(.*)", "destination": "/api/server" }
-  ]
+  ],
+  "functions": {
+    "api/server.js": { "maxDuration": 300 }
+  }
 }

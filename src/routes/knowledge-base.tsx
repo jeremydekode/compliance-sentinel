@@ -554,7 +554,7 @@ function EditSopDialog({
             </div>
             <div>
               <Label>Replacement file</Label>
-              <Input type="file" accept=".pdf,.doc,.docx,.txt,.png,.jpg,.jpeg,.webp" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
+              <Input type="file" accept=".pdf,.doc,.docx,.xlsx,.xls,.txt,.png,.jpg,.jpeg,.webp" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
             </div>
           </div>
           <div>
@@ -674,7 +674,7 @@ function UploadDialog({
             id="batch-upload"
             type="file"
             multiple
-            accept=".pdf,.doc,.docx"
+            accept=".pdf,.doc,.docx,.xlsx,.xls"
             className="hidden"
             onChange={(e) => handleFiles(e.target.files)}
           />

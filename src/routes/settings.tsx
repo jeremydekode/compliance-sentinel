@@ -13,7 +13,9 @@ import {
   getGoogleConnectionStatus,
   disconnectGoogle,
   setDriveFolder,
-  syncDriveFolder,
+  listDriveFilesToSync,
+  mirrorDriveFile,
+  reindexSop,
 } from "@/lib/compliance.functions";
 import { Input } from "@/components/ui/input";
 import { FolderOpen, RefreshCw } from "lucide-react";
@@ -32,8 +34,12 @@ function SettingsPage() {
   const getStatus = useServerFn(getGoogleConnectionStatus);
   const disconnect = useServerFn(disconnectGoogle);
   const setFolder = useServerFn(setDriveFolder);
-  const sync = useServerFn(syncDriveFolder);
+  const listFiles = useServerFn(listDriveFilesToSync);
+  const mirrorFile = useServerFn(mirrorDriveFile);
+  const reindex = useServerFn(reindexSop);
   const [busy, setBusy] = useState<string | null>(null);
+  const [indexProgress, setIndexProgress] = useState<{ done: number; total: number } | null>(null);
+  const [syncPhase, setSyncPhase] = useState<"mirror" | "index" | null>(null);
   const [workspace] = useWorkspace();
   const wsName = WORKSPACES[workspace].name;
   const [folderInput, setFolderInput] = useState("");
@@ -111,26 +117,68 @@ function SettingsPage() {
   async function syncNow() {
     setBusy("sync");
     setSyncResult(null);
+    setIndexProgress(null);
+    setSyncPhase(null);
     try {
-      const r = await sync({ data: { workspace, force: forceResync } });
-      setSyncResult(r);
-      const parts: string[] = [];
-      parts.push(`${r.succeeded} indexed`);
-      if (r.unchanged) parts.push(`${r.unchanged} unchanged (skipped)`);
-      if (r.failedCount) parts.push(`${r.failedCount} failed`);
-      if (r.skippedCount) parts.push(`${r.skippedCount} unsupported`);
-      const msg = parts.join(" · ");
-      if (r.failedCount > 0) toast.warning(`Sync finished with errors`, { description: msg });
-      else toast.success(`Synced from "${r.folderName}"`, { description: msg });
+      // Phase 1: fast list — no downloads, just Drive API metadata
+      const list = await listFiles({ data: { workspace, force: forceResync } });
+      setForceResync(false);
+
+      if (list.toSync.length === 0) {
+        toast.success(`All files up to date`, { description: `${list.unchangedCount} unchanged · ${list.skippedCount} unsupported` });
+        qc.invalidateQueries({ queryKey: ["drive_indexed", workspace] });
+        return;
+      }
+
+      // Phase 2: mirror each file one at a time — each call has its own 60 s budget
+      setSyncPhase("mirror");
+      setIndexProgress({ done: 0, total: list.toSync.length });
+      const syncedDocs: { id: string; title: string }[] = [];
+      let mirrorFailed = 0;
+      for (let i = 0; i < list.toSync.length; i++) {
+        const f = list.toSync[i];
+        setIndexProgress({ done: i, total: list.toSync.length });
+        try {
+          const r = await mirrorFile({ data: { workspace, fileId: f.id, fileName: f.name, mimeType: f.mimeType, modifiedTime: f.modifiedTime, existingSopId: f.existingSopId } });
+          syncedDocs.push({ id: r.sopId, title: r.title });
+        } catch (e: any) {
+          console.warn(`Mirror failed for ${f.name}:`, e?.message);
+          mirrorFailed++;
+        }
+      }
+      setIndexProgress(null);
+
+      const mirrorMsg = `${syncedDocs.length} mirrored${mirrorFailed ? ` · ${mirrorFailed} failed` : ""}${list.unchangedCount ? ` · ${list.unchangedCount} unchanged` : ""}`;
+      if (mirrorFailed) toast.warning(`Sync finished with errors`, { description: mirrorMsg });
+      else toast.success(`Synced from "${list.folderName}"`, { description: mirrorMsg });
+      qc.invalidateQueries({ queryKey: ["drive_indexed", workspace] });
+
+      // Phase 3: index each mirrored doc one at a time (skip forms workspace)
+      if (syncedDocs.length > 0 && workspace !== "forms") {
+        setSyncPhase("index");
+        setIndexProgress({ done: 0, total: syncedDocs.length });
+        let indexed = 0;
+        for (const doc of syncedDocs) {
+          try { await reindex({ data: { id: doc.id } }); } catch (e) {
+            console.warn(`Re-index failed for ${doc.title}:`, e);
+          }
+          indexed++;
+          setIndexProgress({ done: indexed, total: syncedDocs.length });
+        }
+        toast.success(`Indexed ${indexed} of ${syncedDocs.length} documents`);
+        setIndexProgress(null);
+      }
+
       qc.invalidateQueries({ queryKey: ["counts", workspace] });
       qc.invalidateQueries({ queryKey: ["sops"] });
       qc.invalidateQueries({ queryKey: ["sop_chunk_counts", workspace] });
       qc.invalidateQueries({ queryKey: ["drive_indexed", workspace] });
-      setForceResync(false); // reset after every run so it's an explicit opt-in
     } catch (e: any) {
       toast.error("Sync failed", { description: e?.message });
     } finally {
       setBusy(null);
+      setIndexProgress(null);
+      setSyncPhase(null);
     }
   }
 
@@ -272,8 +320,15 @@ function SettingsPage() {
                           disabled={busy === "sync"}
                           className="gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white"
                         >
-                          {busy === "sync" ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
-                          Sync KB from Drive
+                          <Loader2 className={`size-3.5 ${busy === "sync" ? "animate-spin" : "hidden"}`} />
+                          {!busy && <RefreshCw className="size-3.5" />}
+                          {busy === "sync"
+                            ? indexProgress
+                              ? syncPhase === "index"
+                                ? `Indexing ${indexProgress.done}/${indexProgress.total}…`
+                                : `Mirroring ${indexProgress.done + 1}/${indexProgress.total}…`
+                              : "Checking files…"
+                            : "Sync KB from Drive"}
                         </Button>
                         <span className="text-[10px] text-muted-foreground">
                           Skips files unchanged since last successful sync · retries previously failed files automatically.

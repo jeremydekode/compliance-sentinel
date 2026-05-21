@@ -15,6 +15,7 @@ import { Route as IndexRouteImport } from './routes/index'
 import { Route as ReportsIndexRouteImport } from './routes/reports.index'
 import { Route as ReportsReportIdRouteImport } from './routes/reports.$reportId'
 import { Route as ReportsReportIdPresentRouteImport } from './routes/reports.$reportId.present'
+import { Route as AuthGoogleCallbackRouteImport } from './routes/auth.google.callback'
 
 const SettingsRoute = SettingsRouteImport.update({
   id: '/settings',
@@ -46,6 +47,11 @@ const ReportsReportIdPresentRoute = ReportsReportIdPresentRouteImport.update({
   path: '/present',
   getParentRoute: () => ReportsReportIdRoute,
 } as any)
+const AuthGoogleCallbackRoute = AuthGoogleCallbackRouteImport.update({
+  id: '/auth/google/callback',
+  path: '/auth/google/callback',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -53,6 +59,7 @@ export interface FileRoutesByFullPath {
   '/settings': typeof SettingsRoute
   '/reports/$reportId': typeof ReportsReportIdRouteWithChildren
   '/reports/': typeof ReportsIndexRoute
+  '/auth/google/callback': typeof AuthGoogleCallbackRoute
   '/reports/$reportId/present': typeof ReportsReportIdPresentRoute
 }
 export interface FileRoutesByTo {
@@ -61,6 +68,7 @@ export interface FileRoutesByTo {
   '/settings': typeof SettingsRoute
   '/reports/$reportId': typeof ReportsReportIdRouteWithChildren
   '/reports': typeof ReportsIndexRoute
+  '/auth/google/callback': typeof AuthGoogleCallbackRoute
   '/reports/$reportId/present': typeof ReportsReportIdPresentRoute
 }
 export interface FileRoutesById {
@@ -70,6 +78,7 @@ export interface FileRoutesById {
   '/settings': typeof SettingsRoute
   '/reports/$reportId': typeof ReportsReportIdRouteWithChildren
   '/reports/': typeof ReportsIndexRoute
+  '/auth/google/callback': typeof AuthGoogleCallbackRoute
   '/reports/$reportId/present': typeof ReportsReportIdPresentRoute
 }
 export interface FileRouteTypes {
@@ -80,6 +89,7 @@ export interface FileRouteTypes {
     | '/settings'
     | '/reports/$reportId'
     | '/reports/'
+    | '/auth/google/callback'
     | '/reports/$reportId/present'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -88,6 +98,7 @@ export interface FileRouteTypes {
     | '/settings'
     | '/reports/$reportId'
     | '/reports'
+    | '/auth/google/callback'
     | '/reports/$reportId/present'
   id:
     | '__root__'
@@ -96,6 +107,7 @@ export interface FileRouteTypes {
     | '/settings'
     | '/reports/$reportId'
     | '/reports/'
+    | '/auth/google/callback'
     | '/reports/$reportId/present'
   fileRoutesById: FileRoutesById
 }
@@ -105,6 +117,7 @@ export interface RootRouteChildren {
   SettingsRoute: typeof SettingsRoute
   ReportsReportIdRoute: typeof ReportsReportIdRouteWithChildren
   ReportsIndexRoute: typeof ReportsIndexRoute
+  AuthGoogleCallbackRoute: typeof AuthGoogleCallbackRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -151,6 +164,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ReportsReportIdPresentRouteImport
       parentRoute: typeof ReportsReportIdRoute
     }
+    '/auth/google/callback': {
+      id: '/auth/google/callback'
+      path: '/auth/google/callback'
+      fullPath: '/auth/google/callback'
+      preLoaderRoute: typeof AuthGoogleCallbackRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
@@ -172,6 +192,7 @@ const rootRouteChildren: RootRouteChildren = {
   SettingsRoute: SettingsRoute,
   ReportsReportIdRoute: ReportsReportIdRouteWithChildren,
   ReportsIndexRoute: ReportsIndexRoute,
+  AuthGoogleCallbackRoute: AuthGoogleCallbackRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

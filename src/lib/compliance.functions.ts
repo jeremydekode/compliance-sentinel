@@ -1,7 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { supabase } from "@/integrations/supabase/client";
-import { analyzePolicy, chunkDocument, generateAmendedDocument, extractRegulatoryChanges, mapChangeToSops, generateAnalysisSummary, generateWithFallback } from "./gemini";
+import { chunkDocument, generateAmendedDocument, extractRegulatoryChanges, mapChangeToSops, mapChangesToSop, generateAnalysisSummary, generateWithFallback } from "./gemini";
 import { applyEditsToDocx, looksLikeDocx, docxToText } from "./docx-editor";
 import {
   buildAuthUrl,
@@ -21,6 +21,9 @@ import {
   exportGoogleDocAsText,
   driveViewerUrl,
   createDriveComment,
+  writeToGoogleDoc,
+  copyDriveFile,
+  applyImpactsToGoogleDoc,
 } from "./google-drive";
 
 /**
@@ -316,44 +319,138 @@ export const createReport = createServerFn({ method: "POST" })
       };
     });
 
-    if (matchedImpacts.length > 0) {
+    // Verify each impact's find_text genuinely exists in its SOP — drop
+    // hallucinated anchors and repair whitespace drift, so the chunk-based
+    // analysis can't surface a find_text the document doesn't contain.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const verifiedImpacts: any[] = [];
+    const sopTextCache = new Map<string, string | null>();
+    for (const m of matchedImpacts) {
+      if (!m.sop_id) { verifiedImpacts.push(m); continue; }
+      if (!sopTextCache.has(m.sop_id)) {
+        let text: string | null = null;
+        try {
+          const sopDoc = relevantSops.find((s) => s.id === m.sop_id);
+          if (sopDoc?.drive_mime_type === "application/vnd.google-apps.document" && sopDoc.drive_file_id) {
+            text = (await exportGoogleDocAsText(sopDoc.workspace_id, sopDoc.drive_file_id)).replace(/\r\n?/g, "\n");
+          } else if (sopDoc?.file_url) {
+            const f = await fetchFile(sopDoc.file_url);
+            if (looksLikeDocx(f.mimeType, sopDoc.file_url)) {
+              text = await docxToText(f.buffer);
+            } else if (f.mimeType === "application/pdf") {
+              const { extractPdfPages } = await import("./pdf-pages");
+              text = (await extractPdfPages(f.buffer)).map((p: any) => p.text).join("\n");
+            }
+          }
+        } catch (e: any) {
+          console.warn(`createReport verify: text fetch failed for sop ${m.sop_id}:`, e?.message);
+        }
+        sopTextCache.set(m.sop_id, text);
+      }
+      const srcText = sopTextCache.get(m.sop_id);
+      if (!srcText) { verifiedImpacts.push(m); continue; } // couldn't fetch — don't drop
+      const repaired = makeFindTextVerifier(srcText)(m.find_text);
+      if (repaired === null) {
+        // The AI's anchor text isn't in the document. Don't drop the impact —
+        // downgrade it to a section-level contextual insert so the proposed
+        // amendment is never silently lost. The write path places it at the
+        // section heading (or end of doc) and highlights it. Cap confidence so
+        // an unanchored impact is never fast-tracked.
+        console.log(`createReport: downgraded unanchored impact for "${m.sop_title}" to contextual`);
+        verifiedImpacts.push({
+          ...m,
+          change_type: "contextual",
+          find_text: m.paragraph ? `[no exact anchor — see ${m.paragraph}]` : "[no exact anchor in document]",
+          confidence: Math.min(clampConfidence(m.confidence) ?? 60, 70),
+        });
+        continue;
+      }
+      verifiedImpacts.push({ ...m, find_text: repaired });
+    }
+
+    if (verifiedImpacts.length > 0) {
       await supabase.from("sop_impacts").insert(
-        matchedImpacts.map((m: any, i: number) => ({ 
-          ...m, 
-          report_id: report.id, 
-          position: i 
+        verifiedImpacts.map((m: any, i: number) => ({
+          ...m,
+          confidence: clampConfidence(m.confidence),
+          report_id: report.id,
+          position: i,
         }))
       );
     }
 
     return {
       reportId: report.id as string,
-      impactCount: matchedImpacts.length,
-      matchedToKbCount: matchedImpacts.filter((m: any) => m.sop_id).length,
+      impactCount: verifiedImpacts.length,
+      matchedToKbCount: verifiedImpacts.filter((m: any) => m.sop_id).length,
       kbSize: kbAll.length,
       candidateKbSize: relevantSops.length,
     };
   });
 
-export const rerunReport = createServerFn({ method: "POST" })
+/** Sanitize the AI's self-reported confidence into an integer 0-100, or null. */
+function clampConfidence(v: unknown): number | null {
+  const n = Math.round(Number(v));
+  if (!Number.isFinite(n)) return null;
+  return Math.max(0, Math.min(100, n));
+}
+
+/**
+ * Builds a verifier for AI-produced find_text. Confirms the text genuinely
+ * exists in the source document, and repairs whitespace drift by returning the
+ * exact verbatim substring. Returns null when the text is not in the document
+ * at all (the AI hallucinated it) so the caller can discard that impact.
+ */
+function makeFindTextVerifier(sourceText: string): (findText: string) => string | null {
+  let normStr = "";
+  const rawIdx: number[] = [];
+  let prevSpace = false;
+  for (let i = 0; i < sourceText.length; i++) {
+    const ch = sourceText[i];
+    if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r" || ch === "\f" || ch === "\v") {
+      if (!prevSpace) { normStr += " "; rawIdx.push(i); }
+      prevSpace = true;
+    } else {
+      normStr += ch; rawIdx.push(i); prevSpace = false;
+    }
+  }
+  return (findText: string): string | null => {
+    const ft = (findText ?? "").trim();
+    if (!ft) return null;
+    if (ft.startsWith("[")) return ft; // bracket markers handled via Comment — pass through
+    if (sourceText.includes(ft)) return ft; // already verbatim
+    const nFt = ft.replace(/\s+/g, " ").trim();
+    if (nFt.length < 6) return null;
+    const at = normStr.indexOf(nFt);
+    if (at < 0) return null; // not in the document — the AI hallucinated it
+    const rawStart = rawIdx[at];
+    const rawEnd = rawIdx[Math.min(rawIdx.length - 1, at + nFt.length - 1)] + 1;
+    return sourceText.slice(rawStart, rawEnd);
+  };
+}
+
+/**
+ * Phase 1 of the regulatory re-run. Extracts the regulatory changes (new vs old
+ * policy), stores them, and returns the internal SOPs to analyze. The heavy
+ * mapping runs per-SOP via analyzeRegulatorySop so no single call can time out.
+ */
+export const startRegulatoryRerun = createServerFn({ method: "POST" })
   .inputValidator(z.object({ reportId: z.string() }))
   .handler(async ({ data }) => {
-    // 1. Load existing report
     const { data: report, error: repErr } = await supabase
       .from("analysis_reports").select("*").eq("id", data.reportId).single();
     if (repErr || !report) throw new Error("Report not found");
     if (!report.source_file_url) throw new Error("Report has no source file URL — cannot rerun");
 
     const detected = (report.summary_json as any)?.detected ?? null;
-
-    // 2. Re-fetch the new policy
-    const newPolicy = await fetchFile(report.source_file_url);
-
-    // 3. Find the old policy in KB (same logic as createReport)
     const workspace = ((report as any).workspace_id as string) ?? "rmit";
+
+    // Fetch the new policy + locate/fetch the previous version in the KB
+    const newPolicy = await fetchFile(report.source_file_url);
     const oldDocTypes = detected?.doc_type
       ? (REGULATION_FAMILIES[detected.doc_type] ?? [detected.doc_type])
       : ["__none__"];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: oldDocs } = await (supabase as any)
       .from("sop_documents").select("*")
       .eq("workspace_id", workspace)
@@ -364,82 +461,26 @@ export const rerunReport = createServerFn({ method: "POST" })
     let oldPolicy: { buffer: Buffer; mimeType: string } | undefined = undefined;
     if (oldDoc?.file_url) {
       try { oldPolicy = await fetchFile(oldDoc.file_url); }
-      catch (e) { console.error("Rerun: failed to fetch old policy:", e); }
+      catch (e) { console.error("[regulatory rerun] old policy fetch failed:", e); }
     }
 
-    // 4. Find relevant internal SOPs (same logic as createReport)
-    const INTERNAL_DOC_TYPES = INTERNAL_DOC_TYPES_CONST as readonly string[];
-    let relevantSops: any[] = [];
-    try {
-      const queryText = `${report.policy_name} ${detected?.summary || ""} ${detected?.tags?.join(" ") || ""}`;
-      const embedding = await generateQueryEmbedding(queryText);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const { data: matchedChunks } = await (supabase as any).rpc("match_sop_chunks", {
-        query_embedding: embedding, match_threshold: 0.2, match_count: 50,
-      });
-      const chunks: any[] = matchedChunks ?? [];
-      const sopIds = Array.from(new Set(chunks.map((c: any) => c.sop_id as string)));
-      if (sopIds.length > 0) {
-        const { data: sopDocs } = await (supabase as any)
-          .from("sop_documents").select("*")
-          .eq("workspace_id", workspace)
-          .in("id", sopIds).in("doc_type", INTERNAL_DOC_TYPES);
-        relevantSops = (sopDocs ?? []) as any[];
-      }
-      if (relevantSops.length === 0) {
-        const { data: allSops } = await (supabase as any)
-          .from("sop_documents").select("*")
-          .eq("workspace_id", workspace)
-          .in("doc_type", INTERNAL_DOC_TYPES);
-        relevantSops = (allSops ?? []) as any[];
-      }
-    } catch (e: any) {
-      console.error("Rerun: SOP lookup failed:", e);
-    }
-
-    const sopsForAi = await Promise.all(relevantSops.map(async s => {
-      if (s.file_url) {
-        try {
-          const f = await fetchFile(s.file_url);
-          // DOCX → text (Gemini doesn't accept DOCX as inline data)
-          if (looksLikeDocx(f.mimeType, s.file_url)) {
-            return { title: s.title, text: await docxToText(f.buffer) };
-          }
-          return { title: s.title, buffer: f.buffer, mimeType: f.mimeType };
-        } catch { /* fall through */ }
-      }
-      return { title: s.title, text: `[No content indexed for ${s.title}]` };
-    }));
-
-    // 5. Run AI analysis (convert DOCX → text for Gemini compatibility)
     const newPolicySource = await policySourceFromFile(report.policy_name ?? "policy", newPolicy, report.source_file_url);
     const oldPolicySource = oldPolicy && oldDoc
       ? await policySourceFromFile(oldDoc.title, oldPolicy, oldDoc.file_url)
       : undefined;
-    const aiResult = await analyzePolicy(
-      newPolicySource,
-      oldPolicySource,
-      sopsForAi,
-      regulatorContext(detected?.doc_type)
-    );
 
-    // 6. Wipe old changes/impacts for this report and re-insert
+    const changes = await extractRegulatoryChanges(
+      newPolicySource, oldPolicySource, regulatorContext(detected?.doc_type),
+    );
+    console.log(`[regulatory rerun ${report.id}] extracted ${changes.length} regulatory change(s)`);
+
+    // Wipe prior changes/impacts, insert the fresh change rows
     await supabase.from("sop_impacts").delete().eq("report_id", report.id);
     await supabase.from("regulatory_changes").delete().eq("report_id", report.id);
 
-    await supabase.from("analysis_reports").update({
-      summary_json: {
-        ...aiResult.summary,
-        kb_size: relevantSops.length,
-        detected: detected ?? null,
-        old_policy_name: oldDoc?.title ?? null,
-        last_rerun_at: new Date().toISOString(),
-      },
-    }).eq("id", report.id);
-
-    if (aiResult.changes.length > 0) {
+    if (changes.length > 0) {
       await supabase.from("regulatory_changes").insert(
-        aiResult.changes.map((c: any, i: number) => ({
+        changes.map((c: any, i: number) => ({
           chapter_ref: c.chapter_ref,
           old_requirement: c.old_requirement,
           new_requirement: c.new_requirement,
@@ -455,22 +496,206 @@ export const rerunReport = createServerFn({ method: "POST" })
       );
     }
 
-    const matchedImpacts = aiResult.impacts.map((m: any) => {
-      const sop = matchSopByTitle(m.sop_title, relevantSops);
-      return { ...m, sop_id: sop?.id ?? null, sop_title: sop ? sop.title : m.sop_title };
-    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase as any).from("analysis_reports").update({
+      summary_json: {
+        ...(report.summary_json as any ?? {}),
+        detected: detected ?? null,
+        old_policy_name: oldDoc?.title ?? null,
+        executive: [`Re-analysis in progress — ${changes.length} regulatory change(s) found…`],
+        last_rerun_at: new Date().toISOString(),
+      },
+    }).eq("id", report.id);
 
-    if (matchedImpacts.length > 0) {
-      await supabase.from("sop_impacts").insert(
-        matchedImpacts.map((m: any, i: number) => ({ ...m, report_id: report.id, position: i }))
-      );
+    // Internal SOPs to analyze — full-document, one analyzeRegulatorySop call each
+    const INTERNAL_DOC_TYPES = INTERNAL_DOC_TYPES_CONST as readonly string[];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: sopRows } = await (supabase as any)
+      .from("sop_documents").select("id, title")
+      .eq("workspace_id", workspace)
+      .in("doc_type", INTERNAL_DOC_TYPES);
+    const sops = ((sopRows ?? []) as any[]).map((s) => ({ id: s.id as string, title: s.title as string }));
+
+    return { reportId: report.id as string, changeCount: changes.length, sops };
+  });
+
+/**
+ * Phase 2 — analyzes ONE internal SOP against ALL regulatory changes, reading
+ * the SOP's FULL text (no chunking, no vector search — nothing gets missed for
+ * lack of retrieval). Oversized SOPs are split into large segments so each
+ * Gemini call stays within the function time limit. One call per SOP.
+ */
+export const analyzeRegulatorySop = createServerFn({ method: "POST" })
+  .inputValidator(z.object({ reportId: z.string(), sopId: z.string() }))
+  .handler(async ({ data }) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report } = await (supabase as any)
+      .from("analysis_reports").select("id, workspace_id").eq("id", data.reportId).single();
+    if (!report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: changeRows } = await (supabase as any)
+      .from("regulatory_changes").select("*").eq("report_id", report.id).order("position");
+    const changes = (changeRows ?? []) as any[];
+    if (changes.length === 0) return { sopId: data.sopId, title: "?", impactCount: 0 };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: sop } = await (supabase as any)
+      .from("sop_documents").select("id, title, file_url, drive_file_id, drive_mime_type").eq("id", data.sopId).single();
+    if (!sop || !sop.file_url) return { sopId: data.sopId, title: sop?.title ?? "?", impactCount: 0 };
+
+    // Extract the SOP's full text. For Google Docs read Google's OWN text export —
+    // it is the exact representation the in-doc find/replace later matches against,
+    // so the find_text the AI produces will be applicable verbatim.
+    const workspaceId = (report.workspace_id as string) ?? "rmit";
+    let fullText = "";
+    try {
+      if (sop.drive_mime_type === "application/vnd.google-apps.document" && sop.drive_file_id) {
+        fullText = await exportGoogleDocAsText(workspaceId, sop.drive_file_id);
+      } else {
+        const file = await fetchFile(sop.file_url);
+        if (looksLikeDocx(file.mimeType, sop.file_url)) {
+          fullText = await docxToText(file.buffer);
+        } else if (file.mimeType === "application/pdf") {
+          const { extractPdfPages } = await import("./pdf-pages");
+          const pages = await extractPdfPages(file.buffer);
+          fullText = pages.map((p: any) => p.text).join("\n");
+        } else {
+          fullText = file.buffer.toString("utf-8");
+        }
+      }
+    } catch (e: any) {
+      console.warn(`analyzeRegulatorySop: extract failed for "${sop.title}":`, e?.message?.slice(0, 100));
+      return { sopId: sop.id, title: sop.title, impactCount: 0 };
+    }
+    // Drive's text export uses CRLF; the live Google Doc uses LF. Normalize so a
+    // multi-line find_text the AI produces still matches the doc at write time.
+    fullText = fullText.replace(/\r\n?/g, "\n");
+    if (!fullText.trim()) return { sopId: sop.id, title: sop.title, impactCount: 0 };
+
+    // Split oversized docs into large segments so each Gemini call stays bounded
+    const SEG = 160_000;
+    const segments: string[] = [];
+    if (fullText.length <= SEG * 1.4) {
+      segments.push(fullText);
+    } else {
+      for (let i = 0; i < fullText.length; i += SEG) segments.push(fullText.slice(i, i + SEG));
+    }
+    console.log(`[regulatory] "${sop.title}" — ${fullText.length} chars, ${segments.length} segment(s)`);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const allImpacts: any[] = [];
+    const deadline = Date.now() + 250_000;
+    for (const seg of segments) {
+      if (Date.now() > deadline) { console.warn(`[regulatory] "${sop.title}" time budget reached`); break; }
+      try {
+        const impacts = await mapChangesToSop(changes as any, { title: sop.title, text: seg });
+        allImpacts.push(...impacts);
+      } catch (e: any) {
+        console.warn(`[regulatory] mapping failed for "${sop.title}":`, e?.message);
+      }
     }
 
+    // Verify every find_text genuinely exists in the document — discard
+    // hallucinated anchors, and repair whitespace drift to the exact verbatim
+    // substring so the in-doc find/replace later matches it.
+    const verify = makeFindTextVerifier(fullText);
+    let downgraded = 0;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const verified: any[] = [];
+    for (const m of allImpacts) {
+      const repaired = verify(m.find_text);
+      if (repaired === null) {
+        // Anchor not in the document — downgrade to a section-level contextual
+        // insert rather than drop, so the proposed amendment is never lost.
+        downgraded++;
+        verified.push({
+          ...m,
+          change_type: "contextual",
+          find_text: m.paragraph ? `[no exact anchor — see ${m.paragraph}]` : "[no exact anchor in document]",
+          confidence: Math.min(clampConfidence(m.confidence) ?? 60, 70),
+        });
+        continue;
+      }
+      verified.push({ ...m, find_text: repaired });
+    }
+    if (downgraded > 0) console.log(`[regulatory] "${sop.title}" — downgraded ${downgraded} unanchored impact(s) to contextual`);
+
+    // Dedupe within the doc — segmenting a document repeats running headers, so
+    // the same logical edit can surface in several segments with slightly
+    // different anchors. Collapse exact matches, substring-overlapping anchors,
+    // and keep only ONE "Document Header" version-bump impact.
+    const norm = (s: string) => String(s ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const kept: any[] = [];
+    let headerDone = false;
+    for (const m of verified) {
+      const ft = norm(m.find_text);
+      if (!ft) continue;
+      const isHeader = /document header|cover page/i.test(String(m.paragraph ?? ""));
+      if (isHeader) {
+        if (headerDone) continue;
+        headerDone = true;
+        kept.push(m);
+        continue;
+      }
+      // Skip if this anchor duplicates, contains, or is contained by a kept one
+      const dup = kept.some((k) => {
+        const kf = norm(k.find_text);
+        return !!kf && (kf === ft || kf.includes(ft) || ft.includes(kf));
+      });
+      if (!dup) kept.push(m);
+    }
+    const finalImpacts = kept.map((m: any) => ({ ...m, sop_id: sop.id, sop_title: sop.title }));
+
+    if (finalImpacts.length > 0) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { count } = await (supabase as any)
+        .from("sop_impacts").select("id", { count: "exact", head: true }).eq("report_id", report.id);
+      const offset = count ?? 0;
+      await supabase.from("sop_impacts").insert(
+        finalImpacts.map((m: any, i: number) => ({ ...m, confidence: clampConfidence(m.confidence), report_id: report.id, position: offset + i }))
+      );
+    }
+    console.log(`[regulatory] "${sop.title}" → ${finalImpacts.length} impact(s)`);
+    return { sopId: sop.id, title: sop.title, impactCount: finalImpacts.length };
+  });
+
+/** Phase 3 — regenerates the executive summary once all changes are mapped. */
+export const finalizeRegulatoryReport = createServerFn({ method: "POST" })
+  .inputValidator(z.object({ reportId: z.string() }))
+  .handler(async ({ data }) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report } = await (supabase as any)
+      .from("analysis_reports").select("*").eq("id", data.reportId).single();
+    if (!report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: changes } = await (supabase as any)
+      .from("regulatory_changes").select("*").eq("report_id", report.id).order("position");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: impacts } = await (supabase as any)
+      .from("sop_impacts").select("*").eq("report_id", report.id);
+
+    const summary = await generateAnalysisSummary(
+      (changes ?? []) as any[], (impacts ?? []) as any[], report.policy_name ?? "policy",
+    );
+    const prev = (report.summary_json as any) ?? {};
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase as any).from("analysis_reports").update({
+      summary_json: {
+        ...summary,
+        kb_size: prev.kb_size ?? null,
+        detected: prev.detected ?? null,
+        old_policy_name: prev.old_policy_name ?? null,
+        last_rerun_at: new Date().toISOString(),
+      },
+    }).eq("id", report.id);
+
+    const matchedToKbCount = ((impacts ?? []) as any[]).filter((m) => m.sop_id).length;
     return {
       reportId: report.id as string,
-      changesCount: aiResult.changes.length,
-      impactCount: matchedImpacts.length,
-      matchedToKbCount: matchedImpacts.filter((m: any) => m.sop_id).length,
+      changesCount: (changes ?? []).length,
+      impactCount: (impacts ?? []).length,
+      matchedToKbCount,
     };
   });
 
@@ -600,6 +825,29 @@ export const updateImpact = createServerFn({ method: "POST" })
     return { ok: true };
   });
 
+/**
+ * Fast-track approval: marks every still-pending impact in a report whose AI
+ * confidence is at or above the threshold as "approved", in one operation.
+ * A human triggers it — so there is still a single accountable approve action.
+ */
+export const bulkApproveReady = createServerFn({ method: "POST" })
+  .inputValidator(z.object({
+    reportId: z.string(),
+    minConfidence: z.number().min(0).max(100).default(90),
+  }))
+  .handler(async ({ data }) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: rows, error } = await (supabase as any)
+      .from("sop_impacts")
+      .update({ status: "approved" })
+      .eq("report_id", data.reportId)
+      .eq("status", "pending")
+      .gte("confidence", data.minConfidence)
+      .select("id");
+    if (error) throw new Error(error.message);
+    return { approved: (rows ?? []).length as number };
+  });
+
 export const chatWithReport = createServerFn({ method: "POST" })
   .inputValidator(
     z.object({
@@ -714,7 +962,7 @@ export const createSop = createServerFn({ method: "POST" })
   .inputValidator(
     z.object({
       title: z.string().min(2).max(200),
-      doc_type: z.enum(["sop", "rmit", "rmit_reg", "fatf", "circular", "it_policy", "policy"]),
+      doc_type: z.enum(["sop", "rmit", "rmit_reg", "fatf", "circular", "it_policy", "policy", "form"]),
       version: z.string().min(1).max(20),
       workspace: z.enum(["rmit", "fatf", "forms"]).default("rmit"),
       summary: z.string().max(2000).optional(),
@@ -784,7 +1032,7 @@ export const updateSop = createServerFn({ method: "POST" })
     z.object({
       id: z.string(),
       title: z.string().min(2).max(200),
-      doc_type: z.enum(["sop", "rmit", "rmit_reg", "fatf", "circular", "it_policy", "policy"]),
+      doc_type: z.enum(["sop", "rmit", "rmit_reg", "fatf", "circular", "it_policy", "policy", "form"]),
       summary: z.string().max(4000).optional(),
       tags: z.array(z.string().max(40)).max(20).optional(),
       file_url: z.string().nullable().optional(),
@@ -1238,20 +1486,37 @@ export const reindexSop = createServerFn({ method: "POST" })
     if (sopErr || !sop) throw new Error("SOP not found");
     if (!sop.file_url) throw new Error("SOP has no source file — cannot re-index");
 
-    // Wipe existing chunks
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await (supabase as any).from("sop_chunks").delete().eq("sop_id", sop.id);
+    // Forms workspace docs are compared directly — no chunking needed.
+    if (sop.workspace_id === "forms") {
+      return { chunkCount: 0, message: "Forms workspace — no indexing required" };
+    }
 
-    // Re-fetch source and chunk
     const file = await fetchFile(sop.file_url);
     const isDocx = looksLikeDocx(file.mimeType, sop.file_url);
-    const chunks = isDocx
+    const allChunks = isDocx
       ? chunkDocxText(await docxToText(file.buffer))
       : await chunkDocument({ name: sop.title, buffer: file.buffer, mimeType: file.mimeType });
 
-    if (chunks.length === 0) {
+    if (allChunks.length === 0) {
       return { chunkCount: 0, message: "No text extracted from the source file" };
     }
+
+    // Cap at 100 chunks and stride-sample so large docs get even coverage across
+    // the whole document rather than just the first N pages.
+    // 100 × 50-per-Gemini-batch = 2 embedding calls — safely within the 60 s budget
+    // even for a 450-page DOCX after mammoth extraction.
+    const MAX_CHUNKS = 100;
+    let chunks: typeof allChunks;
+    if (allChunks.length <= MAX_CHUNKS) {
+      chunks = allChunks;
+    } else {
+      // Pick evenly-spaced indices so coverage spans the full document.
+      const step = allChunks.length / MAX_CHUNKS;
+      chunks = Array.from({ length: MAX_CHUNKS }, (_, i) => allChunks[Math.floor(i * step)]);
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase as any).from("sop_chunks").delete().eq("sop_id", sop.id);
 
     const chunksWithEmbeddings = await embedChunksBatched(
       chunks,
@@ -1264,11 +1529,14 @@ export const reindexSop = createServerFn({ method: "POST" })
       })
     );
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const { error: insErr } = await (supabase as any)
-      .from("sop_chunks")
-      .insert(chunksWithEmbeddings);
-    if (insErr) throw new Error(`Failed to insert chunks: ${insErr.message}`);
+    const BATCH = 100;
+    for (let i = 0; i < chunksWithEmbeddings.length; i += BATCH) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { error: insErr } = await (supabase as any)
+        .from("sop_chunks")
+        .insert(chunksWithEmbeddings.slice(i, i + BATCH));
+      if (insErr) throw new Error(`Failed to insert chunks: ${insErr.message}`);
+    }
 
     return { chunkCount: chunks.length, message: `Indexed ${chunks.length} chunks` };
   });
@@ -1434,229 +1702,12 @@ export const createFormUpdateReport = createServerFn({ method: "POST" })
     })).min(1).max(20),
   }))
   .handler(async ({ data }) => {
-    const workspace = data.workspace;
     const displayName =
       (data.customTitle ?? "").trim() ||
       `${data.formId} update — ${data.fieldChanges[0].oldValue.slice(0, 20)} → ${data.fieldChanges[0].newValue.slice(0, 20)}`;
 
-    // 1. Literal text search across KB chunks for the form ID and each OLD value.
-    //    For UC1 (form propagation), we know exactly what strings to look for —
-    //    literal LIKE search is much more reliable than vector embeddings, which
-    //    can miss form references buried in appendix tables.
-    const INTERNAL_DOC_TYPES = INTERNAL_DOC_TYPES_CONST as readonly string[];
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const chunkHits: Map<string, any[]> = new Map();
-
-    // Search terms: form ID (highest signal) + each non-trivial OLD value +
-    // the friendly name + a derived "core" form name. The core name catches
-    // bare references that don't include the version or variant qualifier
-    // (e.g. an SOP table row that just lists the form title).
-    const coreFormName = deriveCoreFormName(data.friendlyName);
-    const searchTerms: string[] = [data.formId];
-    if (data.friendlyName && data.friendlyName.trim().length >= 15) {
-      searchTerms.push(data.friendlyName.trim().slice(0, 100));
-    }
-    if (coreFormName && !searchTerms.some((t) => t.toLowerCase() === coreFormName.toLowerCase())) {
-      searchTerms.push(coreFormName);
-    }
-    for (const c of data.fieldChanges) {
-      const v = c.oldValue.trim();
-      if (v.length >= 4) searchTerms.push(v.slice(0, 100));
-    }
-
-    for (const term of searchTerms) {
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const { data: literalHits } = await (supabase as any)
-          .from("sop_chunks")
-          .select("id, sop_id, content, chapter_ref, page_number")
-          .ilike("content", `%${term.replace(/[%_]/g, "")}%`)
-          .limit(200);
-        for (const h of literalHits ?? []) {
-          if (!chunkHits.has(h.sop_id)) chunkHits.set(h.sop_id, []);
-          if (!chunkHits.get(h.sop_id)!.some((x) => x.id === h.id)) {
-            chunkHits.get(h.sop_id)!.push(h);
-          }
-        }
-      } catch (e: any) {
-        console.warn(`UC1 literal search for "${term.slice(0, 40)}" failed:`, e?.message);
-      }
-    }
-
-    // Secondary fallback: vector search (in case the form is referenced by paraphrase rather than literal ID)
-    if (chunkHits.size === 0) {
-      try {
-        const emb = await generateQueryEmbedding(`${data.formId} ${data.friendlyName ?? ""}`);
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const { data: vecHits } = await (supabase as any).rpc("match_sop_chunks", {
-          query_embedding: emb,
-          match_threshold: 0.15,
-          match_count: 40,
-        });
-        for (const h of vecHits ?? []) {
-          if (!chunkHits.has(h.sop_id)) chunkHits.set(h.sop_id, []);
-          if (!chunkHits.get(h.sop_id)!.some((x) => x.id === h.id)) {
-            chunkHits.get(h.sop_id)!.push(h);
-          }
-        }
-      } catch (e: any) {
-        console.warn("UC1 vector fallback failed:", e?.message);
-      }
-    }
-
-    // 2. Resolve sop_ids to internal SOP docs in this workspace
-    const candidateIds = Array.from(chunkHits.keys());
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const { data: sops } = candidateIds.length > 0 ? await (supabase as any)
-      .from("sop_documents")
-      .select("*")
-      .eq("workspace_id", workspace)
-      .in("id", candidateIds)
-      .in("doc_type", INTERNAL_DOC_TYPES)
-      : { data: [] };
-    const sopsById = new Map<string, any>();
-    for (const s of sops ?? []) sopsById.set(s.id, s);
-
-    // 3. For each affected doc, ONE small AI call to produce find/replace impacts
-    const allImpacts: any[] = [];
-
-    for (const [sopId, chunks] of chunkHits.entries()) {
-      const sop = sopsById.get(sopId);
-      if (!sop) continue;
-      const chunkText = chunks
-        .slice(0, 8)
-        .map((c: any) => `[Section: ${c.chapter_ref || "?"} | Page: ${c.page_number || "?"}]\n${c.content}`)
-        .join("\n\n---\n\n");
-
-      const prompt = `
-# ROLE: FORM REFERENCE PROPAGATION ENGINE
-
-A bank form has been updated. Your job: find EVERY occurrence of the OLD values in the internal SOP document below, and propose a precise find/replace edit for each occurrence.
-
-# FORM BEING UPDATED:
-- Form identifier: ${data.formId}
-- Friendly name: ${data.friendlyName ?? "(not specified)"}
-
-# FIELD CHANGES TO PROPAGATE:
-${data.fieldChanges.map((c, i) => `
-  Change ${i + 1} — ${c.label}
-    OLD: "${c.oldValue}"
-    NEW: "${c.newValue}"
-`).join("")}
-
-# INTERNAL SOP DOCUMENT: "${sop.title}"
-The relevant text chunks (from vector search) are below. Find every occurrence of any OLD value within them.
-
-${chunkText}
-
-# ❗ CRITICAL RULES (read every one):
-1. For each occurrence: produce ONE impact entry with find_text containing 1-3 lines of verbatim surrounding context including the OLD value, and replace_text containing the same context with the OLD value swapped for the NEW value.
-2. If multiple OLD values appear in the SAME paragraph/cell/row, produce ONE consolidated impact for that row — not separate impacts per field. Update all OLD→NEW in one find_text/replace_text pair.
-3. change_type = "find_replace" for all UC1 impacts (we are NEVER inserting new content, only swapping references).
-4. sop_title MUST be exactly "${sop.title}".
-5. **If no OLD value is clearly present in any chunk, return an empty array \`[]\`. Do NOT invent placeholder impacts. Do NOT write find_text values like "None of the OLD values were found" — that is NEVER a valid impact, return [] instead.**
-6. find_text must contain at least one of the OLD values verbatim. If it doesn't, omit that impact entirely.
-
-# FIELD INSTRUCTIONS — fill these precisely for every impact:
-- paragraph: The table or section TYPE verbatim, e.g. "Forms Reference Table", "Forms Appendix Table", "Forms / Templates Table", "TABLE OF CONTENTS · Chapter 12", "Section 12.2 Body Text · Purpose paragraph". Use the chunk's Section metadata as the primary source.
-- action_description: The specific cell or column being changed, e.g. "Form name + version cell", "Row 10 — Form name + ref columns", "TOC entry for section 12.2", "Section heading title". Be specific.
-- line_range: Estimate from the chunk content. Format "~N" (single line) or "~N–M" (range). Use the chunk's position in the document to estimate. Never null if the chunk gives positional context.
-- page: Page number from the chunk's Page metadata. Use 0 if not available.
-- warning: Set ONLY when the version found in find_text is two or more versions behind the new value being applied (version skip). Explain the skip, e.g. "Doc is on v9.0 — was on FGROP v9 (missed the v9→v10 cycle). Apply v9→v11 in one go." Otherwise set to null.
-
-# GROUNDING EXAMPLES — outputs must match this format and level of detail:
-
-Example A — Forms Reference Table (version skip):
-{
-  "paragraph": "Forms Reference Table",
-  "action_description": "Form name + version cell",
-  "line_range": "~3723–3724",
-  "page": 186,
-  "warning": "Doc is on v9.0 — was on FGROP v9 (missed the v9→v10 cycle). Apply v9→v11 in one go.",
-  "find_text": "Account Opening Application Form\\n– Commercial /Corporate        FGROP 037/2016\\n                               (Version 9.0 Updated\\n                               08.06.2023)",
-  "replace_text": "Account Opening Application Form\\n– Commercial /Corporate/\\n  Family Office (Dummy Form)     FGROP 037/2016\\n                               (Version 11.0 Updated\\n                               27.05.2026)"
-}
-
-Example B — Forms Appendix Table (no version skip):
-{
-  "paragraph": "Forms Appendix Table",
-  "action_description": "Row 10 — Form name + ref columns",
-  "line_range": "~1948–1950",
-  "page": 98,
-  "warning": null,
-  "find_text": "Account Opening Application    Form – FGROP 037/2016\\nCommercial / Corporate                (Version 10, updated\\n                               27.02.2025)",
-  "replace_text": "Account Opening Application    Form – FGROP 037/2016\\nCommercial / Corporate/               (Version 11, updated\\nFamily Office (Dummy Form)     27.05.2026)"
-}
-
-Example C — TABLE OF CONTENTS entry:
-{
-  "paragraph": "TABLE OF CONTENTS · Chapter 12",
-  "action_description": "TOC entry for section 12.2",
-  "line_range": "~16638",
-  "page": 3,
-  "warning": null,
-  "find_text": "12.2. ACCOUNT OPENING APPLICATION FORM – PERSONAL / COMMERCIAL/CORPORATE . 12-2",
-  "replace_text": "12.2. ACCOUNT OPENING APPLICATION FORM – PERSONAL / COMMERCIAL/CORPORATE/ FAMILY OFFICE (DUMMY FORM) . 12-2"
-}
-
-# OUTPUT JSON ARRAY of impacts:
-[{
-  "sop_title": "${sop.title}",
-  "paragraph": "<table or section type>",
-  "action_description": "<specific cell/column description>",
-  "change_type": "find_replace",
-  "chapter": "${data.formId}",
-  "find_text": "Verbatim text containing OLD value(s) with 1-3 lines of context",
-  "replace_text": "Same context with OLD value(s) swapped for NEW",
-  "page": <page number from chunk metadata or 0>,
-  "line_range": "<~N or ~N–M estimate>",
-  "warning": "<version skip explanation or null>"
-}]
-
-Return ONLY the JSON array. No commentary.
-      `;
-
-      try {
-        const resp = await generateWithFallback({
-          contents: [{ role: "user", parts: [{ text: prompt }] }],
-          config: { responseMimeType: "application/json", maxOutputTokens: 16384 },
-        });
-        const text = resp.text ?? "";
-        const impacts = JSON.parse(text);
-        if (Array.isArray(impacts)) {
-          for (const imp of impacts) {
-            // Validate: find_text must contain at least one OLD value verbatim.
-            // Otherwise the AI hallucinated — discard.
-            const ft = String(imp.find_text ?? "").toLowerCase();
-            if (!ft.trim()) continue;
-            // Reject obvious AI excuses
-            if (/none.*old.*values|not found|no occurrences|could not (find|locate)/i.test(ft)) {
-              console.log(`  - [${sop.title}] discarded AI excuse impact: "${ft.slice(0, 60)}"`);
-              continue;
-            }
-            // Accept impact if find_text contains: any OLD value verbatim,
-            // OR the form ID, OR the friendly name / core form name.
-            // The friendly-name allowance lets us keep impacts on bare form-title
-            // references (e.g. Forms Tables) that don't carry the version code.
-            const containsAnOld = data.fieldChanges.some((c) =>
-              ft.includes(c.oldValue.toLowerCase().trim())
-            )
-              || ft.includes(data.formId.toLowerCase())
-              || (!!data.friendlyName && ft.includes(data.friendlyName.toLowerCase()))
-              || (!!coreFormName && ft.includes(coreFormName.toLowerCase()));
-            if (!containsAnOld) {
-              console.log(`  - [${sop.title}] discarded impact with no OLD value in find_text`);
-              continue;
-            }
-            allImpacts.push({ ...imp, sop_id: sop.id, sop_title: sop.title });
-          }
-        }
-      } catch (e: any) {
-        console.warn(`UC1: mapping failed for ${sop.title}:`, e?.message);
-      }
-    }
-
-    // 4. Create report row
+    // Create the report shell only. The heavy analysis runs per-document via
+    // analyzeDocForForm — one Vercel call each — so no single call can time out.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: report, error } = await (supabase as any)
       .from("analysis_reports")
@@ -1665,12 +1716,11 @@ Return ONLY the JSON array. No commentary.
         policy_name: data.formId,
         status: "pending_validation",
         source_file_url: data.newFileUrl ?? null,
-        workspace_id: workspace,
+        workspace_id: data.workspace,
         summary_json: {
           executive: [
             `Form ${data.formId} updated with ${data.fieldChanges.length} field change(s).`,
-            `Found ${allImpacts.length} references across ${chunkHits.size} downstream document(s) requiring update.`,
-            `All edits are mechanical find/replace — no regulatory interpretation needed.`,
+            `Analysis in progress…`,
           ],
           effective_date: new Date().toISOString().slice(0, 10),
           before_count: data.fieldChanges.length,
@@ -1688,7 +1738,7 @@ Return ONLY the JSON array. No commentary.
       .single();
     if (error || !report) throw new Error(error?.message || "Failed to create form-update report");
 
-    // 5. Create one "regulatory_changes" row per field change (so it shows in Change Analysis tab)
+    // One regulatory_changes row per field change (shows in the Change Analysis tab)
     await supabase.from("regulatory_changes").insert(
       data.fieldChanges.map((c, i) => ({
         chapter_ref: `${data.formId} · ${c.label}`,
@@ -1705,25 +1755,14 @@ Return ONLY the JSON array. No commentary.
       }))
     );
 
-    // 6. Insert impacts (with ground-truth page overrides applied)
-    const finalImpacts = applyPageOverrides(data.formId, allImpacts);
-    if (finalImpacts.length > 0) {
-      await supabase.from("sop_impacts").insert(
-        finalImpacts.map((m: any, i: number) => ({ ...m, report_id: report.id, position: i }))
-      );
-    }
-
-    return {
-      reportId: report.id as string,
-      impactCount: allImpacts.length,
-      affectedDocs: chunkHits.size,
-    };
+    const docsToAnalyze = await getFormCandidateDocs(data.workspace);
+    return { reportId: report.id as string, docsToAnalyze };
   });
 
 /**
- * Re-runs a UC1 form-update analysis using the form_id + field_changes stored
- * in the original report's summary_json. Wipes and replaces all changes/impacts
- * but keeps the same report row (so the URL stays stable).
+ * Resets a UC1 form-update report for re-analysis: wipes existing impacts/changes,
+ * re-creates the field-change rows, and returns the candidate docs for the client
+ * to analyze one at a time via analyzeDocForForm.
  */
 export const rerunFormUpdateReport = createServerFn({ method: "POST" })
   .inputValidator(z.object({ reportId: z.string() }))
@@ -1738,153 +1777,14 @@ export const rerunFormUpdateReport = createServerFn({ method: "POST" })
       throw new Error("This report is not a Form Update — use the regular Re-run instead.");
     }
     const formId: string = summary.form_id ?? report.policy_name;
-    const friendlyName: string | null = summary.friendly_name ?? null;
     const fieldChanges: { label: string; oldValue: string; newValue: string }[] = summary.field_changes ?? [];
     if (!formId || fieldChanges.length === 0) {
       throw new Error("Original form-update parameters missing from this report — cannot rerun.");
     }
-    const workspace = (report.workspace_id as "rmit" | "fatf" | "forms") ?? "forms";
 
-    // Wipe existing changes + impacts
+    // Wipe + re-create the field-change rows
     await supabase.from("sop_impacts").delete().eq("report_id", report.id);
     await supabase.from("regulatory_changes").delete().eq("report_id", report.id);
-
-    // Re-run the same engine inline (mirrors createFormUpdateReport logic)
-    const INTERNAL_DOC_TYPES = INTERNAL_DOC_TYPES_CONST as readonly string[];
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const chunkHits: Map<string, any[]> = new Map();
-    const coreFormName = deriveCoreFormName(friendlyName);
-    const searchTerms: string[] = [formId];
-    if (friendlyName && friendlyName.trim().length >= 15) {
-      searchTerms.push(friendlyName.trim().slice(0, 100));
-    }
-    if (coreFormName && !searchTerms.some((t) => t.toLowerCase() === coreFormName.toLowerCase())) {
-      searchTerms.push(coreFormName);
-    }
-    for (const c of fieldChanges) {
-      const v = c.oldValue.trim();
-      if (v.length >= 4) searchTerms.push(v.slice(0, 100));
-    }
-    for (const term of searchTerms) {
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const { data: literalHits } = await (supabase as any)
-          .from("sop_chunks")
-          .select("id, sop_id, content, chapter_ref, page_number")
-          .ilike("content", `%${term.replace(/[%_]/g, "")}%`)
-          .limit(200);
-        for (const h of literalHits ?? []) {
-          if (!chunkHits.has(h.sop_id)) chunkHits.set(h.sop_id, []);
-          if (!chunkHits.get(h.sop_id)!.some((x) => x.id === h.id)) chunkHits.get(h.sop_id)!.push(h);
-        }
-      } catch (e: any) {
-        console.warn(`UC1 rerun: literal search failed for "${term.slice(0, 40)}":`, e?.message);
-      }
-    }
-
-    const candidateIds = Array.from(chunkHits.keys());
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const { data: sops } = candidateIds.length > 0 ? await (supabase as any)
-      .from("sop_documents").select("*")
-      .eq("workspace_id", workspace)
-      .in("id", candidateIds)
-      .in("doc_type", INTERNAL_DOC_TYPES)
-      : { data: [] };
-    const sopsById = new Map<string, any>();
-    for (const s of sops ?? []) sopsById.set(s.id, s);
-
-    const allImpacts: any[] = [];
-    for (const [sopId, chunks] of chunkHits.entries()) {
-      const sop = sopsById.get(sopId);
-      if (!sop) continue;
-      const chunkText = chunks.slice(0, 8)
-        .map((c: any) => `[Section: ${c.chapter_ref || "?"} | Page: ${c.page_number || "?"}]\n${c.content}`)
-        .join("\n\n---\n\n");
-
-      const prompt = `
-# ROLE: FORM REFERENCE PROPAGATION ENGINE
-
-A bank form has been updated. Find every occurrence of the OLD values in the SOP chunks below and produce a precise find/replace impact for each.
-
-# FORM: ${formId}
-
-# FIELD CHANGES:
-${fieldChanges.map((c, i) => `Change ${i + 1} — ${c.label}\n  OLD: "${c.oldValue}"\n  NEW: "${c.newValue}"`).join("\n")}
-
-# SOP DOCUMENT: "${sop.title}"
-${chunkText}
-
-# RULES:
-1. For each occurrence: ONE impact with find_text (verbatim surrounding context including OLD value) and replace_text (same context with OLD→NEW).
-2. If multiple OLD values appear in the SAME row/cell: ONE consolidated impact.
-3. If no OLD value found, return [].
-4. NEVER write find_text like "None of the OLD values were found" — that is invalid.
-5. sop_title MUST be exactly "${sop.title}".
-
-# FIELD INSTRUCTIONS:
-- paragraph: Table or section TYPE, e.g. "Forms Reference Table", "Forms Appendix Table", "TABLE OF CONTENTS · Chapter 12". Use the chunk's Section metadata.
-- action_description: Specific cell/column, e.g. "Form name + version cell", "Row 10 — Form name + ref columns", "TOC entry for section 12.2".
-- line_range: Estimate from chunk position. Format "~N" or "~N–M". Never null if position is derivable.
-- page: From chunk Page metadata, or 0.
-- warning: Set only if the version in find_text is two or more versions behind the new value (version skip). Explain the skip explicitly. Otherwise null.
-
-# GROUNDING EXAMPLES:
-Example A — Forms Reference Table (version skip):
-{ "paragraph": "Forms Reference Table", "action_description": "Form name + version cell", "line_range": "~3723–3724", "page": 186, "warning": "Doc is on v9.0 — was on FGROP v9 (missed the v9→v10 cycle). Apply v9→v11 in one go." }
-
-Example B — Forms Appendix Table:
-{ "paragraph": "Forms Appendix Table", "action_description": "Row 10 — Form name + ref columns", "line_range": "~1948–1950", "page": 98, "warning": null }
-
-Example C — TABLE OF CONTENTS:
-{ "paragraph": "TABLE OF CONTENTS · Chapter 12", "action_description": "TOC entry for section 12.2", "line_range": "~16638", "page": 3, "warning": null }
-
-# OUTPUT JSON:
-[{ "sop_title": "${sop.title}", "paragraph": "<table/section type>", "action_description": "<cell/column description>",
-   "change_type": "find_replace", "chapter": "${formId}",
-   "find_text": "verbatim with OLD value", "replace_text": "same with NEW value",
-   "page": <num or 0>, "line_range": "<~N or ~N–M>", "warning": "<version skip explanation or null>" }]
-`;
-      try {
-        const resp = await generateWithFallback({
-          contents: [{ role: "user", parts: [{ text: prompt }] }],
-          config: { responseMimeType: "application/json", maxOutputTokens: 16384 },
-        });
-        const impacts = JSON.parse(resp.text ?? "[]");
-        if (Array.isArray(impacts)) {
-          for (const imp of impacts) {
-            const ft = String(imp.find_text ?? "").toLowerCase();
-            if (!ft.trim()) continue;
-            if (/none.*old.*values|not found|no occurrences|could not (find|locate)/i.test(ft)) continue;
-            const containsAnOld = fieldChanges.some((c) =>
-              ft.includes(c.oldValue.toLowerCase().trim())
-            )
-              || ft.includes(formId.toLowerCase())
-              || (!!friendlyName && ft.includes(friendlyName.toLowerCase()))
-              || (!!coreFormName && ft.includes(coreFormName.toLowerCase()));
-            if (!containsAnOld) continue;
-            allImpacts.push({ ...imp, sop_id: sop.id, sop_title: sop.title });
-          }
-        }
-      } catch (e: any) {
-        console.warn(`UC1 rerun: mapping failed for ${sop.title}:`, e?.message);
-      }
-    }
-
-    // Update summary, re-insert changes + impacts
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await (supabase as any).from("analysis_reports").update({
-      summary_json: {
-        ...summary,
-        executive: [
-          `Form ${formId} updated with ${fieldChanges.length} field change(s).`,
-          `Found ${allImpacts.length} references across ${chunkHits.size} downstream document(s) requiring update.`,
-          `All edits are mechanical find/replace — no regulatory interpretation needed.`,
-          `Last re-run: ${new Date().toISOString()}`,
-        ],
-        last_rerun_at: new Date().toISOString(),
-      },
-    }).eq("id", report.id);
-
     await supabase.from("regulatory_changes").insert(
       fieldChanges.map((c, i) => ({
         chapter_ref: `${formId} · ${c.label}`,
@@ -1901,20 +1801,281 @@ Example C — TABLE OF CONTENTS:
       }))
     );
 
-    const finalImpacts = applyPageOverrides(formId, allImpacts);
-    if (finalImpacts.length > 0) {
-      await supabase.from("sop_impacts").insert(
-        finalImpacts.map((m: any, i: number) => ({ ...m, report_id: report.id, position: i }))
-      );
+    const docsToAnalyze = await getFormCandidateDocs((report.workspace_id as string) ?? "forms");
+    return { reportId: report.id as string, docsToAnalyze };
+  });
+
+/**
+ * Analyzes ONE knowledge-base document for references to an updated form.
+ * The client calls this once per candidate doc — each call gets its own Vercel
+ * function budget, so a single large document can never make the run time out.
+ */
+export const analyzeDocForForm = createServerFn({ method: "POST" })
+  .inputValidator(z.object({ reportId: z.string(), docId: z.string() }))
+  .handler(async ({ data }) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report } = await (supabase as any)
+      .from("analysis_reports").select("*").eq("id", data.reportId).single();
+    if (!report) throw new Error("Report not found");
+    const summary = (report.summary_json ?? {}) as any;
+    const formId: string = summary.form_id ?? report.policy_name;
+    const friendlyName: string | null = summary.friendly_name ?? null;
+    const fieldChanges: { label: string; oldValue: string; newValue: string }[] = summary.field_changes ?? [];
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: doc } = await (supabase as any)
+      .from("sop_documents").select("id, title, file_url, workspace_id, drive_file_id, drive_mime_type").eq("id", data.docId).single();
+    if (!doc || !doc.file_url) return { docId: data.docId, title: doc?.title ?? "?", impactCount: 0 };
+
+    // Search terms: form ID + friendly name + core name + each old value
+    const coreFormName = deriveCoreFormName(friendlyName);
+    const searchTerms: string[] = [formId];
+    if (friendlyName && friendlyName.trim().length >= 15) searchTerms.push(friendlyName.trim().slice(0, 100));
+    if (coreFormName && !searchTerms.some((t) => t.toLowerCase() === coreFormName.toLowerCase())) {
+      searchTerms.push(coreFormName);
+    }
+    for (const c of fieldChanges) {
+      const v = c.oldValue.trim();
+      if (v.length >= 4) searchTerms.push(v.slice(0, 100));
     }
 
-    return {
-      reportId: report.id as string,
-      changesCount: fieldChanges.length,
-      impactCount: allImpacts.length,
-      affectedDocs: chunkHits.size,
-    };
+    // Extract full text. Google Docs → Google's own text export, so the find_text
+    // the AI produces matches what the in-doc find/replace later searches for.
+    let fullText = "";
+    try {
+      if (doc.drive_mime_type === "application/vnd.google-apps.document" && doc.drive_file_id) {
+        fullText = await exportGoogleDocAsText((doc.workspace_id as string) ?? "forms", doc.drive_file_id);
+      } else {
+        const file = await fetchFile(doc.file_url);
+        if (looksLikeDocx(file.mimeType, doc.file_url)) {
+          fullText = await docxToText(file.buffer);
+        } else if (file.mimeType === "application/pdf") {
+          const { extractPdfPages } = await import("./pdf-pages");
+          const pages = await extractPdfPages(file.buffer);
+          fullText = pages.map((p: any) => p.text).join("\n");
+        } else {
+          fullText = file.buffer.toString("utf-8");
+        }
+      }
+    } catch (e: any) {
+      console.warn(`analyzeDocForForm: extract failed for "${doc.title}":`, e?.message?.slice(0, 100));
+      return { docId: doc.id, title: doc.title, impactCount: 0 };
+    }
+    // Drive's text export uses CRLF; the live Google Doc uses LF — normalize.
+    fullText = fullText.replace(/\r\n?/g, "\n");
+    if (!fullText.trim()) return { docId: doc.id, title: doc.title, impactCount: 0 };
+
+    // Literal search → context windows around every match
+    const lowerText = fullText.toLowerCase();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const contexts: any[] = [];
+    for (const term of searchTerms) {
+      const lowerTerm = term.toLowerCase();
+      let pos = 0;
+      while (contexts.length < 30) {
+        const idx = lowerText.indexOf(lowerTerm, pos);
+        if (idx === -1) break;
+        const start = Math.max(0, idx - 500);
+        const end = Math.min(fullText.length, idx + term.length + 500);
+        const excerpt = fullText.slice(start, end);
+        const key = excerpt.slice(10, 50);
+        if (!contexts.some((c: any) => c.content.includes(key))) {
+          contexts.push({ content: excerpt });
+        }
+        pos = idx + term.length;
+      }
+    }
+    if (contexts.length === 0) return { docId: doc.id, title: doc.title, impactCount: 0 };
+
+    // ONE Gemini call → find/replace impacts for this doc
+    const chunkText = contexts.slice(0, 8).map((c: any) => c.content).join("\n\n---\n\n");
+    const prompt = buildUC1Prompt({ formId, friendlyName, fieldChanges, sopTitle: doc.title, chunkText });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const impacts: any[] = [];
+    try {
+      const resp = await generateWithFallback({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        config: { responseMimeType: "application/json", maxOutputTokens: 16384 },
+      });
+      const parsed = JSON.parse(resp.text ?? "[]");
+      if (Array.isArray(parsed)) {
+        for (const imp of parsed) {
+          const ft = String(imp.find_text ?? "").toLowerCase();
+          if (!ft.trim()) continue;
+          if (/none.*old.*values|not found|no occurrences|could not (find|locate)/i.test(ft)) continue;
+          const containsAnOld = fieldChanges.some((c) => ft.includes(c.oldValue.toLowerCase().trim()))
+            || ft.includes(formId.toLowerCase())
+            || (!!friendlyName && ft.includes(friendlyName.toLowerCase()))
+            || (!!coreFormName && ft.includes(coreFormName.toLowerCase()));
+          if (!containsAnOld) continue;
+          impacts.push({ ...imp, sop_id: doc.id, sop_title: doc.title });
+        }
+      }
+    } catch (e: any) {
+      console.warn(`analyzeDocForForm: mapping failed for "${doc.title}":`, e?.message);
+    }
+
+    // Verify each find_text genuinely exists in the document — discard
+    // hallucinations, repair whitespace drift to the exact verbatim substring.
+    const verifyForm = makeFindTextVerifier(fullText);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const verifiedImpacts: any[] = [];
+    for (const m of impacts) {
+      const repaired = verifyForm(m.find_text);
+      if (repaired === null) continue;
+      verifiedImpacts.push({ ...m, find_text: repaired });
+    }
+
+    // Collapse duplicates — the same form reference often appears verbatim in
+    // several places (table + TOC + appendix). One find/replace covers them all,
+    // so keep a single impact per distinct find_text + replace_text pair.
+    const seenImpact = new Set<string>();
+    const uniqueImpacts = verifiedImpacts.filter((m: any) => {
+      const norm = (s: string) => String(s ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+      const key = `${norm(m.find_text)}|||${norm(m.replace_text)}`;
+      if (seenImpact.has(key)) return false;
+      seenImpact.add(key);
+      return true;
+    });
+
+    // Insert impacts (append after any already inserted for this report)
+    const finalImpacts = applyPageOverrides(formId, uniqueImpacts);
+    if (finalImpacts.length > 0) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { count } = await (supabase as any)
+        .from("sop_impacts").select("id", { count: "exact", head: true }).eq("report_id", report.id);
+      const offset = count ?? 0;
+      await supabase.from("sop_impacts").insert(
+        finalImpacts.map((m: any, i: number) => ({ ...m, confidence: clampConfidence(m.confidence), report_id: report.id, position: offset + i }))
+      );
+    }
+    return { docId: doc.id, title: doc.title, impactCount: finalImpacts.length };
   });
+
+/** Writes the final executive summary once all per-doc analysis calls are done. */
+export const finalizeFormUpdateReport = createServerFn({ method: "POST" })
+  .inputValidator(z.object({ reportId: z.string() }))
+  .handler(async ({ data }) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report } = await (supabase as any)
+      .from("analysis_reports").select("*").eq("id", data.reportId).single();
+    if (!report) throw new Error("Report not found");
+    const summary = (report.summary_json ?? {}) as any;
+    const formId: string = summary.form_id ?? report.policy_name;
+    const fieldChanges: any[] = summary.field_changes ?? [];
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: impacts } = await (supabase as any)
+      .from("sop_impacts").select("sop_id").eq("report_id", report.id);
+    const impactCount = (impacts ?? []).length;
+    const affectedDocs = new Set((impacts ?? []).map((i: any) => i.sop_id)).size;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase as any).from("analysis_reports").update({
+      status: "pending_validation",
+      summary_json: {
+        ...summary,
+        executive: [
+          `Form ${formId} updated with ${fieldChanges.length} field change(s).`,
+          `Found ${impactCount} reference(s) across ${affectedDocs} downstream document(s) requiring update.`,
+          `All edits are mechanical find/replace — no regulatory interpretation needed.`,
+        ],
+        last_rerun_at: new Date().toISOString(),
+      },
+    }).eq("id", report.id);
+
+    return { reportId: report.id as string, changesCount: fieldChanges.length, impactCount, affectedDocs };
+  });
+
+/** Lists the policy/SOP documents in ONE workspace that could reference a form. */
+async function getFormCandidateDocs(workspace: string): Promise<{ docId: string; title: string }[]> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const { data } = await (supabase as any)
+    .from("sop_documents")
+    .select("id, title, file_url, doc_type")
+    .eq("workspace_id", workspace)
+    .in("doc_type", ["sop", "it_policy", "policy"]);
+  return ((data ?? []) as any[])
+    .filter((d) => !!d.file_url)
+    .map((d) => ({ docId: d.id as string, title: d.title as string }));
+}
+
+/** Builds the UC1 find/replace propagation prompt for one SOP document. */
+function buildUC1Prompt(opts: {
+  formId: string;
+  friendlyName: string | null;
+  fieldChanges: { label: string; oldValue: string; newValue: string }[];
+  sopTitle: string;
+  chunkText: string;
+}): string {
+  return `
+# ROLE: FORM REFERENCE PROPAGATION ENGINE
+
+A bank form has been updated. Your job: find EVERY occurrence of the OLD values in the internal SOP document below, and propose a precise find/replace edit for each occurrence.
+
+# FORM BEING UPDATED:
+- Form identifier: ${opts.formId}
+- Friendly name: ${opts.friendlyName ?? "(not specified)"}
+
+# FIELD CHANGES TO PROPAGATE:
+${opts.fieldChanges.map((c, i) => `
+  Change ${i + 1} — ${c.label}
+    OLD: "${c.oldValue}"
+    NEW: "${c.newValue}"
+`).join("")}
+
+# INTERNAL SOP DOCUMENT: "${opts.sopTitle}"
+The relevant text excerpts (from a literal search of the document) are below. Find every occurrence of any OLD value within them.
+
+${opts.chunkText}
+
+# ❗ CRITICAL RULES (read every one):
+0. PROPAGATE EVERY FIELD CHANGE. Every change listed above must be reflected. In particular, if a **Name** change is listed (the form's name/description changed), you MUST produce a Description-cell impact updating the name for EVERY table row where this form appears — never skip the name and only do the version/date. The form name is referenced as a full or partial phrase in the row's Description column; find that phrase and amend it. A missing name update is a failure.
+1. For each occurrence: produce ONE impact entry with find_text containing 1-3 lines of verbatim surrounding context including the OLD value, and replace_text containing the same context with the OLD value swapped for the NEW value.
+2. ONE CELL PER IMPACT. find_text must contain ONLY the text of the single cell being amended — and NOTHING from any other cell or column.
+   - ❗ NEVER include the row number / sequence number (e.g. "10.", "11.") in find_text or replace_text — that number lives in a SEPARATE "No." column cell. Including it makes the anchor span two cells and the edit is silently skipped.
+   - The find/replace engine edits text within a single cell — text spanning two cells cannot be placed.
+   - If OLD values are in the SAME cell, consolidate them into ONE impact for that cell.
+   - If the form's NAME is in one cell and its NUMBER / VERSION / DATE is in a DIFFERENT cell (the usual layout of a Forms Reference / Forms & Templates table — Description column vs Reference No. column), produce TWO SEPARATE impacts:
+     • Impact A — the Description cell: find_text = ONLY the old form name (no row number, no reference). replace_text = ONLY the new form name.
+     • Impact B — the Reference No. cell: find_text = ONLY the old "FGROP …/… (version …, Updated …)" block. replace_text = ONLY the new number + version + date.
+   Do NOT merge a name change and a number/version change into one find_text — they live in different cells.
+3. change_type = "find_replace" for all UC1 impacts (we are NEVER inserting new content, only swapping references).
+4. sop_title MUST be exactly "${opts.sopTitle}".
+5. **If no OLD value is clearly present in any excerpt, return an empty array \`[]\`. Do NOT invent placeholder impacts. Do NOT write find_text values like "None of the OLD values were found" — that is NEVER a valid impact, return [] instead.**
+6. find_text must contain at least one of the OLD values verbatim. If it doesn't, omit that impact entirely.
+
+# FIELD INSTRUCTIONS — fill these precisely for every impact:
+- paragraph: The table or section TYPE verbatim, e.g. "Forms Reference Table", "Forms Appendix Table", "Forms / Templates Table", "TABLE OF CONTENTS · Chapter 12", "Section 12.2 Body Text · Purpose paragraph".
+- action_description: The specific cell or column being changed, e.g. "Form name + version cell", "Row 10 — Form name + ref columns", "TOC entry for section 12.2", "Section heading title". Be specific.
+- line_range: Estimate from the excerpt content. Format "~N" (single line) or "~N–M" (range). Use null if not derivable.
+- page: Use 0 if not available.
+- warning: Set ONLY when the version found in find_text is two or more versions behind the new value being applied (version skip). Explain the skip, e.g. "Doc is on v9.0 — was on FGROP v9 (missed the v9→v10 cycle). Apply v9→v11 in one go." Otherwise set to null.
+
+# OUTPUT JSON ARRAY of impacts:
+[{
+  "sop_title": "${opts.sopTitle}",
+  "paragraph": "<table or section type>",
+  "action_description": "<specific cell/column description>",
+  "change_type": "find_replace",
+  "chapter": "${opts.formId}",
+  "find_text": "Verbatim text containing OLD value(s) with 1-3 lines of context",
+  "replace_text": "Same context with OLD value(s) swapped for NEW",
+  "page": <page number or 0>,
+  "line_range": "<~N or ~N–M estimate, or null>",
+  "warning": "<version skip explanation or null>",
+  "confidence": <integer 0-100 — honest certainty this impact is correct>
+}]
+
+# CONFIDENCE — score every impact honestly:
+- 90-100: find_text is an exact verbatim quote from the document AND the swap is purely mechanical (form name / number / version / date). Safe to fast-track.
+- 70-89: the anchor is solid but the wording or placement needs a human check.
+- below 70: the anchor is uncertain or the change needs judgement. Flag for review.
+Never inflate — a wrong "95" that gets fast-tracked is a compliance failure.
+
+Return ONLY the JSON array. No commentary.
+`;
+}
 
 // ── Google Drive OAuth + connection management ────────────────────────────────
 
@@ -2049,6 +2210,7 @@ export const syncDriveFolder = createServerFn({ method: "POST" })
 
     let succeeded = 0;
     let unchanged = 0;
+    const syncedDocs: { id: string; title: string }[] = [];
     const failures: Array<{ name: string; reason: string }> = [];
 
     for (const f of indexable) {
@@ -2065,17 +2227,15 @@ export const syncDriveFolder = createServerFn({ method: "POST" })
       }
 
       try {
-        // 1. Pull binary representation + chunks for this file. We need a real
-        //    downloadable buffer (not just text) because we mirror the file
-        //    into Supabase storage and use THAT as file_url. Drive's viewer
-        //    URLs return HTML, which breaks downstream Gemini calls.
+        // Sync = mirror only. Download the file, store in Supabase storage, upsert
+        // sop_documents. No chunking or embedding here — indexing runs per-doc after
+        // sync completes (client calls reindexSop for each returned sopId one at a
+        // time, staying well within the 60 s Vercel function budget per call).
         let fileBuffer: Buffer;
         let storageContentType: string;
         let storageFilename: string;
-        let chunks: Array<{ content: string; chapter_ref?: string; page_number?: number }>;
 
         if (f.mimeType === "application/vnd.google-apps.document") {
-          // Export Google Docs to DOCX so we can both chunk it and mirror it.
           const token = await (await import("./google-oauth")).refreshAccessToken(data.workspace);
           const r = await fetch(
             `https://www.googleapis.com/drive/v3/files/${f.id}/export?mimeType=application/vnd.openxmlformats-officedocument.wordprocessingml.document&supportsAllDrives=true`,
@@ -2085,25 +2245,13 @@ export const syncDriveFolder = createServerFn({ method: "POST" })
           fileBuffer = Buffer.from(await r.arrayBuffer());
           storageContentType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
           storageFilename = `${f.name.replace(/\.(pdf|docx?|gdoc)$/i, "")}.docx`;
-          const text = await docxToText(fileBuffer);
-          chunks = chunkDocxText(text);
-        } else if (f.mimeType === "application/pdf") {
-          fileBuffer = await downloadFile(data.workspace, f.id);
-          storageContentType = f.mimeType;
-          storageFilename = f.name;
-          chunks = await chunkDocument({ name: f.name, buffer: fileBuffer, mimeType: f.mimeType });
         } else {
-          // .docx / .doc
           fileBuffer = await downloadFile(data.workspace, f.id);
           storageContentType = f.mimeType;
           storageFilename = f.name;
-          const text = await docxToText(fileBuffer);
-          chunks = chunkDocxText(text);
         }
 
-        // 2. Mirror the file into Supabase storage so file_url is a real
-        //    downloadable URL (not Drive's HTML viewer page). This unifies the
-        //    file-fetch path for local-upload and Drive-synced SOPs.
+        // Mirror into Supabase storage so file_url is always a downloadable URL.
         const safeName = storageFilename.replace(/[^A-Za-z0-9._-]+/g, "_");
         const storagePath = `kb/${Date.now()}-${safeName}`;
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -2115,12 +2263,8 @@ export const syncDriveFolder = createServerFn({ method: "POST" })
         const { data: pub } = (supabase as any).storage.from("policies").getPublicUrl(storagePath);
         const mirroredUrl = pub.publicUrl as string;
 
-        // 3. Upsert sop_documents row keyed on (workspace_id, drive_file_id).
-        // Run the same filename-based detector that local uploads use so docs
-        // like "PD-RMiT-June2023.pdf" get doc_type=rmit (not the generic
-        // "policy" default), which matters for the regulator-vs-SOP split in
-        // the analysis pipeline.
-        const cleanTitle = f.name.replace(/\.(pdf|docx?|gdoc)$/i, "");
+        // Upsert sop_documents row.
+        const cleanTitle = f.name.replace(/\.(pdf|docx?|gdoc|xlsx?)$/i, "");
         const detected = autoDetectDocMeta(f.name);
         const sopRow: any = {
           workspace_id: data.workspace,
@@ -2129,9 +2273,6 @@ export const syncDriveFolder = createServerFn({ method: "POST" })
           version: detected?.version ?? "1.0",
           tags: detected?.tags ?? [],
           is_active: true,
-          // file_url = the mirrored Supabase storage URL (used by every
-          // downstream fetchFile call). drive_view_url kept separately on the
-          // row so the KB UI can still link out to Drive for editing.
           file_url: mirroredUrl,
           drive_view_url: driveViewerUrl(f.id, f.mimeType),
           drive_file_id: f.id,
@@ -2151,25 +2292,7 @@ export const syncDriveFolder = createServerFn({ method: "POST" })
           sopId = row.id;
         }
 
-        // 3. Wipe + re-insert chunks for this doc
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        await (supabase as any).from("sop_chunks").delete().eq("sop_id", sopId);
-        if (chunks.length > 0) {
-          const chunksWithEmbeddings = await embedChunksBatched(
-            chunks,
-            (c: any, embedding: number[]) => ({
-              sop_id: sopId,
-              content: c.content,
-              chapter_ref: c.chapter_ref ?? null,
-              page_number: c.page_number ?? null,
-              embedding,
-            }),
-          );
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const { error: insErr } = await (supabase as any).from("sop_chunks").insert(chunksWithEmbeddings);
-          if (insErr) throw insErr;
-        }
-
+        syncedDocs.push({ id: sopId, title: cleanTitle });
         succeeded++;
       } catch (e: any) {
         const reason = e?.message ?? "unknown";
@@ -2194,7 +2317,158 @@ export const syncDriveFolder = createServerFn({ method: "POST" })
       skippedCount: skipped.length,
       failures: failures.slice(0, 10),
       skipped: skipped.slice(0, 10).map((f) => ({ name: f.name, mimeType: f.mimeType })),
+      syncedDocs,
     };
+  });
+
+// ── Drive sync — phase 1: list files that need mirroring ─────────────────────
+
+/**
+ * Returns the list of Drive files that need to be (re-)mirrored into Supabase
+ * storage for this workspace. No downloads happen here — this is fast.
+ * The client then calls mirrorDriveFile once per file.
+ */
+export const listDriveFilesToSync = createServerFn({ method: "POST" })
+  .inputValidator(z.object({
+    workspace: workspaceSchema,
+    force: z.boolean().optional().default(false),
+  }))
+  .handler(async ({ data }) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: conn, error: connErr } = await (supabase as any)
+      .from("workspace_google_connections")
+      .select("drive_folder_id, drive_folder_name")
+      .eq("workspace_id", data.workspace)
+      .single();
+    if (connErr || !conn?.drive_folder_id) throw new Error("No Drive folder configured.");
+
+    const files = await listFolderFiles(data.workspace, conn.drive_folder_id);
+    const indexable = files.filter((f) => isIndexableMimeType(f.mimeType));
+    const skipped = files.filter((f) => !isIndexableMimeType(f.mimeType));
+
+    const driveIds = indexable.map((f) => f.id);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: existingRows } = driveIds.length > 0 ? await (supabase as any)
+      .from("sop_documents")
+      .select("id, drive_file_id, drive_modified_time, last_sync_error")
+      .eq("workspace_id", data.workspace)
+      .in("drive_file_id", driveIds) : { data: [] };
+    const existingByFileId = new Map<string, any>();
+    for (const r of existingRows ?? []) existingByFileId.set(r.drive_file_id, r);
+
+    const toSync: Array<{ id: string; name: string; mimeType: string; modifiedTime?: string; existingSopId?: string }> = [];
+    const unchanged: string[] = [];
+
+    for (const f of indexable) {
+      const existing = existingByFileId.get(f.id);
+      if (!data.force && existing && !existing.last_sync_error && existing.drive_modified_time && f.modifiedTime) {
+        if (new Date(f.modifiedTime).getTime() <= new Date(existing.drive_modified_time).getTime()) {
+          unchanged.push(f.name);
+          continue;
+        }
+      }
+      toSync.push({ id: f.id, name: f.name, mimeType: f.mimeType, modifiedTime: f.modifiedTime, existingSopId: existing?.id });
+    }
+
+    return {
+      folderName: conn.drive_folder_name ?? conn.drive_folder_id,
+      toSync,
+      unchangedCount: unchanged.length,
+      skippedCount: skipped.length,
+    };
+  });
+
+// ── Drive sync — phase 2: mirror one file ─────────────────────────────────────
+
+/**
+ * Downloads one Drive file, mirrors it to Supabase storage, and upserts the
+ * sop_documents row. Called once per file by the client after listDriveFilesToSync.
+ * Returns { sopId, title } so the client can queue it for indexing.
+ */
+export const mirrorDriveFile = createServerFn({ method: "POST" })
+  .inputValidator(z.object({
+    workspace: workspaceSchema,
+    fileId: z.string(),
+    fileName: z.string(),
+    mimeType: z.string(),
+    modifiedTime: z.string().optional(),
+    existingSopId: z.string().optional(),
+  }))
+  .handler(async ({ data }) => {
+    const f = { id: data.fileId, name: data.fileName, mimeType: data.mimeType, modifiedTime: data.modifiedTime };
+
+    let fileBuffer: Buffer;
+    let storageContentType: string;
+    let storageFilename: string;
+
+    if (f.mimeType === "application/vnd.google-apps.document") {
+      const token = await (await import("./google-oauth")).refreshAccessToken(data.workspace);
+      const r = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${f.id}/export?mimeType=application/vnd.openxmlformats-officedocument.wordprocessingml.document&supportsAllDrives=true`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (!r.ok) throw new Error(`Drive export failed: ${r.status}`);
+      fileBuffer = Buffer.from(await r.arrayBuffer());
+      storageContentType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+      storageFilename = `${f.name.replace(/\.(pdf|docx?|gdoc)$/i, "")}.docx`;
+    } else if (f.mimeType === "application/vnd.google-apps.spreadsheet") {
+      const token = await (await import("./google-oauth")).refreshAccessToken(data.workspace);
+      const r = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${f.id}/export?mimeType=application/vnd.openxmlformats-officedocument.spreadsheetml.sheet&supportsAllDrives=true`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (!r.ok) throw new Error(`Drive Sheets export failed: ${r.status}`);
+      fileBuffer = Buffer.from(await r.arrayBuffer());
+      storageContentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+      storageFilename = `${f.name.replace(/\.xlsx?$/i, "")}.xlsx`;
+    } else {
+      fileBuffer = await downloadFile(data.workspace, f.id);
+      storageContentType = f.mimeType;
+      storageFilename = f.name;
+    }
+
+    const safeName = storageFilename.replace(/[^A-Za-z0-9._-]+/g, "_");
+    const storagePath = `kb/${Date.now()}-${safeName}`;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { error: upErr } = await (supabase as any).storage
+      .from("policies")
+      .upload(storagePath, fileBuffer, { upsert: false, contentType: storageContentType });
+    if (upErr) throw new Error(`Storage mirror failed: ${upErr.message}`);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: pub } = (supabase as any).storage.from("policies").getPublicUrl(storagePath);
+    const mirroredUrl = pub.publicUrl as string;
+
+    const cleanTitle = f.name.replace(/\.(pdf|docx?|gdoc|xlsx?)$/i, "");
+    const detected = autoDetectDocMeta(f.name);
+    const sopRow: any = {
+      workspace_id: data.workspace,
+      title: cleanTitle,
+      doc_type: detected?.doc_type ?? "policy",
+      version: detected?.version ?? "1.0",
+      tags: detected?.tags ?? [],
+      is_active: true,
+      file_url: mirroredUrl,
+      drive_view_url: driveViewerUrl(f.id, f.mimeType),
+      drive_file_id: f.id,
+      drive_mime_type: f.mimeType,
+      drive_modified_time: f.modifiedTime ?? null,
+      last_sync_error: null,
+    };
+
+    let sopId: string;
+    if (data.existingSopId) {
+      sopId = data.existingSopId;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (supabase as any).from("sop_documents").update(sopRow).eq("id", sopId);
+    } else {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: row, error } = await (supabase as any)
+        .from("sop_documents").insert(sopRow).select("id").single();
+      if (error) throw error;
+      sopId = row.id;
+    }
+
+    return { sopId, title: cleanTitle };
   });
 
 // ── Stage 3: Pick a policy doc from Drive to feed into a New Analysis ────────
@@ -2323,8 +2597,8 @@ export const insertImpactAsDriveComment = createServerFn({ method: "POST" })
     const isInsertion = imp.change_type === "insertion" || imp.change_type === "new_section";
     const newText = (imp.edited_text ?? imp.replace_text ?? "").trim();
     const headline = isInsertion
-      ? "Compliance Sentinel — Insert new content"
-      : "Compliance Sentinel — Suggested change";
+      ? "Suggested Amendments — Insert new content"
+      : "Suggested Amendments";
     const lines: string[] = [headline];
     if (imp.paragraph) lines.push(`Section: ${imp.paragraph}`);
     if (imp.chapter) lines.push(`Regulator ref: ${imp.chapter}`);
@@ -2338,7 +2612,7 @@ export const insertImpactAsDriveComment = createServerFn({ method: "POST" })
       workspaceId: sop.workspace_id,
       fileId: sop.drive_file_id,
       content: lines.join("\n"),
-      quotedText: imp.find_text || imp.paragraph || undefined,
+      quotedText: (imp.find_text && !imp.find_text.startsWith("[")) ? imp.find_text : (imp.paragraph || undefined),
     });
 
     // 4. Record it on the impact so the UI shows "Inserted" + re-clicks are no-ops
@@ -2349,6 +2623,173 @@ export const insertImpactAsDriveComment = createServerFn({ method: "POST" })
     }).eq("id", imp.id);
 
     return { commentId: r.id, alreadyInserted: false };
+  });
+
+/**
+ * Writes an impact's amendment directly into the source document.
+ * Google Docs: edits in place via the Docs API (insert/replace + yellow highlight).
+ * PDF/DOCX-in-Drive: falls back to a Drive comment, since those can't be edited in place.
+ */
+export const writeImpactToDoc = createServerFn({ method: "POST" })
+  .inputValidator(z.object({
+    impactId: z.string().min(1),
+    // comment = Drive comment; insert = add new text after the found statement;
+    // replace = swap the found text for the amended text. Both in-doc modes highlight.
+    mode: z.enum(["comment", "insert", "replace"]).default("comment"),
+  }))
+  .handler(async ({ data }) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: imp, error: impErr } = await (supabase as any)
+      .from("sop_impacts")
+      .select("id, sop_id, chapter, paragraph, change_type, find_text, replace_text, edited_text, drive_comment_id, inserted_at, status")
+      .eq("id", data.impactId)
+      .single();
+    if (impErr || !imp) throw new Error("Impact not found");
+    if (imp.inserted_at || imp.drive_comment_id) {
+      return { alreadyApplied: true, method: "previous" as const };
+    }
+    if (!imp.sop_id) throw new Error("This impact is not linked to a KB document.");
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: sop, error: sopErr } = await (supabase as any)
+      .from("sop_documents")
+      .select("workspace_id, title, drive_file_id, drive_mime_type")
+      .eq("id", imp.sop_id)
+      .single();
+    if (sopErr || !sop) throw new Error("Source SOP not found");
+    if (!sop.drive_file_id) {
+      throw new Error("This SOP wasn't synced from Drive — re-add it through the Drive folder to enable edits.");
+    }
+
+    const isInsertion = imp.change_type === "insertion" || imp.change_type === "new_section" || imp.change_type === "contextual";
+    const newText = (imp.edited_text ?? imp.replace_text ?? "").trim();
+    if (!newText) throw new Error("This impact has no amended text to apply.");
+    const isGoogleDoc = sop.drive_mime_type === "application/vnd.google-apps.document";
+
+    // ── COMMENT — a Drive comment (works on any file type) ──────────────────
+    // Also the automatic fallback for PDF/DOCX, which can't be edited in place.
+    if (data.mode === "comment" || !isGoogleDoc) {
+      const headline = isInsertion ? "Suggested Amendments — Insert new content" : "Suggested Amendments";
+      const lines: string[] = [headline];
+      if (imp.paragraph) lines.push(`Section: ${imp.paragraph}`);
+      if (imp.chapter) lines.push(`Regulator ref: ${imp.chapter}`);
+      if (!isInsertion && imp.find_text) lines.push("", "Replace:", `"${String(imp.find_text).slice(0, 600)}"`);
+      lines.push("", isInsertion ? "Insert:" : "With:", `"${newText.slice(0, 1500)}"`);
+      const r = await createDriveComment({
+        workspaceId: sop.workspace_id,
+        fileId: sop.drive_file_id,
+        content: lines.join("\n"),
+        quotedText: (imp.find_text && !imp.find_text.startsWith("[")) ? imp.find_text : (imp.paragraph || undefined),
+      });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (supabase as any).from("sop_impacts").update({
+        drive_comment_id: r.id,
+        inserted_at: new Date().toISOString(),
+      }).eq("id", imp.id);
+      return { alreadyApplied: false, method: "comment" as const };
+    }
+
+    // ── INSERT / REPLACE — edit the Google Doc in place, highlighted ────────
+    const result = await writeToGoogleDoc({
+      workspaceId: sop.workspace_id,
+      fileId: sop.drive_file_id,
+      findText: imp.find_text ?? "",
+      anchor: imp.paragraph ?? imp.chapter ?? "",
+      newText,
+      mode: data.mode === "replace" ? "replace" : "insert",
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase as any).from("sop_impacts").update({
+      inserted_at: new Date().toISOString(),
+    }).eq("id", imp.id);
+    return {
+      alreadyApplied: false,
+      method: data.mode as "insert" | "replace",
+      highlighted: result.highlighted,
+      occurrences: result.occurrences,
+    };
+  });
+
+/**
+ * Phase 3 — versioned amended draft. For each affected SOP, COPIES the source
+ * Google Doc and applies every APPROVED impact to the copy (highlighted). The
+ * live document is never touched — the copy is the reviewable draft version.
+ * Draft links are recorded on the report's summary_json.amended_drafts.
+ */
+export const generateAmendedDraft = createServerFn({ method: "POST" })
+  .inputValidator(z.object({ reportId: z.string() }))
+  .handler(async ({ data }) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report } = await (supabase as any)
+      .from("analysis_reports").select("*").eq("id", data.reportId).single();
+    if (!report) throw new Error("Report not found");
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: impactRows } = await (supabase as any)
+      .from("sop_impacts").select("*").eq("report_id", report.id).eq("status", "approved");
+    const approved = (impactRows ?? []) as any[];
+    if (approved.length === 0) {
+      throw new Error("No approved impacts yet — approve impacts first, then generate the amended draft.");
+    }
+
+    // Group approved impacts by their source SOP
+    const bySop = new Map<string, any[]>();
+    for (const imp of approved) {
+      if (!imp.sop_id) continue;
+      if (!bySop.has(imp.sop_id)) bySop.set(imp.sop_id, []);
+      bySop.get(imp.sop_id)!.push(imp);
+    }
+
+    const drafts: any[] = [];
+    const skipped: { title: string; reason: string }[] = [];
+    const stamp = new Date().toISOString().slice(0, 10);
+
+    for (const [sopId, imps] of bySop.entries()) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: sop } = await (supabase as any)
+        .from("sop_documents")
+        .select("title, workspace_id, drive_file_id, drive_mime_type, drive_view_url")
+        .eq("id", sopId).single();
+      if (!sop?.drive_file_id || sop.drive_mime_type !== "application/vnd.google-apps.document") {
+        skipped.push({ title: sop?.title ?? "Unknown SOP", reason: "not a Google Doc — can't draft a copy" });
+        continue;
+      }
+      try {
+        const copy = await copyDriveFile(
+          sop.workspace_id, sop.drive_file_id,
+          `${sop.title} — AMENDED DRAFT (pending sign-off) ${stamp}`,
+        );
+        const result = await applyImpactsToGoogleDoc(
+          sop.workspace_id, copy.id,
+          imps.map((im) => ({
+            findText: im.find_text ?? "",
+            newText: (im.edited_text ?? im.replace_text ?? "").trim(),
+            anchor: im.paragraph ?? im.chapter ?? "",
+            mode: (im.change_type === "insertion" || im.change_type === "new_section" || im.change_type === "contextual")
+              ? "insert" as const : "replace" as const,
+          })),
+        );
+        drafts.push({
+          sopId, sopTitle: sop.title, draftFileId: copy.id, draftUrl: copy.url,
+          originalUrl: sop.drive_view_url ?? driveViewerUrl(sop.drive_file_id, sop.drive_mime_type),
+          impactCount: imps.length, applied: result.applied,
+        });
+      } catch (e: any) {
+        console.warn(`generateAmendedDraft: failed for "${sop.title}":`, e?.message);
+        skipped.push({ title: sop.title, reason: e?.message?.slice(0, 140) ?? "draft failed" });
+      }
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase as any).from("analysis_reports").update({
+      summary_json: {
+        ...(report.summary_json as any ?? {}),
+        amended_drafts: drafts,
+        amended_drafts_at: new Date().toISOString(),
+      },
+    }).eq("id", report.id);
+
+    return { drafts, skipped };
   });
 
 // ── Stage 5: open-ended form-diff detection ──────────────────────────────────

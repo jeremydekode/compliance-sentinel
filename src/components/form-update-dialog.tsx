@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useServerFn } from "@tanstack/react-start";
-import { createFormUpdateReport, extractFormMetadata, detectFormChanges } from "@/lib/compliance.functions";
+import { createFormUpdateReport, analyzeDocForForm, finalizeFormUpdateReport, extractFormMetadata, detectFormChanges } from "@/lib/compliance.functions";
 import { useWorkspace, WORKSPACES, type WorkspaceId } from "@/lib/workspace";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
@@ -58,6 +58,8 @@ export function FormUpdateDialog({
   onCreated: (reportId: string) => void;
 }) {
   const createFn = useServerFn(createFormUpdateReport);
+  const analyzeDocFn = useServerFn(analyzeDocForForm);
+  const finalizeFn = useServerFn(finalizeFormUpdateReport);
   const extractFn = useServerFn(extractFormMetadata);
   const detectFn = useServerFn(detectFormChanges);
   const [workspace] = useWorkspace();
@@ -165,35 +167,59 @@ export function FormUpdateDialog({
 
       const meta = await extractFn({ data: { fileUrl: pub.publicUrl, fileName: picked.name } });
 
-      // Derive base formId by stripping version suffix: "FGROP 037/2016_v10" → "FGROP 037/2016"
-      if (meta.formNumber && !formId) {
-        const baseId = meta.formNumber.replace(/_v\d+$/i, "").trim();
-        setFormId(baseId);
-      }
-      if (meta.formName && !friendlyName) {
-        setFriendlyName(meta.formName);
-      }
+      // Derive base formId by stripping version suffix: "FGROP 037/2016_v11" → "FGROP 037/2016"
+      const baseId = meta.formNumber ? meta.formNumber.replace(/_v\d+$/i, "").trim() : "";
+      if (baseId && !formId) setFormId(baseId);
+      if (meta.formName && !friendlyName) setFriendlyName(meta.formName);
 
-      // Populate the standard oldValue fields only if they're still empty
+      // Extracted data = the NEW form values
       setFields((fs) =>
         fs.map((f) => {
-          if (f.oldValue) return f; // don't overwrite user input
-          if (f.label === "Name" && meta.formName) return { ...f, oldValue: meta.formName };
-          if (f.label === "Version" && meta.formNumber) return { ...f, oldValue: meta.formNumber };
-          if (f.label === "Date" && meta.updatedDate) return { ...f, oldValue: meta.updatedDate };
+          if (f.newValue) return f; // don't overwrite user input
+          if (f.label === "Name" && meta.formName) return { ...f, newValue: meta.formName };
+          if (f.label === "Version" && meta.formNumber) return { ...f, newValue: meta.formNumber };
+          if (f.label === "Date" && meta.updatedDate) return { ...f, newValue: meta.updatedDate };
           return f;
         })
       );
 
-      // Save extracted metadata to cache
+      // Save to cache
       if (meta.formNumber) {
-        const entry: CachedFormMeta = {
-          formName: meta.formName ?? "",
-          formNumber: meta.formNumber,
-          updatedDate: meta.updatedDate ?? "",
-        };
-        saveToCache(entry);
+        saveToCache({ formName: meta.formName ?? "", formNumber: meta.formNumber, updatedDate: meta.updatedDate ?? "" });
         setCachedSuggestions(loadCache());
+      }
+
+      // Auto-fetch old values from the matching KB original
+      if (baseId) {
+        try {
+          const flat = baseId.replace(/[^A-Za-z0-9]/g, "");
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const { data: candidates } = await (supabase as any)
+            .from("sop_documents")
+            .select("id, title, file_url")
+            .eq("workspace_id", "forms")
+            .order("created_at", { ascending: false });
+          const oldDoc = (candidates ?? []).find((c: any) => {
+            const flatTitle = (c.title ?? "").replace(/[^A-Za-z0-9]/g, "");
+            return flatTitle.toUpperCase().includes(flat.toUpperCase()) &&
+              c.file_url !== pub.publicUrl; // don't match the just-uploaded file
+          }) ?? null;
+
+          if (oldDoc?.file_url) {
+            const oldMeta = await extractFn({ data: { fileUrl: oldDoc.file_url, fileName: oldDoc.title ?? "" } });
+            setFields((fs) =>
+              fs.map((f) => {
+                if (f.oldValue) return f; // don't overwrite user input
+                if (f.label === "Name" && oldMeta.formName) return { ...f, oldValue: oldMeta.formName };
+                if (f.label === "Version" && oldMeta.formNumber) return { ...f, oldValue: oldMeta.formNumber };
+                if (f.label === "Date" && oldMeta.updatedDate) return { ...f, oldValue: oldMeta.updatedDate };
+                return f;
+              })
+            );
+          }
+        } catch (e) {
+          console.warn("Old form lookup failed:", e); // non-fatal — user can fill in manually
+        }
       }
     } catch (e) {
       console.warn("Form metadata extraction failed:", e);
@@ -274,8 +300,8 @@ export function FormUpdateDialog({
           }))
         : fields.filter((f) => f.label.trim() && f.oldValue.trim() && f.newValue.trim());
 
-      toast.message("Analysing form references across the KB…", { duration: 4000 });
-      const res = await createFn({
+      // Phase 1 — create the report shell + get the list of docs to analyze
+      const { reportId, docsToAnalyze } = await createFn({
         data: {
           workspace,
           formId: formId.trim(),
@@ -286,12 +312,27 @@ export function FormUpdateDialog({
           fieldChanges: validFields,
         },
       });
+
+      // Phase 2 — analyze one document per call (each gets its own 60 s budget)
+      for (let i = 0; i < docsToAnalyze.length; i++) {
+        const d = docsToAnalyze[i];
+        toast.message(`Analysing ${i + 1}/${docsToAnalyze.length}: ${d.title}…`, { id: "uc1-progress", duration: 60000 });
+        try {
+          await analyzeDocFn({ data: { reportId, docId: d.docId } });
+        } catch (err: any) {
+          console.warn(`Analysis failed for ${d.title}:`, err?.message);
+        }
+      }
+
+      // Phase 3 — write the final summary
+      const fin = await finalizeFn({ data: { reportId } });
+      toast.dismiss("uc1-progress");
       toast.success(`Form update analysis complete`, {
-        description: `${res.impactCount} edit${res.impactCount !== 1 ? "s" : ""} across ${res.affectedDocs} document${res.affectedDocs !== 1 ? "s" : ""}`,
+        description: `${fin.impactCount} edit${fin.impactCount !== 1 ? "s" : ""} across ${fin.affectedDocs} document${fin.affectedDocs !== 1 ? "s" : ""}`,
       });
       reset();
       onOpenChange(false);
-      onCreated(res.reportId);
+      onCreated(reportId);
     } catch (e: any) {
       toast.error("Form update failed", { description: e?.message });
     } finally {
@@ -307,14 +348,14 @@ export function FormUpdateDialog({
             <FileEdit className="size-4 text-amber-600" /> New Form / Template Update
           </DialogTitle>
           <DialogDescription>
-            Upload the old form to auto-extract its details, or fill in manually. Then specify what changed.
+            Upload the new/updated form — the system will extract its details and auto-fill the old values from the matching original in the KB.
           </DialogDescription>
         </DialogHeader>
 
         <div className="space-y-5 py-2">
           {/* Step 1 — Upload old form (extraction source) */}
           <section className="space-y-3">
-            <div className="text-[10px] font-black uppercase tracking-widest text-muted-foreground">Step 1 · Upload the old form (auto-fills fields below)</div>
+            <div className="text-[10px] font-black uppercase tracking-widest text-muted-foreground">Step 1 · Upload the new/updated form</div>
 
             <label className={cn(
               "relative block border-2 border-dashed rounded-lg px-4 py-3 text-center cursor-pointer transition-colors text-sm",
@@ -331,14 +372,14 @@ export function FormUpdateDialog({
                 <span className="flex items-center justify-center gap-2">
                   <Sparkles className="size-4 text-amber-500" />
                   <span className="font-semibold">{file.name}</span>
-                  {fields.some((f) => f.oldValue) && (
+                  {fields.some((f) => f.newValue) && (
                     <span className="text-[10px] text-emerald-600 font-semibold">· fields auto-filled</span>
                   )}
                 </span>
               ) : (
                 <span className="flex items-center justify-center gap-2 text-muted-foreground">
                   <Upload className="size-4 opacity-60" />
-                  <span>Drop the old form PDF here to auto-fill · or skip and enter manually</span>
+                  <span>Drop the new/updated form PDF here · old values fetched from KB automatically</span>
                 </span>
               )}
             </label>

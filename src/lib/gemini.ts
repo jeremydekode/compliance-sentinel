@@ -165,37 +165,20 @@ This document is from the Financial Action Task Force AML/CFT framework. Apply t
 ## Topic patterns to watch for
 beneficial ownership transparency · PEP screening · virtual asset service providers (VASPs) · travel rule · NPO oversight · sanctions evasion · correspondent banking · wire-transfer information · customer due diligence (CDD) tiering · EDD triggers · suspicious transaction reporting (STR/SAR) thresholds · record-retention periods · beneficial-ownership registry obligations · **High-Risk Jurisdictions subject to a Call for Action** · **Jurisdictions under Increased Monitoring (Grey List)**.
 
-## FATF PLENARY STATEMENT — REFERENCE TEMPLATE (use as a structural example only)
-When analysing a Plenary Statement (which updates Call-for-Action and Increased-Monitoring lists), expect changes of these forms:
+## FATF PLENARY STATEMENT — ❗ GROUP changes by ACTION, never one per country
+A Plenary Statement updates the Call-for-Action and Increased-Monitoring lists. Do NOT emit a separate change entry per country — GROUP them by action type:
 
-  ┌──────────────────────────────────────────────────────────────────────────────┐
-  │ EXAMPLE 1 — Country ADDED to Increased Monitoring                            │
-  │   chapter_ref: "FATF Increased Monitoring list — [Country] (added)"          │
-  │   title: "[Country] added to Increased Monitoring"                           │
-  │   tone_shift: "Scope expansion — new jurisdiction subject to EDD"            │
-  │   Internal SOP impact: country lists / risk-rating tables / EDD trigger     │
-  │   sections must include the new jurisdiction.                                │
-  │                                                                              │
-  │ EXAMPLE 2 — Country REMOVED from Increased Monitoring                        │
-  │   chapter_ref: "FATF Increased Monitoring list — [Country] (removed)"        │
-  │   title: "[Country] removed from Increased Monitoring"                       │
-  │   tone_shift: "Scope contraction — jurisdiction no longer requires EDD"      │
-  │   Internal SOP impact: same country lists / EDD triggers — country exits.   │
-  │                                                                              │
-  │ EXAMPLE 3 — Countermeasures ESCALATED for Call-for-Action jurisdiction       │
-  │   chapter_ref: "FATF Call for Action — [Country] (countermeasures enhanced)" │
-  │   title: "Enhanced countermeasures for [Country]"                            │
-  │   tone_shift: "Mandate strengthened — additional countermeasures required"   │
-  │   Internal SOP impact: restricted-customer lists, prohibited-account rules. │
-  │                                                                              │
-  │ EXAMPLE 4 — Plenary date / list version reference                            │
-  │   chapter_ref: "Plenary date reference"                                      │
-  │   title: "Update plenary date reference"                                     │
-  │   tone_shift: "Administrative — reference date refresh"                      │
-  │   Internal SOP impact: any "Refer to FATF [Month Year] statement" lines.   │
-  └──────────────────────────────────────────────────────────────────────────────┘
+- ONE change entry for ALL countries ADDED to Increased Monitoring this plenary.
+    chapter_ref: "FATF Increased Monitoring list — additions"
+    title lists every added country; old_requirement/new_requirement state the full before/after list.
+- ONE change entry for ALL countries REMOVED from Increased Monitoring this plenary.
+    chapter_ref: "FATF Increased Monitoring list — removals"
+    title lists every removed country.
+- ONE change entry PER country whose Call-for-Action status escalated (countermeasures enhanced) — these are individually material, so keep them separate.
+    chapter_ref: "FATF Call for Action — <Country>"
+- ONE change entry for the plenary date-reference refresh.
 
-  These are EXAMPLES of the structural form. Your output must use the ACTUAL country names, dates, and references from the attached documents — not these placeholders.
+Worked example: a plenary that ADDS 2 countries, REMOVES 4, and ESCALATES 1 = exactly **4** change entries (1 additions + 1 removals + 1 escalation + 1 date) — NEVER 8. Use the ACTUAL country names and dates from the attached documents.
 
 ## Common internal SOP sections that need updating after a Plenary Statement
 For AML/CFT internal policies (e.g. Group AML/CFT/CPF Guidelines, Group AML/CFT/CPF Policy, division-level AML/CFT Guidelines), expect impacts in sections like:
@@ -203,10 +186,10 @@ For AML/CFT internal policies (e.g. Group AML/CFT/CPF Guidelines, Group AML/CFT/
 - "Jurisdiction Risk Table" / "EDD Trigger" / "Enhanced Due Diligence"
 - "Jurisdiction Monitoring Procedures" / "Compliance-maintained list"
 - "Document Header" / "Cover Page" version-bump on the SOP itself
-Consolidate multi-country list updates into ONE impact per affected SOP section (e.g. one impact "update FATF risk-country list" rather than four separate per-country edits).
+Consolidate multi-country list updates into ONE impact per affected SOP section (one impact "update FATF risk-country list" — never one per country).
 
 ## Completeness
-A typical FATF Plenary Statement update produces 4-8 distinct regulatory changes and touches 2-5 internal SOP sections. Re-scan the document if your output is materially smaller than that.`;
+A typical FATF Plenary Statement update, grouped this way, produces 3-6 distinct regulatory changes touching 2-5 internal SOP sections.`;
   }
   if (ctx === "circular") {
     return `
@@ -371,10 +354,104 @@ There is NO upper limit on the number of changes you may return. List every mate
  * SEMANTIC CHUNKING ENGINE
  * Extracts granular text pieces from a document for full-text indexing.
  */
+/**
+ * Deterministic chunker for plain text (used for DOCX files to avoid
+ * sending a huge binary to Gemini — mammoth extracts text in milliseconds,
+ * then we split on paragraph/section boundaries locally).
+ *
+ * Targets ~800 chars per chunk. Tracks the most recent heading-like line as
+ * chapter_ref. No page numbers (DOCX has no inherent pages).
+ */
+function chunkTextDeterministic(
+  text: string
+): Array<{ content: string; chapter_ref?: string }> {
+  // Split on blank lines to get paragraph-level units.
+  const paragraphs = text.split(/\n{2,}/).map((p) => p.trim()).filter(Boolean);
+
+  const TARGET = 800;
+  const chunks: Array<{ content: string; chapter_ref?: string }> = [];
+  let currentChapter: string | undefined;
+  let buffer = "";
+
+  const flush = () => {
+    const c = buffer.trim();
+    if (c) chunks.push({ content: c, chapter_ref: currentChapter });
+    buffer = "";
+  };
+
+  for (const para of paragraphs) {
+    // Detect headings: short lines that look like "1.2 Title", "CHAPTER X", numbered clauses, etc.
+    const isHeading =
+      para.length < 120 &&
+      (/^(\d+(\.\d+)*\.?\s+\S)/.test(para) ||  // "1.2.3 Something"
+       /^(chapter|section|clause|part|appendix)\b/i.test(para) ||
+       /^[A-Z][A-Z\s\d]{3,60}$/.test(para));     // ALL-CAPS short line
+
+    if (isHeading) {
+      flush();
+      currentChapter = para.slice(0, 120);
+    }
+
+    if (buffer.length + para.length + 2 > TARGET * 1.5 && buffer.length > 0) {
+      flush();
+    }
+    buffer = buffer ? buffer + "\n\n" + para : para;
+    if (buffer.length >= TARGET) flush();
+  }
+  flush();
+  return chunks;
+}
+
 export async function chunkDocument(
   doc: { name: string; buffer: Buffer; mimeType: string }
 ): Promise<Array<{ content: string; chapter_ref?: string; page_number?: number }>> {
   const isPdf = doc.mimeType === "application/pdf" || /\.pdf$/i.test(doc.name);
+  const isDocx =
+    doc.mimeType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+    doc.mimeType === "application/msword" ||
+    /\.docx?$/i.test(doc.name);
+  const isXlsx =
+    doc.mimeType === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
+    doc.mimeType === "application/vnd.ms-excel" ||
+    /\.xlsx?$/i.test(doc.name);
+
+  // For XLSX: extract sheet data with SheetJS — fast, no Gemini needed.
+  if (isXlsx) {
+    try {
+      const XLSX = await import("xlsx");
+      const workbook = XLSX.read(doc.buffer, { type: "buffer" });
+      const chunks: Array<{ content: string; chapter_ref?: string }> = [];
+      for (const sheetName of workbook.SheetNames) {
+        const sheet = workbook.Sheets[sheetName];
+        // Convert to CSV rows, filter blanks
+        const rows: string[][] = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" }) as string[][];
+        const nonEmpty = rows.filter((r) => r.some((c) => String(c).trim()));
+        if (nonEmpty.length === 0) continue;
+        // Chunk every 20 rows so individual chunks stay manageable
+        const ROW_BATCH = 20;
+        for (let i = 0; i < nonEmpty.length; i += ROW_BATCH) {
+          const slice = nonEmpty.slice(i, i + ROW_BATCH);
+          const content = slice.map((r) => r.map((c) => String(c).trim()).join("\t")).join("\n");
+          chunks.push({ content, chapter_ref: `Sheet: ${sheetName} (rows ${i + 1}–${i + slice.length})` });
+        }
+      }
+      if (chunks.length > 0) return chunks;
+    } catch (e) {
+      console.warn(`[chunkDocument] XLSX extraction failed for ${doc.name}, falling back to Gemini:`, (e as Error)?.message);
+    }
+  }
+
+  // For DOCX: extract text locally with mammoth (fast, no AI call needed).
+  // Sending a 400-page DOCX binary to Gemini routinely times out on Vercel.
+  if (isDocx) {
+    try {
+      const { docxToText } = await import("./docx-editor");
+      const text = await docxToText(doc.buffer);
+      if (text.length > 0) return chunkTextDeterministic(text);
+    } catch (e) {
+      console.warn(`[chunkDocument] DOCX text extraction failed for ${doc.name}, falling back to Gemini:`, (e as Error)?.message);
+    }
+  }
 
   // For PDFs: extract real page boundaries first so the chunker can use them as
   // ground truth instead of guessing page numbers from layout cues.
@@ -449,6 +526,13 @@ export async function mapChangeToSops(
 
 You have one specific REGULATORY CHANGE. Your task is to find the EXACT location(s) in our internal SOPs that need to be updated to comply with this change.
 
+# REASONING STEP — do this SILENTLY first, inside a <thinking></thinking> block:
+1. DEFINE — what exactly did this regulatory change add, remove, reclassify, or re-deadline?
+2. MATCH — which SOP clause(s) below topically OWN this control? Name the clause number.
+3. ANCHOR — what is the single most distinctive short sentence in that clause to use as find_text?
+4. FLAG — would the current SOP wording become NON-COMPLIANT or directly CONFLICT with the new requirement if left unchanged? If so, say so in the action_description.
+Then output ONLY the JSON array — NEVER include the <thinking> block or any prose in your final output.
+
 # REGULATORY CHANGE TO MAP:
 - Chapter Reference: ${change.chapter_ref}
 - Impact Level: ${change.impact}
@@ -488,7 +572,22 @@ Examples of topic alignment that should trigger an impact:
 - Change about "SBOM" / "third-party software inventory" → SOP sections on vendor management, supplier risk, third-party security
 - Change about "uptime disclosure" → SOP sections on service availability, customer communications, public reporting
 
-# CRITICAL: For find_text, provide VERBATIM text from the SOP (at least 20 words of context) so it can be found programmatically. Do not paraphrase or shorten.
+# ❗❗ CRITICAL — find_text is a LITERAL QUOTE you COPY, never a sentence you WRITE:
+find_text is fed to an exact text-locator that searches the real SOP document. Treat it like a Ctrl+F string: if the exact characters are not in the document, the search returns nothing and the impact is THROWN AWAY.
+
+MANDATORY PROCEDURE for every find_text — no exceptions:
+1. Find the sentence in the SOP text below — point to where it physically sits.
+2. Select a contiguous run of 6-25 words on word boundaries. SHORTER IS BETTER — one precise sentence beats a whole paragraph; a long multi-line quote will not match.
+3. Reproduce it character-for-character: same words, same order, same spelling, same punctuation, same dates and numbers.
+4. Re-scan the SOP and confirm that exact string is present as one unbroken run. If you cannot find it, you do NOT have an anchor — use the FALLBACK in Rule A.
+
+A find_text is a HALLUCINATION — silently DISCARDED, the whole impact LOST — if you:
+- paraphrase, summarise, "tidy up", or rebuild the sentence from memory instead of copying it;
+- swap any word for a synonym (SOP says "Guideline" → do NOT write "circular");
+- merge two lines, fix a typo, or add an ellipsis ("...");
+- include a date, year, or number that is not in that exact SOP sentence (e.g. writing "October 2025" when the sentence has no such date).
+- Pick the most unique fragment available: a sentence containing a specific date, number, defined term, proper noun, or clause number.
+- Never quote the chunk's "[Section: … | Page: …]" header — that is metadata, not document text.
 
 # ❗ ANTI-HALLUCINATION RULES — READ CAREFULLY:
 
@@ -497,6 +596,9 @@ The "Old Requirement" and "New Requirement" fields above contain REGULATION text
 You MUST NOT copy text from "Old Requirement" or "New Requirement" into the find_text field.
 The find_text field is a verbatim quote from the BANK'S INTERNAL SOP PDF that you can see attached below — NOT from the regulation.
 If the SOP does not contain matching anchor text, do NOT invent it from the regulation. Use change_type "insertion" with find_text="[end of {nearest existing section heading}]" pointing at the right SOP section, OR change_type "contextual" if the SOP topically owns the area but no precise insertion point exists.
+✅ A square-bracket marker is the CORRECT answer when no verbatim sentence can be copied — NOT a failure. It is handled as a review comment on the right section. A bracket marker that ships always beats a fabricated sentence that gets discarded. NEVER invent a sentence just to avoid a bracket marker.
+This ban covers ALL of: Change Summary, Old Requirement, New Requirement, and Tone Shift — every word of the REGULATORY CHANGE block. A country name (Burkina Faso, Myanmar…), a FATF list name ("Jurisdictions under Increased Monitoring"), or a plenary month/year ("October 2025", "February 2026") may appear in find_text ONLY if you found that exact wording in the SOP body. Most SOPs reference FATF/sanctions lists generically and name no countries or plenary dates — so for a country-list or plenary-date change the EXPECTED, CORRECT output is change_type "contextual" with a "[bracket marker]". Do not force a find_replace.
+FINAL SELF-CHECK: before output, re-read every find_text — if it contains a country name, a plenary date, or any phrase you took from the REGULATORY CHANGE block, DELETE it and switch that impact to change_type "contextual" with a "[bracket marker]" naming the SOP section.
 
 ## Rule B — Consolidate related edits
 If a single regulatory change affects multiple closely-related items in the SAME SECTION of an SOP (e.g. "add Kuwait, Papua New Guinea, and update Myanmar" all in the same risk-country table), return ONE consolidated impact entry that updates the whole list/table at once, NOT one impact per item. Do not split a list update into N separate find/replace entries.
@@ -504,23 +606,47 @@ If a single regulatory change affects multiple closely-related items in the SAME
 ## Rule C — Page numbers
 The page number MUST be the actual page where the find_text appears in the SOP PDF. If uncertain, set page to 0 — do NOT guess. A wrong page number is worse than no page number.
 
-## Rule D — Section references
-The paragraph reference MUST exist in the SOP. Do not invent section numbers like "Section 4.2" if the SOP only has sections 1-3. If the SOP only contains 30 pages, do NOT cite page 50.
+## Rule D — Section references: the SOP's OWN clause number, never the regulator's
+The "paragraph" field MUST be the INTERNAL SOP's own clause/section number, exactly as printed in the SOP body — e.g. "C.25.3.1", "Section 8.2.4", "Appendix 5, Part E".
+START the paragraph value with that bare clause number so it can be used as an anchor (e.g. "C.25.3.1 · AML/CFT Program Controls").
+NEVER put a regulation/Act reference here. "Section 19(2)(b) of AMLA", "Paragraph 10.31 of RMiT", "FATF Recommendation 16" are REGULATOR references — they belong in the "chapter" field, NOT "paragraph".
+The clause number MUST physically exist in the SOP. Do not invent "Section 4.2" if the SOP only has sections 1-3.
 
 ## Rule E — sop_title must match the actual document title
 Use the document title EXACTLY as it appears in the "--- INTERNAL DOCUMENT" header below (e.g., "R13 GL248"), NOT the long descriptive name from inside the document.
 
+## Rule F — Replacement-text quality bar (this is the standard you MUST hit)
+Every replace_text / insertion you produce must be implementation-ready, not a vague summary:
+- END with a "Reference:" line citing the regulator source(s) and date(s) — e.g. "Reference: BNM Notification 26 March 2026; FATF Statement 24 March 2026".
+- State the effective date and any compliance deadline explicitly — e.g. "effective 24 March 2026", "RHB deadline June 2026".
+- Cross-reference the authoritative sibling section when one exists — e.g. "See Section C.14.1.3 for the updated classification table".
+- PRESERVE the SOP's existing numbering and layout: if you amend item "3.", keep "3." and append the note; if you add table rows, keep the exact column layout of the existing table.
+- KEEP the original obligation text intact and ADD the new note — never delete an existing obligation unless the regulation explicitly revokes it.
+- DATES: use ONLY dates that literally appear in the REGULATORY CHANGE block above or in the SOP text. NEVER invent or guess a year. If this is the February 2026 plenary, every date you write is 2026 or later — writing "2024" or "2025" is a hallucination and is forbidden. When unsure of an exact date, omit it rather than guess.
+
+## Rule G — Document version bump
+ONLY when the internal SOP's header/cover page shows an effective date that is clearly EARLIER than this regulatory change's effective date, emit ONE extra impact. If the SOP header is already dated on or after the change, do NOT emit a version bump. When you do bump, emit:
+- paragraph: "Document Header / Cover Page"
+- change_type: "find_replace"
+- action_description: "Version bump after changes applied"
+- find_text: the verbatim "Version" + "Effective Date" lines from the header
+- replace_text: the bumped version, the original effective date kept, plus an "Amended:" line and a "Reason:" line citing this regulatory update.
+
+## Rule H — Contextual, not mechanical
+FATF / AML changes require Compliance Officer + Legal interpretation. Treat every impact as a DRAFT for human sign-off — accurate and specific, but never framed as an auto-publishable mechanical edit.
+
 # OUTPUT FORMAT (JSON Array):
 [{
   "sop_title": "Exact title of the internal SOP/policy document (short code from the document header, e.g. 'R13 GL248')",
-  "paragraph": "Full section reference with name (e.g. 'Section C.14.1.4 · High-risk country customer types')",
+  "paragraph": "The SOP's OWN clause number first, then its name — e.g. 'C.14.1.4 · High-risk country customer types'. NEVER a regulation/Act reference.",
   "action_description": "ONE-LINE imperative headline describing what changes. Examples: 'Plenary date reference — \\'June 2025\\' → \\'February 2026\\'', 'Add 2 new rows; update Myanmar row', 'Add cross-reference note after existing FATF reference clause', 'Myanmar countermeasure note — add after existing Iran / North Korea entry', 'Version bump after all changes applied'. Be specific and action-oriented.",
   "change_type": "find_replace" | "insertion" | "full_rewrite" | "new_section" | "contextual",
   "chapter": "${change.chapter_ref}",
-  "find_text": "VERBATIM text from the SOP that anchors this edit. For find_replace: the exact text to be replaced. For insertion: the exact text the new content goes AFTER. If the anchor is a structural location with no concise verbatim text, use a descriptive marker in square brackets: '[end of existing monitoring procedures clause]', '[end of FATF / relevant authorities reference clause — no Feb 2026 note]', '[end of Call for Action prohibition clause referencing Compliance-maintained list]'.",
+  "find_text": "ONE short, distinctive sentence (6-25 words) COPIED character-for-character from the SOP body — never written from memory. For find_replace: the exact text to be replaced. For insertion: the exact existing sentence the new content goes immediately AFTER. If no sentence can be copied verbatim, use a square-bracket marker like '[end of existing monitoring procedures clause]' — that is a correct, equally-valid answer, not a fallback to avoid.",
   "replace_text": "The full new text content. For find_replace: the replacement. For insertion: the new paragraphs/rows being added.",
   "page": <page number in the SOP document where this text appears, or 0 if unknown>,
-  "line_range": "Best-effort line reference such as '~19056' (single line) or '~4378-4435' (range), or null if unknown"
+  "line_range": "Best-effort line reference such as '~19056' (single line) or '~4378-4435' (range), or null if unknown",
+  "confidence": <integer 0-100 — honest certainty: 90-100 = exact verbatim anchor + mechanical change; 70-89 = solid anchor, wording needs a human check; below 70 = uncertain. Never inflate.>
 }]
 
 # REFERENCE EXAMPLES OF GOOD OUTPUT (use as a STRUCTURAL template; substitute real values from the attached SOPs):
@@ -596,6 +722,134 @@ Use the document title EXACTLY as it appears in the "--- INTERNAL DOCUMENT" head
     return Array.isArray(parsed) ? parsed : [];
   } catch (e) {
     console.error(`Failed to parse SOP mapping for ${change.chapter_ref}:`, text.slice(0, 300));
+    return [];
+  }
+}
+
+/**
+ * Maps a LIST of regulatory changes against the FULL TEXT of ONE internal SOP.
+ * Unlike mapChangeToSops (which sees only vector-matched chunks), this sees the
+ * entire document — nothing can be missed for lack of retrieval. Used by the
+ * full-document regulatory analysis (one call per SOP, or per large segment).
+ */
+export async function mapChangesToSop(
+  changes: RegulatoryDelta[],
+  sop: { title: string; text: string },
+): Promise<SopGap[]> {
+  const prompt = `
+# ROLE: COMPLIANCE GAP ANALYST — PRECISION SOP MAPPER
+
+You are given a LIST of regulatory changes and the FULL TEXT of ONE internal SOP document.
+Your task: find EVERY location in this SOP that must be updated for ANY of these changes.
+
+# REASONING STEP — do this SILENTLY first, inside a <thinking></thinking> block:
+1. DEFINE — for each regulatory change, what exactly did it add, remove, reclassify, or re-deadline?
+2. MATCH — scan the SOP. Which clause(s) topically OWN each affected control? Name the clause number.
+3. ANCHOR — for each, pick the single most distinctive short sentence to use as find_text.
+4. FLAG — would the current SOP wording become NON-COMPLIANT or CONFLICT with a new requirement if unchanged?
+Then output ONLY the JSON array — NEVER include the <thinking> block or any prose.
+
+# REGULATORY CHANGES (${changes.length}):
+${changes.map((c, i) => `--- CHANGE ${i + 1} ---
+Chapter Reference: ${c.chapter_ref}
+Impact Level: ${c.impact}
+Change Summary: ${c.change_summary}
+Old Requirement: ${c.old_requirement}
+New Requirement: ${c.new_requirement}
+Tone Shift: ${c.tone_shift}`).join("\n\n")}
+
+# MAPPING INSTRUCTIONS:
+- For each affected location, identify the EXACT current text and propose precise replacement text.
+- There is NO limit on impacts. If 5 different clauses are affected, return 5 entries — one per location.
+- Prefer "find_replace" when there is exact text to anchor on; "insertion" for new clauses; "contextual" when the SOP owns the topic but has no precise anchor sentence.
+
+# ❗ find_text is a LITERAL QUOTE — you COPY it, you do not WRITE it:
+find_text is fed to an automatic text-locator that runs an exact search against the real SOP. Treat it like a Ctrl+F string: if the exact characters are not in the document, the search returns nothing and the impact is THROWN AWAY.
+
+MANDATORY PROCEDURE — do this for every find_text, no exceptions:
+1. Find the sentence in the "INTERNAL SOP DOCUMENT" text below — point to where it physically sits.
+2. Select a contiguous run of 6-25 words starting and ending on a word boundary.
+3. Reproduce it character-for-character: same words, same order, same spelling, same punctuation, same dates and numbers.
+4. Re-scan the SOP text and confirm that exact string is present as one unbroken run. If you cannot find it, you do NOT have an anchor — use the FALLBACK below.
+
+A find_text is a HALLUCINATION — it will be silently DISCARDED and the entire impact LOST — if you:
+- paraphrase, summarise, "tidy up", or rebuild the sentence from memory instead of copying it;
+- swap any word for a synonym (SOP says "Guideline" → do NOT write "circular"; "this Guideline aims" → do NOT write "circular... aims");
+- merge two lines, fix a typo, or add an ellipsis ("...");
+- include a date, year, or number that is not in that exact SOP sentence (e.g. writing "October 2025" when the SOP sentence has no such date).
+
+# ✅ FALLBACK — when no exact anchor exists, this is the CORRECT answer, NOT a failure:
+If no contiguous prose sentence can be copied verbatim, set change_type "contextual" and put a plain-language description in square brackets as the find_text, e.g. "[end of FATF jurisdiction monitoring clause]". This is handled as a review comment on the right section — a perfectly good, fully-usable outcome. A bracket marker that ships always beats a fabricated sentence that gets discarded. NEVER invent a sentence just to avoid using a bracket marker — there is no penalty for the bracket marker and a total loss for the fabrication.
+
+# Rules for a real (non-bracket) find_text:
+- It must be running PROSE with a verb — NOT a heading, section title, table row/cell, "Version"/"Effective Date" line, list label, or anything starting with a bare section number (e.g. "C.1.2 Risk Profiling"). Those live in tables/headings the find/replace engine cannot target and the edit silently fails — use a bracket marker for those instead.
+- Avoid any candidate with a run of 3+ spaces or a tab — that is table/column layout, not a sentence.
+- Prefer a sentence containing a date, number, defined term, or proper noun, for distinctiveness.
+
+# 🚫 RULE — find_text comes ONLY from the SOP, NEVER from the REGULATORY CHANGES block:
+The "REGULATORY CHANGES" block at the top of this prompt (Change Summary / Old Requirement / New Requirement) is the EXTERNAL regulation. Its sentences are crisp and tempting — but copying ANY of them into find_text is the #1 cause of failure.
+- find_text must be text you located INSIDE the "INTERNAL SOP DOCUMENT" section at the BOTTOM of this prompt — nowhere else.
+- A country name (Burkina Faso, Myanmar, Mozambique…), a FATF list name ("Jurisdictions under Increased Monitoring"), or a plenary month/year ("October 2025", "February 2026") may ONLY appear in find_text if you found that exact wording in the SOP body itself. If you got it from a Change block, it is FORBIDDEN.
+- Most internal SOPs reference FATF/sanctions lists GENERICALLY ("FATF-listed jurisdictions", "high-risk countries") and do NOT name individual countries or plenary dates. So for a country-list or plenary-date change, the SOP usually has NO verbatim anchor — the EXPECTED, CORRECT output is change_type "contextual" with a "[bracket marker]". Do not force a find_replace.
+
+# ✅ FINAL SELF-CHECK — before you output, re-read every find_text you wrote:
+For each one, ask: "Could I find this exact string by searching the INTERNAL SOP DOCUMENT text — not the regulation?"
+If a find_text contains a country name, a plenary date, or a phrase you actually took from a Change block — DELETE it and replace it with change_type "contextual" + a "[bracket marker]" naming the SOP section. Keep the replace_text. An impact that ships as a comment is a success; a fabricated find_replace that gets discarded is a total loss.
+
+# RULE — Section references: the SOP's OWN clause number
+"paragraph" MUST be the SOP's own clause/section number as printed in the SOP (e.g. "C.14.1.3 · High-risk country customer types"). START it with the bare clause number. NEVER put a regulation/Act reference here — those go in "chapter".
+
+# RULE F — Replacement-text quality bar:
+Every replace_text / insertion must be implementation-ready:
+- Your replace_text MUST contain the ENTIRE find_text reproduced WORD-FOR-WORD, then your additions appended. NEVER drop, shorten, reorder, or reword any part of the original text — only ADD to it.
+- END with a "Reference:" line citing the regulator source(s) and date(s).
+- State effective dates and deadlines explicitly.
+- Cross-reference the authoritative sibling section when one exists.
+- PRESERVE the SOP's existing numbering and table layout.
+- KEEP the original obligation text intact and ADD the new note — never delete unless the regulation revokes it.
+- DATES: use ONLY dates that literally appear in a regulatory change above or in the SOP. NEVER invent or guess a year.
+
+# RULE G — Document version bump:
+Emit the version bump AT MOST ONCE for the whole document, ONLY if the SOP header/cover shows an effective date EARLIER than these changes. Anchor it ONLY on the verbatim "Version" + "Effective Date" lines of the cover page — NEVER on the document title or filename string. If those header lines do not appear in this text, do NOT emit a version bump at all. When you do: paragraph "Document Header / Cover Page", change_type "find_replace", replace_text = bumped version + original effective date kept + an "Amended:" line + a "Reason:" line.
+
+# RULE H — Contextual, not mechanical: treat every impact as a DRAFT for Compliance + Legal sign-off.
+
+# OUTPUT FORMAT (JSON Array):
+[{
+  "sop_title": "${sop.title}",
+  "paragraph": "<SOP clause number · name>",
+  "action_description": "<one-line imperative headline of what changes>",
+  "change_type": "find_replace" | "insertion" | "contextual" | "new_section",
+  "chapter": "<the Chapter Reference of whichever regulatory change this addresses>",
+  "find_text": "<short verbatim anchor sentence from the SOP, or a [bracket marker]>",
+  "replace_text": "<the full amended/inserted text, meeting Rule F>",
+  "page": <page number or 0>,
+  "line_range": "<~N or ~N–M, or null>",
+  "confidence": <integer 0-100 — your honest certainty this impact is correct (see CONFIDENCE below)>
+}]
+
+# CONFIDENCE — score every impact honestly:
+- 90-100: the find_text is an exact, unambiguous verbatim quote from the SOP AND the change is mechanical (a clear date/number/term swap or a clearly-scoped note). Safe to fast-track.
+- 70-89: the anchor is solid but the replacement wording needs human judgement, OR the regulatory mapping is sound but not certain.
+- below 70: the anchor is uncertain, the SOP ownership is debatable, or the change needs interpretation. Flag for review.
+Never inflate. A wrong "95" that gets fast-tracked is a compliance failure.
+
+Return ONLY the JSON array. If no location in this SOP is affected by any change, return [].
+
+# INTERNAL SOP DOCUMENT (full text) — "${sop.title}":
+${sop.text}
+`;
+
+  const response = await generateWithFallback({
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    config: { responseMimeType: "application/json", maxOutputTokens: 32768 },
+  });
+  const text = response.text ?? "";
+  try {
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    console.error(`Failed to parse SOP mapping for "${sop.title}":`, text.slice(0, 300));
     return [];
   }
 }

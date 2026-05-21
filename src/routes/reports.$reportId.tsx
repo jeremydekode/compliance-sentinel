@@ -226,25 +226,27 @@ function ReportPage() {
         toast.dismiss("uc1-rerun");
         result = await finalizeFn({ data: { reportId: rid, coverage } });
       } else {
-        // Regulatory analysis — phased: extract changes, then one call per SOP
-        // (full-document, no chunking). A failed SOP is retried, then flagged.
+        // Regulatory analysis — one call per SOP (full-document, no chunking),
+        // run in PARALLEL. A failed SOP is retried, then flagged.
         const { reportId: rid, sops } = await startRegRerun({ data: { reportId } });
-        const coverage: { title: string; status: string }[] = [];
-        for (let i = 0; i < sops.length; i++) {
-          toast.message(`Analysing ${i + 1}/${sops.length}: ${sops[i].title}…`, { id: "reg-rerun", duration: 60000 });
+        let regDone = 0;
+        toast.message(`Analysing ${sops.length} document(s)…`, { id: "reg-rerun", duration: 180000 });
+        const coverage = await Promise.all(sops.map(async (sop) => {
           let status = "failed";
           for (let attempt = 1; attempt <= 3; attempt++) {
             try {
-              const res = await analyzeSop({ data: { reportId: rid, sopId: sops[i].id } });
+              const res = await analyzeSop({ data: { reportId: rid, sopId: sop.id } });
               status = res?.status ?? "analyzed";
               if (status !== "failed") break;
             } catch (err: any) {
-              console.warn(`Analysis attempt ${attempt} failed for ${sops[i].title}:`, err?.message);
+              console.warn(`Analysis attempt ${attempt} failed for ${sop.title}:`, err?.message);
               status = "failed";
             }
           }
-          coverage.push({ title: sops[i].title, status });
-        }
+          regDone++;
+          toast.message(`Analysed ${regDone}/${sops.length} document(s)…`, { id: "reg-rerun", duration: 180000 });
+          return { title: sop.title, status };
+        }));
         toast.dismiss("reg-rerun");
         result = await finalizeReg({ data: { reportId: rid, coverage } });
       }

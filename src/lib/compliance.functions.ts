@@ -1,7 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { supabase } from "@/integrations/supabase/client";
-import { chunkDocument, generateAmendedDocument, extractRegulatoryChanges, mapChangeToSops, analyzeSopAgainstRegulation, buildSopTopicMap, generateAnalysisSummary, generateWithFallback } from "./gemini";
+import { chunkDocument, generateAmendedDocument, extractRegulatoryChanges, extractFatfRequirements, mapChangeToSops, analyzeSopAgainstRegulation, buildSopTopicMap, generateAnalysisSummary, generateWithFallback } from "./gemini";
 import { applyEditsToDocx, looksLikeDocx, docxToText } from "./docx-editor";
 import {
   buildAuthUrl,
@@ -652,11 +652,40 @@ export const startRegulatoryRerun = createServerFn({ method: "POST" })
     const detected = (report.summary_json as any)?.detected ?? null;
     const workspace = ((report as any).workspace_id as string) ?? "rmit";
 
-    // Bare mode — no separate extraction stage. Just clear any prior results
-    // and return the internal SOPs; each is analysed directly against the
-    // regulation document by analyzeRegulatorySop.
     await supabase.from("sop_impacts").delete().eq("report_id", report.id);
     await supabase.from("regulatory_changes").delete().eq("report_id", report.id);
+
+    // Light context summary — the regulation's key requirements, shown in the
+    // report's "Change Analysis" panel so the reviewer sees WHAT the regulation
+    // demands alongside WHERE the SOPs must change. This is independent of the
+    // per-SOP analysis (analyzeRegulatorySop reads the regulation directly) —
+    // it never feeds it, so the bare one-call analysis is untouched.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let requirements: any[] = [];
+    try {
+      const regFile = await fetchFile(report.source_file_url);
+      const regSource = await policySourceFromFile(report.policy_name ?? "regulation", regFile, report.source_file_url);
+      requirements = await extractFatfRequirements(regSource, await fetchAnalysisGuidance(workspace));
+      if (requirements.length > 0) {
+        await supabase.from("regulatory_changes").insert(
+          requirements.map((c: any, i: number) => ({
+            chapter_ref: c.chapter_ref,
+            old_requirement: c.old_requirement,
+            new_requirement: c.new_requirement,
+            change_summary: c.change_summary,
+            impact: c.impact,
+            tone_shift: c.tone_shift,
+            pages: c.pages,
+            legal_refs: c.legal_refs,
+            related_instruments: c.related_instruments,
+            report_id: report.id,
+            position: i,
+          }))
+        );
+      }
+    } catch (e: any) {
+      console.warn(`[regulatory] requirements summary failed:`, e?.message?.slice(0, 120));
+    }
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (supabase as any).from("analysis_reports").update({
@@ -677,7 +706,7 @@ export const startRegulatoryRerun = createServerFn({ method: "POST" })
       .in("doc_type", INTERNAL_DOC_TYPES);
     const sops = ((sopRows ?? []) as any[]).map((s) => ({ id: s.id as string, title: s.title as string }));
 
-    return { reportId: report.id as string, changeCount: 0, sops };
+    return { reportId: report.id as string, changeCount: requirements.length, sops };
   });
 
 /**

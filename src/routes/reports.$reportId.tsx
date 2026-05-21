@@ -227,18 +227,26 @@ function ReportPage() {
         result = await finalizeFn({ data: { reportId: rid, coverage } });
       } else {
         // Regulatory analysis — phased: extract changes, then one call per SOP
-        // (full-document, no chunking).
+        // (full-document, no chunking). A failed SOP is retried, then flagged.
         const { reportId: rid, sops } = await startRegRerun({ data: { reportId } });
+        const coverage: { title: string; status: string }[] = [];
         for (let i = 0; i < sops.length; i++) {
           toast.message(`Analysing ${i + 1}/${sops.length}: ${sops[i].title}…`, { id: "reg-rerun", duration: 60000 });
-          try {
-            await analyzeSop({ data: { reportId: rid, sopId: sops[i].id } });
-          } catch (err: any) {
-            console.warn(`Analysis failed for ${sops[i].title}:`, err?.message);
+          let status = "failed";
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+              const res = await analyzeSop({ data: { reportId: rid, sopId: sops[i].id } });
+              status = res?.status ?? "analyzed";
+              if (status !== "failed") break;
+            } catch (err: any) {
+              console.warn(`Analysis attempt ${attempt} failed for ${sops[i].title}:`, err?.message);
+              status = "failed";
+            }
           }
+          coverage.push({ title: sops[i].title, status });
         }
         toast.dismiss("reg-rerun");
-        result = await finalizeReg({ data: { reportId: rid } });
+        result = await finalizeReg({ data: { reportId: rid, coverage } });
       }
       toast.success(`Re-analysis complete: ${result.changesCount} change${result.changesCount !== 1 ? "s" : ""}, ${result.impactCount} edit${result.impactCount !== 1 ? "s" : ""}`);
       qc.invalidateQueries({ queryKey: ["report", reportId] });

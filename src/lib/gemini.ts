@@ -336,6 +336,60 @@ There is NO upper limit on the number of changes you may return. List every mate
 }
 
 /**
+ * CONFORMANCE EXTRACTION (FATF). Unlike extractRegulatoryChanges (which diffs a
+ * new vs old document), this reads ONE current FATF statement and extracts its
+ * STANDING obligations — the positions a bank's SOPs must currently reflect,
+ * whether or not they changed recently. Output is shaped as RegulatoryDelta[]
+ * (old_requirement = "N/A") so the rest of the pipeline is unchanged.
+ */
+export async function extractFatfRequirements(
+  statement: PolicySource,
+  guidance?: string | null,
+): Promise<RegulatoryDelta[]> {
+  const prompt = `
+# ROLE: FATF COMPLIANCE ANALYST — STANDING-REQUIREMENT EXTRACTOR
+
+You are given the CURRENT FATF statement / circular issued to reporting institutions. Do NOT diff it against any previous version. Extract its STANDING OBLIGATIONS — every position a bank's internal AML/CFT/CPF SOPs must currently reflect to be compliant.
+${guidanceBlock(guidance)}
+# WHAT TO EXTRACT — one entry per distinct standing obligation:
+- Each High-Risk Jurisdiction subject to a Call for Action (e.g. DPRK, Iran, Myanmar): name it, and capture its required measures verbatim/closely — enhanced CDD, countermeasures, and any SPECIFIC restrictions (correspondent banking, branches/subsidiaries/representative offices, **virtual asset service providers and virtual asset transactions**, wire-transfer information), plus any stated deadline.
+- The Jurisdictions under Increased Monitoring ("grey list"): ONE entry capturing the CURRENT list of jurisdictions named in this statement.
+- Cross-cutting obligations: the risk-based approach, no blanket de-risking / NPO and humanitarian-flow carve-outs.
+- Any explicit date or deadline the statement sets.
+Each entry is a requirement the SOP must conform to — include it even if it is long-standing, not only if it is new.
+
+# OUTPUT FORMAT (JSON array):
+[{
+  "chapter_ref": "short reference, e.g. 'Call for Action — Iran', 'Jurisdictions under Increased Monitoring', 'Risk-based approach'",
+  "old_requirement": "N/A - standing FATF requirement",
+  "new_requirement": "the obligation, quoted or closely paraphrased from the statement — exactly what the SOP must reflect",
+  "change_summary": "one line: what the bank's SOPs must ensure",
+  "impact": "high" | "medium" | "low",
+  "tone_shift": "Standing requirement",
+  "legal_refs": ["any references cited, e.g. 'AMLA section 83', 'FATF Recommendation 19'"],
+  "pages": ""
+}]
+
+Return ONLY the JSON array. Extract EVERY distinct standing obligation — a quarterly FATF statement typically yields 5-10.
+
+# FATF STATEMENT:
+`;
+  const parts: any[] = [{ text: prompt }];
+  parts.push(...policyToParts("FATF STATEMENT", statement));
+  const response = await generateWithFallback({
+    contents: [{ role: "user", parts }],
+    config: { responseMimeType: "application/json", maxOutputTokens: 16384 },
+  });
+  try {
+    const parsed = JSON.parse(response.text ?? "[]");
+    return Array.isArray(parsed) ? parsed : (parsed.requirements ?? []);
+  } catch {
+    console.error("Failed to parse FATF requirements:", (response.text ?? "").slice(0, 400));
+    return [];
+  }
+}
+
+/**
  * SEMANTIC CHUNKING ENGINE
  * Extracts granular text pieces from a document for full-text indexing.
  */
@@ -746,30 +800,35 @@ export async function mapChangesToSop(
   changes: RegulatoryDelta[],
   sop: { title: string; text: string; governanceTier?: string | null },
   guidance?: string | null,
+  mode: "delta" | "conformance" = "delta",
 ): Promise<SopGap[]> {
+  const conformance = mode === "conformance";
+  const itemWord = conformance ? "REQUIREMENT" : "CHANGE";
   const prompt = `
 # ROLE: COMPLIANCE GAP ANALYST — PRECISION SOP MAPPER
 
-You are given a LIST of regulatory changes and the FULL TEXT of ONE internal SOP document.
-Your task: find EVERY location in this SOP that must be updated for ANY of these changes.
+You are given a LIST of ${conformance ? "current regulatory requirements" : "regulatory changes"} and the FULL TEXT of ONE internal SOP document.
+${conformance
+  ? `Your task: for EACH requirement, check whether this SOP already correctly and currently reflects it. Produce an impact for every clause that is STALE, SILENT, INCONSISTENT, or CONTRADICTS the requirement. A clause that is already fully consistent needs NO impact — do not invent busy-work edits.`
+  : `Your task: find EVERY location in this SOP that must be updated for ANY of these changes.`}
 ${buildSopRoleBlock(sop.governanceTier)}
 ${guidanceBlock(guidance)}
 
 # REASONING STEP — do this SILENTLY first, inside a <thinking></thinking> block:
 1. INDEX — scan the FULL SOP below and note where its volatile compliance topics are governed: country/jurisdiction risk tables, prohibited & sanctioned jurisdiction lists, virtual-asset / digital-currency clauses, EDD triggers, screening, record-keeping. For each, record the clause's REAL number AND its actual heading exactly as printed.
-2. DEFINE — for each regulatory change, what exactly did it add, remove, reclassify, or re-deadline?
-3. MATCH — map each change to the owning clause(s) from your step-1 index. "paragraph" = that clause's real number + real heading. NEVER a topic label, NEVER an invented clause.
+2. DEFINE — for each ${itemWord.toLowerCase()}, what exactly does it ${conformance ? "demand the SOP say or do" : "add, remove, reclassify, or re-deadline"}?
+3. MATCH — map each ${itemWord.toLowerCase()} to the owning clause(s) from your step-1 index. "paragraph" = that clause's real number + real heading. NEVER a topic label, NEVER an invented clause.
 4. ANCHOR — for each, pick the single most distinctive short sentence to use as find_text (verbatim), or a [bracket marker] if no clean anchor sentence exists.
-5. FLAG — would the current SOP wording become NON-COMPLIANT or CONFLICT with a new requirement if unchanged?
+5. FLAG — ${conformance ? "is the SOP's current wording out of conformance with this requirement (stale list, missing measure, wrong date, silent)?" : "would the current SOP wording become NON-COMPLIANT or CONFLICT with a new requirement if unchanged?"}
 Then output ONLY the JSON array — NEVER include the <thinking> block or any prose.
 
-# REGULATORY CHANGES (${changes.length}):
-${changes.map((c, i) => `--- CHANGE ${i + 1} ---
+# ${conformance ? "CURRENT REGULATORY REQUIREMENTS" : "REGULATORY CHANGES"} (${changes.length}):
+${changes.map((c, i) => `--- ${itemWord} ${i + 1} ---
 Chapter Reference: ${c.chapter_ref}
 Impact Level: ${c.impact}
-Change Summary: ${c.change_summary}
-Old Requirement: ${c.old_requirement}
-New Requirement: ${c.new_requirement}
+${conformance ? "Requirement Summary" : "Change Summary"}: ${c.change_summary}
+${conformance ? "What the SOP must reflect" : "Old Requirement"}: ${conformance ? c.new_requirement : c.old_requirement}
+${conformance ? "Source detail" : "New Requirement"}: ${conformance ? c.new_requirement : c.new_requirement}
 Tone Shift: ${c.tone_shift}`).join("\n\n")}
 
 # MAPPING INSTRUCTIONS:

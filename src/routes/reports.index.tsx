@@ -167,19 +167,28 @@ function ReportsList() {
       });
 
       // 2. Phased full-document analysis — extract changes, then one call per
-      //    internal SOP (whole document, no chunking), then finalise.
+      //    internal SOP (whole document, no chunking), then finalise. A SOP
+      //    whose call fails is retried up to 3× and, if still failing, flagged.
       setStepIdx(8);
       const { sops } = await startReg({ data: { reportId } });
+      const coverage: { title: string; status: string }[] = [];
       for (let i = 0; i < sops.length; i++) {
         toast.message(`Analysing ${i + 1}/${sops.length}: ${sops[i].title}…`, { id: "reg-analyze", duration: 90000 });
-        try {
-          await analyzeReg({ data: { reportId, sopId: sops[i].id } });
-        } catch (err: any) {
-          console.warn(`Analysis failed for ${sops[i].title}:`, err?.message);
+        let status = "failed";
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            const res = await analyzeReg({ data: { reportId, sopId: sops[i].id } });
+            status = res?.status ?? "analyzed";
+            if (status !== "failed") break;
+          } catch (err: any) {
+            console.warn(`Analysis attempt ${attempt} failed for ${sops[i].title}:`, err?.message);
+            status = "failed";
+          }
         }
+        coverage.push({ title: sops[i].title, status });
       }
       toast.dismiss("reg-analyze");
-      await finalizeReg({ data: { reportId } });
+      await finalizeReg({ data: { reportId, coverage } });
 
       const res = { reportId };
       toast.success("Analysis complete");

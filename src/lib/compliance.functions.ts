@@ -1,7 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { supabase } from "@/integrations/supabase/client";
-import { chunkDocument, generateAmendedDocument, extractRegulatoryChanges, mapChangeToSops, mapChangesToSop, buildSopTopicMap, generateAnalysisSummary, generateWithFallback } from "./gemini";
+import { chunkDocument, generateAmendedDocument, extractRegulatoryChanges, extractFatfRequirements, mapChangeToSops, mapChangesToSop, buildSopTopicMap, generateAnalysisSummary, generateWithFallback } from "./gemini";
 import { applyEditsToDocx, looksLikeDocx, docxToText } from "./docx-editor";
 import {
   buildAuthUrl,
@@ -589,6 +589,53 @@ async function buildAndVerifyTopicMap(
   return verified;
 }
 
+/** Regulation-relevant anchor terms — used to section-target a document too
+ *  large to analyse whole. */
+const REGULATORY_ANCHOR_TERMS = [
+  "FATF", "Increased Monitoring", "Call for Action", "high-risk countr", "high risk countr",
+  "sanctioned", "prohibited", "virtual asset", "digital currency", "Iran", "Myanmar",
+  "DPRK", "North Korea", "country risk", "jurisdiction", "enhanced due diligence", "EDD",
+  "correspondent", "watchlist", "worldcheck", "screening", "monitoring", "countermeasure",
+];
+
+/**
+ * For a document too large to analyse whole, returns context windows around
+ * every regulation-relevant term — merged where they overlap and packed into
+ * <= maxSeg-char segments. Empty if the document mentions none of the terms.
+ */
+function buildRelevantWindows(fullText: string, maxSeg: number): string[] {
+  const lc = fullText.toLowerCase();
+  const ranges: Array<[number, number]> = [];
+  const PAD = 1500;
+  for (const term of REGULATORY_ANCHOR_TERMS) {
+    const t = term.toLowerCase();
+    let pos = 0;
+    for (;;) {
+      const i = lc.indexOf(t, pos);
+      if (i < 0) break;
+      ranges.push([Math.max(0, i - PAD), Math.min(fullText.length, i + t.length + PAD)]);
+      pos = i + t.length;
+    }
+  }
+  if (ranges.length === 0) return [];
+  ranges.sort((a, b) => a[0] - b[0]);
+  const merged: Array<[number, number]> = [];
+  for (const r of ranges) {
+    const last = merged[merged.length - 1];
+    if (last && r[0] <= last[1]) last[1] = Math.max(last[1], r[1]);
+    else merged.push([r[0], r[1]]);
+  }
+  const out: string[] = [];
+  let buf = "";
+  for (const [s, e] of merged) {
+    const piece = fullText.slice(s, e);
+    if (buf && buf.length + piece.length + 8 > maxSeg) { out.push(buf); buf = ""; }
+    buf = buf ? `${buf}\n\n[…]\n\n${piece}` : piece;
+  }
+  if (buf) out.push(buf);
+  return out;
+}
+
 /**
  * Phase 1 of the regulatory re-run. Extracts the regulatory changes (new vs old
  * policy), stores them, and returns the internal SOPs to analyze. The heavy
@@ -605,35 +652,45 @@ export const startRegulatoryRerun = createServerFn({ method: "POST" })
     const detected = (report.summary_json as any)?.detected ?? null;
     const workspace = ((report as any).workspace_id as string) ?? "rmit";
 
-    // Fetch the new policy + locate/fetch the previous version in the KB
+    // FATF runs CONFORMANCE mode — analyse against the CURRENT statement, no
+    // prior version. Other regulators run DELTA mode — diff vs the KB's
+    // previous version.
+    const isFatf = regulatorContext(detected?.doc_type) === "fatf";
+    const guidance = await fetchAnalysisGuidance(workspace);
     const newPolicy = await fetchFile(report.source_file_url);
-    const oldDocTypes = detected?.doc_type
-      ? (REGULATION_FAMILIES[detected.doc_type] ?? [detected.doc_type])
-      : ["__none__"];
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const { data: oldDocs } = await (supabase as any)
-      .from("sop_documents").select("*")
-      .eq("workspace_id", workspace)
-      .in("doc_type", oldDocTypes)
-      .neq("version", detected?.version ?? "")
-      .order("created_at", { ascending: false }).limit(1);
-    const oldDoc = oldDocs?.[0];
-    let oldPolicy: { buffer: Buffer; mimeType: string } | undefined = undefined;
-    if (oldDoc?.file_url) {
-      try { oldPolicy = await fetchFile(oldDoc.file_url); }
-      catch (e) { console.error("[regulatory rerun] old policy fetch failed:", e); }
-    }
-
     const newPolicySource = await policySourceFromFile(report.policy_name ?? "policy", newPolicy, report.source_file_url);
-    const oldPolicySource = oldPolicy && oldDoc
-      ? await policySourceFromFile(oldDoc.title, oldPolicy, oldDoc.file_url)
-      : undefined;
 
-    const changes = await extractRegulatoryChanges(
-      newPolicySource, oldPolicySource, regulatorContext(detected?.doc_type),
-      await fetchAnalysisGuidance(workspace),
-    );
-    console.log(`[regulatory rerun ${report.id}] extracted ${changes.length} regulatory change(s)`);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let changes: any[];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let oldDoc: any = null;
+    if (isFatf) {
+      changes = await extractFatfRequirements(newPolicySource, guidance);
+    } else {
+      const oldDocTypes = detected?.doc_type
+        ? (REGULATION_FAMILIES[detected.doc_type] ?? [detected.doc_type])
+        : ["__none__"];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: oldDocs } = await (supabase as any)
+        .from("sop_documents").select("*")
+        .eq("workspace_id", workspace)
+        .in("doc_type", oldDocTypes)
+        .neq("version", detected?.version ?? "")
+        .order("created_at", { ascending: false }).limit(1);
+      oldDoc = oldDocs?.[0] ?? null;
+      let oldPolicy: { buffer: Buffer; mimeType: string } | undefined = undefined;
+      if (oldDoc?.file_url) {
+        try { oldPolicy = await fetchFile(oldDoc.file_url); }
+        catch (e) { console.error("[regulatory rerun] old policy fetch failed:", e); }
+      }
+      const oldPolicySource = oldPolicy && oldDoc
+        ? await policySourceFromFile(oldDoc.title, oldPolicy, oldDoc.file_url)
+        : undefined;
+      changes = await extractRegulatoryChanges(
+        newPolicySource, oldPolicySource, regulatorContext(detected?.doc_type), guidance,
+      );
+    }
+    console.log(`[regulatory rerun ${report.id}] ${isFatf ? "conformance" : "delta"} — extracted ${changes.length} item(s)`);
 
     // Wipe prior changes/impacts, insert the fresh change rows
     await supabase.from("sop_impacts").delete().eq("report_id", report.id);
@@ -663,7 +720,8 @@ export const startRegulatoryRerun = createServerFn({ method: "POST" })
         ...(report.summary_json as any ?? {}),
         detected: detected ?? null,
         old_policy_name: oldDoc?.title ?? null,
-        executive: [`Re-analysis in progress — ${changes.length} regulatory change(s) found…`],
+        analysis_mode: isFatf ? "conformance" : "delta",
+        executive: [`Re-analysis in progress — ${changes.length} ${isFatf ? "requirement" : "change"}(s) found…`],
         last_rerun_at: new Date().toISOString(),
       },
     }).eq("id", report.id);
@@ -691,18 +749,20 @@ export const analyzeRegulatorySop = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: report } = await (supabase as any)
-      .from("analysis_reports").select("id, workspace_id").eq("id", data.reportId).single();
+      .from("analysis_reports").select("id, workspace_id, summary_json").eq("id", data.reportId).single();
     if (!report) throw new Error("Report not found");
+    const analysisMode: "delta" | "conformance" =
+      (report.summary_json as any)?.analysis_mode === "conformance" ? "conformance" : "delta";
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: changeRows } = await (supabase as any)
       .from("regulatory_changes").select("*").eq("report_id", report.id).order("position");
     const changes = (changeRows ?? []) as any[];
-    if (changes.length === 0) return { sopId: data.sopId, title: "?", impactCount: 0 };
+    if (changes.length === 0) return { sopId: data.sopId, title: "?", impactCount: 0, status: "analyzed" as const };
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: sop } = await (supabase as any)
       .from("sop_documents").select("id, title, file_url, drive_file_id, drive_mime_type, governance_tier, topic_map").eq("id", data.sopId).single();
-    if (!sop || !sop.file_url) return { sopId: data.sopId, title: sop?.title ?? "?", impactCount: 0 };
+    if (!sop || !sop.file_url) return { sopId: data.sopId, title: sop?.title ?? "?", impactCount: 0, status: "failed" as const };
 
     // Extract the SOP's full text. For Google Docs this reads Google's OWN text
     // export — the exact representation the in-doc find/replace later matches.
@@ -710,17 +770,24 @@ export const analyzeRegulatorySop = createServerFn({ method: "POST" })
     const fullText = await fetchSopText(sop, workspaceId);
     if (!fullText || !fullText.trim()) {
       console.warn(`analyzeRegulatorySop: could not read "${sop.title}"`);
-      return { sopId: sop.id, title: sop.title, impactCount: 0 };
+      return { sopId: sop.id, title: sop.title, impactCount: 0, status: "failed" as const };
     }
 
 
-    // Split oversized docs into large segments so each Gemini call stays bounded
+    // A document small enough is analysed whole. One too large to read whole
+    // is section-targeted — context windows around the regulation-relevant
+    // terms — rather than sliced into blind segments, so the AI sees focused
+    // relevant text instead of arbitrary cuts.
     const SEG = 160_000;
-    const segments: string[] = [];
+    let segments: string[];
     if (fullText.length <= SEG * 1.4) {
-      segments.push(fullText);
+      segments = [fullText];
     } else {
-      for (let i = 0; i < fullText.length; i += SEG) segments.push(fullText.slice(i, i + SEG));
+      const windows = buildRelevantWindows(fullText, SEG);
+      segments = windows.length > 0
+        ? windows
+        : Array.from({ length: Math.ceil(fullText.length / SEG) }, (_, i) => fullText.slice(i * SEG, (i + 1) * SEG));
+      console.log(`[regulatory] "${sop.title}" — ${fullText.length} chars too large; ${segments.length} targeted window(s)`);
     }
     console.log(`[regulatory] "${sop.title}" — ${fullText.length} chars, ${segments.length} segment(s)`);
 
@@ -734,7 +801,7 @@ export const analyzeRegulatorySop = createServerFn({ method: "POST" })
         const impacts = await mapChangesToSop(changes as any, {
           title: sop.title, text: seg,
           governanceTier: sop.governance_tier ?? null,
-        }, analysisGuidance);
+        }, analysisGuidance, analysisMode);
         allImpacts.push(...impacts);
       } catch (e: any) {
         console.warn(`[regulatory] mapping failed for "${sop.title}":`, e?.message);
@@ -807,12 +874,17 @@ export const analyzeRegulatorySop = createServerFn({ method: "POST" })
       );
     }
     console.log(`[regulatory] "${sop.title}" → ${finalImpacts.length} impact(s)`);
-    return { sopId: sop.id, title: sop.title, impactCount: finalImpacts.length };
+    return { sopId: sop.id, title: sop.title, impactCount: finalImpacts.length, status: "analyzed" as const };
   });
 
 /** Phase 3 — regenerates the executive summary once all changes are mapped. */
 export const finalizeRegulatoryReport = createServerFn({ method: "POST" })
-  .inputValidator(z.object({ reportId: z.string() }))
+  .inputValidator(z.object({
+    reportId: z.string(),
+    // Per-SOP outcome from the analysis loop. "failed" = could not be analysed
+    // (e.g. document unreadable / call errored) and needs a manual check.
+    coverage: z.array(z.object({ title: z.string(), status: z.string() })).optional(),
+  }))
   .handler(async ({ data }) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: report } = await (supabase as any)
@@ -829,6 +901,11 @@ export const finalizeRegulatoryReport = createServerFn({ method: "POST" })
       (changes ?? []) as any[], (impacts ?? []) as any[], report.policy_name ?? "policy",
     );
     const prev = (report.summary_json as any) ?? {};
+    // SOPs that could not be analysed — surfaced on the report so a failure is
+    // never silently invisible.
+    const coverageWarnings = (data.coverage ?? [])
+      .filter((c) => c.status === "failed")
+      .map((c) => ({ title: c.title, status: c.status }));
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (supabase as any).from("analysis_reports").update({
       summary_json: {
@@ -836,6 +913,7 @@ export const finalizeRegulatoryReport = createServerFn({ method: "POST" })
         kb_size: prev.kb_size ?? null,
         detected: prev.detected ?? null,
         old_policy_name: prev.old_policy_name ?? null,
+        coverage_warnings: coverageWarnings,
         last_rerun_at: new Date().toISOString(),
       },
     }).eq("id", report.id);
@@ -846,6 +924,7 @@ export const finalizeRegulatoryReport = createServerFn({ method: "POST" })
       changesCount: (changes ?? []).length,
       impactCount: (impacts ?? []).length,
       matchedToKbCount,
+      coverageWarnings,
     };
   });
 

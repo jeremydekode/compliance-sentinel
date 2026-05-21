@@ -733,8 +733,9 @@ function SummaryOverview({
         </div>
         <h1 className="font-display text-xl font-bold leading-tight">{newPolicyName}</h1>
         <p className="text-xs text-muted-foreground mt-1">
-          Benchmarked against <span className="font-semibold">{oldPolicyName}</span> ·{" "}
-          {changes.length} regulatory changes mapped to {totalImpacts} SOP actions
+          {changes.length > 0
+            ? <>Benchmarked against <span className="font-semibold">{oldPolicyName}</span> · {changes.length} regulatory changes mapped to {totalImpacts} SOP actions</>
+            : <>{totalImpacts} SOP amendment{totalImpacts !== 1 ? "s" : ""} identified against this regulation</>}
         </p>
       </div>
 
@@ -818,7 +819,8 @@ function SummaryOverview({
             </div>
           )}
 
-          {/* Changes table */}
+          {/* Changes table — only when a delta extraction produced changes */}
+          {changes.length > 0 && (
           <div>
             <div className="text-[10px] font-black uppercase tracking-widest text-muted-foreground mb-2">
               All Changes ({changes.length}) — click to review
@@ -877,6 +879,7 @@ function SummaryOverview({
               </table>
             </div>
           </div>
+          )}
 
         </div>
       </div>

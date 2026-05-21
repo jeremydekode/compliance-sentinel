@@ -1,7 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { supabase } from "@/integrations/supabase/client";
-import { chunkDocument, generateAmendedDocument, extractRegulatoryChanges, extractFatfRequirements, mapChangeToSops, mapChangesToSop, buildSopTopicMap, generateAnalysisSummary, generateWithFallback } from "./gemini";
+import { chunkDocument, generateAmendedDocument, extractRegulatoryChanges, mapChangeToSops, analyzeSopAgainstRegulation, buildSopTopicMap, generateAnalysisSummary, generateWithFallback } from "./gemini";
 import { applyEditsToDocx, looksLikeDocx, docxToText } from "./docx-editor";
 import {
   buildAuthUrl,
@@ -652,76 +652,18 @@ export const startRegulatoryRerun = createServerFn({ method: "POST" })
     const detected = (report.summary_json as any)?.detected ?? null;
     const workspace = ((report as any).workspace_id as string) ?? "rmit";
 
-    // FATF runs CONFORMANCE mode — analyse against the CURRENT statement, no
-    // prior version. Other regulators run DELTA mode — diff vs the KB's
-    // previous version.
-    const isFatf = regulatorContext(detected?.doc_type) === "fatf";
-    const guidance = await fetchAnalysisGuidance(workspace);
-    const newPolicy = await fetchFile(report.source_file_url);
-    const newPolicySource = await policySourceFromFile(report.policy_name ?? "policy", newPolicy, report.source_file_url);
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let changes: any[];
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let oldDoc: any = null;
-    if (isFatf) {
-      changes = await extractFatfRequirements(newPolicySource, guidance);
-    } else {
-      const oldDocTypes = detected?.doc_type
-        ? (REGULATION_FAMILIES[detected.doc_type] ?? [detected.doc_type])
-        : ["__none__"];
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const { data: oldDocs } = await (supabase as any)
-        .from("sop_documents").select("*")
-        .eq("workspace_id", workspace)
-        .in("doc_type", oldDocTypes)
-        .neq("version", detected?.version ?? "")
-        .order("created_at", { ascending: false }).limit(1);
-      oldDoc = oldDocs?.[0] ?? null;
-      let oldPolicy: { buffer: Buffer; mimeType: string } | undefined = undefined;
-      if (oldDoc?.file_url) {
-        try { oldPolicy = await fetchFile(oldDoc.file_url); }
-        catch (e) { console.error("[regulatory rerun] old policy fetch failed:", e); }
-      }
-      const oldPolicySource = oldPolicy && oldDoc
-        ? await policySourceFromFile(oldDoc.title, oldPolicy, oldDoc.file_url)
-        : undefined;
-      changes = await extractRegulatoryChanges(
-        newPolicySource, oldPolicySource, regulatorContext(detected?.doc_type), guidance,
-      );
-    }
-    console.log(`[regulatory rerun ${report.id}] ${isFatf ? "conformance" : "delta"} — extracted ${changes.length} item(s)`);
-
-    // Wipe prior changes/impacts, insert the fresh change rows
+    // Bare mode — no separate extraction stage. Just clear any prior results
+    // and return the internal SOPs; each is analysed directly against the
+    // regulation document by analyzeRegulatorySop.
     await supabase.from("sop_impacts").delete().eq("report_id", report.id);
     await supabase.from("regulatory_changes").delete().eq("report_id", report.id);
-
-    if (changes.length > 0) {
-      await supabase.from("regulatory_changes").insert(
-        changes.map((c: any, i: number) => ({
-          chapter_ref: c.chapter_ref,
-          old_requirement: c.old_requirement,
-          new_requirement: c.new_requirement,
-          change_summary: c.change_summary,
-          impact: c.impact,
-          tone_shift: c.tone_shift,
-          pages: c.pages,
-          legal_refs: c.legal_refs,
-          related_instruments: c.related_instruments,
-          report_id: report.id,
-          position: i,
-        }))
-      );
-    }
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (supabase as any).from("analysis_reports").update({
       summary_json: {
         ...(report.summary_json as any ?? {}),
         detected: detected ?? null,
-        old_policy_name: oldDoc?.title ?? null,
-        analysis_mode: isFatf ? "conformance" : "delta",
-        executive: [`Re-analysis in progress — ${changes.length} ${isFatf ? "requirement" : "change"}(s) found…`],
+        executive: ["Analysis in progress — comparing each internal SOP against the regulation…"],
         last_rerun_at: new Date().toISOString(),
       },
     }).eq("id", report.id);
@@ -735,7 +677,7 @@ export const startRegulatoryRerun = createServerFn({ method: "POST" })
       .in("doc_type", INTERNAL_DOC_TYPES);
     const sops = ((sopRows ?? []) as any[]).map((s) => ({ id: s.id as string, title: s.title as string }));
 
-    return { reportId: report.id as string, changeCount: changes.length, sops };
+    return { reportId: report.id as string, changeCount: 0, sops };
   });
 
 /**
@@ -749,24 +691,28 @@ export const analyzeRegulatorySop = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: report } = await (supabase as any)
-      .from("analysis_reports").select("id, workspace_id, summary_json").eq("id", data.reportId).single();
+      .from("analysis_reports").select("id, workspace_id, policy_name, source_file_url").eq("id", data.reportId).single();
     if (!report) throw new Error("Report not found");
-    const analysisMode: "delta" | "conformance" =
-      (report.summary_json as any)?.analysis_mode === "conformance" ? "conformance" : "delta";
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const { data: changeRows } = await (supabase as any)
-      .from("regulatory_changes").select("*").eq("report_id", report.id).order("position");
-    const changes = (changeRows ?? []) as any[];
-    if (changes.length === 0) return { sopId: data.sopId, title: "?", impactCount: 0, status: "analyzed" as const };
+    if (!report.source_file_url) return { sopId: data.sopId, title: "?", impactCount: 0, status: "failed" as const };
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: sop } = await (supabase as any)
-      .from("sop_documents").select("id, title, file_url, drive_file_id, drive_mime_type, governance_tier, topic_map").eq("id", data.sopId).single();
+      .from("sop_documents").select("id, title, file_url, drive_file_id, drive_mime_type, governance_tier").eq("id", data.sopId).single();
     if (!sop || !sop.file_url) return { sopId: data.sopId, title: sop?.title ?? "?", impactCount: 0, status: "failed" as const };
 
-    // Extract the SOP's full text. For Google Docs this reads Google's OWN text
-    // export — the exact representation the in-doc find/replace later matches.
+    // Bare mode — fetch the regulation document and the SOP's full text, then
+    // analyse the SOP directly against the regulation in one call (no separate
+    // change-extraction stage). For Google Docs the SOP is read via Google's
+    // OWN text export — the exact representation the in-doc edit later matches.
     const workspaceId = (report.workspace_id as string) ?? "rmit";
+    let regulation;
+    try {
+      const regFile = await fetchFile(report.source_file_url);
+      regulation = await policySourceFromFile(report.policy_name ?? "regulation", regFile, report.source_file_url);
+    } catch (e: any) {
+      console.warn(`analyzeRegulatorySop: could not read the regulation:`, e?.message?.slice(0, 100));
+      return { sopId: sop.id, title: sop.title, impactCount: 0, status: "failed" as const };
+    }
     const fullText = await fetchSopText(sop, workspaceId);
     if (!fullText || !fullText.trim()) {
       console.warn(`analyzeRegulatorySop: could not read "${sop.title}"`);
@@ -798,13 +744,13 @@ export const analyzeRegulatorySop = createServerFn({ method: "POST" })
     for (const seg of segments) {
       if (Date.now() > deadline) { console.warn(`[regulatory] "${sop.title}" time budget reached`); break; }
       try {
-        const impacts = await mapChangesToSop(changes as any, {
+        const impacts = await analyzeSopAgainstRegulation(regulation, {
           title: sop.title, text: seg,
           governanceTier: sop.governance_tier ?? null,
-        }, analysisGuidance, analysisMode);
+        }, analysisGuidance);
         allImpacts.push(...impacts);
       } catch (e: any) {
-        console.warn(`[regulatory] mapping failed for "${sop.title}":`, e?.message);
+        console.warn(`[regulatory] analysis failed for "${sop.title}":`, e?.message);
       }
     }
 

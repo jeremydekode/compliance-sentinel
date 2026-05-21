@@ -796,40 +796,25 @@ function buildSopRoleBlock(governanceTier?: string | null): string {
   return `\n# DOCUMENT ROLE:\nThis SOP is ${role}\n`;
 }
 
-export async function mapChangesToSop(
-  changes: RegulatoryDelta[],
+export async function analyzeSopAgainstRegulation(
+  regulation: PolicySource,
   sop: { title: string; text: string; governanceTier?: string | null },
   guidance?: string | null,
-  mode: "delta" | "conformance" = "delta",
 ): Promise<SopGap[]> {
-  const conformance = mode === "conformance";
-  const itemWord = conformance ? "REQUIREMENT" : "CHANGE";
-  const prompt = `
-# ROLE: COMPLIANCE GAP ANALYST — PRECISION SOP MAPPER
+  const promptHead = `
+# ROLE: COMPLIANCE GAP ANALYST — SOP vs REGULATION
 
-You are given a LIST of ${conformance ? "current regulatory requirements" : "regulatory changes"} and the FULL TEXT of ONE internal SOP document.
-${conformance
-  ? `Your task: for EACH requirement, check whether this SOP already correctly and currently reflects it. Produce an impact for every clause that is STALE, SILENT, INCONSISTENT, or CONTRADICTS the requirement. A clause that is already fully consistent needs NO impact — do not invent busy-work edits.`
-  : `Your task: find EVERY location in this SOP that must be updated for ANY of these changes.`}
+You are given ONE regulatory document (the REGULATION, attached) and — at the BOTTOM of this prompt — the FULL TEXT of ONE internal SOP. Find EVERY place the SOP must be amended to comply with the regulation.
 ${buildSopRoleBlock(sop.governanceTier)}
 ${guidanceBlock(guidance)}
 
 # REASONING STEP — do this SILENTLY first, inside a <thinking></thinking> block:
-1. INDEX — scan the FULL SOP below and note where its volatile compliance topics are governed: country/jurisdiction risk tables, prohibited & sanctioned jurisdiction lists, virtual-asset / digital-currency clauses, EDD triggers, screening, record-keeping. For each, record the clause's REAL number AND its actual heading exactly as printed.
-2. DEFINE — for each ${itemWord.toLowerCase()}, what exactly does it ${conformance ? "demand the SOP say or do" : "add, remove, reclassify, or re-deadline"}?
-3. MATCH — map each ${itemWord.toLowerCase()} to the owning clause(s) from your step-1 index. "paragraph" = that clause's real number + real heading. NEVER a topic label, NEVER an invented clause.
+1. READ the attached REGULATION — list every obligation, restriction, jurisdiction list, deadline and standing requirement it imposes.
+2. INDEX the SOP — scan the FULL SOP and note where its compliance topics are governed: country/jurisdiction risk tables, prohibited & sanctioned jurisdiction lists, virtual-asset / digital-currency clauses, EDD triggers, screening, record-keeping, monitoring. For each, record the clause's REAL number AND its actual heading exactly as printed.
+3. MATCH — for each regulatory obligation, find the owning SOP clause from your step-2 index; decide whether the SOP is STALE, SILENT, INCONSISTENT, or in CONFLICT with it. "paragraph" = that clause's real number + real heading. NEVER a topic label, NEVER an invented clause.
 4. ANCHOR — for each, pick the single most distinctive short sentence to use as find_text (verbatim), or a [bracket marker] if no clean anchor sentence exists.
-5. FLAG — ${conformance ? "is the SOP's current wording out of conformance with this requirement (stale list, missing measure, wrong date, silent)?" : "would the current SOP wording become NON-COMPLIANT or CONFLICT with a new requirement if unchanged?"}
+Produce an impact for every clause that must change. A clause already fully compliant with the regulation needs NO impact — do not invent busy-work edits.
 Then output ONLY the JSON array — NEVER include the <thinking> block or any prose.
-
-# ${conformance ? "CURRENT REGULATORY REQUIREMENTS" : "REGULATORY CHANGES"} (${changes.length}):
-${changes.map((c, i) => `--- ${itemWord} ${i + 1} ---
-Chapter Reference: ${c.chapter_ref}
-Impact Level: ${c.impact}
-${conformance ? "Requirement Summary" : "Change Summary"}: ${c.change_summary}
-${conformance ? "What the SOP must reflect" : "Old Requirement"}: ${conformance ? c.new_requirement : c.old_requirement}
-${conformance ? "Source detail" : "New Requirement"}: ${conformance ? c.new_requirement : c.new_requirement}
-Tone Shift: ${c.tone_shift}`).join("\n\n")}
 
 # MAPPING INSTRUCTIONS:
 - For each affected location, identify the EXACT current text and propose precise replacement text.
@@ -859,11 +844,11 @@ If no contiguous prose sentence can be copied verbatim, set change_type "context
 - Avoid any candidate with a run of 3+ spaces or a tab — that is table/column layout, not a sentence.
 - Prefer a sentence containing a date, number, defined term, or proper noun, for distinctiveness.
 
-# 🚫 RULE — find_text comes ONLY from the SOP, NEVER from the REGULATORY CHANGES block:
-The "REGULATORY CHANGES" block at the top of this prompt (Change Summary / Old Requirement / New Requirement) is the EXTERNAL regulation. Its sentences are crisp and tempting — but copying ANY of them into find_text is the #1 cause of failure.
+# 🚫 RULE — find_text comes ONLY from the SOP, NEVER from the REGULATION:
+The attached REGULATION's sentences are crisp and tempting — but copying ANY of them into find_text is the #1 cause of failure.
 - find_text must be text you located INSIDE the "INTERNAL SOP DOCUMENT" section at the BOTTOM of this prompt — nowhere else.
-- A country name (Burkina Faso, Myanmar, Mozambique…), a FATF list name ("Jurisdictions under Increased Monitoring"), or a plenary month/year ("October 2025", "February 2026") may ONLY appear in find_text if you found that exact wording in the SOP body itself. If you got it from a Change block, it is FORBIDDEN.
-- Most internal SOPs reference FATF/sanctions lists GENERICALLY ("FATF-listed jurisdictions", "high-risk countries") and do NOT name individual countries or plenary dates. So for a country-list or plenary-date change, the SOP usually has NO verbatim anchor — the EXPECTED, CORRECT output is change_type "contextual" with a "[bracket marker]". Do not force a find_replace.
+- A country name (Burkina Faso, Myanmar, Mozambique…), a FATF list name ("Jurisdictions under Increased Monitoring"), or a plenary month/year ("October 2025", "February 2026") may ONLY appear in find_text if you found that exact wording in the SOP body itself. If you got it from the REGULATION, it is FORBIDDEN.
+- Most internal SOPs reference FATF/sanctions lists GENERICALLY ("FATF-listed jurisdictions", "high-risk countries") and do NOT name individual countries or plenary dates. So for a country-list or plenary-date obligation, the SOP usually has NO verbatim anchor — the EXPECTED, CORRECT output is change_type "contextual" with a "[bracket marker]". Do not force a find_replace.
 
 # ✅ FINAL SELF-CHECK — before you output, re-read every impact:
 - find_text — ask: "Could I find this exact string by searching the INTERNAL SOP DOCUMENT text — not the regulation?" If it contains a country name, a plenary date, or a phrase you took from a Change block, DELETE it and use change_type "contextual" + a "[bracket marker]" naming the SOP section. Keep the replace_text — a comment is a success; a fabricated find_replace is discarded entirely.
@@ -910,14 +895,16 @@ Emit the version bump AT MOST ONCE for the whole document, ONLY if the SOP heade
 - below 70: the anchor is uncertain, the SOP ownership is debatable, or the change needs interpretation. Flag for review.
 Never inflate. A wrong "95" that gets fast-tracked is a compliance failure.
 
-Return ONLY the JSON array. If no location in this SOP is affected by any change, return [].
-
-# INTERNAL SOP DOCUMENT (full text) — "${sop.title}":
-${sop.text}
+Return ONLY the JSON array. If this SOP is already fully compliant with the regulation, return [].
 `;
+  const sopBlock = `\n# INTERNAL SOP DOCUMENT (full text) — "${sop.title}":\n${sop.text}`;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const parts: any[] = [{ text: promptHead }];
+  parts.push(...policyToParts("REGULATION", regulation));
+  parts.push({ text: sopBlock });
 
   const response = await generateWithFallback({
-    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    contents: [{ role: "user", parts }],
     config: { responseMimeType: "application/json", maxOutputTokens: 32768 },
   });
   const text = response.text ?? "";
@@ -925,7 +912,7 @@ ${sop.text}
     const parsed = JSON.parse(text);
     return Array.isArray(parsed) ? parsed : [];
   } catch (e) {
-    console.error(`Failed to parse SOP mapping for "${sop.title}":`, text.slice(0, 300));
+    console.error(`Failed to parse SOP analysis for "${sop.title}":`, text.slice(0, 300));
     return [];
   }
 }

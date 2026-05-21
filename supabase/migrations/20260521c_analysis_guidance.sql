@@ -7,3 +7,8 @@ CREATE TABLE IF NOT EXISTS public.analysis_guidance (
   guidance text NOT NULL DEFAULT '',
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- The app's server functions access the database with the project key (no
+-- per-user auth), exactly as they do for the other tables. Disable RLS so the
+-- guidance can be read and saved, consistent with the rest of the schema.
+ALTER TABLE public.analysis_guidance DISABLE ROW LEVEL SECURITY;

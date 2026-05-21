@@ -153,49 +153,10 @@ For RMiT specifically, you MUST examine each of these sections by name and compa
 The general "renumbering alone is not a change" rule still holds, BUT: when a section is BOTH renumbered AND substantively expanded/restructured (e.g. §15 "Cloud Services" → §17 "Cloud Services and Emerging Technology"), the substantive part IS a material change. Do not let the renumbering trip you into skipping it. Quote both old and new to prove the substantive delta.`;
   }
   if (ctx === "fatf") {
-    return `
-# REGULATOR CONTEXT: FATF (AML/CFT)
-This document is from the Financial Action Task Force AML/CFT framework. Apply these FATF-specific rules:
-
-## Structural references
-- FATF uses **R.X** = Recommendation, **INR.X** = Interpretive Note, **IO.X** = Immediate Outcome (for Mutual Evaluation Methodology). Use the actual reference type in chapter_ref (e.g. "R.15", "INR.10", "IO.4").
-- For FATF **Plenary Statements** (quarterly updates), use references like "Call for Action statement — Iran", "Increased Monitoring list — Kuwait", "Increased Monitoring list — Papua New Guinea".
-- "Recommendations" are mandatory standards. "Interpretive Notes" explain HOW to implement them. Changes to INRs typically tighten the implementation bar even when the underlying Recommendation text is unchanged — flag these as material.
-
-## Topic patterns to watch for
-beneficial ownership transparency · PEP screening · virtual asset service providers (VASPs) · travel rule · NPO oversight · sanctions evasion · correspondent banking · wire-transfer information · customer due diligence (CDD) tiering · EDD triggers · suspicious transaction reporting (STR/SAR) thresholds · record-retention periods · beneficial-ownership registry obligations · **High-Risk Jurisdictions subject to a Call for Action** · **Jurisdictions under Increased Monitoring (Grey List)**.
-
-## FATF PLENARY STATEMENT — ❗ GROUP changes by ACTION, never one per country
-A Plenary Statement updates the Call-for-Action and Increased-Monitoring lists. Do NOT emit a separate change entry per country — GROUP them by action type:
-
-- ONE change entry for ALL countries ADDED to Increased Monitoring this plenary.
-    chapter_ref: "FATF Increased Monitoring list — additions"
-    title lists every added country.
-    old_requirement = the COMPLETE prior Increased Monitoring list, every country enumerated verbatim.
-    new_requirement = that SAME list reproduced verbatim, with ONLY the newly-added countries appended — same lead-in words, same order, same punctuation.
-- ONE change entry for ALL countries REMOVED from Increased Monitoring this plenary.
-    chapter_ref: "FATF Increased Monitoring list — removals"
-    title lists every removed country.
-    old_requirement = the COMPLETE prior list, every country enumerated verbatim.
-    new_requirement = that SAME list reproduced verbatim with ONLY the removed countries deleted — everything else identical.
-
-❗❗ old_requirement and new_requirement MUST BE PARALLEL — the full list on BOTH sides, in the SAME enumerated form. The UI word-diffs these two fields against each other. If new_requirement is a SUMMARY (e.g. "now includes: Kuwait and PNG (in addition to existing jurisdictions)") instead of the full updated list, every country absent from that summary is rendered STRUCK-THROUGH as if it were removed — which is false and alarming. The ONLY words that may differ between old_requirement and new_requirement are the actual countries added (additions entry) or the actual countries removed (removals entry). Never summarise, never paraphrase, never abbreviate one side.
-- ONE change entry PER country whose Call-for-Action status escalated (countermeasures enhanced) — these are individually material, so keep them separate.
-    chapter_ref: "FATF Call for Action — <Country>"
-- ONE change entry for the plenary date-reference refresh.
-
-Worked example: a plenary that ADDS 2 countries, REMOVES 4, and ESCALATES 1 = exactly **4** change entries (1 additions + 1 removals + 1 escalation + 1 date) — NEVER 8. Use the ACTUAL country names and dates from the attached documents.
-
-## Common internal SOP sections that need updating after a Plenary Statement
-For AML/CFT internal policies (e.g. Group AML/CFT/CPF Guidelines, Group AML/CFT/CPF Policy, division-level AML/CFT Guidelines), expect impacts in sections like:
-- "High-risk country customer types" / "Restricted Customers" / "Prohibited Customers"
-- "Jurisdiction Risk Table" / "EDD Trigger" / "Enhanced Due Diligence"
-- "Jurisdiction Monitoring Procedures" / "Compliance-maintained list"
-- "Document Header" / "Cover Page" version-bump on the SOP itself
-Consolidate multi-country list updates into ONE impact per affected SOP section (one impact "update FATF risk-country list" — never one per country).
-
-## Completeness
-A typical FATF Plenary Statement update, grouped this way, produces 3-6 distinct regulatory changes touching 2-5 internal SOP sections.`;
+    // Intentionally empty — FATF analysis runs on the generic extraction prompt
+    // plus whatever the compliance team configures in the editable Analysis
+    // Guidance (Settings). No hard-coded grouping or change-count rules.
+    return "";
   }
   if (ctx === "circular") {
     return `

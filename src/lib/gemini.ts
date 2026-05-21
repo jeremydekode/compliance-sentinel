@@ -34,17 +34,29 @@ export async function generateWithFallback(
   const models = FALLBACK_CHAINS[opts?.tier ?? "quality"];
   let lastError: unknown;
   for (const model of models) {
-    try {
-      return await ai.models.generateContent({ ...params, model });
-    } catch (e: any) {
-      const msg: string = e?.message ?? "";
-      // Only fall back on capacity / not-found errors, not on auth or bad-request errors
-      if (msg.includes("high demand") || msg.includes("overloaded") || msg.includes("503") || msg.includes("NOT_FOUND") || msg.includes("not found")) {
-        console.warn(`Model ${model} unavailable (${msg.slice(0, 80)}), trying next...`);
-        lastError = e;
-        continue;
+    // A transient capacity error ("high demand"/503) gets ONE retry on the
+    // SAME model after a short wait — so a momentary overload does not
+    // permanently downgrade the analysis to a weaker fallback model.
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        return await ai.models.generateContent({ ...params, model });
+      } catch (e: any) {
+        const msg: string = e?.message ?? "";
+        const capacity = msg.includes("high demand") || msg.includes("overloaded") || msg.includes("503");
+        const notFound = msg.includes("NOT_FOUND") || msg.includes("not found") || msg.includes("404");
+        if (capacity && attempt === 1) {
+          console.warn(`Model ${model} busy (${msg.slice(0, 60)}) — retrying in 5s…`);
+          lastError = e;
+          await new Promise((r) => setTimeout(r, 5000));
+          continue;
+        }
+        if (capacity || notFound) {
+          console.warn(`Model ${model} unavailable (${msg.slice(0, 80)}), trying next…`);
+          lastError = e;
+          break;
+        }
+        throw e;
       }
-      throw e;
     }
   }
   throw lastError;

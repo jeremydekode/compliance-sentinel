@@ -204,17 +204,27 @@ function ReportPage() {
       if (isFormUpdate) {
         // Per-document re-analysis — each doc is its own call so none can time out.
         const { reportId: rid, docsToAnalyze } = await rerunForm({ data: { reportId } });
+        const coverage: { title: string; status: string }[] = [];
         for (let i = 0; i < docsToAnalyze.length; i++) {
           const d = docsToAnalyze[i];
           toast.message(`Re-analysing ${i + 1}/${docsToAnalyze.length}: ${d.title}…`, { id: "uc1-rerun", duration: 60000 });
-          try {
-            await analyzeDocFn({ data: { reportId: rid, docId: d.docId } });
-          } catch (err: any) {
-            console.warn(`Re-analysis failed for ${d.title}:`, err?.message);
+          // Retry a doc that comes back "failed" (dropped connection / API
+          // error) — up to 3 attempts — so it is never silently skipped.
+          let status = "failed";
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+              const res = await analyzeDocFn({ data: { reportId: rid, docId: d.docId } });
+              status = res?.status ?? "analyzed";
+              if (status !== "failed") break;
+            } catch (err: any) {
+              console.warn(`Re-analysis attempt ${attempt} failed for ${d.title}:`, err?.message);
+              status = "failed";
+            }
           }
+          coverage.push({ title: d.title, status });
         }
         toast.dismiss("uc1-rerun");
-        result = await finalizeFn({ data: { reportId: rid } });
+        result = await finalizeFn({ data: { reportId: rid, coverage } });
       } else {
         // Regulatory analysis — phased: extract changes, then one call per SOP
         // (full-document, no chunking).
@@ -740,6 +750,28 @@ function SummaryOverview({
               <ProgressStat label="Pending" count={pendingImpacts} color="text-blue-600" />
             </div>
           </div>
+
+          {/* Coverage warnings — documents that couldn't be fully verified */}
+          {Array.isArray(summary.coverage_warnings) && summary.coverage_warnings.length > 0 && (
+            <div className="rounded-xl border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/30 p-4">
+              <div className="flex items-center gap-2 text-[11px] font-black uppercase tracking-widest text-amber-700 dark:text-amber-400 mb-2">
+                <AlertTriangle className="size-3.5" /> Needs a manual check ({summary.coverage_warnings.length})
+              </div>
+              <p className="text-xs text-amber-800 dark:text-amber-300/90 mb-2 leading-relaxed">
+                These documents reference the form but could not be fully verified automatically — review them by hand to be sure nothing was missed.
+              </p>
+              <ul className="space-y-1">
+                {summary.coverage_warnings.map((c: { title: string; status: string }) => (
+                  <li key={c.title} className="text-xs text-amber-900 dark:text-amber-200 flex items-center gap-2">
+                    <span className="font-semibold">{c.title}</span>
+                    <span className="text-[10px] uppercase tracking-wide opacity-70">
+                      {c.status === "failed" ? "could not analyse" : "no edit produced"}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
 
           {/* Executive summary */}
           {summary.executive && (

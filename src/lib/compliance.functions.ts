@@ -1870,7 +1870,9 @@ export const analyzeDocForForm = createServerFn({ method: "POST" })
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: doc } = await (supabase as any)
       .from("sop_documents").select("id, title, file_url, workspace_id, drive_file_id, drive_mime_type").eq("id", data.docId).single();
-    if (!doc || !doc.file_url) return { docId: data.docId, title: doc?.title ?? "?", impactCount: 0 };
+    if (!doc || !doc.file_url) {
+      return { docId: data.docId, title: doc?.title ?? "?", impactCount: 0, status: "failed" as const, referenceHits: 0 };
+    }
 
     // Search terms: form ID + friendly name + core name + each old value
     const coreFormName = deriveCoreFormName(friendlyName);
@@ -1903,12 +1905,16 @@ export const analyzeDocForForm = createServerFn({ method: "POST" })
         }
       }
     } catch (e: any) {
+      // Couldn't read the document (often a flaky connection / Drive timeout).
+      // Report it as a failure so the caller retries and never silently drops it.
       console.warn(`analyzeDocForForm: extract failed for "${doc.title}":`, e?.message?.slice(0, 100));
-      return { docId: doc.id, title: doc.title, impactCount: 0 };
+      return { docId: doc.id, title: doc.title, impactCount: 0, status: "failed" as const, referenceHits: 0 };
     }
     // Drive's text export uses CRLF; the live Google Doc uses LF — normalize.
     fullText = fullText.replace(/\r\n?/g, "\n");
-    if (!fullText.trim()) return { docId: doc.id, title: doc.title, impactCount: 0 };
+    if (!fullText.trim()) {
+      return { docId: doc.id, title: doc.title, impactCount: 0, status: "failed" as const, referenceHits: 0 };
+    }
 
     // Literal search → context windows around every match
     const lowerText = fullText.toLowerCase();
@@ -1930,19 +1936,45 @@ export const analyzeDocForForm = createServerFn({ method: "POST" })
         pos = idx + term.length;
       }
     }
-    if (contexts.length === 0) return { docId: doc.id, title: doc.title, impactCount: 0 };
+    if (contexts.length === 0) {
+      // No literal occurrence of the form ID / name / any old value anywhere in
+      // the document — it genuinely does not reference this form. Zero impacts
+      // is the CORRECT answer here, not a miss: nothing to flag.
+      return { docId: doc.id, title: doc.title, impactCount: 0, status: "not_referenced" as const, referenceHits: 0 };
+    }
 
-    // ONE Gemini call → find/replace impacts for this doc
+    // The document DOES reference the form (referenceHits > 0). So if mapping
+    // comes back empty, that is a miss or a failure — never "info not there".
+    const referenceHits = contexts.length;
     const chunkText = contexts.slice(0, 8).map((c: any) => c.content).join("\n\n---\n\n");
     const prompt = buildUC1Prompt({ formId, friendlyName, fieldChanges, sopTitle: doc.title, chunkText });
+    const verifyForm = makeFindTextVerifier(fullText);
+
+    // Run the mapping with up to 2 attempts — the model is non-deterministic,
+    // so a doc that genuinely references the form should not come back empty
+    // on a single unlucky roll. Re-runs the Gemini call only (text already
+    // extracted), so a retry is cheap.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const impacts: any[] = [];
-    try {
-      const resp = await generateWithFallback({
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        config: { responseMimeType: "application/json", maxOutputTokens: 16384 },
-      });
-      const parsed = JSON.parse(resp.text ?? "[]");
+    let finalImpacts: any[] = [];
+    let aiThrew = false;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let parsed: any = null;
+      try {
+        const resp = await generateWithFallback({
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          config: { responseMimeType: "application/json", maxOutputTokens: 16384 },
+        });
+        parsed = JSON.parse(resp.text ?? "[]");
+        aiThrew = false;
+      } catch (e: any) {
+        aiThrew = true;
+        console.warn(`analyzeDocForForm: mapping attempt ${attempt} failed for "${doc.title}":`, e?.message);
+        continue;
+      }
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const impacts: any[] = [];
       if (Array.isArray(parsed)) {
         for (const imp of parsed) {
           const ft = String(imp.find_text ?? "").toLowerCase();
@@ -1956,35 +1988,36 @@ export const analyzeDocForForm = createServerFn({ method: "POST" })
           impacts.push({ ...imp, sop_id: doc.id, sop_title: doc.title });
         }
       }
-    } catch (e: any) {
-      console.warn(`analyzeDocForForm: mapping failed for "${doc.title}":`, e?.message);
+
+      // Verify each find_text genuinely exists in the document — discard
+      // hallucinations, repair whitespace drift to the exact verbatim substring.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const verifiedImpacts: any[] = [];
+      for (const m of impacts) {
+        const repaired = verifyForm(m.find_text);
+        if (repaired === null) continue;
+        verifiedImpacts.push({ ...m, find_text: repaired });
+      }
+
+      // Collapse duplicates — the same form reference often appears verbatim in
+      // several places (table + TOC + appendix). One find/replace covers them
+      // all, so keep a single impact per distinct find_text + replace_text pair.
+      const seenImpact = new Set<string>();
+      const uniqueImpacts = verifiedImpacts.filter((m: any) => {
+        const norm = (s: string) => String(s ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+        const key = `${norm(m.find_text)}|||${norm(m.replace_text)}`;
+        if (seenImpact.has(key)) return false;
+        seenImpact.add(key);
+        return true;
+      });
+
+      finalImpacts = applyPageOverrides(formId, uniqueImpacts);
+      if (finalImpacts.length > 0) break; // got real impacts — no need to retry
     }
 
-    // Verify each find_text genuinely exists in the document — discard
-    // hallucinations, repair whitespace drift to the exact verbatim substring.
-    const verifyForm = makeFindTextVerifier(fullText);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const verifiedImpacts: any[] = [];
-    for (const m of impacts) {
-      const repaired = verifyForm(m.find_text);
-      if (repaired === null) continue;
-      verifiedImpacts.push({ ...m, find_text: repaired });
-    }
-
-    // Collapse duplicates — the same form reference often appears verbatim in
-    // several places (table + TOC + appendix). One find/replace covers them all,
-    // so keep a single impact per distinct find_text + replace_text pair.
-    const seenImpact = new Set<string>();
-    const uniqueImpacts = verifiedImpacts.filter((m: any) => {
-      const norm = (s: string) => String(s ?? "").replace(/\s+/g, " ").trim().toLowerCase();
-      const key = `${norm(m.find_text)}|||${norm(m.replace_text)}`;
-      if (seenImpact.has(key)) return false;
-      seenImpact.add(key);
-      return true;
-    });
-
-    // Insert impacts (append after any already inserted for this report)
-    const finalImpacts = applyPageOverrides(formId, uniqueImpacts);
+    // Idempotent: clear this doc's prior impacts for the report before inserting
+    // so a retried call (e.g. after a dropped connection) can never double-up.
+    await supabase.from("sop_impacts").delete().eq("report_id", report.id).eq("sop_id", doc.id);
     if (finalImpacts.length > 0) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const { count } = await (supabase as any)
@@ -1994,12 +2027,23 @@ export const analyzeDocForForm = createServerFn({ method: "POST" })
         finalImpacts.map((m: any, i: number) => ({ ...m, confidence: clampConfidence(m.confidence), report_id: report.id, position: offset + i }))
       );
     }
-    return { docId: doc.id, title: doc.title, impactCount: finalImpacts.length };
+
+    // Status — the doc references the form, so 0 impacts is NOT "info absent":
+    //   analyzed = produced impacts; missed = AI ran but found nothing;
+    //   failed   = the AI call errored on every attempt (retry at caller).
+    const status = finalImpacts.length > 0 ? "analyzed" : aiThrew ? "failed" : "missed";
+    return { docId: doc.id, title: doc.title, impactCount: finalImpacts.length, status, referenceHits };
   });
 
 /** Writes the final executive summary once all per-doc analysis calls are done. */
 export const finalizeFormUpdateReport = createServerFn({ method: "POST" })
-  .inputValidator(z.object({ reportId: z.string() }))
+  .inputValidator(z.object({
+    reportId: z.string(),
+    // Per-document outcome from the analysis loop. "failed" = could not be
+    // analyzed (e.g. connection dropped); "missed" = the document references
+    // the form but the AI produced no edit. Both need a manual check.
+    coverage: z.array(z.object({ title: z.string(), status: z.string() })).optional(),
+  }))
   .handler(async ({ data }) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: report } = await (supabase as any)
@@ -2015,21 +2059,36 @@ export const finalizeFormUpdateReport = createServerFn({ method: "POST" })
     const impactCount = (impacts ?? []).length;
     const affectedDocs = new Set((impacts ?? []).map((i: any) => i.sop_id)).size;
 
+    // Documents that could not be fully verified. A "not_referenced" doc is NOT
+    // listed — it genuinely has no reference to this form, which is a correct,
+    // expected outcome, not something to flag.
+    const coverageWarnings = (data.coverage ?? [])
+      .filter((c) => c.status === "failed" || c.status === "missed")
+      .map((c) => ({ title: c.title, status: c.status }));
+
+    const executive = [
+      `Form ${formId} updated with ${fieldChanges.length} field change(s).`,
+      `Found ${impactCount} reference(s) across ${affectedDocs} downstream document(s) requiring update.`,
+      `All edits are mechanical find/replace — no regulatory interpretation needed.`,
+    ];
+    if (coverageWarnings.length > 0) {
+      executive.push(
+        `${coverageWarnings.length} document(s) could not be fully verified and need a manual check: ${coverageWarnings.map((c) => c.title).join(", ")}.`,
+      );
+    }
+
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (supabase as any).from("analysis_reports").update({
       status: "pending_validation",
       summary_json: {
         ...summary,
-        executive: [
-          `Form ${formId} updated with ${fieldChanges.length} field change(s).`,
-          `Found ${impactCount} reference(s) across ${affectedDocs} downstream document(s) requiring update.`,
-          `All edits are mechanical find/replace — no regulatory interpretation needed.`,
-        ],
+        executive,
+        coverage_warnings: coverageWarnings,
         last_rerun_at: new Date().toISOString(),
       },
     }).eq("id", report.id);
 
-    return { reportId: report.id as string, changesCount: fieldChanges.length, impactCount, affectedDocs };
+    return { reportId: report.id as string, changesCount: fieldChanges.length, impactCount, affectedDocs, coverageWarnings };
   });
 
 /** Lists the policy/SOP documents in ONE workspace that could reference a form. */
@@ -2075,7 +2134,8 @@ The relevant text excerpts (from a literal search of the document) are below. Fi
 ${opts.chunkText}
 
 # ❗ CRITICAL RULES (read every one):
-0. PROPAGATE EVERY FIELD CHANGE. Every change listed above must be reflected. In particular, if a **Name** change is listed (the form's name/description changed), you MUST produce a Description-cell impact updating the name for EVERY table row where this form appears — never skip the name and only do the version/date. The form name is referenced as a full or partial phrase in the row's Description column; find that phrase and amend it. A missing name update is a failure.
+0. PROPAGATE EVERY FIELD CHANGE, EVERYWHERE. Every change listed above must be reflected at EVERY place the form appears — every table row, TOC entry, appendix line AND prose/body reference. In particular, if a **Name** change is listed (the form's name/description changed), you MUST produce an impact updating the name at every such place — never skip the name and only do the version/date. The form name often appears as a full OR PARTIAL phrase (e.g. just "Commercial / Corporate"); find that phrase and amend it. A missing name update is a failure.
+   COMPLETENESS CHECK before you finish: for each excerpt that contains the form, confirm you produced an impact for the name AND for the number/version/date. If an excerpt mentions the form but you produced no impact for it, you have missed it — go back and add it.
 1. For each occurrence: produce ONE impact entry with find_text containing 1-3 lines of verbatim surrounding context including the OLD value, and replace_text containing the same context with the OLD value swapped for the NEW value.
 2. ONE CELL PER IMPACT. find_text must contain ONLY the text of the single cell being amended — and NOTHING from any other cell or column.
    - ❗ NEVER include the row number / sequence number (e.g. "10.", "11.") in find_text or replace_text — that number lives in a SEPARATE "No." column cell. Including it makes the anchor span two cells and the edit is silently skipped.

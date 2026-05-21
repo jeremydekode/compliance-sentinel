@@ -313,22 +313,34 @@ export function FormUpdateDialog({
         },
       });
 
-      // Phase 2 — analyze one document per call (each gets its own 60 s budget)
+      // Phase 2 — analyze one document per call (each gets its own 60 s budget).
+      // A doc that comes back "failed" (dropped connection / API error) is
+      // retried up to 3 times so it is never silently skipped.
+      const coverage: { title: string; status: string }[] = [];
       for (let i = 0; i < docsToAnalyze.length; i++) {
         const d = docsToAnalyze[i];
         toast.message(`Analysing ${i + 1}/${docsToAnalyze.length}: ${d.title}…`, { id: "uc1-progress", duration: 60000 });
-        try {
-          await analyzeDocFn({ data: { reportId, docId: d.docId } });
-        } catch (err: any) {
-          console.warn(`Analysis failed for ${d.title}:`, err?.message);
+        let status = "failed";
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            const res = await analyzeDocFn({ data: { reportId, docId: d.docId } });
+            status = res?.status ?? "analyzed";
+            if (status !== "failed") break;
+          } catch (err: any) {
+            console.warn(`Analysis attempt ${attempt} failed for ${d.title}:`, err?.message);
+            status = "failed";
+          }
         }
+        coverage.push({ title: d.title, status });
       }
 
       // Phase 3 — write the final summary
-      const fin = await finalizeFn({ data: { reportId } });
+      const fin = await finalizeFn({ data: { reportId, coverage } });
       toast.dismiss("uc1-progress");
+      const flagged = fin.coverageWarnings?.length ?? 0;
       toast.success(`Form update analysis complete`, {
-        description: `${fin.impactCount} edit${fin.impactCount !== 1 ? "s" : ""} across ${fin.affectedDocs} document${fin.affectedDocs !== 1 ? "s" : ""}`,
+        description: `${fin.impactCount} edit${fin.impactCount !== 1 ? "s" : ""} across ${fin.affectedDocs} document${fin.affectedDocs !== 1 ? "s" : ""}`
+          + (flagged > 0 ? ` · ${flagged} need a manual check` : ""),
       });
       reset();
       onOpenChange(false);

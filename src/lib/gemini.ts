@@ -670,8 +670,9 @@ FATF / AML changes require Compliance Officer + Legal interpretation. Treat ever
 # OUTPUT FORMAT (JSON Array):
 [{
   "sop_title": "Exact title of the internal SOP/policy document (short code from the document header, e.g. 'R13 GL248')",
-  "paragraph": "The SOP's OWN clause number first, then its name — e.g. 'C.14.1.4 · High-risk country customer types'. NEVER a regulation/Act reference.",
+  "paragraph": "The SOP's OWN clause number first, then its name — e.g. 'C.14.1.4 · High-risk country customer types'. ALWAYS a real clause from this SOP — prefer one from the TOPIC INDEX above. NEVER a regulation/Act reference. Use 'General' ONLY as a genuine last resort when no indexed clause is even loosely relevant.",
   "action_description": "ONE-LINE imperative headline describing what changes. Examples: 'Plenary date reference — \\'June 2025\\' → \\'February 2026\\'', 'Add 2 new rows; update Myanmar row', 'Add cross-reference note after existing FATF reference clause', 'Myanmar countermeasure note — add after existing Iran / North Korea entry', 'Version bump after all changes applied'. Be specific and action-oriented.",
+  "justification": "ONE sentence: WHY this amendment belongs at this clause — name the clause's subject and how the regulatory change connects to it (e.g. 'C.6.3.1 governs Digital Currency Exchangers, and the FATF Iran update extends restrictions to VASPs'). If paragraph is 'General', say plainly why no specific clause fits.",
   "change_type": "find_replace" | "insertion" | "full_rewrite" | "new_section" | "contextual",
   "chapter": "${change.chapter_ref}",
   "find_text": "ONE short, distinctive sentence (6-25 words) COPIED character-for-character from the SOP body — never written from memory. For find_replace: the exact text to be replaced. For insertion: the exact existing sentence the new content goes immediately AFTER. If no sentence can be copied verbatim, use a square-bracket marker like '[end of existing monitoring procedures clause]' — that is a correct, equally-valid answer, not a fallback to avoid.",
@@ -680,6 +681,8 @@ FATF / AML changes require Compliance Officer + Legal interpretation. Treat ever
   "line_range": "Best-effort line reference such as '~19056' (single line) or '~4378-4435' (range), or null if unknown",
   "confidence": <integer 0-100 — honest certainty: 90-100 = exact verbatim anchor + mechanical change; 70-89 = solid anchor, wording needs a human check; below 70 = uncertain. Never inflate.>
 }]
+
+# ❗ PARAGRAPH IS ALWAYS A REAL CLAUSE: even when find_text is a bracket marker (no verbatim anchor), "paragraph" must still point at a real clause that owns this topic — pick the closest one from the TOPIC INDEX. A bracketed find_text means "no exact anchor sentence"; it does NOT mean "no known location". Only fall back to "General" when the topic genuinely is not covered anywhere in this SOP.
 
 # REFERENCE EXAMPLES OF GOOD OUTPUT (use as a STRUCTURAL template; substitute real values from the attached SOPs):
 [
@@ -878,8 +881,9 @@ Emit the version bump AT MOST ONCE for the whole document, ONLY if the SOP heade
 # OUTPUT FORMAT (JSON Array):
 [{
   "sop_title": "${sop.title}",
-  "paragraph": "<SOP clause number · name>",
+  "paragraph": "<a REAL SOP clause from this document — prefer one from the TOPIC INDEX above; 'General' ONLY as a genuine last resort>",
   "action_description": "<one-line imperative headline of what changes>",
+  "justification": "<ONE sentence: WHY this amendment belongs at this clause — the clause's subject and how the change connects to it. If paragraph is 'General', state plainly why no specific clause fits.>",
   "change_type": "find_replace" | "insertion" | "contextual" | "new_section",
   "chapter": "<the Chapter Reference of whichever regulatory change this addresses>",
   "find_text": "<short verbatim anchor sentence from the SOP, or a [bracket marker]>",
@@ -888,6 +892,8 @@ Emit the version bump AT MOST ONCE for the whole document, ONLY if the SOP heade
   "line_range": "<~N or ~N–M, or null>",
   "confidence": <integer 0-100 — your honest certainty this impact is correct (see CONFIDENCE below)>
 }]
+
+# ❗ PARAGRAPH IS ALWAYS A REAL CLAUSE: even when find_text is a [bracket marker] (no verbatim anchor), "paragraph" must still name a real clause that owns this topic — pick the closest from the TOPIC INDEX. A bracketed find_text means "no exact anchor sentence", NOT "no known location". Only use "General" when the topic genuinely is not covered anywhere in this SOP.
 
 # CONFIDENCE — score every impact honestly:
 - 90-100: the find_text is an exact, unambiguous verbatim quote from the SOP AND the change is mechanical (a clear date/number/term swap or a clearly-scoped note). Safe to fast-track.

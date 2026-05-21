@@ -1188,6 +1188,13 @@ function ImpactCard({
               )}
             </div>
           )}
+          {/* Why this placement — the AI's rationale for the clause it chose */}
+          {imp.justification && (
+            <div className="flex items-start gap-1.5 text-[11px] leading-relaxed text-muted-foreground mt-1.5">
+              <AlertCircle className="size-3 shrink-0 mt-0.5 text-sky-500" />
+              <span><span className="font-semibold text-foreground/70">Why here:</span> {imp.justification}</span>
+            </div>
+          )}
           {/* Row 3: version-skip or other warning */}
           {imp.warning && (
             <div className="flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 px-3 py-2 text-[11px] text-amber-800 dark:text-amber-300">

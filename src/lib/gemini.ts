@@ -13,12 +13,13 @@ const ai = new GoogleGenAI({ apiKey: process.env.GOOGLE_GENERATIVE_AI_API_KEY ||
 //    one-liner summaries.
 //
 // Model IDs verified available on the project's API key (probed 2026-05-22):
-// gemini-2.5-pro and gemini-2.5-flash and gemini-3.1-flash-lite exist;
-// gemini-3.1-pro / gemini-3.0-flash / gemini-2.0-flash return 404.
-// "quality" leads with the real Pro model — the regulatory/compliance
-// analysis is a hard reasoning task and must not run on a flash-lite model.
+// gemini-2.5-pro, gemini-2.5-flash and gemini-3.1-flash-lite exist;
+// gemini-3.1-pro / gemini-3.1-flash / gemini-3.0-flash / gemini-2.0-flash 404.
+// "quality" leads with gemini-2.5-flash: gemini-2.5-pro is materially slower
+// and overruns the serverless time limit (504) on large SOPs, while
+// gemini-2.5-flash is a capable reasoning model that reliably finishes.
 const FALLBACK_CHAINS = {
-  quality: ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-3.1-flash-lite"],
+  quality: ["gemini-2.5-flash", "gemini-3.1-flash-lite"],
   fast:    ["gemini-3.1-flash-lite", "gemini-2.5-flash"],
 } as const;
 

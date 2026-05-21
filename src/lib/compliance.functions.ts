@@ -828,8 +828,13 @@ export const finalizeRegulatoryReport = createServerFn({ method: "POST" })
   .inputValidator(z.object({
     reportId: z.string(),
     // Per-SOP outcome from the analysis loop. "failed" = could not be analysed
-    // (e.g. document unreadable / call errored) and needs a manual check.
-    coverage: z.array(z.object({ title: z.string(), status: z.string() })).optional(),
+    // and needs a manual check; "analyzed" with impactCount 0 = reviewed and
+    // conformant (no amendment needed).
+    coverage: z.array(z.object({
+      title: z.string(),
+      status: z.string(),
+      impactCount: z.number().optional(),
+    })).optional(),
   }))
   .handler(async ({ data }) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -847,11 +852,16 @@ export const finalizeRegulatoryReport = createServerFn({ method: "POST" })
       (changes ?? []) as any[], (impacts ?? []) as any[], report.policy_name ?? "policy",
     );
     const prev = (report.summary_json as any) ?? {};
-    // SOPs that could not be analysed — surfaced on the report so a failure is
-    // never silently invisible.
-    const coverageWarnings = (data.coverage ?? [])
+    const cov = data.coverage ?? [];
+    // SOPs that could not be analysed — surfaced so a failure is never invisible.
+    const coverageWarnings = cov
       .filter((c) => c.status === "failed")
       .map((c) => ({ title: c.title, status: c.status }));
+    // SOPs reviewed successfully with no amendment needed — surfaced as a
+    // positive result so a clean SOP reads as "checked & conformant", not empty.
+    const reviewedClean = cov
+      .filter((c) => c.status !== "failed" && (c.impactCount ?? 0) === 0)
+      .map((c) => c.title);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (supabase as any).from("analysis_reports").update({
       summary_json: {
@@ -860,6 +870,7 @@ export const finalizeRegulatoryReport = createServerFn({ method: "POST" })
         detected: prev.detected ?? null,
         old_policy_name: prev.old_policy_name ?? null,
         coverage_warnings: coverageWarnings,
+        reviewed_clean: reviewedClean,
         last_rerun_at: new Date().toISOString(),
       },
     }).eq("id", report.id);

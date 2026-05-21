@@ -233,10 +233,12 @@ function ReportPage() {
         toast.message(`Analysing ${sops.length} document(s)…`, { id: "reg-rerun", duration: 180000 });
         const coverage = await Promise.all(sops.map(async (sop) => {
           let status = "failed";
+          let impactCount = 0;
           for (let attempt = 1; attempt <= 3; attempt++) {
             try {
               const res = await analyzeSop({ data: { reportId: rid, sopId: sop.id } });
               status = res?.status ?? "analyzed";
+              impactCount = res?.impactCount ?? 0;
               if (status !== "failed") break;
             } catch (err: any) {
               console.warn(`Analysis attempt ${attempt} failed for ${sop.title}:`, err?.message);
@@ -245,7 +247,7 @@ function ReportPage() {
           }
           regDone++;
           toast.message(`Analysed ${regDone}/${sops.length} document(s)…`, { id: "reg-rerun", duration: 180000 });
-          return { title: sop.title, status };
+          return { title: sop.title, status, impactCount };
         }));
         toast.dismiss("reg-rerun");
         result = await finalizeReg({ data: { reportId: rid, coverage } });
@@ -779,6 +781,23 @@ function SummaryOverview({
                       {c.status === "failed" ? "could not analyse" : "no edit produced"}
                     </span>
                   </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {/* Reviewed & conformant — SOPs analysed with no amendment needed */}
+          {Array.isArray(summary.reviewed_clean) && summary.reviewed_clean.length > 0 && (
+            <div className="rounded-xl border border-emerald-300 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950/30 p-4">
+              <div className="flex items-center gap-2 text-[11px] font-black uppercase tracking-widest text-emerald-700 dark:text-emerald-400 mb-2">
+                <CheckCircle2 className="size-3.5" /> Reviewed — no amendment needed ({summary.reviewed_clean.length})
+              </div>
+              <p className="text-xs text-emerald-800 dark:text-emerald-300/90 mb-2 leading-relaxed">
+                These documents were analysed against the regulation and are already conformant — no change required.
+              </p>
+              <ul className="space-y-1">
+                {summary.reviewed_clean.map((title: string) => (
+                  <li key={title} className="text-xs text-emerald-900 dark:text-emerald-200 font-semibold">{title}</li>
                 ))}
               </ul>
             </div>

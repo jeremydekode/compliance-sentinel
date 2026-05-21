@@ -670,7 +670,7 @@ FATF / AML changes require Compliance Officer + Legal interpretation. Treat ever
 # OUTPUT FORMAT (JSON Array):
 [{
   "sop_title": "Exact title of the internal SOP/policy document (short code from the document header, e.g. 'R13 GL248')",
-  "paragraph": "The SOP's OWN clause number first, then its name — e.g. 'C.14.1.4 · High-risk country customer types'. ALWAYS a real clause from this SOP — prefer one from the TOPIC INDEX above. NEVER a regulation/Act reference. Use 'General' ONLY as a genuine last resort when no indexed clause is even loosely relevant.",
+  "paragraph": "The SOP's OWN clause number then its REAL heading — e.g. 'C.14.1.4 · High-risk country customer types'. When you route via the TOPIC INDEX, copy the index ref VERBATIM (it already has the clause's real heading). The name MUST be the clause's actual heading from the SOP — NEVER the topic-index grouping label (e.g. never 'C.14.1.3 · Sanctioned & Prohibited Jurisdictions' unless that is literally the clause's printed heading). NEVER a regulation/Act reference. Use 'General' ONLY as a genuine last resort.",
   "action_description": "ONE-LINE imperative headline describing what changes. Examples: 'Plenary date reference — \\'June 2025\\' → \\'February 2026\\'', 'Add 2 new rows; update Myanmar row', 'Add cross-reference note after existing FATF reference clause', 'Myanmar countermeasure note — add after existing Iran / North Korea entry', 'Version bump after all changes applied'. Be specific and action-oriented.",
   "justification": "ONE sentence: WHY this amendment belongs at this clause — name the clause's subject and how the regulatory change connects to it (e.g. 'C.6.3.1 governs Digital Currency Exchangers, and the FATF Iran update extends restrictions to VASPs'). If paragraph is 'General', say plainly why no specific clause fits.",
   "change_type": "find_replace" | "insertion" | "full_rewrite" | "new_section" | "contextual",
@@ -783,10 +783,13 @@ function buildSopRoleBlock(governanceTier?: string | null, topicMap?: Record<str
   if (entries.length > 0) {
     lines.push(
       "",
-      "PRE-BUILT TOPIC INDEX — where each topic is governed in THIS document (verified clause refs):",
-      ...entries.map(([topic, refs]) => `- ${topic}: ${refs.join("; ")}`),
+      "PRE-BUILT TOPIC INDEX — verified clause refs in THIS document, grouped by topic:",
+      ...entries.map(([topic, refs]) => `- [${topic}] → ${refs.join("  |  ")}`),
       "",
-      "ROUTING: when a regulatory change matches an indexed topic, anchor the impact in that clause — put that clause number in \"paragraph\". If a change's topic is NOT in this index, this document most likely does not cover it: prefer returning nothing for that change over inventing a location.",
+      "HOW TO USE THE INDEX:",
+      "- The bracketed label (e.g. [Sanctioned & Prohibited Jurisdictions]) is ONLY a grouping key. It is NOT the name of any clause. NEVER write it into \"paragraph\".",
+      "- Each ref after the arrow is a real clause as printed in the SOP — it already includes the clause number AND its actual heading. When you route an impact, copy that ref VERBATIM into \"paragraph\".",
+      "- ROUTING: when a regulatory change matches an indexed topic, anchor the impact in one of that topic's clauses, using the ref exactly as written. If a change's topic is not indexed, this document most likely does not cover it — prefer returning nothing over inventing a location.",
     );
   }
   if (lines.length === 0) return "";
@@ -881,7 +884,7 @@ Emit the version bump AT MOST ONCE for the whole document, ONLY if the SOP heade
 # OUTPUT FORMAT (JSON Array):
 [{
   "sop_title": "${sop.title}",
-  "paragraph": "<a REAL SOP clause from this document — prefer one from the TOPIC INDEX above; 'General' ONLY as a genuine last resort>",
+  "paragraph": "<a REAL SOP clause — clause number + its ACTUAL heading from the SOP. When routing via the TOPIC INDEX, copy the index ref verbatim. NEVER use the topic-index grouping label as the heading. 'General' ONLY as a genuine last resort.>",
   "action_description": "<one-line imperative headline of what changes>",
   "justification": "<ONE sentence: WHY this amendment belongs at this clause — the clause's subject and how the change connects to it. If paragraph is 'General', state plainly why no specific clause fits.>",
   "change_type": "find_replace" | "insertion" | "contextual" | "new_section",
@@ -961,17 +964,20 @@ heading(s) where it is governed.
 ${SOP_TOPIC_TAXONOMY.map((t) => `- ${t}`).join("\n")}
 
 # RULES:
-- Each clause ref MUST be copied VERBATIM from the document — a real clause
-  number or heading printed in the text (e.g. "C.6.3.1", "Appendix D.2.1.4",
-  "Section 8.2"). Never invent one. If a topic has no clear owning clause in
-  this document, omit that topic entirely.
+- Each ref MUST be the clause's number FOLLOWED BY its actual heading, both
+  copied VERBATIM from the document as printed — e.g. "C.6.3.1 Digital Currency
+  Exchanger", "Appendix D.2.1.4 Country Risk Scoring", "Section 8.2 Record
+  Keeping". The heading is the clause's OWN title in the SOP — NOT the topic
+  label above. If a clause has only a number and no printed heading, the ref is
+  just the number. NEVER invent a clause or a heading.
+- If a topic has no clear owning clause in this document, omit that topic.
 - List the most specific owning clause(s). 1-3 refs per topic is typical.
-- Output a JSON object: keys are topic labels, values are arrays of clause-ref
+- Output a JSON object: keys are topic labels, values are arrays of ref
   strings. Include ONLY topics that are present. If the document covers none
   of these topics, return {}.
 
 # OUTPUT (JSON object):
-{ "<topic label>": ["<verbatim clause ref>", ...], ... }
+{ "<topic label>": ["<clause number + verbatim heading>", ...], ... }
 
 # INTERNAL DOCUMENT — "${opts.title}":
 ${text}

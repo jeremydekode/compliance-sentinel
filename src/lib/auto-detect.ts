@@ -10,12 +10,18 @@ export type DetectedDocType =
   | "sop"        // Internal SOP
   | "form";      // Internal form / fillable template
 
+// Where an internal document sits in RHB's policy hierarchy. Drives how an
+// amendment is worded: a Policy change touches principles, a Guideline change
+// touches operational parameters. Null for regulations / forms / plain SOPs.
+export type GovernanceTier = "policy" | "guideline" | "sector_guideline";
+
 export interface DetectedMeta {
   title: string;
   doc_type: DetectedDocType;
   version: string;
   summary: string;
   tags: string[];
+  governance_tier: GovernanceTier | null;
 }
 
 const RULES: Array<{
@@ -93,9 +99,22 @@ function deriveVersion(filename: string): string {
   return m ? m[1] : "1.0";
 }
 
+// Infers the governance tier from RHB's document code convention:
+//   PO (e.g. R13_PO004) = Policy — high-level principles.
+//   GL (e.g. R13_GL248) = Guideline — operational parameters.
+//   An S-prefixed code (S08_GL151) marks a subsidiary / sector guideline.
+// Regulations, forms and plain SOPs have no tier — return null.
+export function detectGovernanceTier(filename: string): GovernanceTier | null {
+  const typeMatch = filename.match(/(?:^|[_\s-])(PO|GL)\s*\d/i);
+  if (!typeMatch) return null;
+  if (typeMatch[1].toUpperCase() === "PO") return "policy";
+  return /^\s*S\d/i.test(filename) ? "sector_guideline" : "guideline";
+}
+
 export function autoDetectDocMeta(filename: string): DetectedMeta {
   const title = deriveTitle(filename);
   const version = deriveVersion(filename);
+  const governance_tier = detectGovernanceTier(filename);
 
   for (const rule of RULES) {
     if (rule.test.test(filename)) {
@@ -105,6 +124,7 @@ export function autoDetectDocMeta(filename: string): DetectedMeta {
         version,
         summary: rule.summary,
         tags: rule.tags,
+        governance_tier,
       };
     }
   }
@@ -115,6 +135,7 @@ export function autoDetectDocMeta(filename: string): DetectedMeta {
     version,
     summary: "Compliance / policy document.",
     tags: ["Policy"],
+    governance_tier,
   };
 }
 

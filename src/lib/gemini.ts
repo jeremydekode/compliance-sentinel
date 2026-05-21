@@ -741,15 +741,41 @@ FATF / AML changes require Compliance Officer + Legal interpretation. Treat ever
  * entire document — nothing can be missed for lack of retrieval. Used by the
  * full-document regulatory analysis (one call per SOP, or per large segment).
  */
+const TIER_ROLE: Record<string, string> = {
+  policy: "the high-level GROUP POLICY — it states principles and obligations. Amendments here update a principle or obligation statement, not operational numbers.",
+  guideline: "the operational GUIDELINE — it holds the concrete parameters, thresholds, lists and procedures. Amendments here update specific values and clauses.",
+  sector_guideline: "a SECTOR / SUBSIDIARY GUIDELINE — sector-specific parameters and adaptations. Amend its own clauses.",
+};
+
+/** Builds the optional "document role & topic index" block for the mapping prompt. */
+function buildSopRoleBlock(governanceTier?: string | null, topicMap?: Record<string, string[]> | null): string {
+  const lines: string[] = [];
+  const role = governanceTier ? TIER_ROLE[governanceTier] : null;
+  if (role) lines.push(`This SOP is ${role}`);
+  const entries = topicMap ? Object.entries(topicMap).filter(([, v]) => Array.isArray(v) && v.length > 0) : [];
+  if (entries.length > 0) {
+    lines.push(
+      "",
+      "PRE-BUILT TOPIC INDEX — where each topic is governed in THIS document (verified clause refs):",
+      ...entries.map(([topic, refs]) => `- ${topic}: ${refs.join("; ")}`),
+      "",
+      "ROUTING: when a regulatory change matches an indexed topic, anchor the impact in that clause — put that clause number in \"paragraph\". If a change's topic is NOT in this index, this document most likely does not cover it: prefer returning nothing for that change over inventing a location.",
+    );
+  }
+  if (lines.length === 0) return "";
+  return `\n# DOCUMENT ROLE & TOPIC INDEX:\n${lines.join("\n")}\n`;
+}
+
 export async function mapChangesToSop(
   changes: RegulatoryDelta[],
-  sop: { title: string; text: string },
+  sop: { title: string; text: string; governanceTier?: string | null; topicMap?: Record<string, string[]> | null },
 ): Promise<SopGap[]> {
   const prompt = `
 # ROLE: COMPLIANCE GAP ANALYST — PRECISION SOP MAPPER
 
 You are given a LIST of regulatory changes and the FULL TEXT of ONE internal SOP document.
 Your task: find EVERY location in this SOP that must be updated for ANY of these changes.
+${buildSopRoleBlock(sop.governanceTier, sop.topicMap)}
 
 # REASONING STEP — do this SILENTLY first, inside a <thinking></thinking> block:
 1. DEFINE — for each regulatory change, what exactly did it add, remove, reclassify, or re-deadline?
@@ -860,6 +886,81 @@ ${sop.text}
   } catch (e) {
     console.error(`Failed to parse SOP mapping for "${sop.title}":`, text.slice(0, 300));
     return [];
+  }
+}
+
+/**
+ * Fixed AML/compliance topic taxonomy for the structural index. A stable list
+ * keeps the topic map consistent across documents and usable as a routing key.
+ */
+export const SOP_TOPIC_TAXONOMY = [
+  "Country / Jurisdiction Risk",
+  "Sanctioned & Prohibited Jurisdictions",
+  "Prohibited Customers & Business Relationships",
+  "Virtual Assets / Digital Currency / VASP",
+  "Customer Due Diligence (CDD)",
+  "Enhanced Due Diligence (EDD) triggers",
+  "Beneficial Ownership (UBO)",
+  "Name & Sanctions Screening",
+  "Politically Exposed Persons (PEP)",
+  "Transaction Thresholds & Monitoring",
+  "Record Keeping & Retention",
+  "Suspicious Transaction Reporting & Escalation",
+  "Risk-Based Approach & Governance",
+] as const;
+
+/**
+ * Builds a { topic -> [clause refs] } index for ONE internal SOP — a one-time
+ * structural map so the regulatory analysis can route a change straight to the
+ * owning clause instead of guessing. Clause refs are copied verbatim from the
+ * document; the caller verifies them against the source text before storing.
+ */
+export async function buildSopTopicMap(
+  opts: { title: string; text: string },
+): Promise<Record<string, string[]>> {
+  const text = opts.text.slice(0, 250_000);
+  const prompt = `
+# ROLE: SOP STRUCTURAL INDEXER
+Build a topic index for ONE internal compliance document: for each topic below
+that the document actually covers, list the clause number(s) / section
+heading(s) where it is governed.
+
+# TOPICS (use these labels EXACTLY; omit any the document does not cover):
+${SOP_TOPIC_TAXONOMY.map((t) => `- ${t}`).join("\n")}
+
+# RULES:
+- Each clause ref MUST be copied VERBATIM from the document — a real clause
+  number or heading printed in the text (e.g. "C.6.3.1", "Appendix D.2.1.4",
+  "Section 8.2"). Never invent one. If a topic has no clear owning clause in
+  this document, omit that topic entirely.
+- List the most specific owning clause(s). 1-3 refs per topic is typical.
+- Output a JSON object: keys are topic labels, values are arrays of clause-ref
+  strings. Include ONLY topics that are present. If the document covers none
+  of these topics, return {}.
+
+# OUTPUT (JSON object):
+{ "<topic label>": ["<verbatim clause ref>", ...], ... }
+
+# INTERNAL DOCUMENT — "${opts.title}":
+${text}
+`;
+  const response = await generateWithFallback({
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    config: { responseMimeType: "application/json", maxOutputTokens: 4096 },
+  });
+  try {
+    const parsed = JSON.parse(response.text ?? "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const out: Record<string, string[]> = {};
+    for (const [topic, refs] of Object.entries(parsed)) {
+      if (!Array.isArray(refs)) continue;
+      const clean = refs.map((r) => String(r ?? "").trim()).filter(Boolean);
+      if (clean.length > 0) out[topic] = clean;
+    }
+    return out;
+  } catch {
+    console.error(`Failed to parse topic map for "${opts.title}"`);
+    return {};
   }
 }
 

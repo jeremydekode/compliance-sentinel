@@ -1,7 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { supabase } from "@/integrations/supabase/client";
-import { chunkDocument, generateAmendedDocument, extractRegulatoryChanges, mapChangeToSops, mapChangesToSop, generateAnalysisSummary, generateWithFallback } from "./gemini";
+import { chunkDocument, generateAmendedDocument, extractRegulatoryChanges, mapChangeToSops, mapChangesToSop, buildSopTopicMap, generateAnalysisSummary, generateWithFallback } from "./gemini";
 import { applyEditsToDocx, looksLikeDocx, docxToText } from "./docx-editor";
 import {
   buildAuthUrl,
@@ -581,7 +581,7 @@ export const analyzeRegulatorySop = createServerFn({ method: "POST" })
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: sop } = await (supabase as any)
-      .from("sop_documents").select("id, title, file_url, drive_file_id, drive_mime_type").eq("id", data.sopId).single();
+      .from("sop_documents").select("id, title, file_url, drive_file_id, drive_mime_type, governance_tier, topic_map").eq("id", data.sopId).single();
     if (!sop || !sop.file_url) return { sopId: data.sopId, title: sop?.title ?? "?", impactCount: 0 };
 
     // Extract the SOP's full text. For Google Docs read Google's OWN text export —
@@ -613,6 +613,34 @@ export const analyzeRegulatorySop = createServerFn({ method: "POST" })
     fullText = fullText.replace(/\r\n?/g, "\n");
     if (!fullText.trim()) return { sopId: sop.id, title: sop.title, impactCount: 0 };
 
+    // Structural topic index — built once per document and cached on the row,
+    // so the mapping below routes changes to real clauses instead of guessing.
+    // Clause refs are kept only if they (or their clause number) appear in the
+    // document text — a fabricated ref never enters the index.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let topicMap: Record<string, string[]> | null = (sop.topic_map as any) ?? null;
+    if (!topicMap || Object.keys(topicMap).length === 0) {
+      try {
+        const raw = await buildSopTopicMap({ title: sop.title, text: fullText });
+        const verified: Record<string, string[]> = {};
+        for (const [topic, refs] of Object.entries(raw)) {
+          const good = (refs as string[]).filter((r) => {
+            if (fullText.includes(r)) return true;
+            const tok = (r.match(/\b[A-Za-z]?\.?\d+(?:\.\d+)+\b/) ?? [])[0];
+            return !!tok && fullText.includes(tok);
+          });
+          if (good.length > 0) verified[topic] = good;
+        }
+        topicMap = verified;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        await (supabase as any).from("sop_documents").update({ topic_map: verified }).eq("id", sop.id);
+        console.log(`[regulatory] "${sop.title}" — topic index: ${Object.keys(verified).length} topic(s)`);
+      } catch (e: any) {
+        console.warn(`[regulatory] topic-map build failed for "${sop.title}":`, e?.message);
+        topicMap = null;
+      }
+    }
+
     // Split oversized docs into large segments so each Gemini call stays bounded
     const SEG = 160_000;
     const segments: string[] = [];
@@ -629,7 +657,11 @@ export const analyzeRegulatorySop = createServerFn({ method: "POST" })
     for (const seg of segments) {
       if (Date.now() > deadline) { console.warn(`[regulatory] "${sop.title}" time budget reached`); break; }
       try {
-        const impacts = await mapChangesToSop(changes as any, { title: sop.title, text: seg });
+        const impacts = await mapChangesToSop(changes as any, {
+          title: sop.title, text: seg,
+          governanceTier: sop.governance_tier ?? null,
+          topicMap,
+        });
         allImpacts.push(...impacts);
       } catch (e: any) {
         console.warn(`[regulatory] mapping failed for "${sop.title}":`, e?.message);
@@ -2377,6 +2409,10 @@ export const syncDriveFolder = createServerFn({ method: "POST" })
           doc_type: detected?.doc_type ?? "policy",
           version: detected?.version ?? "1.0",
           tags: detected?.tags ?? [],
+          governance_tier: detected?.governance_tier ?? null,
+          // Clear the cached topic index — sync only reaches here when the file
+          // changed, so the index is rebuilt on the next regulatory analysis.
+          topic_map: null,
           is_active: true,
           file_url: mirroredUrl,
           drive_view_url: driveViewerUrl(f.id, f.mimeType),
@@ -2551,6 +2587,8 @@ export const mirrorDriveFile = createServerFn({ method: "POST" })
       doc_type: detected?.doc_type ?? "policy",
       version: detected?.version ?? "1.0",
       tags: detected?.tags ?? [],
+      governance_tier: detected?.governance_tier ?? null,
+      topic_map: null,
       is_active: true,
       file_url: mirroredUrl,
       drive_view_url: driveViewerUrl(f.id, f.mimeType),

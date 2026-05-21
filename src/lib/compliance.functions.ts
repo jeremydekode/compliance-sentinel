@@ -349,6 +349,9 @@ export const createReport = createServerFn({ method: "POST" })
       }
       const srcText = sopTextCache.get(m.sop_id);
       if (!srcText) { verifiedImpacts.push(m); continue; } // couldn't fetch — don't drop
+      // Verify the section reference too — never show a clause/section the SOP
+      // does not contain (strips Act references, fabricated clause numbers).
+      const para = verifyParagraph(srcText, m.paragraph);
       const repaired = makeFindTextVerifier(srcText)(m.find_text);
       if (repaired === null) {
         // The AI's anchor text isn't in the document. Don't drop the impact —
@@ -359,13 +362,14 @@ export const createReport = createServerFn({ method: "POST" })
         console.log(`createReport: downgraded unanchored impact for "${m.sop_title}" to contextual`);
         verifiedImpacts.push({
           ...m,
+          paragraph: para,
           change_type: "contextual",
-          find_text: m.paragraph ? `[no exact anchor — see ${m.paragraph}]` : "[no exact anchor in document]",
+          find_text: para === PARAGRAPH_UNLOCATED ? "[no exact anchor in document]" : `[no exact anchor — see ${para}]`,
           confidence: Math.min(clampConfidence(m.confidence) ?? 60, 70),
         });
         continue;
       }
-      verifiedImpacts.push({ ...m, find_text: repaired });
+      verifiedImpacts.push({ ...m, paragraph: para, find_text: repaired });
     }
 
     if (verifiedImpacts.length > 0) {
@@ -427,6 +431,43 @@ function makeFindTextVerifier(sourceText: string): (findText: string) => string 
     const rawEnd = rawIdx[Math.min(rawIdx.length - 1, at + nFt.length - 1)] + 1;
     return sourceText.slice(rawStart, rawEnd);
   };
+}
+
+const PARAGRAPH_UNLOCATED = "General — section to be confirmed by reviewer";
+
+/**
+ * Verifies an AI-produced "paragraph" (the SOP section reference) genuinely
+ * exists in the document, so the report never shows a clause number or section
+ * the SOP does not contain. A claimed clause number (e.g. "C.14.1.3") MUST be
+ * present verbatim; an Act/regulator reference (e.g. "Section 19(2)(b) of
+ * AMLA") is never a SOP section and is stripped. When nothing can be verified
+ * the value is replaced with an honest "section to be confirmed" label.
+ */
+function verifyParagraph(sourceText: string, paragraph: string): string {
+  const p = String(paragraph ?? "").trim();
+  if (!p) return PARAGRAPH_UNLOCATED;
+  const lcSource = sourceText.toLowerCase();
+  const inDoc = (s: string) => !!s && s.trim().length >= 4 && lcSource.includes(s.trim().toLowerCase());
+
+  // Structural labels that are valid even without literal matching doc text.
+  if (/^(introduction|document header|cover page|appendix|general\b)/i.test(p)) return p;
+
+  const parts = p.split(/\s*[·—|]\s*/).map((s) => s.trim()).filter(Boolean);
+  const head = parts[0] ?? "";
+  const name = parts.length > 1 ? parts.slice(1).join(" · ") : "";
+
+  // A clause number like "C.14.1.3", "D.2.1.8.4" or "8.2.4".
+  const clauseTok =
+    (head.match(/\b[A-Za-z]\.\d+(?:\.\d+)*\b/) ?? [])[0] ??
+    (head.match(/\b\d+(?:\.\d+)+\b/) ?? [])[0];
+
+  // A claimed clause number must physically exist in the SOP.
+  if (clauseTok && sourceText.includes(clauseTok)) return p;
+  // Clause fabricated (or an Act reference) — keep only the section NAME, and
+  // only if that name is real text in the document.
+  if (inDoc(name)) return name;
+  if (!clauseTok && inDoc(head)) return head;
+  return PARAGRAPH_UNLOCATED;
 }
 
 /**
@@ -603,6 +644,9 @@ export const analyzeRegulatorySop = createServerFn({ method: "POST" })
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const verified: any[] = [];
     for (const m of allImpacts) {
+      // Verify the section reference — never show a clause/section the SOP does
+      // not contain (strips Act references and fabricated clause numbers).
+      const para = verifyParagraph(fullText, m.paragraph);
       const repaired = verify(m.find_text);
       if (repaired === null) {
         // Anchor not in the document — downgrade to a section-level contextual
@@ -610,13 +654,14 @@ export const analyzeRegulatorySop = createServerFn({ method: "POST" })
         downgraded++;
         verified.push({
           ...m,
+          paragraph: para,
           change_type: "contextual",
-          find_text: m.paragraph ? `[no exact anchor — see ${m.paragraph}]` : "[no exact anchor in document]",
+          find_text: para === PARAGRAPH_UNLOCATED ? "[no exact anchor in document]" : `[no exact anchor — see ${para}]`,
           confidence: Math.min(clampConfidence(m.confidence) ?? 60, 70),
         });
         continue;
       }
-      verified.push({ ...m, find_text: repaired });
+      verified.push({ ...m, paragraph: para, find_text: repaired });
     }
     if (downgraded > 0) console.log(`[regulatory] "${sop.title}" — downgraded ${downgraded} unanchored impact(s) to contextual`);
 

@@ -598,7 +598,9 @@ The find_text field is a verbatim quote from the BANK'S INTERNAL SOP PDF that yo
 If the SOP does not contain matching anchor text, do NOT invent it from the regulation. Use change_type "insertion" with find_text="[end of {nearest existing section heading}]" pointing at the right SOP section, OR change_type "contextual" if the SOP topically owns the area but no precise insertion point exists.
 ✅ A square-bracket marker is the CORRECT answer when no verbatim sentence can be copied — NOT a failure. It is handled as a review comment on the right section. A bracket marker that ships always beats a fabricated sentence that gets discarded. NEVER invent a sentence just to avoid a bracket marker.
 This ban covers ALL of: Change Summary, Old Requirement, New Requirement, and Tone Shift — every word of the REGULATORY CHANGE block. A country name (Burkina Faso, Myanmar…), a FATF list name ("Jurisdictions under Increased Monitoring"), or a plenary month/year ("October 2025", "February 2026") may appear in find_text ONLY if you found that exact wording in the SOP body. Most SOPs reference FATF/sanctions lists generically and name no countries or plenary dates — so for a country-list or plenary-date change the EXPECTED, CORRECT output is change_type "contextual" with a "[bracket marker]". Do not force a find_replace.
-FINAL SELF-CHECK: before output, re-read every find_text — if it contains a country name, a plenary date, or any phrase you took from the REGULATORY CHANGE block, DELETE it and switch that impact to change_type "contextual" with a "[bracket marker]" naming the SOP section.
+FINAL SELF-CHECK: before output, re-read every impact:
+- find_text — if it contains a country name, a plenary date, or any phrase you took from the REGULATORY CHANGE block, DELETE it and switch the impact to change_type "contextual" with a "[bracket marker]" naming the SOP section.
+- paragraph — if it contains an Act/regulator reference ("of AMLA", "RMiT", "FATF Recommendation"), or a clause number you cannot find printed in the SOP text, fix it: use the SOP's own real heading, or just "General". A fabricated paragraph is stripped automatically — so it only makes the report look wrong.
 
 ## Rule B — Consolidate related edits
 If a single regulatory change affects multiple closely-related items in the SAME SECTION of an SOP (e.g. "add Kuwait, Papua New Guinea, and update Myanmar" all in the same risk-country table), return ONE consolidated impact entry that updates the whole list/table at once, NOT one impact per item. Do not split a list update into N separate find/replace entries.
@@ -606,11 +608,12 @@ If a single regulatory change affects multiple closely-related items in the SAME
 ## Rule C — Page numbers
 The page number MUST be the actual page where the find_text appears in the SOP PDF. If uncertain, set page to 0 — do NOT guess. A wrong page number is worse than no page number.
 
-## Rule D — Section references: the SOP's OWN clause number, never the regulator's
-The "paragraph" field MUST be the INTERNAL SOP's own clause/section number, exactly as printed in the SOP body — e.g. "C.25.3.1", "Section 8.2.4", "Appendix 5, Part E".
-START the paragraph value with that bare clause number so it can be used as an anchor (e.g. "C.25.3.1 · AML/CFT Program Controls").
-NEVER put a regulation/Act reference here. "Section 19(2)(b) of AMLA", "Paragraph 10.31 of RMiT", "FATF Recommendation 16" are REGULATOR references — they belong in the "chapter" field, NOT "paragraph".
-The clause number MUST physically exist in the SOP. Do not invent "Section 4.2" if the SOP only has sections 1-3.
+## Rule D — "paragraph" is COPIED from the SOP, never invented:
+Like find_text, the "paragraph" field is a quote you COPY — the SOP's own clause number / heading, exactly as printed in the SOP body (e.g. "C.25.3.1 · AML/CFT Program Controls"). Before you write a clause number, find it in the SOP text and confirm it is there.
+- ❌ NEVER put a regulation/Act reference here. "Section 19(2)(b) of AMLA", "Paragraph 10.31 of RMiT", "FATF Recommendation 16" are REGULATOR references — they go in "chapter", NEVER in "paragraph". The bank's SOP does not have a section called "19(2)(b) of AMLA".
+- ❌ NEVER invent a clause number. If the SOP only numbers sections 1-3, do not write "Section 4.2". A clause number that is not physically in the SOP is a hallucination.
+- If you cannot find the SOP's own clause number, use the SOP's own section HEADING text (copied verbatim) instead. If you cannot find either, leave "paragraph" as just a short generic label like "General" — do NOT fabricate a number.
+- VERIFICATION: every "paragraph" is checked against the SOP; a clause number or heading the document does not contain is stripped and replaced with "General — section to be confirmed". So a fabricated paragraph helps nobody — copy a real one or say "General".
 
 ## Rule E — sop_title must match the actual document title
 Use the document title EXACTLY as it appears in the "--- INTERNAL DOCUMENT" header below (e.g., "R13 GL248"), NOT the long descriptive name from inside the document.
@@ -792,12 +795,12 @@ The "REGULATORY CHANGES" block at the top of this prompt (Change Summary / Old R
 - A country name (Burkina Faso, Myanmar, Mozambique…), a FATF list name ("Jurisdictions under Increased Monitoring"), or a plenary month/year ("October 2025", "February 2026") may ONLY appear in find_text if you found that exact wording in the SOP body itself. If you got it from a Change block, it is FORBIDDEN.
 - Most internal SOPs reference FATF/sanctions lists GENERICALLY ("FATF-listed jurisdictions", "high-risk countries") and do NOT name individual countries or plenary dates. So for a country-list or plenary-date change, the SOP usually has NO verbatim anchor — the EXPECTED, CORRECT output is change_type "contextual" with a "[bracket marker]". Do not force a find_replace.
 
-# ✅ FINAL SELF-CHECK — before you output, re-read every find_text you wrote:
-For each one, ask: "Could I find this exact string by searching the INTERNAL SOP DOCUMENT text — not the regulation?"
-If a find_text contains a country name, a plenary date, or a phrase you actually took from a Change block — DELETE it and replace it with change_type "contextual" + a "[bracket marker]" naming the SOP section. Keep the replace_text. An impact that ships as a comment is a success; a fabricated find_replace that gets discarded is a total loss.
+# ✅ FINAL SELF-CHECK — before you output, re-read every impact:
+- find_text — ask: "Could I find this exact string by searching the INTERNAL SOP DOCUMENT text — not the regulation?" If it contains a country name, a plenary date, or a phrase you took from a Change block, DELETE it and use change_type "contextual" + a "[bracket marker]" naming the SOP section. Keep the replace_text — a comment is a success; a fabricated find_replace is discarded entirely.
+- paragraph — ask: "Is this clause number / heading actually printed in the SOP text?" If it is an Act/regulator reference ("of AMLA", "RMiT", "FATF Recommendation") or a clause number not in the SOP, fix it: use the SOP's own real heading, or just "General".
 
-# RULE — Section references: the SOP's OWN clause number
-"paragraph" MUST be the SOP's own clause/section number as printed in the SOP (e.g. "C.14.1.3 · High-risk country customer types"). START it with the bare clause number. NEVER put a regulation/Act reference here — those go in "chapter".
+# RULE — "paragraph" is COPIED from the SOP, never invented:
+"paragraph" MUST be the SOP's own clause/section number or heading, exactly as printed in the SOP body (e.g. "C.14.1.3 · High-risk country customer types") — confirm it is physically in the SOP text before writing it. NEVER put a regulation/Act reference here ("Section 19(2)(b) of AMLA", "Paragraph 10.31 of RMiT") — those go in "chapter". NEVER invent a clause number. If you cannot find a real SOP clause/heading, write just "General". Every paragraph is verified against the SOP — a fabricated one is stripped automatically.
 
 # RULE F — Replacement-text quality bar:
 Every replace_text / insertion must be implementation-ready:

@@ -12,10 +12,14 @@ const ai = new GoogleGenAI({ apiKey: process.env.GOOGLE_GENERATIVE_AI_API_KEY ||
 //    chunking every doc at indexing time, extracting form header fields,
 //    one-liner summaries.
 //
-// Both chains fall through older flash variants on quota / capacity errors.
+// Model IDs verified available on the project's API key (probed 2026-05-22):
+// gemini-2.5-pro and gemini-2.5-flash and gemini-3.1-flash-lite exist;
+// gemini-3.1-pro / gemini-3.0-flash / gemini-2.0-flash return 404.
+// "quality" leads with the real Pro model — the regulatory/compliance
+// analysis is a hard reasoning task and must not run on a flash-lite model.
 const FALLBACK_CHAINS = {
-  quality: ["gemini-3.1-pro", "gemini-3.1-flash-lite", "gemini-3.0-flash", "gemini-2.5-flash"],
-  fast:    ["gemini-3.1-flash-lite", "gemini-3.0-flash", "gemini-2.5-flash"],
+  quality: ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-3.1-flash-lite"],
+  fast:    ["gemini-3.1-flash-lite", "gemini-2.5-flash"],
 } as const;
 
 export type ModelTier = keyof typeof FALLBACK_CHAINS;

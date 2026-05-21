@@ -26,7 +26,10 @@ import { FormUpdateDialog } from "@/components/form-update-dialog";
 import { formatDate, statusMeta } from "@/lib/format";
 import {
   deleteReport,
-  createReport,
+  createRegulatoryReport,
+  startRegulatoryRerun,
+  analyzeRegulatorySop,
+  finalizeRegulatoryReport,
   listWorkspaceDriveFiles,
   importDriveFileForAnalysis,
   getGoogleConnectionStatus,
@@ -45,7 +48,10 @@ export const Route = createFileRoute("/reports/")({
 function ReportsList() {
   const qc = useQueryClient();
   const remove = useServerFn(deleteReport);
-  const create = useServerFn(createReport);
+  const createReg = useServerFn(createRegulatoryReport);
+  const startReg = useServerFn(startRegulatoryRerun);
+  const analyzeReg = useServerFn(analyzeRegulatorySop);
+  const finalizeReg = useServerFn(finalizeRegulatoryReport);
   const listDrive = useServerFn(listWorkspaceDriveFiles);
   const importDrive = useServerFn(importDriveFileForAnalysis);
   const getGoogleStatus = useServerFn(getGoogleConnectionStatus);
@@ -148,7 +154,8 @@ function ReportsList() {
         ...detected,
         doc_type: (overrideDocType || detected.doc_type) as DetectedMeta["doc_type"],
       } : undefined;
-      const res = await create({
+      // 1. Create the report row (lightweight — no analysis yet).
+      const { reportId } = await createReg({
         data: {
           filename,
           fileUrl,
@@ -159,9 +166,22 @@ function ReportsList() {
         },
       });
 
+      // 2. Phased full-document analysis — extract changes, then one call per
+      //    internal SOP (whole document, no chunking), then finalise.
       setStepIdx(8);
-      await new Promise((r) => setTimeout(r, 800));
+      const { sops } = await startReg({ data: { reportId } });
+      for (let i = 0; i < sops.length; i++) {
+        toast.message(`Analysing ${i + 1}/${sops.length}: ${sops[i].title}…`, { id: "reg-analyze", duration: 90000 });
+        try {
+          await analyzeReg({ data: { reportId, sopId: sops[i].id } });
+        } catch (err: any) {
+          console.warn(`Analysis failed for ${sops[i].title}:`, err?.message);
+        }
+      }
+      toast.dismiss("reg-analyze");
+      await finalizeReg({ data: { reportId } });
 
+      const res = { reportId };
       toast.success("Analysis complete");
       qc.invalidateQueries({ queryKey: ["reports"] });
 

@@ -407,6 +407,56 @@ export const createReport = createServerFn({ method: "POST" })
     };
   });
 
+/**
+ * Lightweight regulatory upload — creates the report row only. The analysis
+ * itself runs through the phased full-document pipeline (startRegulatoryRerun
+ * → analyzeRegulatorySop per SOP → finalizeRegulatoryReport), the same path a
+ * re-run uses, so the upload never chunks and never times out.
+ */
+export const createRegulatoryReport = createServerFn({ method: "POST" })
+  .inputValidator(
+    z.object({
+      filename: z.string(),
+      fileUrl: z.string().nullable(),
+      workspace: z.enum(["rmit", "fatf", "forms"]).default("rmit"),
+      customTitle: z.string().optional(),
+      notes: z.string().optional(),
+      detected: z
+        .object({
+          doc_type: z.string(),
+          tags: z.array(z.string()).default([]),
+          title: z.string().optional(),
+          version: z.string().optional(),
+          summary: z.string().optional(),
+        })
+        .optional(),
+    })
+  )
+  .handler(async ({ data }) => {
+    if (!data.fileUrl) throw new Error("No file URL provided for analysis");
+    const fallbackName = data.filename.replace(/\.[^.]+$/, "").trim() || data.filename;
+    const displayName = (data.customTitle ?? "").trim() || fallbackName;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report, error } = await (supabase as any)
+      .from("analysis_reports")
+      .insert({
+        title: displayName,
+        policy_name: displayName,
+        status: "pending_validation",
+        source_file_url: data.fileUrl,
+        workspace_id: data.workspace,
+        summary_json: {
+          detected: data.detected ?? null,
+          analyst_notes: data.notes ?? null,
+          executive: ["Analysis queued — extracting regulatory changes…"],
+        },
+      })
+      .select("id")
+      .single();
+    if (error || !report) throw new Error(error?.message || "Failed to create report");
+    return { reportId: report.id as string };
+  });
+
 /** Sanitize the AI's self-reported confidence into an integer 0-100, or null. */
 function clampConfidence(v: unknown): number | null {
   const n = Math.round(Number(v));
@@ -663,19 +713,6 @@ export const analyzeRegulatorySop = createServerFn({ method: "POST" })
       return { sopId: sop.id, title: sop.title, impactCount: 0 };
     }
 
-    // Structural topic index — built once per document and cached on the row,
-    // so the mapping below routes changes to real clauses instead of guessing.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let topicMap: Record<string, string[]> | null = (sop.topic_map as any) ?? null;
-    if (!topicMap || Object.keys(topicMap).length === 0) {
-      try {
-        topicMap = await buildAndVerifyTopicMap(sop.id, sop.title, fullText);
-        console.log(`[regulatory] "${sop.title}" — topic index: ${Object.keys(topicMap).length} topic(s)`);
-      } catch (e: any) {
-        console.warn(`[regulatory] topic-map build failed for "${sop.title}":`, e?.message);
-        topicMap = null;
-      }
-    }
 
     // Split oversized docs into large segments so each Gemini call stays bounded
     const SEG = 160_000;
@@ -697,7 +734,6 @@ export const analyzeRegulatorySop = createServerFn({ method: "POST" })
         const impacts = await mapChangesToSop(changes as any, {
           title: sop.title, text: seg,
           governanceTier: sop.governance_tier ?? null,
-          topicMap,
         }, analysisGuidance);
         allImpacts.push(...impacts);
       } catch (e: any) {

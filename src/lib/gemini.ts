@@ -736,7 +736,7 @@ FATF / AML changes require Compliance Officer + Legal interpretation. Treat ever
         parts.push({ inlineData: { data: sop.buffer.toString("base64"), mimeType: sop.mimeType } });
       }
     } else {
-      const roleBlock = buildSopRoleBlock(sop.governanceTier, sop.topicMap);
+      const roleBlock = buildSopRoleBlock(sop.governanceTier);
       parts.push({ text: `\n--- INTERNAL DOCUMENT: "${sop.title}" ---${roleBlock}\n${sop.text}` });
     }
   }
@@ -774,31 +774,16 @@ const TIER_ROLE: Record<string, string> = {
   sector_guideline: "a SECTOR / SUBSIDIARY GUIDELINE — sector-specific parameters and adaptations. Amend its own clauses.",
 };
 
-/** Builds the optional "document role & topic index" block for the mapping prompt. */
-function buildSopRoleBlock(governanceTier?: string | null, topicMap?: Record<string, string[]> | null): string {
-  const lines: string[] = [];
+/** Builds the optional "document role" block (governance tier) for the prompt. */
+function buildSopRoleBlock(governanceTier?: string | null): string {
   const role = governanceTier ? TIER_ROLE[governanceTier] : null;
-  if (role) lines.push(`This SOP is ${role}`);
-  const entries = topicMap ? Object.entries(topicMap).filter(([, v]) => Array.isArray(v) && v.length > 0) : [];
-  if (entries.length > 0) {
-    lines.push(
-      "",
-      "PRE-BUILT TOPIC INDEX — verified clause refs in THIS document, grouped by topic:",
-      ...entries.map(([topic, refs]) => `- [${topic}] → ${refs.join("  |  ")}`),
-      "",
-      "HOW TO USE THE INDEX:",
-      "- The bracketed label (e.g. [Sanctioned & Prohibited Jurisdictions]) is ONLY a grouping key. It is NOT the name of any clause. NEVER write it into \"paragraph\".",
-      "- Each ref after the arrow is a real clause as printed in the SOP — it already includes the clause number AND its actual heading. When you route an impact, copy that ref VERBATIM into \"paragraph\".",
-      "- ROUTING: when a regulatory change matches an indexed topic, anchor the impact in one of that topic's clauses, using the ref exactly as written. If a change's topic is not indexed, this document most likely does not cover it — prefer returning nothing over inventing a location.",
-    );
-  }
-  if (lines.length === 0) return "";
-  return `\n# DOCUMENT ROLE & TOPIC INDEX:\n${lines.join("\n")}\n`;
+  if (!role) return "";
+  return `\n# DOCUMENT ROLE:\nThis SOP is ${role}\n`;
 }
 
 export async function mapChangesToSop(
   changes: RegulatoryDelta[],
-  sop: { title: string; text: string; governanceTier?: string | null; topicMap?: Record<string, string[]> | null },
+  sop: { title: string; text: string; governanceTier?: string | null },
   guidance?: string | null,
 ): Promise<SopGap[]> {
   const prompt = `
@@ -806,14 +791,15 @@ export async function mapChangesToSop(
 
 You are given a LIST of regulatory changes and the FULL TEXT of ONE internal SOP document.
 Your task: find EVERY location in this SOP that must be updated for ANY of these changes.
-${buildSopRoleBlock(sop.governanceTier, sop.topicMap)}
+${buildSopRoleBlock(sop.governanceTier)}
 ${guidanceBlock(guidance)}
 
 # REASONING STEP — do this SILENTLY first, inside a <thinking></thinking> block:
-1. DEFINE — for each regulatory change, what exactly did it add, remove, reclassify, or re-deadline?
-2. MATCH — scan the SOP. Which clause(s) topically OWN each affected control? Name the clause number.
-3. ANCHOR — for each, pick the single most distinctive short sentence to use as find_text.
-4. FLAG — would the current SOP wording become NON-COMPLIANT or CONFLICT with a new requirement if unchanged?
+1. INDEX — scan the FULL SOP below and note where its volatile compliance topics are governed: country/jurisdiction risk tables, prohibited & sanctioned jurisdiction lists, virtual-asset / digital-currency clauses, EDD triggers, screening, record-keeping. For each, record the clause's REAL number AND its actual heading exactly as printed.
+2. DEFINE — for each regulatory change, what exactly did it add, remove, reclassify, or re-deadline?
+3. MATCH — map each change to the owning clause(s) from your step-1 index. "paragraph" = that clause's real number + real heading. NEVER a topic label, NEVER an invented clause.
+4. ANCHOR — for each, pick the single most distinctive short sentence to use as find_text (verbatim), or a [bracket marker] if no clean anchor sentence exists.
+5. FLAG — would the current SOP wording become NON-COMPLIANT or CONFLICT with a new requirement if unchanged?
 Then output ONLY the JSON array — NEVER include the <thinking> block or any prose.
 
 # REGULATORY CHANGES (${changes.length}):
@@ -884,7 +870,7 @@ Emit the version bump AT MOST ONCE for the whole document, ONLY if the SOP heade
 # OUTPUT FORMAT (JSON Array):
 [{
   "sop_title": "${sop.title}",
-  "paragraph": "<a REAL SOP clause — clause number + its ACTUAL heading from the SOP. When routing via the TOPIC INDEX, copy the index ref verbatim. NEVER use the topic-index grouping label as the heading. 'General' ONLY as a genuine last resort.>",
+  "paragraph": "<a REAL SOP clause — its clause number + its ACTUAL heading exactly as printed in the SOP, taken from your step-1 INDEX. NEVER an invented clause, NEVER a topic label as the heading. 'General' ONLY as a genuine last resort.>",
   "action_description": "<one-line imperative headline of what changes>",
   "justification": "<ONE sentence: WHY this amendment belongs at this clause — the clause's subject and how the change connects to it. If paragraph is 'General', state plainly why no specific clause fits.>",
   "change_type": "find_replace" | "insertion" | "contextual" | "new_section",
@@ -896,7 +882,7 @@ Emit the version bump AT MOST ONCE for the whole document, ONLY if the SOP heade
   "confidence": <integer 0-100 — your honest certainty this impact is correct (see CONFIDENCE below)>
 }]
 
-# ❗ PARAGRAPH IS ALWAYS A REAL CLAUSE: even when find_text is a [bracket marker] (no verbatim anchor), "paragraph" must still name a real clause that owns this topic — pick the closest from the TOPIC INDEX. A bracketed find_text means "no exact anchor sentence", NOT "no known location". Only use "General" when the topic genuinely is not covered anywhere in this SOP.
+# ❗ PARAGRAPH IS ALWAYS A REAL CLAUSE: even when find_text is a [bracket marker] (no verbatim anchor), "paragraph" must still name a real clause (number + real heading) that owns this topic — use the closest one from your step-1 INDEX of the SOP. A bracketed find_text means "no exact anchor sentence", NOT "no known location". Only use "General" when the topic genuinely is not covered anywhere in this SOP.
 
 # CONFIDENCE — score every impact honestly:
 - 90-100: the find_text is an exact, unambiguous verbatim quote from the SOP AND the change is mechanical (a clear date/number/term swap or a clearly-scoped note). Safe to fast-track.

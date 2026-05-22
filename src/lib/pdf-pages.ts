@@ -3,25 +3,19 @@
  * Used to anchor chunker output to real page numbers instead of letting
  * the LLM guess. Returns one entry per page in document order.
  *
- * NOTE: pdf-parse is imported LAZILY (dynamic import). It pulls in pdfjs-dist
- * which crashes at module-load time on Vercel serverless ("DOMMatrix is not
- * defined") if loaded eagerly. Lazy import keeps the entire pdf chain out of
- * cold-start unless this function is actually called.
+ * Uses `unpdf` — a serverless-safe PDF library that ships its own pdfjs build
+ * with the browser globals (DOMMatrix etc.) polyfilled, so it runs in the
+ * Vercel Node runtime where bare pdfjs-dist crashes ("DOMMatrix is not
+ * defined"). Imported lazily to keep the pdf chain out of cold-start.
  */
 export async function extractPdfPages(
   buffer: Buffer
 ): Promise<Array<{ page: number; text: string }>> {
-  const { PDFParse } = await import("pdf-parse");
-  const parser = new PDFParse({ data: new Uint8Array(buffer) });
-  try {
-    const result = await parser.getText();
-    return result.pages.map((p) => ({
-      page: p.num,
-      text: (p.text ?? "").trim(),
-    }));
-  } finally {
-    try { await (parser as any).destroy?.(); } catch { /* ignore */ }
-  }
+  const { getDocumentProxy, extractText } = await import("unpdf");
+  const pdf = await getDocumentProxy(new Uint8Array(buffer));
+  const { text } = await extractText(pdf, { mergePages: false });
+  const pages = Array.isArray(text) ? text : [text];
+  return pages.map((t, i) => ({ page: i + 1, text: String(t ?? "").trim() }));
 }
 
 /**

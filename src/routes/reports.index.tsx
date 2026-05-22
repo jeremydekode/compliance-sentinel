@@ -27,16 +27,12 @@ import { formatDate, statusMeta } from "@/lib/format";
 import {
   deleteReport,
   createRegulatoryReport,
-  startRegulatoryRerun,
-  analyzeRegulatorySop,
-  finalizeRegulatoryReport,
   listWorkspaceDriveFiles,
   importDriveFileForAnalysis,
   getGoogleConnectionStatus,
 } from "@/lib/compliance.functions";
 import { autoDetectDocMeta, DOC_TYPE_LABEL, type DetectedMeta } from "@/lib/auto-detect";
 import { useWorkspace, WORKSPACES } from "@/lib/workspace";
-import { PIPELINE_STEPS } from "@/lib/mock-pipeline";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 
@@ -49,9 +45,6 @@ function ReportsList() {
   const qc = useQueryClient();
   const remove = useServerFn(deleteReport);
   const createReg = useServerFn(createRegulatoryReport);
-  const startReg = useServerFn(startRegulatoryRerun);
-  const analyzeReg = useServerFn(analyzeRegulatorySop);
-  const finalizeReg = useServerFn(finalizeRegulatoryReport);
   const listDrive = useServerFn(listWorkspaceDriveFiles);
   const importDrive = useServerFn(importDriveFileForAnalysis);
   const getGoogleStatus = useServerFn(getGoogleConnectionStatus);
@@ -67,7 +60,6 @@ function ReportsList() {
   const [overrideDocType, setOverrideDocType] = useState<string>("");
   const [notes, setNotes] = useState("");
   const [running, setRunning] = useState(false);
-  const [stepIdx, setStepIdx] = useState(-1);
   const [workspace] = useWorkspace();
 
   // Google connection status — drives whether the "Pick from Drive" tab is usable
@@ -108,7 +100,6 @@ function ReportsList() {
   async function startAnalysis() {
     if (!file && !driveFile) return;
     setRunning(true);
-    setStepIdx(0);
 
     let fileUrl: string | null = null;
     let filename: string = "";
@@ -137,24 +128,18 @@ function ReportsList() {
       console.error("Upload/import failed:", e);
       toast.error("Could not prepare file for analysis", { description: e?.message });
       setRunning(false);
-      setStepIdx(-1);
       return;
     }
 
-    // Progress simulation for UI
-    for (let i = 0; i < PIPELINE_STEPS.length - 1; i++) {
-      setStepIdx(i);
-      await new Promise((r) => setTimeout(r, PIPELINE_STEPS[i].duration));
-    }
-
     try {
-      setStepIdx(7);
       // Merge user overrides into detected meta
       const detectedWithOverrides = detected ? {
         ...detected,
         doc_type: (overrideDocType || detected.doc_type) as DetectedMeta["doc_type"],
       } : undefined;
-      // 1. Create the report row (lightweight — no analysis yet).
+      // Create the report row only (lightweight — no analysis yet). The report
+      // page picks up the pending_analysis flag and runs the analysis there,
+      // so the user lands on the live report instead of a blocking loader.
       const { reportId } = await createReg({
         data: {
           filename,
@@ -165,56 +150,11 @@ function ReportsList() {
           notes: notes.trim() || undefined,
         },
       });
-
-      // 2. Full-document analysis — one call per internal SOP, run in PARALLEL
-      //    (each is an isolated server call), then finalise. A SOP whose call
-      //    fails is retried up to 3× and, if still failing, flagged.
-      setStepIdx(8);
-      const { sops } = await startReg({ data: { reportId } });
-      let regDone = 0;
-      toast.message(`Analysing ${sops.length} document(s)…`, { id: "reg-analyze", duration: 180000 });
-      const coverage = await Promise.all(sops.map(async (sop) => {
-        let status = "failed";
-        let impactCount = 0;
-        for (let attempt = 1; attempt <= 3; attempt++) {
-          try {
-            const res = await analyzeReg({ data: { reportId, sopId: sop.id } });
-            status = res?.status ?? "analyzed";
-            impactCount = res?.impactCount ?? 0;
-            if (status !== "failed") break;
-          } catch (err: any) {
-            console.warn(`Analysis attempt ${attempt} failed for ${sop.title}:`, err?.message);
-            status = "failed";
-          }
-        }
-        regDone++;
-        toast.message(`Analysed ${regDone}/${sops.length} document(s)…`, { id: "reg-analyze", duration: 180000 });
-        return { title: sop.title, status, impactCount };
-      }));
-      toast.dismiss("reg-analyze");
-      await finalizeReg({ data: { reportId, coverage } });
-
-      const res = { reportId };
-      toast.success("Analysis complete");
       qc.invalidateQueries({ queryKey: ["reports"] });
-
-      // Close upload and reset
-      setShowUpload(false);
-      setFile(null);
-      setDriveFile(null);
-      setSource("local");
-      setDetected(null);
-      setAnalysisName("");
-      setOverrideDocType("");
-      setNotes("");
-      setRunning(false);
-      setStepIdx(-1);
-
-      nav({ to: "/reports/$reportId", params: { reportId: res.reportId } });
+      nav({ to: "/reports/$reportId", params: { reportId } });
     } catch (e: any) {
-      toast.error("Analysis failed", { description: e?.message });
+      toast.error("Could not create analysis", { description: e?.message });
       setRunning(false);
-      setStepIdx(-1);
     }
   }
 
@@ -526,53 +466,19 @@ function ReportsList() {
                 </div>
               </div>
             ) : (
-              <div className="py-8">
-                <div className="flex items-center justify-between mb-8">
-                  <div>
-                    <h2 className="text-2xl font-black italic tracking-tighter text-primary">Intelligence Pipeline</h2>
-                    <p className="text-sm text-muted-foreground font-medium uppercase tracking-widest mt-1">Executing multi-stage analysis...</p>
-                  </div>
-                  <Loader2 className="size-8 text-primary animate-spin" />
-                </div>
-                
-              <div className="flex flex-col items-center justify-center py-12 space-y-12">
+              <div className="py-12 flex flex-col items-center justify-center text-center gap-4">
                 <div className="relative">
-                  <div className="absolute inset-0 bg-primary/20 rounded-full blur-3xl animate-pulse" />
-                  <div className="relative size-32 rounded-full border-4 border-primary/10 grid place-items-center bg-white dark:bg-slate-950 shadow-2xl">
-                    <Loader2 className="size-16 text-primary animate-spin" strokeWidth={1.5} />
+                  <div className="absolute inset-0 bg-primary/20 rounded-full blur-2xl animate-pulse" />
+                  <div className="relative size-14 rounded-2xl border bg-card grid place-items-center shadow-sm">
+                    <Loader2 className="size-7 text-primary animate-spin" strokeWidth={1.75} />
                   </div>
                 </div>
-
-                <div className="text-center max-w-md mx-auto space-y-4">
-                  <div className="space-y-1">
-                    <h3 className="text-2xl font-black italic tracking-tighter text-primary animate-in fade-in slide-in-from-bottom-4 duration-500">
-                      {PIPELINE_STEPS[stepIdx]?.label || "Intelligence Pipeline"}
-                    </h3>
-                    <p className="text-[10px] text-muted-foreground font-black uppercase tracking-[0.3em]">
-                      Executing Autonomous Analysis Stage {stepIdx + 1} of {PIPELINE_STEPS.length}
-                    </p>
-                  </div>
-
-                  <div className="w-full bg-muted/30 h-1.5 rounded-full overflow-hidden border border-primary/5">
-                    <div 
-                      className="bg-primary h-full transition-all duration-700 ease-out shadow-[0_0_15px_rgba(var(--primary),0.5)]" 
-                      style={{ width: `${((stepIdx + 1) / PIPELINE_STEPS.length) * 100}%` }}
-                    />
-                  </div>
-                  
-                  <div className="flex items-center justify-center gap-3 pt-2">
-                    {PIPELINE_STEPS.map((_, i) => (
-                      <div 
-                        key={i}
-                        className={cn(
-                          "size-2 rounded-full transition-all duration-500",
-                          i === stepIdx ? "bg-primary w-6" : i < stepIdx ? "bg-primary/40" : "bg-muted-foreground/20"
-                        )}
-                      />
-                    ))}
-                  </div>
+                <div className="space-y-1">
+                  <div className="font-bold text-sm">Preparing your analysis…</div>
+                  <p className="text-xs text-muted-foreground max-w-xs">
+                    Uploading the document and opening the report — the analysis runs there.
+                  </p>
                 </div>
-              </div>
               </div>
             )}
           </Card>

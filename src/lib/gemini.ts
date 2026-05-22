@@ -3,24 +3,25 @@ import { extractPdfPages, pagesToMarkedText } from "./pdf-pages";
 
 const ai = new GoogleGenAI({ apiKey: process.env.GOOGLE_GENERATIVE_AI_API_KEY || "" });
 
-// Two fallback chains keyed by call tier.
+// Two fallback chains keyed by call tier. Each chain is tried in order; a model
+// that returns a capacity error (503 "high demand") is retried once, then the
+// next model is used.
 //
-//  - "quality" (default): Pro-primary. Use for high-stakes reasoning:
-//    UC1 find/replace, RMiT/FATF regulatory delta extraction + SOP mapping,
-//    amended-document HTML generation.
-//  - "fast": flash-lite-primary. Use for high-volume / low-stakes work:
-//    chunking every doc at indexing time, extracting form header fields,
+//  - "quality" (default): high-stakes reasoning — regulatory delta extraction,
+//    SOP mapping, change routing, amended-document generation.
+//  - "fast": high-volume / low-stakes — chunking, header-field extraction,
 //    one-liner summaries.
 //
-// Model IDs verified available on the project's API key (probed 2026-05-22):
-// gemini-2.5-pro, gemini-2.5-flash and gemini-3.1-flash-lite exist;
-// gemini-3.1-pro / gemini-3.1-flash / gemini-3.0-flash / gemini-2.0-flash 404.
-// "quality" leads with gemini-2.5-flash: gemini-2.5-pro is materially slower
-// and overruns the serverless time limit (504) on large SOPs, while
-// gemini-2.5-flash is a capable reasoning model that reliably finishes.
+// Available on the project key (probed 2026-05-22): gemini-3.5-flash,
+// gemini-2.5-flash, gemini-2.5-pro, gemini-3.1-flash-lite (+ older -lite).
+// "quality" LEADS with gemini-3.5-flash — newer and stronger than 2.5-flash,
+// on a fresher capacity pool, so far less prone to the 503 overload 2.5-flash
+// hits at peak. 2.5-flash is the fallback; flash-lite is the LAST resort only
+// (the weak tier — capable of returning an empty extraction — so it is never
+// the primary for a quality call).
 const FALLBACK_CHAINS = {
-  quality: ["gemini-2.5-flash", "gemini-3.1-flash-lite"],
-  fast:    ["gemini-3.1-flash-lite", "gemini-2.5-flash"],
+  quality: ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-3.1-flash-lite"],
+  fast:    ["gemini-3.1-flash-lite", "gemini-3.5-flash"],
 } as const;
 
 export type ModelTier = keyof typeof FALLBACK_CHAINS;
@@ -217,6 +218,53 @@ ${g}
 `;
 }
 
+/**
+ * Parses a JSON array out of a model response. If the response was truncated
+ * (the model ran into maxOutputTokens mid-array, leaving invalid JSON), this
+ * SALVAGES every COMPLETE top-level object rather than losing the whole batch —
+ * a partial gap/impact list is far more useful than zero. String contents
+ * (including braces inside quoted values) are tracked so depth stays correct.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function parseJsonArrayLoose(raw: string | null | undefined): any[] {
+  const text = String(raw ?? "").trim();
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) return parsed;
+    if (Array.isArray(parsed?.changes)) return parsed.changes;
+    if (Array.isArray(parsed?.requirements)) return parsed.requirements;
+    if (Array.isArray(parsed?.impacts)) return parsed.impacts;
+    if (parsed && typeof parsed === "object") return [parsed];
+    return [];
+  } catch {
+    const start = text.indexOf("[");
+    if (start < 0) return [];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const out: any[] = [];
+    let depth = 0, objStart = -1, inStr = false, esc = false;
+    for (let i = start + 1; i < text.length; i++) {
+      const ch = text[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === "\\") esc = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') { inStr = true; continue; }
+      if (ch === "{") { if (depth === 0) objStart = i; depth++; }
+      else if (ch === "}") {
+        depth--;
+        if (depth === 0 && objStart >= 0) {
+          try { out.push(JSON.parse(text.slice(objStart, i + 1))); } catch { /* skip partial */ }
+          objStart = -1;
+        }
+      }
+    }
+    return out;
+  }
+}
+
 export async function extractRegulatoryChanges(
   newPolicy: PolicySource,
   oldPolicy?: PolicySource,
@@ -239,7 +287,7 @@ Compare Document A against Document B section by section.` : `# DOCUMENT PROVIDE
 - NEW POLICY: First attachment (treat as entirely new requirements)
 `}
 
-# WHAT CONSTITUTES A MATERIAL POLICY CHANGE (EXTRACT EVERY ONE OF THESE):
+# WHAT CONSTITUTES A MATERIAL POLICY CHANGE (these are the RAW SIGNALS — you GROUP related ones into thematic changes, see CONSOLIDATE below):
 
 ## Category A — Quantitative shifts
 - A reporting/notification deadline changed (e.g. "24 hours" → "6 hours", "annual" → "semi-annual")
@@ -299,8 +347,15 @@ Do NOT conflate these. The summary's effective_date field must be the policy's c
 3. Would the Head of Compliance need to commission a project, write a new control, update an SOP, retrain staff, modify a system, or notify a customer because of this change?
 If YES to all → extract it. If text is identical but renumbered → SKIP. If unsure on substance → extract it (false positives are easy to filter; missing a real change is a compliance risk).
 
-# COMPLETENESS REQUIREMENT:
-Sweep the ENTIRE document including ALL appendices, interpretive notes, glossary entries, and best-practice annexes before finalising. Re-scan specifically for: (a) new appendices, (b) new sub-paragraphs and sub-sub-paragraphs, (c) softly-worded new obligations the AI tends to skip, (d) regulator-specific patterns listed in the REGULATOR CONTEXT block above. Refer to the typical revision-size estimate in that block — if your output is materially smaller than that range, do another pass.
+# ❗ CONSOLIDATE INTO THEMATIC CHANGES — this is critical:
+Report changes at the level a compliance team briefs its board: THEMATIC changes, not atomic paragraph diffs. When comparing two full policies, group EVERY paragraph-, sub-paragraph- and appendix-level edit that serves the SAME underlying control or obligation into ONE entry.
+- Example: a "should → must" hardening of authentication that repeats across Appendix 3 points 1(a), 1(b), 1(g)…1(j), 2, 3, 7, 8 and 9 is ONE thematic change — "Stricter MFA & OTP Rules" — NOT nine or twelve.
+- Example: a new appendix PLUS every paragraph that now points to it = ONE thematic change.
+- A thematic change's chapter_ref may list several references (e.g. "Paragraph 10.67, 10.71 → Appendix 3"); its new_requirement should still capture the substantive sub-points, grouped under the one entry.
+- A major regulation revision typically yields ~10-15 thematic changes — the ones a board would be briefed on. If you have more than 15, you are itemising too finely: merge the smaller related items into their parent theme, and drop genuinely minor or purely administrative changes. If you are about to output 30+ entries you are diffing atomically — STOP and regroup.
+
+# COVERAGE:
+Sweep the ENTIRE document including all appendices and annexes so no THEME of change is missed — but report each theme ONCE. Coverage means every distinct changed control is represented, not that every paragraph gets its own row. Pure renumbering, cosmetic rewording and identical-text-moved are NOT changes — drop them.
 
 # STRUCTURED COMPARISON DOCUMENTS — STRICT RULE:
 If the NEW POLICY document is itself a comparison table or change-log that already enumerates the changes (rows beginning "1.", "2.", … "N.", or columns like "Impacted Item / Old Policy / New Policy / Explanation"), then this is a pre-digested map — your job is to extract EVERY numbered row, not to re-analyse from scratch:
@@ -327,8 +382,7 @@ If the NEW POLICY document is itself a comparison table or change-log that alrea
   "tone_shift": "e.g. 'Guidance → Mandate', 'Relaxed → Prescriptive', 'New requirement'"
 }]
 
-Return ONLY material, actionable changes. Be thorough — missing a real change is a compliance risk.
-There is NO upper limit on the number of changes you may return. List every material policy shift you can detect, even if it produces 20, 50, or more entries. Do not summarise multiple distinct obligations into a single entry.
+Return ONLY material, actionable, THEMATIC changes — consolidated per the CONSOLIDATE rule above. Aim for roughly 10-15 entries for a major revision; a long list of atomic paragraph diffs is wrong. Cover every distinct control that changed, but report each as ONE thematic entry.
   `;
 
   const parts: any[] = [{ text: prompt }];
@@ -339,17 +393,14 @@ There is NO upper limit on the number of changes you may return. List every mate
 
   const response = await generateWithFallback({
     contents: [{ role: "user", parts }],
-    config: { responseMimeType: "application/json", maxOutputTokens: 32768 },
+    config: { responseMimeType: "application/json", maxOutputTokens: 65536 },
   });
 
-  const text = response.text ?? "";
-  try {
-    const parsed = JSON.parse(text);
-    return Array.isArray(parsed) ? parsed : (parsed.changes ?? []);
-  } catch (e) {
-    console.error("Failed to parse regulatory changes:", text.slice(0, 500));
-    return [];
+  const out = parseJsonArrayLoose(response.text);
+  if (out.length === 0) {
+    console.error("extractRegulatoryChanges: no changes parsed:", (response.text ?? "").slice(0, 400));
   }
+  return out;
 }
 
 /**
@@ -395,15 +446,13 @@ Return ONLY the JSON array. Extract EVERY distinct standing obligation — a qua
   parts.push(...policyToParts("FATF STATEMENT", statement));
   const response = await generateWithFallback({
     contents: [{ role: "user", parts }],
-    config: { responseMimeType: "application/json", maxOutputTokens: 16384 },
+    config: { responseMimeType: "application/json", maxOutputTokens: 65536 },
   });
-  try {
-    const parsed = JSON.parse(response.text ?? "[]");
-    return Array.isArray(parsed) ? parsed : (parsed.requirements ?? []);
-  } catch {
-    console.error("Failed to parse FATF requirements:", (response.text ?? "").slice(0, 400));
-    return [];
+  const out = parseJsonArrayLoose(response.text);
+  if (out.length === 0) {
+    console.error("extractFatfRequirements: no requirements parsed:", (response.text ?? "").slice(0, 400));
   }
+  return out;
 }
 
 /**
@@ -569,6 +618,70 @@ The document text below has been pre-segmented with explicit page markers of the
 }
 
 /**
+ * ROUTING — given the regulatory change list and a catalogue of the internal
+ * documents (title + opening-scope text), decides which document(s) each change
+ * belongs to. This is the relevance filter: the per-change mapping then drafts
+ * edits ONLY inside the routed documents, so an impact cannot spread across
+ * every overlapping policy. Returns { changeIndex -> [docIndex] }.
+ */
+export async function routeChangesToSops(
+  changes: { chapter_ref: string; change_summary: string }[],
+  docs: { title: string; blurb: string }[],
+  guidance?: string | null,
+): Promise<Record<string, number[]>> {
+  if (changes.length === 0 || docs.length === 0) return {};
+  const docList = docs
+    .map((d, i) => `[${i}] "${d.title}"\n     scope: ${d.blurb}`)
+    .join("\n\n");
+  const changeList = changes
+    .map((c, i) => `CHANGE ${i} — ${c.chapter_ref}: ${c.change_summary}`)
+    .join("\n");
+  const prompt = `
+# ROLE: COMPLIANCE ANALYST — ROUTE EACH REGULATORY CHANGE TO ITS OWNING DOCUMENT(S)
+
+You are given a list of regulatory CHANGES and a numbered catalogue of the bank's INTERNAL DOCUMENTS. For EVERY change, decide which internal document(s) must be amended to implement it.
+${guidanceBlock(guidance)}
+# RULES:
+- A change is OWNED by the document whose subject is the natural home for that topic. MOST changes have exactly ONE owning document. Some genuinely span 2. Use 3 only when the change truly cuts across that many.
+- Do NOT route a change to a document just because the document mentions the topic in passing — list only the document(s) that must actually be edited.
+- Judge by each document's stated SCOPE, not keyword overlap.
+- If no internal document plausibly owns a change, return an empty array — that is a valid and important answer (it means no SOP yet covers the new requirement).
+
+# INTERNAL DOCUMENTS (catalogue):
+${docList}
+
+# REGULATORY CHANGES:
+${changeList}
+
+# OUTPUT — a JSON object. Key = change number (as a string). Value = array of document numbers.
+{ "0": [3], "1": [0, 5], "2": [] }
+Every change number from 0 to ${changes.length - 1} MUST appear as a key. Return ONLY the JSON object.
+`;
+  const response = await generateWithFallback(
+    {
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      config: { responseMimeType: "application/json", maxOutputTokens: 8192 },
+    },
+    { tier: "fast" },
+  );
+  try {
+    const parsed = JSON.parse(response.text ?? "{}");
+    const out: Record<string, number[]> = {};
+    for (const [k, v] of Object.entries(parsed)) {
+      if (Array.isArray(v)) {
+        out[k] = (v as unknown[])
+          .map((n) => Number(n))
+          .filter((n) => Number.isInteger(n) && n >= 0 && n < docs.length);
+      }
+    }
+    return out;
+  } catch {
+    console.error("routeChangesToSops: parse failed:", (response.text ?? "").slice(0, 300));
+    return {};
+  }
+}
+
+/**
  * STAGE 2: TARGETED SOP GAP MAPPING
  * For a single regulatory change, finds the EXACT paragraph(s) in internal SOPs that need updating.
  * Runs independently per change so the model has full focus on one gap at a time.
@@ -613,7 +726,7 @@ Then output ONLY the JSON array — NEVER include the <thinking> block or any pr
    - Propose precise replacement text that satisfies the new regulatory requirement.
    - Be specific — use the same professional regulatory tone as the original SOP.
 4. Prefer "find_replace" when you can identify exact text. Use "insertion" for new clauses. Use "contextual" when the SOP topically owns this area but no precise anchor text exists. Use "new_section" only if an entirely new section must be created.
-5. There is NO upper limit on the number of impacts you may return. If a single regulatory change affects 7 different internal SOPs (or 7 different paragraphs in the same SOP), return all 7 entries. Do NOT consolidate distinct affected paragraphs into a single entry.
+5. Be PRECISE, not exhaustive. Per internal document, find the SINGLE clause that is the primary home for this change and emit ONE impact for it. Emit a second impact for the same document ONLY if the change genuinely cannot be implemented at one clause (e.g. it both revises an existing rule AND requires a new sub-clause). Never more than 2 per document. Do NOT enumerate every clause that merely touches the topic — the goal is the precise primary edit a reviewer applies, not wall-to-wall coverage.
 
 # EVERY CHANGE SHOULD FIND AN OWNER (when candidates were pre-filtered):
 The SOP chunks below were ranked by semantic similarity to this change. At least one of them is almost certainly the owning document for this control.
@@ -781,17 +894,14 @@ FATF / AML changes require Compliance Officer + Legal interpretation. Treat ever
 
   const response = await generateWithFallback({
     contents: [{ role: "user", parts }],
-    config: { responseMimeType: "application/json", maxOutputTokens: 32768 },
+    config: { responseMimeType: "application/json", maxOutputTokens: 65536 },
   });
 
-  const text = response.text ?? "";
-  try {
-    const parsed = JSON.parse(text);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (e) {
-    console.error(`Failed to parse SOP mapping for ${change.chapter_ref}:`, text.slice(0, 300));
-    return [];
+  const out = parseJsonArrayLoose(response.text);
+  if (out.length === 0 && (response.text ?? "").trim()) {
+    console.error(`Failed to parse SOP mapping for ${change.chapter_ref}:`, (response.text ?? "").slice(0, 300));
   }
+  return out;
 }
 
 /**
@@ -813,30 +923,63 @@ function buildSopRoleBlock(governanceTier?: string | null): string {
   return `\n# DOCUMENT ROLE:\nThis SOP is ${role}\n`;
 }
 
-export async function analyzeSopAgainstRegulation(
-  regulation: PolicySource,
+/** Renders the Stage-1 gap list as a compact, numbered ruleset for the prompt. */
+function renderGapList(gaps: RegulatoryDelta[]): string {
+  return gaps
+    .map((g, i) => {
+      const prev = String(g.old_requirement ?? "").trim();
+      const hasPrev = prev.length > 0 && !/^n\/?a\b/i.test(prev);
+      return [
+        `GAP ${i + 1} — ${g.chapter_ref}  [${g.impact ?? "medium"} impact]`,
+        `  Requirement the SOP must satisfy: ${g.new_requirement}`,
+        hasPrev ? `  Previously (for reference only): ${prev}` : null,
+        g.change_summary ? `  In short: ${g.change_summary}` : null,
+      ]
+        .filter(Boolean)
+        .join("\n");
+    })
+    .join("\n\n");
+}
+
+/**
+ * STAGE 2 — checks ONE internal SOP against the Stage-1 GAP LIST (the ruleset
+ * already extracted from the regulation). For every gap it decides whether this
+ * SOP is affected and, if so, produces the precise amendment. The gaps ARE the
+ * rules, so the analysis is driven by the regulation's real content — not a
+ * domain-specific re-derivation — and every impact is tagged to the gap it
+ * answers (the "chapter" field), which makes the gap→document mapping traceable.
+ */
+export async function analyzeSopAgainstGaps(
+  gaps: RegulatoryDelta[],
   sop: { title: string; text: string; governanceTier?: string | null },
   guidance?: string | null,
 ): Promise<SopGap[]> {
+  if (gaps.length === 0) return [];
   const promptHead = `
-# ROLE: COMPLIANCE GAP ANALYST — SOP vs REGULATION
+# ROLE: COMPLIANCE GAP ANALYST — SOP vs REGULATORY GAP LIST
 
-You are given ONE regulatory document (the REGULATION, attached) and — at the BOTTOM of this prompt — the FULL TEXT of ONE internal SOP. Find EVERY place the SOP must be amended to comply with the regulation.
+You are given a fixed list of REGULATORY GAPS (the ruleset, already extracted from the regulation — see the bottom of this prompt) and the FULL TEXT of ONE internal SOP (below the gap list). Work through the gap list and find EVERY place this SOP must be amended to satisfy it.
 ${buildSopRoleBlock(sop.governanceTier)}
 ${guidanceBlock(guidance)}
 
 # REASONING STEP — do this SILENTLY first, inside a <thinking></thinking> block:
-1. READ the attached REGULATION — list every obligation, restriction, jurisdiction list, deadline and standing requirement it imposes.
-2. INDEX the SOP — scan the FULL SOP and note where its compliance topics are governed: country/jurisdiction risk tables, prohibited & sanctioned jurisdiction lists, virtual-asset / digital-currency clauses, EDD triggers, screening, record-keeping, monitoring. For each, record the clause's REAL number AND its actual heading exactly as printed.
-3. MATCH — for each regulatory obligation, find the owning SOP clause from your step-2 index; decide whether the SOP is STALE, SILENT, INCONSISTENT, or in CONFLICT with it. "paragraph" = that clause's real number + real heading. NEVER a topic label, NEVER an invented clause.
-4. ANCHOR — for each, pick the single most distinctive short sentence to use as find_text (verbatim), or a [bracket marker] if no clean anchor sentence exists.
-Produce an impact for every clause that must change. A clause already fully compliant with the regulation needs NO impact — do not invent busy-work edits.
+1. INDEX the SOP — scan the FULL SOP top to bottom; for each section record its REAL clause number and its actual printed heading. From its title and headings, decide this SOP's SUBJECT AREA (what it is the document-of-record for).
+2. WALK THE GAP LIST — take each gap in turn. FIRST apply the OWNERSHIP test below: does this gap's topic belong to THIS SOP? If NO, skip it. If YES, find the owning SOP clause and decide whether the SOP is STALE, SILENT, INCONSISTENT, or in CONFLICT with the gap. "paragraph" = that clause's real number + real heading. NEVER a topic label, NEVER an invented clause.
+3. ANCHOR — for each impact you keep, pick the single most distinctive short sentence to use as find_text (verbatim), or a [bracket marker] if no clean anchor sentence exists.
 Then output ONLY the JSON array — NEVER include the <thinking> block or any prose.
 
+# ❗ OWNERSHIP — only amend this SOP for the gaps it actually owns:
+This SOP is ONE document in a library of many; each gap belongs to whichever document governs that subject. Before emitting ANY impact, ask: "Is this SOP a natural home for this gap's topic?"
+- YES — the SOP already has a section on this subject (even if out of date), OR the topic squarely falls under this SOP's stated scope / title. → produce an impact.
+- NO — the gap belongs to a DIFFERENT document (a board-governance gap belongs in the governance policy; a cryptography gap in the security policy; an incident-handling gap in the incident SOP; a third-party gap in the vendor policy). → emit NOTHING for it. Another document owns it.
+A gap this SOP OWNS but is SILENT on → "insertion" / "new_section". A gap this SOP does NOT own → skip entirely. Do NOT force an unrelated requirement into this SOP just to have an answer for every gap.
+REALITY CHECK: a typical SOP is touched by only a HANDFUL of the gaps — the ones in its subject area. If you are emitting an impact for nearly every gap in the list, you are forcing unrelated content in — stop and re-apply the ownership test. A focused set of well-owned impacts is the goal; a long scattershot list is a failure.
+
 # MAPPING INSTRUCTIONS:
-- For each affected location, identify the EXACT current text and propose precise replacement text.
-- There is NO limit on impacts. If 5 different clauses are affected, return 5 entries — one per location.
-- Prefer "find_replace" when there is exact text to anchor on; "insertion" for new clauses; "contextual" when the SOP owns the topic but has no precise anchor sentence.
+- Consider every gap, but emit impacts ONLY for the gaps this SOP owns. A gap the SOP already fully satisfies needs NO impact — do not invent busy-work edits.
+- There is no fixed cap, but a focused set of well-owned impacts beats a long scattershot list. One owned gap may affect several SOP clauses — one entry per location.
+- Prefer "find_replace" when there is exact text to anchor on; "insertion" / "new_section" when the SOP owns the topic but lacks the requirement; "contextual" when the SOP owns the topic but has no precise anchor sentence.
+- Every impact's "chapter" field MUST be the GAP reference it answers — copied verbatim from the gap list.
 
 # ❗ find_text is a LITERAL QUOTE — you COPY it, you do not WRITE it:
 find_text is fed to an automatic text-locator that runs an exact search against the real SOP. Treat it like a Ctrl+F string: if the exact characters are not in the document, the search returns nothing and the impact is THROWN AWAY.
@@ -849,30 +992,30 @@ MANDATORY PROCEDURE — do this for every find_text, no exceptions:
 
 A find_text is a HALLUCINATION — it will be silently DISCARDED and the entire impact LOST — if you:
 - paraphrase, summarise, "tidy up", or rebuild the sentence from memory instead of copying it;
-- swap any word for a synonym (SOP says "Guideline" → do NOT write "circular"; "this Guideline aims" → do NOT write "circular... aims");
+- swap any word for a synonym (SOP says "Guideline" → do NOT write "circular");
 - merge two lines, fix a typo, or add an ellipsis ("...");
-- include a date, year, or number that is not in that exact SOP sentence (e.g. writing "October 2025" when the SOP sentence has no such date).
+- include a date, year, or number that is not in that exact SOP sentence.
 
 # ✅ FALLBACK — when no exact anchor exists, this is the CORRECT answer, NOT a failure:
-If no contiguous prose sentence can be copied verbatim, set change_type "contextual" and put a plain-language description in square brackets as the find_text, e.g. "[end of FATF jurisdiction monitoring clause]". This is handled as a review comment on the right section — a perfectly good, fully-usable outcome. A bracket marker that ships always beats a fabricated sentence that gets discarded. NEVER invent a sentence just to avoid using a bracket marker — there is no penalty for the bracket marker and a total loss for the fabrication.
+If no contiguous prose sentence can be copied verbatim, set change_type "contextual" and put a plain-language description in square brackets as the find_text, e.g. "[end of the incident-escalation clause]". This is handled as a review comment on the right section — a perfectly good, fully-usable outcome. A bracket marker that ships always beats a fabricated sentence that gets discarded. NEVER invent a sentence just to avoid using a bracket marker — there is no penalty for the bracket marker and a total loss for the fabrication.
 
 # Rules for a real (non-bracket) find_text:
 - It must be running PROSE with a verb — NOT a heading, section title, table row/cell, "Version"/"Effective Date" line, list label, or anything starting with a bare section number (e.g. "C.1.2 Risk Profiling"). Those live in tables/headings the find/replace engine cannot target and the edit silently fails — use a bracket marker for those instead.
 - Avoid any candidate with a run of 3+ spaces or a tab — that is table/column layout, not a sentence.
 - Prefer a sentence containing a date, number, defined term, or proper noun, for distinctiveness.
 
-# 🚫 RULE — find_text comes ONLY from the SOP, NEVER from the REGULATION:
-The attached REGULATION's sentences are crisp and tempting — but copying ANY of them into find_text is the #1 cause of failure.
-- find_text must be text you located INSIDE the "INTERNAL SOP DOCUMENT" section at the BOTTOM of this prompt — nowhere else.
-- A country name (Burkina Faso, Myanmar, Mozambique…), a FATF list name ("Jurisdictions under Increased Monitoring"), or a plenary month/year ("October 2025", "February 2026") may ONLY appear in find_text if you found that exact wording in the SOP body itself. If you got it from the REGULATION, it is FORBIDDEN.
-- Most internal SOPs reference FATF/sanctions lists GENERICALLY ("FATF-listed jurisdictions", "high-risk countries") and do NOT name individual countries or plenary dates. So for a country-list or plenary-date obligation, the SOP usually has NO verbatim anchor — the EXPECTED, CORRECT output is change_type "contextual" with a "[bracket marker]". Do not force a find_replace.
+# 🚫 RULE — find_text comes ONLY from the SOP, NEVER from the GAP LIST:
+The gap list's sentences are crisp and tempting — but copying ANY of them into find_text is the #1 cause of failure.
+- find_text must be text you located INSIDE the "INTERNAL SOP DOCUMENT" section — nowhere else.
+- A specific value from a gap (a named entity, a threshold, a date, a list item) may ONLY appear in find_text if you found that exact wording in the SOP body itself. If you took it from the gap list, it is FORBIDDEN.
+- When a gap concerns something the SOP only references generically — or does not mention at all — the SOP usually has NO verbatim anchor. The EXPECTED, CORRECT output is then change_type "contextual" (or "insertion") with a "[bracket marker]". Do not force a find_replace.
 
 # ✅ FINAL SELF-CHECK — before you output, re-read every impact:
-- find_text — ask: "Could I find this exact string by searching the INTERNAL SOP DOCUMENT text — not the regulation?" If it contains a country name, a plenary date, or a phrase you took from a Change block, DELETE it and use change_type "contextual" + a "[bracket marker]" naming the SOP section. Keep the replace_text — a comment is a success; a fabricated find_replace is discarded entirely.
-- paragraph — ask: "Is this clause number / heading actually printed in the SOP text?" If it is an Act/regulator reference ("of AMLA", "RMiT", "FATF Recommendation") or a clause number not in the SOP, fix it: use the SOP's own real heading, or just "General".
+- find_text — ask: "Could I find this exact string by searching the INTERNAL SOP DOCUMENT text — not the gap list?" If it contains a phrase you took from a gap, DELETE it and use change_type "contextual" + a "[bracket marker]" naming the SOP section. Keep the replace_text — a comment is a success; a fabricated find_replace is discarded entirely.
+- paragraph — ask: "Is this clause number / heading actually printed in the SOP text?" If it is a regulator/Act reference ("of AMLA", "RMiT", "FATF Recommendation") or a clause number not in the SOP, fix it: use the SOP's own real heading, or just "General".
 
 # RULE — "paragraph" is COPIED from the SOP, never invented:
-"paragraph" MUST be the SOP's own clause/section number or heading, exactly as printed in the SOP body (e.g. "C.14.1.3 · High-risk country customer types") — confirm it is physically in the SOP text before writing it. NEVER put a regulation/Act reference here ("Section 19(2)(b) of AMLA", "Paragraph 10.31 of RMiT") — those go in "chapter". NEVER invent a clause number. If you cannot find a real SOP clause/heading, write just "General". Every paragraph is verified against the SOP — a fabricated one is stripped automatically.
+"paragraph" MUST be the SOP's own clause/section number or heading, exactly as printed in the SOP body (e.g. "8.2 · Incident Management and Escalation") — confirm it is physically in the SOP text before writing it. NEVER put a regulation/Act reference here ("Section 19(2)(b) of AMLA", "Paragraph 10.31 of RMiT") — those go in "chapter". NEVER invent a clause number. If you cannot find a real SOP clause/heading, write just "General". Every paragraph is verified against the SOP — a fabricated one is stripped automatically.
 
 # RULE F — Replacement-text quality bar:
 Every replace_text / insertion must be implementation-ready:
@@ -882,7 +1025,7 @@ Every replace_text / insertion must be implementation-ready:
 - Cross-reference the authoritative sibling section when one exists.
 - PRESERVE the SOP's existing numbering and table layout.
 - KEEP the original obligation text intact and ADD the new note — never delete unless the regulation revokes it.
-- DATES: use ONLY dates that literally appear in a regulatory change above or in the SOP. NEVER invent or guess a year.
+- DATES: use ONLY dates that literally appear in a gap above or in the SOP. NEVER invent or guess a year.
 
 # RULE G — Document version bump:
 Emit the version bump AT MOST ONCE for the whole document, ONLY if the SOP header/cover shows an effective date EARLIER than these changes. Anchor it ONLY on the verbatim "Version" + "Effective Date" lines of the cover page — NEVER on the document title or filename string. If those header lines do not appear in this text, do NOT emit a version bump at all. When you do: paragraph "Document Header / Cover Page", change_type "find_replace", replace_text = bumped version + original effective date kept + an "Amended:" line + a "Reason:" line.
@@ -894,9 +1037,9 @@ Emit the version bump AT MOST ONCE for the whole document, ONLY if the SOP heade
   "sop_title": "${sop.title}",
   "paragraph": "<a REAL SOP clause — its clause number + its ACTUAL heading exactly as printed in the SOP, taken from your step-1 INDEX. NEVER an invented clause, NEVER a topic label as the heading. 'General' ONLY as a genuine last resort.>",
   "action_description": "<one-line imperative headline of what changes>",
-  "justification": "<ONE sentence: WHY this amendment belongs at this clause — the clause's subject and how the change connects to it. If paragraph is 'General', state plainly why no specific clause fits.>",
+  "justification": "<ONE sentence: WHY this amendment belongs at this clause — the clause's subject and how the gap connects to it. If paragraph is 'General', state plainly why no specific clause fits.>",
   "change_type": "find_replace" | "insertion" | "contextual" | "new_section",
-  "chapter": "<the Chapter Reference of whichever regulatory change this addresses>",
+  "chapter": "<the GAP reference (its 'GAP N — <chapter_ref>' chapter_ref) this impact answers — copied verbatim from the gap list>",
   "find_text": "<short verbatim anchor sentence from the SOP, or a [bracket marker]>",
   "replace_text": "<the full amended/inserted text, meeting Rule F>",
   "page": <page number or 0>,
@@ -908,30 +1051,28 @@ Emit the version bump AT MOST ONCE for the whole document, ONLY if the SOP heade
 
 # CONFIDENCE — score every impact honestly:
 - 90-100: the find_text is an exact, unambiguous verbatim quote from the SOP AND the change is mechanical (a clear date/number/term swap or a clearly-scoped note). Safe to fast-track.
-- 70-89: the anchor is solid but the replacement wording needs human judgement, OR the regulatory mapping is sound but not certain.
+- 70-89: the anchor is solid but the replacement wording needs human judgement, OR the gap mapping is sound but not certain.
 - below 70: the anchor is uncertain, the SOP ownership is debatable, or the change needs interpretation. Flag for review.
 Never inflate. A wrong "95" that gets fast-tracked is a compliance failure.
 
-Return ONLY the JSON array. If this SOP is already fully compliant with the regulation, return [].
+Return ONLY the JSON array. If this SOP already satisfies every gap, return [].
+
+# REGULATORY GAPS (the ruleset — check the SOP against each gap):
+${renderGapList(gaps)}
 `;
   const sopBlock = `\n# INTERNAL SOP DOCUMENT (full text) — "${sop.title}":\n${sop.text}`;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const parts: any[] = [{ text: promptHead }];
-  parts.push(...policyToParts("REGULATION", regulation));
-  parts.push({ text: sopBlock });
+  const parts: any[] = [{ text: promptHead }, { text: sopBlock }];
 
   const response = await generateWithFallback({
     contents: [{ role: "user", parts }],
-    config: { responseMimeType: "application/json", maxOutputTokens: 32768 },
+    config: { responseMimeType: "application/json", maxOutputTokens: 65536 },
   });
-  const text = response.text ?? "";
-  try {
-    const parsed = JSON.parse(text);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (e) {
-    console.error(`Failed to parse SOP analysis for "${sop.title}":`, text.slice(0, 300));
-    return [];
+  const out = parseJsonArrayLoose(response.text);
+  if (out.length === 0 && (response.text ?? "").trim()) {
+    console.error(`analyzeSopAgainstGaps: no impacts parsed for "${sop.title}":`, (response.text ?? "").slice(0, 300));
   }
+  return out;
 }
 
 /**

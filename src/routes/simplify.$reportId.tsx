@@ -307,9 +307,10 @@ function SimplifyReportPage() {
           </Button>
         </div>
 
-        {/* provenance strip */}
+        {/* provenance strip — cost is intentionally NOT a top-level tile; the
+            run cost lives behind the ⓘ on Analysed to keep the surface clean. */}
         <Card className="p-0 overflow-hidden glass-card">
-          <div className="grid grid-cols-2 sm:grid-cols-5 divide-x divide-y sm:divide-y-0 divide-border/60">
+          <div className="grid grid-cols-2 sm:grid-cols-4 divide-x divide-y sm:divide-y-0 divide-border/60">
             <Provenance
               icon={<Hash className="size-4" />}
               label="Words"
@@ -326,15 +327,10 @@ function SimplifyReportPage() {
               value={structure ? num(structure.tableCount) : "—"}
             />
             <Provenance
-              icon={<Coins className="size-4" />}
-              label="Est. cost"
-              value={sj.cost ? formatUsd(sj.cost.usd) : "—"}
-              info={sj.cost ? <CostBreakdown cost={sj.cost} /> : undefined}
-            />
-            <Provenance
               icon={<Sparkles className="size-4" />}
               label="Analysed"
               value={sj.last_run_at ? formatDate(sj.last_run_at) : "—"}
+              info={sj.cost ? <CostBreakdown cost={sj.cost} /> : undefined}
             />
           </div>
         </Card>

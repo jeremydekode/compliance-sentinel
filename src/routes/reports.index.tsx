@@ -25,7 +25,6 @@ import {
 import { FormUpdateDialog } from "@/components/form-update-dialog";
 import { SimplifyUploadDialog } from "@/components/simplify-upload-dialog";
 import { formatDate, statusMeta } from "@/lib/format";
-import { formatUsd } from "@/lib/pricing";
 import {
   deleteReport,
   createRegulatoryReport,
@@ -154,7 +153,6 @@ function SimplifyReportsList() {
                         ) : v ? (
                           <span>
                             {v.verified} verified · {v.review} review · {v.rejected} quarantined
-                            {sj.cost ? ` · ${formatUsd(sj.cost.usd)}` : ""}
                           </span>
                         ) : (
                           <span>Ready</span>

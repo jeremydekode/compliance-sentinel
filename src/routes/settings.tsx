@@ -6,7 +6,7 @@ import { AppShell } from "@/components/app-shell";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { supabase } from "@/integrations/supabase/client";
-import { AlertTriangle, Trash2, CheckCircle2, Loader2, Plug, Unplug } from "lucide-react";
+import { AlertTriangle, Trash2, CheckCircle2, Loader2, Plug, Unplug, Eye, EyeOff, Briefcase } from "lucide-react";
 import {
   clearWorkspace,
   getGoogleAuthUrl,
@@ -18,11 +18,14 @@ import {
   reindexSop,
   getAnalysisGuidance,
   saveAnalysisGuidance,
+  getWorkspaceVisibility,
+  setWorkspaceVisibility,
 } from "@/lib/compliance.functions";
 import { Input } from "@/components/ui/input";
 import { FolderOpen, RefreshCw } from "lucide-react";
-import { useWorkspace, WORKSPACES } from "@/lib/workspace";
+import { useWorkspace, WORKSPACES, type WorkspaceId } from "@/lib/workspace";
 import { DEFAULT_SIMPLIFY_GUIDANCE } from "@/lib/simplify";
+import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 
 export const Route = createFileRoute("/settings")({
@@ -42,6 +45,9 @@ function SettingsPage() {
   const reindex = useServerFn(reindexSop);
   const getGuidance = useServerFn(getAnalysisGuidance);
   const saveGuidance = useServerFn(saveAnalysisGuidance);
+  const getVis = useServerFn(getWorkspaceVisibility);
+  const setVis = useServerFn(setWorkspaceVisibility);
+  const [visBusy, setVisBusy] = useState<WorkspaceId | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [guidanceText, setGuidanceText] = useState("");
   const [guidanceSaving, setGuidanceSaving] = useState(false);
@@ -57,6 +63,32 @@ function SettingsPage() {
     queryKey: ["google_connection", workspace],
     queryFn: async () => await getStatus({ data: { workspace } }),
   });
+
+  // Master visibility — which workspaces appear in the AppShell switcher.
+  // Missing rows default to visible, so an empty table behaves like "all on".
+  const visibilityQuery = useQuery({
+    queryKey: ["workspace_visibility"],
+    queryFn: () => getVis(),
+    staleTime: 60_000,
+  });
+  const visibility = visibilityQuery.data?.visibility ?? {};
+
+  async function toggleVisibility(ws: WorkspaceId, next: boolean) {
+    setVisBusy(ws);
+    try {
+      await setVis({ data: { workspace: ws, visible: next } });
+      await qc.invalidateQueries({ queryKey: ["workspace_visibility"] });
+      toast.success(
+        next
+          ? `${WORKSPACES[ws].name} is now visible`
+          : `${WORKSPACES[ws].name} hidden from switcher`,
+      );
+    } catch (e: any) {
+      toast.error("Could not update visibility", { description: e?.message });
+    } finally {
+      setVisBusy(null);
+    }
+  }
 
   /** Persistent "what's currently indexed from Drive" tally — survives across reloads. */
   const driveIndex = useQuery({
@@ -251,6 +283,85 @@ function SettingsPage() {
             Other workspaces are unaffected.
           </p>
         </div>
+
+        <Card className="p-6">
+          <div className="flex items-start gap-3">
+            <div className="size-10 rounded-lg bg-primary/10 grid place-items-center shrink-0">
+              <Briefcase className="size-5 text-primary" />
+            </div>
+            <div className="min-w-0">
+              <h2 className="font-display text-lg font-semibold">Workspace Visibility</h2>
+              <p className="text-sm text-muted-foreground mt-1">
+                Master switch for which demos appear in the workspace switcher.
+                Hidden workspaces stay intact — toggle back on any time. The
+                current workspace can't be hidden from itself to avoid trapping you.
+              </p>
+            </div>
+          </div>
+          <div className="mt-5 grid gap-2 sm:grid-cols-2">
+            {(Object.keys(WORKSPACES) as WorkspaceId[]).map((id) => {
+              const meta = WORKSPACES[id];
+              const isVisible = visibility[id] !== false; // default true
+              const isCurrent = id === workspace;
+              const isBusy = visBusy === id;
+              return (
+                <div
+                  key={id}
+                  className={cn(
+                    "flex items-center justify-between gap-3 rounded-md border p-3 transition-colors",
+                    isVisible ? "bg-card" : "bg-muted/40 opacity-75",
+                  )}
+                >
+                  <div className="min-w-0 flex items-center gap-3">
+                    <div
+                      className={cn(
+                        "size-8 rounded-md grid place-items-center shrink-0 text-[11px] font-bold",
+                        meta.bgColor,
+                        meta.color,
+                      )}
+                    >
+                      {meta.short.slice(0, 2).toUpperCase()}
+                    </div>
+                    <div className="min-w-0">
+                      <div className="font-medium text-sm flex items-center gap-2">
+                        {meta.name}
+                        {isCurrent && (
+                          <span className="text-[9px] font-bold uppercase tracking-wider text-primary bg-primary/10 rounded px-1.5 py-0.5">
+                            Current
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-[11px] text-muted-foreground truncate">
+                        {meta.tagline}
+                      </div>
+                    </div>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant={isVisible ? "outline" : "default"}
+                    onClick={() => toggleVisibility(id, !isVisible)}
+                    disabled={isBusy || isCurrent || visibilityQuery.isLoading}
+                    className="gap-1.5 shrink-0"
+                    title={isCurrent ? "Switch to another workspace first" : undefined}
+                  >
+                    {isBusy ? (
+                      <Loader2 className="size-3.5 animate-spin" />
+                    ) : isVisible ? (
+                      <Eye className="size-3.5" />
+                    ) : (
+                      <EyeOff className="size-3.5" />
+                    )}
+                    {isVisible ? "Visible" : "Hidden"}
+                  </Button>
+                </div>
+              );
+            })}
+          </div>
+          <p className="mt-3 text-[11px] text-muted-foreground">
+            Tip: Hide non-bank demos before screen-sharing with the bank, then
+            toggle them back on for internal use.
+          </p>
+        </Card>
 
         <Card className="p-6">
           <h2 className="font-display text-lg font-semibold">Workspace</h2>

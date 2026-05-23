@@ -5,6 +5,9 @@ import { useRole, ROLE_META, type UserRole } from "@/lib/role";
 import { useWorkspace, WORKSPACES, type WorkspaceId } from "@/lib/workspace";
 import { useState, useRef, useEffect } from "react";
 import { Briefcase } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
+import { useServerFn } from "@tanstack/react-start";
+import { getWorkspaceVisibility } from "@/lib/compliance.functions";
 
 const NAV = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard },
@@ -234,7 +237,19 @@ function WorkspaceSwitcher() {
   }, []);
 
   const meta = WORKSPACES[ws];
-  const options = Object.keys(WORKSPACES) as WorkspaceId[];
+  // The super-admin can hide workspaces (master visibility toggle). The
+  // switcher filters them out; the CURRENT workspace stays visible even if
+  // hidden, so the user isn't trapped if they just hid the one they're on.
+  const getVis = useServerFn(getWorkspaceVisibility);
+  const visibilityQuery = useQuery({
+    queryKey: ["workspace_visibility"],
+    queryFn: () => getVis(),
+    staleTime: 60_000,
+  });
+  const visibility = visibilityQuery.data?.visibility ?? {};
+  const options = (Object.keys(WORKSPACES) as WorkspaceId[]).filter(
+    (id) => visibility[id] !== false || id === ws,
+  );
 
   return (
     <div ref={ref} className="relative">

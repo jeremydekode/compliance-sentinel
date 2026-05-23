@@ -3930,3 +3930,54 @@ export const applySimplificationReport = createServerFn({ method: "POST" })
       .eq("id", report.id);
     return apply;
   });
+
+// ── Workspace visibility (master toggle) ─────────────────────────────────────
+// A super-admin can flip workspaces on/off here without touching deploy. The
+// workspace switcher reads this and hides any workspace marked invisible. If
+// the `workspace_settings` table has no row for a workspace, it is treated as
+// VISIBLE — so the feature degrades safely when the migration hasn't been run.
+
+/** Returns the per-workspace visibility map. Missing rows default to true. */
+export const getWorkspaceVisibility = createServerFn({ method: "GET" }).handler(
+  async () => {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data, error } = await (supabase as any)
+        .from("workspace_settings")
+        .select("workspace_id, visible");
+      if (error) {
+        // Most likely the table hasn't been created yet — treat all as visible.
+        return { visibility: {} as Record<string, boolean> };
+      }
+      const visibility: Record<string, boolean> = {};
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      for (const row of (data ?? []) as any[]) {
+        visibility[row.workspace_id as string] = !!row.visible;
+      }
+      return { visibility };
+    } catch {
+      return { visibility: {} as Record<string, boolean> };
+    }
+  },
+);
+
+/** Sets a workspace's visibility (super-admin action). */
+export const setWorkspaceVisibility = createServerFn({ method: "POST" })
+  .inputValidator(
+    z.object({
+      workspace: workspaceSchema,
+      visible: z.boolean(),
+    }),
+  )
+  .handler(async ({ data }) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { error } = await (supabase as any)
+      .from("workspace_settings")
+      .upsert({
+        workspace_id: data.workspace,
+        visible: data.visible,
+        updated_at: new Date().toISOString(),
+      });
+    if (error) throw new Error(`Failed to save workspace visibility: ${error.message}`);
+    return { ok: true };
+  });

@@ -422,7 +422,7 @@ export function applySimplificationToDocx(
   if (!docFile) throw new Error("Invalid DOCX: word/document.xml not found");
   let documentXml = docFile.asText();
 
-  const author = (opts.author ?? "Compliance Sentinel").slice(0, 60);
+  const author = (opts.author ?? "AI Document Workflow").slice(0, 60);
   const dateIso = new Date().toISOString();
   const commentEntries: string[] = [];
   const paraIds: string[] = []; // one per comment — links commentsExtended.xml back

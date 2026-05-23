@@ -384,26 +384,80 @@ export function reviewGroup(action: VerifiedAction): ReviewGroup {
  * six action types, the JSON contract, the verbatim-anchor rule) stays in code;
  * this only refines emphasis, terminology and tone, and can be freely edited.
  */
-export const DEFAULT_SIMPLIFY_GUIDANCE = `DOCUMENT SIMPLIFICATION — HOUSE RULES
-Edit this to match RHB conventions. It is applied on top of the built-in rules.
+export const DEFAULT_SIMPLIFY_GUIDANCE = `DOCUMENT SIMPLIFICATION — RHB HOUSE RULES (applied on top of the built-in rules)
 
-EMPHASIS
-- Don't stop at sentence-level rewording. Actively merge overlapping points and turn dense prose into bullet lists — those changes add the most clarity.
-- Target short sentences (aim for 25 words or fewer) and active voice: "the Document Owner reviews the manual", not "the manual is to be reviewed by the Document Owner".
-- Prefer plain verbs over nominalisations: "decide" not "make a decision"; "review" not "carry out a review of".
+# THOROUGHNESS — work the WHOLE section, top to bottom
+- Go section by section. Do NOT skip a section because its heading sounds administrative ("Applicability", "Objectives", "Overview", "Declaration", "Purpose", "Scope"). In bank documents those sections are usually the most verbose and the highest-value to simplify.
+- For each section, actively scan for 3-6 simplification candidates before moving on. If after honest review a section is genuinely clean, return zero edits for it — but only after you've checked.
+- Don't pre-filter for "important parts". Simplification value is highest in dense, bureaucratic prose, which usually lives in the boilerplate at the top and bottom of the document.
 
-TERMINOLOGY — keep it consistent
-- When you rephrase a sentence, also bring its wording in line with the house glossary. Use one term throughout, for example:
-  - "Document Owner" — not "doc owner" or "owner of the document".
-  - "Operations & Methods (O&M)" on first use, then "O&M".
-  - Keep the order "Framework, Policy, Guideline, Manual and Circular" wherever that list appears.
-- Use British English spelling (organise, prioritise, programme, authorise).
-(Extend this glossary with your real RHB house terms.)
+# COMMON VERBOSITY PATTERNS — actively hunt for every one of these
+1. Nominalisations → plain verbs.
+   - "make a decision" → "decide"
+   - "carry out a review of" → "review"
+   - "provide assistance to" → "help"
+   - "have an obligation to" → "must"
+2. Passive voice with weak subjects → active voice.
+   - "approval is to be obtained from X" → "obtain approval from X"
+   - "the manual is to be reviewed by the Document Owner" → "the Document Owner reviews the manual"
+3. Filler phrases → drop or shorten.
+   - "in order to" → "to"
+   - "for the purpose of" → "to"
+   - "with respect to" / "in relation to" → "for" / "about"
+   - "in the event that" → "if"
+   - "is in the process of" → "is"
+4. Doublets → pick the more specific one.
+   - "rules and regulations" → "rules" (or "regulations" if that's what's meant)
+   - "terms and conditions" → "terms"
+   - "policies and procedures" → whichever applies
+5. Modal stacks → tighten.
+   - "shall be required to" → "must"
+   - "may be considered to be" → "may be"
+   - "shall be deemed to constitute" → "constitutes"
+6. Redundant qualifiers → drop.
+   - "absolutely necessary" → "necessary"; "completely eliminate" → "eliminate"
+   - "advance planning" → "planning"; "end result" → "result"; "final outcome" → "outcome"
+7. Long lists in prose → to_bullets.
+   - Anything with 3+ commas describing parallel items is a candidate for bullet conversion.
+8. Long cross-reference clauses → terse parenthetical.
+   - "as outlined in Section 4 of this manual which sets out the procedures for X" → "(see Section 4)"
+9. Sentences over 25 words → almost always shorten or split.
+10. Definite-article inconsistency around defined terms.
+    - Pick one form per document: either "the Document Owner" or "Document Owner". Standardise.
 
-LEAVE UNTOUCHED
-- Defined terms, role titles, committee names and system names — never reword these.
-- Numbers, thresholds, dates, percentages, monetary amounts and authority limits.
-- Any wording whose change would alter the scope of an obligation.
+# STYLE — direction of every rewrite
+- Active voice (named subject does the action).
+- Short sentences (≤ 25 words). Split if there are 3+ clauses joined by "and".
+- One idea per sentence.
+- British English spelling (organise, prioritise, programme, authorise, behaviour, centre).
+- Plain verbs over Latinate nominalisations.
 
-TONE
-- Professional and instructional, suitable for a bank operations manual. No marketing language.`;
+# TERMINOLOGY — bring wording into line as you rephrase
+Pick one canonical form per term and use it everywhere. Examples — extend with real RHB house glossary:
+- "Document Owner" (never "doc owner", "owner of the document", "the owner")
+- "Operations & Methods (O&M)" on first use; "O&M" thereafter
+- Keep list order "Framework, Policy, Guideline, Manual and Circular" exactly when that list appears
+- "Approving Authority" — treat as a defined term (capitalised, singular)
+- "RHB Banking Group" — never just "the Group" outside clearly local context
+- Preserve slash notation "Business/Functional Units" — do NOT normalise to "Business and Functional Units"
+- Committee names verbatim: Board Risk Committee (BRC), Group Management Committee (GMC), etc.
+
+# CONFIDENCE CALIBRATION — be honest, this drives auto-accept
+- 100 — wording-only rewrite with no scope/number/term changes. Most plain_english + shorten edits.
+- 95-99 — sentence restructured but every clause's meaning is preserved. Common for to_bullets, merge.
+- 90-94 — one ambiguity in source you've resolved a particular way. Note the ambiguity in rationale.
+- 80-89 — moderate rewrite where source could plausibly read another way. Honest "reviewer please check" signal.
+- < 80 — DO NOT emit. Skip the action instead.
+
+# LEAVE UNTOUCHED — non-negotiable
+- Defined terms, role titles, committee names (BRC, GMC, MANCO, etc.), system names, product names.
+- Numbers, thresholds, dates, percentages, monetary amounts, authority limits.
+- Any wording whose change would alter the SCOPE of an obligation (e.g. "all staff" vs "all relevant staff" — leave as-is).
+- Cross-reference numbering (Section 4.2.1, Appendix B) — don't renumber.
+- Quoted regulatory citations — never paraphrase.
+
+# TONE
+- Professional and instructional, suitable for an internal bank operations manual.
+- No marketing language ("seamless", "world-class", "best-in-class", "robust", "leverage").
+- No conversational filler ("you'll find that", "as you can see", "of course", "simply", "just").
+- Third-person institutional voice (the Document Owner, staff, the Bank), not "you" or "we" — except where the source already uses them.`;

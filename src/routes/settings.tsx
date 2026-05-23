@@ -6,7 +6,7 @@ import { AppShell } from "@/components/app-shell";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { supabase } from "@/integrations/supabase/client";
-import { AlertTriangle, Trash2, CheckCircle2, Loader2, Plug, Unplug, Eye, EyeOff, Briefcase } from "lucide-react";
+import { AlertTriangle, Trash2, CheckCircle2, Loader2, Plug, Unplug, Eye, EyeOff, Briefcase, RotateCcw } from "lucide-react";
 import {
   clearWorkspace,
   getGoogleAuthUrl,
@@ -25,12 +25,13 @@ import { Input } from "@/components/ui/input";
 import { FolderOpen, RefreshCw } from "lucide-react";
 import { useWorkspace, WORKSPACES, type WorkspaceId } from "@/lib/workspace";
 import { DEFAULT_SIMPLIFY_GUIDANCE } from "@/lib/simplify";
+import { DEFAULT_FRAME_EXTRACTION_PROMPT } from "@/lib/layout/prompt";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 
 export const Route = createFileRoute("/settings")({
   component: SettingsPage,
-  head: () => ({ meta: [{ title: "Settings · Compliance Sentinel" }] }),
+  head: () => ({ meta: [{ title: "Settings · AI Document Workflow" }] }),
 });
 
 function SettingsPage() {
@@ -121,10 +122,27 @@ function SettingsPage() {
   useEffect(() => {
     if (!guidanceQuery.data) return;
     const saved = (guidanceQuery.data.guidance ?? "").trim();
-    // The Document Simplification workspace shows the built-in starter rules
-    // pre-filled when nothing has been saved yet; other workspaces stay blank.
-    setGuidanceText(saved || (workspace === "simplify" ? DEFAULT_SIMPLIFY_GUIDANCE : ""));
+    // Some workspaces pre-fill with their starter system prompt so users can
+    // see the full instructions and amend them without code changes:
+    //   - simplify: editable DEFAULT_SIMPLIFY_GUIDANCE
+    //   - layout:   editable DEFAULT_FRAME_EXTRACTION_PROMPT (full replacement)
+    // Other workspaces (rmit/fatf/forms) treat guidance as a supplemental
+    // prefix and stay blank by default.
+    setGuidanceText(
+      saved ||
+        (workspace === "simplify"
+          ? DEFAULT_SIMPLIFY_GUIDANCE
+          : workspace === "layout"
+            ? DEFAULT_FRAME_EXTRACTION_PROMPT
+            : ""),
+    );
   }, [guidanceQuery.data, workspace]);
+
+  function resetGuidanceToDefault() {
+    if (workspace === "simplify") setGuidanceText(DEFAULT_SIMPLIFY_GUIDANCE);
+    else if (workspace === "layout") setGuidanceText(DEFAULT_FRAME_EXTRACTION_PROMPT);
+    else setGuidanceText("");
+  }
 
   async function saveGuidanceNow() {
     setGuidanceSaving(true);
@@ -382,11 +400,25 @@ function SettingsPage() {
         </Card>
 
         <Card className="p-6">
-          <h2 className="font-display text-lg font-semibold">Analysis Guidance</h2>
+          <h2 className="font-display text-lg font-semibold">
+            {workspace === "layout" ? "System Prompt" : "Analysis Guidance"}
+          </h2>
           <p className="text-sm text-muted-foreground mt-1">
-            Extra instruction added to the AI&apos;s regulatory analysis for the{" "}
-            <span className="font-semibold text-foreground">{wsName}</span> workspace. It refines focus and
-            emphasis — the output format and verification rules stay fixed.
+            {workspace === "layout" ? (
+              <>
+                The complete AI system prompt for the{" "}
+                <span className="font-semibold text-foreground">{wsName}</span> workspace.
+                Whatever you save here REPLACES the built-in default on the next digitization run.
+                Use <span className="font-semibold">Reset to default</span> to restore the
+                shipped prompt if your edits break extraction.
+              </>
+            ) : (
+              <>
+                Extra instruction added to the AI&apos;s regulatory analysis for the{" "}
+                <span className="font-semibold text-foreground">{wsName}</span> workspace.
+                It refines focus and emphasis — the output format and verification rules stay fixed.
+              </>
+            )}
           </p>
           <textarea
             className="mt-4 w-full min-h-[220px] text-xs font-mono p-3 rounded-lg border bg-muted/30 leading-relaxed resize-y focus:outline-none focus:ring-1 focus:ring-primary"
@@ -394,13 +426,29 @@ function SettingsPage() {
             value={guidanceText}
             onChange={(e) => setGuidanceText(e.target.value)}
             disabled={guidanceQuery.isLoading}
+            style={workspace === "layout" ? { minHeight: 480 } : undefined}
           />
-          <div className="mt-3 flex items-center gap-3">
+          <div className="mt-3 flex items-center gap-3 flex-wrap">
             <Button onClick={saveGuidanceNow} disabled={guidanceSaving || guidanceQuery.isLoading}>
               {guidanceSaving ? <Loader2 className="size-4 animate-spin" /> : <CheckCircle2 className="size-4" />}
-              Save guidance
+              {workspace === "layout" ? "Save system prompt" : "Save guidance"}
             </Button>
-            <span className="text-xs text-muted-foreground">Applies to the next analysis run.</span>
+            {(workspace === "layout" || workspace === "simplify") && (
+              <Button
+                variant="outline"
+                onClick={resetGuidanceToDefault}
+                disabled={guidanceSaving || guidanceQuery.isLoading}
+                className="gap-1.5"
+              >
+                <RotateCcw className="size-3.5" />
+                Reset to default
+              </Button>
+            )}
+            <span className="text-xs text-muted-foreground">
+              {workspace === "layout"
+                ? "Applies to the next Re-digitize run. Keep the JSON output schema intact."
+                : "Applies to the next analysis run."}
+            </span>
           </div>
         </Card>
 

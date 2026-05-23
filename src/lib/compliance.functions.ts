@@ -93,7 +93,7 @@ export const createReport = createServerFn({ method: "POST" })
     z.object({
       filename: z.string(),
       fileUrl: z.string().nullable(),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout"]).default("rmit"),
       customTitle: z.string().optional(),
       notes: z.string().optional(),
       detected: z
@@ -421,7 +421,7 @@ export const createRegulatoryReport = createServerFn({ method: "POST" })
     z.object({
       filename: z.string(),
       fileUrl: z.string().nullable(),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout"]).default("rmit"),
       customTitle: z.string().optional(),
       notes: z.string().optional(),
       detected: z
@@ -1479,7 +1479,7 @@ export const createSop = createServerFn({ method: "POST" })
       title: z.string().min(2).max(200),
       doc_type: z.enum(["sop", "rmit", "rmit_reg", "fatf", "circular", "it_policy", "policy", "form"]),
       version: z.string().min(1).max(20),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout"]).default("rmit"),
       summary: z.string().max(2000).optional(),
       tags: z.array(z.string().max(40)).max(20).optional(),
       file_url: z.string().nullable().optional(),
@@ -1584,7 +1584,7 @@ export const clearWorkspace = createServerFn({ method: "POST" })
   .inputValidator(
     z.object({
       scope: z.enum(["analyses", "kb", "all"]),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout"]).default("rmit"),
     })
   )
   .handler(async ({ data }) => {
@@ -1962,7 +1962,7 @@ function escapeHtml(s: string): string {
  * Used to show indexing health in the KB list ("X chunks" or "Not indexed").
  */
 export const getChunkCounts = createServerFn({ method: "GET" })
-  .inputValidator(z.object({ workspace: z.enum(["rmit", "fatf", "forms", "simplify"]).default("rmit") }))
+  .inputValidator(z.object({ workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout"]).default("rmit") }))
   .handler(async ({ data }) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: sops } = await (supabase as any)
@@ -2069,16 +2069,40 @@ export const extractFormMetadata = createServerFn({ method: "POST" })
     fileName: z.string().optional(),
   }))
   .handler(async ({ data }) => {
-    const prompt = `You are extracting specific header fields from a bank form document.
-Look in the top-right corner header area and the main title area of the document.
+    const prompt = `You are extracting header fields from an RHB Banking Group internal form.
 
-Extract these three fields exactly as they appear:
-1. form_name — the main form title in UPPERCASE (e.g. "ACCOUNT OPENING APPLICATION FORM – COMMERCIAL / CORPORATE")
-2. form_number — full reference number with version suffix (e.g. "FGROP 037/2016_v10")
-3. updated_date — the updated/effective date string verbatim (e.g. "Updated on 27.02.2025")
+LOOK IN TWO ZONES on page 1:
+  • TOP-RIGHT CORNER — small text, usually contains the form reference and updated date.
+  • CENTRE TOP — the main title block.
 
-Return ONLY valid JSON: {"form_name": "...", "form_number": "...", "updated_date": "..."}
-Use null for any field you cannot find.`;
+Extract these THREE fields EXACTLY as they appear (verbatim — preserve capitalisation, punctuation,
+slashes, en-dashes "–" and em-dashes "—"):
+
+1. form_number  (reference + version)
+   • Pattern:  "{LETTERS} {DIGITS}/{YEAR}_v{N}"  or  "{LETTERS} {DIGITS}/{YEAR} v{N}"
+   • Example:  "FGROP 037/2016_v10"
+   • Where:    top-right header.
+   • Keep the version suffix attached. Do NOT split it off.
+
+2. updated_date  (date string with its prefix word)
+   • Pattern:  "Updated on DD.MM.YYYY"  or  "(Updated on DD.MM.YYYY)"  or  "Effective DD/MM/YYYY"
+   • Example:  "Updated on 27.02.2025"
+   • Where:    directly below or beside the form_number. Include parentheses if printed.
+
+3. form_name  (English title — UPPERCASE)
+   • Pattern:  ALL UPPERCASE, usually contains "FORM" or "APPLICATION".
+   • Example:  "ACCOUNT OPENING APPLICATION FORM – COMMERCIAL / CORPORATE"
+   • Where:    centred title block. ENGLISH LINE ONLY — if the form has a Malay translation line below
+              (e.g. "BORANG PERMOHONAN MEMBUKA AKAUN..."), ignore it. Downstream SOPs only reference
+              the English title, so the Malay line doesn't need to be captured.
+
+GROUNDING RULES — non-negotiable:
+- Every field must appear LITERALLY in the document. Copy character-for-character.
+- Do NOT generate, paraphrase, translate, or "correct" typos.
+- If a field truly cannot be located, return null (not an empty string, not your best guess).
+
+Return ONLY this JSON, no markdown fences:
+{"form_number":"...","updated_date":"...","form_name":"..."}`;
 
     try {
       const fetched = await fetchFile(data.fileUrl);
@@ -2100,12 +2124,14 @@ Use null for any field you cannot find.`;
       }
 
       // Header-field extraction is a simple parse — fast tier is plenty.
+      // Output cap bumped to 1024 because the 4-field response (incl. Malay)
+      // can be ~250-400 tokens of UTF-8 verbatim text.
       const resp = await generateWithFallback({
         contents: [{
           role: "user",
           parts: [contentPart, { text: prompt }],
         }],
-        config: { responseMimeType: "application/json", maxOutputTokens: 512 },
+        config: { responseMimeType: "application/json", maxOutputTokens: 1024 },
       }, { tier: "fast" });
       const parsed = JSON.parse(resp.text ?? "{}");
       return {
@@ -2204,7 +2230,7 @@ function applyPageOverrides(formId: string, impacts: any[]): any[] {
 // downstream documents in the KB that reference the form.
 export const createFormUpdateReport = createServerFn({ method: "POST" })
   .inputValidator(z.object({
-    workspace: z.enum(["rmit", "fatf", "forms", "simplify"]).default("forms"),
+    workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout"]).default("forms"),
     formId: z.string().min(1),                  // e.g. "FGROP 037/2016"
     friendlyName: z.string().optional(),         // e.g. "Account Opening Application Form"
     customTitle: z.string().optional(),
@@ -2645,7 +2671,7 @@ Return ONLY the JSON array. No commentary.
 
 // ── Google Drive OAuth + connection management ────────────────────────────────
 
-const workspaceSchema = z.enum(["rmit", "fatf", "forms", "simplify"]);
+const workspaceSchema = z.enum(["rmit", "fatf", "forms", "simplify", "layout"]);
 
 // ── Analysis guidance — user-editable instruction injected into the prompts ───
 
@@ -3471,11 +3497,19 @@ export const detectFormChanges = createServerFn({ method: "POST" })
     const newFetched = await fetchFile(data.newFileUrl);
     const newMeta = await (async () => {
       const isDocx = looksLikeDocx(newFetched.mimeType, data.newFileUrl);
-      const prompt = `Extract these three fields from this bank form (look at the header / top of page 1):
-1. form_name - the main form title in uppercase
-2. form_number - full reference number with version suffix (e.g. "FGROP 037/2016_v11")
-3. updated_date - the updated/effective date string verbatim
-Return ONLY JSON: {"form_name":"...","form_number":"...","updated_date":"..."}. null for fields you can't find.`;
+      // Same grounded extraction prompt as extractFormMetadata — kept inline
+      // here so the diff path doesn't depend on the helper, and so we can
+      // tune them independently if the diff needs different anchors later.
+      const prompt = `Extract these THREE header fields from the RHB bank form on page 1.
+Copy EXACTLY (case, punctuation, dashes, parentheses). DO NOT paraphrase.
+
+1. form_number — reference + version, top-right header.   e.g. "FGROP 037/2016_v11"
+2. updated_date — date string WITH its prefix word.        e.g. "Updated on 27.05.2026"
+3. form_name — English title in UPPERCASE, centre top.     e.g. "ACCOUNT OPENING APPLICATION FORM – COMMERCIAL / CORPORATE"
+   English line ONLY — if a Malay translation line ("BORANG...") sits below it, ignore that line.
+
+Every field must appear LITERALLY in the document. Use null if you cannot locate it (no guessing).
+Return ONLY JSON: {"form_number":"...","updated_date":"...","form_name":"..."}.`;
       let part: any;
       if (isDocx) {
         const text = await docxToText(newFetched.buffer);
@@ -3485,7 +3519,7 @@ Return ONLY JSON: {"form_name":"...","form_number":"...","updated_date":"..."}. 
       }
       const r = await generateWithFallback({
         contents: [{ role: "user", parts: [part, { text: prompt }] }],
-        config: { responseMimeType: "application/json", maxOutputTokens: 512 },
+        config: { responseMimeType: "application/json", maxOutputTokens: 1024 },
       }, { tier: "fast" });
       try { return JSON.parse(r.text ?? "{}"); } catch { return {}; }
     })();
@@ -3544,7 +3578,11 @@ Return ONLY JSON: {"form_name":"...","form_number":"...","updated_date":"..."}. 
 Compare two versions of an internal bank form and list every substantive change.
 
 # WHAT TO LOOK FOR:
-- Header fields: form name/title, form reference number, version, updated/effective date
+- Header fields — treat each of these as a SEPARATE detected change if it differs:
+    • Form reference + version (e.g. "FGROP 037/2016_v10" vs "FGROP 037/2016_v11")
+    • Updated/effective date (e.g. "Updated on 27.02.2025" vs "Updated on 27.05.2026")
+    • English form title (UPPERCASE line, usually contains "FORM" or "APPLICATION")
+  Focus on the English title only — Malay translation lines ("BORANG…") are not referenced by downstream SOPs, so ignore them unless their absence/presence is itself the change.
 - Structural changes: new/removed/renamed section, new/removed/relabeled checkbox or field, signature block changes
 - Instruction / disclosure / note changes: modified clause text, new mandatory note, changed footer text
 
@@ -3902,7 +3940,7 @@ export const applySimplificationReport = createServerFn({ method: "POST" })
         "Local apply currently supports DOCX sources only. For PDFs, re-upload as DOCX.",
       );
     }
-    const result = applySimplificationToDocx(file.buffer, edits, { author: "Compliance Sentinel" });
+    const result = applySimplificationToDocx(file.buffer, edits, { author: "AI Document Workflow" });
 
     // Upload the amended .docx to storage and surface a download URL.
     const safeName = title.replace(/[^A-Za-z0-9_.-]+/g, "_").slice(0, 80) || "amended";

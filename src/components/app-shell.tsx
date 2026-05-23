@@ -1,5 +1,5 @@
 import { Link, useLocation } from "@tanstack/react-router";
-import { LayoutDashboard, FolderOpen, ShieldCheck, FileSearch, Settings, Zap, Scale, UserRound, ChevronDown, PanelLeftClose, PanelLeftOpen } from "lucide-react";
+import { LayoutDashboard, FolderOpen, ShieldCheck, FileSearch, Settings, Zap, Scale, UserRound, ChevronDown, PanelLeftClose, PanelLeftOpen, Layers } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useRole, ROLE_META, type UserRole } from "@/lib/role";
 import { useWorkspace, WORKSPACES, type WorkspaceId } from "@/lib/workspace";
@@ -9,10 +9,16 @@ import { useQuery } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
 import { getWorkspaceVisibility } from "@/lib/compliance.functions";
 
-const NAV = [
+const BASE_NAV = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard },
   { to: "/knowledge-base", label: "Knowledge Base", icon: FolderOpen },
   { to: "/reports", label: "Analyses", icon: FileSearch },
+  { to: "/settings", label: "Settings", icon: Settings },
+] as const;
+
+const LAYOUT_NAV = [
+  { to: "/", label: "Dashboard", icon: LayoutDashboard },
+  { to: "/layout", label: "Layouts", icon: Layers },
   { to: "/settings", label: "Settings", icon: Settings },
 ] as const;
 
@@ -20,6 +26,14 @@ const SIDEBAR_KEY = "sidebar_collapsed";
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const loc = useLocation();
+  const [ws] = useWorkspace();
+  // Workspace lives in localStorage, which doesn't exist on the server.
+  // Defer the nav switch to AFTER hydration so the server's BASE_NAV and
+  // the client's first render match — otherwise React throws a hydration
+  // mismatch when the layout nav has different anchors/icons than base.
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+  const NAV = mounted && ws === "layout" ? LAYOUT_NAV : BASE_NAV;
   const currentNav = NAV.find((n) =>
     n.to === "/" ? loc.pathname === "/" : loc.pathname.startsWith(n.to)
   );
@@ -56,7 +70,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           {!collapsed && (
             <div className="flex-1 min-w-0">
               <div className="font-display text-sm font-bold leading-tight text-sidebar-foreground truncate">
-                Compliance Sentinel
+                AI Document Workflow
               </div>
               <div className="text-[10px] text-sidebar-foreground/50 font-medium uppercase tracking-widest">
                 Intelligence Platform
@@ -127,7 +141,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <header className="h-14 border-b bg-card/80 backdrop-blur-sm flex items-center justify-between px-6 sticky top-0 z-20">
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
             <ShieldCheck className="size-4 text-primary/60" />
-            <span className="text-foreground font-semibold">{currentNav?.label ?? "Compliance Sentinel"}</span>
+            <span className="text-foreground font-semibold">{currentNav?.label ?? "AI Document Workflow"}</span>
           </div>
           <div className="flex items-center gap-2">
             <WorkspaceSwitcher />
@@ -227,6 +241,13 @@ function WorkspaceSwitcher() {
   const [ws, setWs] = useWorkspace();
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  // Workspace lives in localStorage — server has no access, so it defaults
+  // to "rmit". Defer the workspace-specific display (name, colours) to the
+  // post-hydration tick so the server's render and the client's first render
+  // match (both show "rmit" briefly), avoiding a React 19 hydration error.
+  // Behaviour is identical across all workspaces — this is purely a timing fix.
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
 
   useEffect(() => {
     function onClick(e: MouseEvent) {
@@ -236,7 +257,9 @@ function WorkspaceSwitcher() {
     return () => document.removeEventListener('mousedown', onClick);
   }, []);
 
-  const meta = WORKSPACES[ws];
+  // Until mounted, render as if on the default workspace (matches server).
+  const displayWs: WorkspaceId = mounted ? ws : "rmit";
+  const meta = WORKSPACES[displayWs];
   // The super-admin can hide workspaces (master visibility toggle). The
   // switcher filters them out; the CURRENT workspace stays visible even if
   // hidden, so the user isn't trapped if they just hid the one they're on.

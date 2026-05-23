@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-export type WorkspaceId = "rmit" | "fatf" | "forms" | "simplify";
+export type WorkspaceId = "rmit" | "fatf" | "forms" | "simplify" | "layout";
 
 export const WORKSPACES: Record<WorkspaceId, {
   id: WorkspaceId;
@@ -41,6 +41,14 @@ export const WORKSPACES: Record<WorkspaceId, {
     tagline: "Plain-English rewrite · Verifiable redline",
     color: "text-violet-700",
     bgColor: "bg-violet-100",
+  },
+  layout: {
+    id: "layout",
+    name: "Retail Layout Planner",
+    short: "Layout",
+    tagline: "Sketch → digital layout · Rules-based fixture placement",
+    color: "text-orange-700",
+    bgColor: "bg-orange-100",
   },
 };
 

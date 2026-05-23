@@ -39,7 +39,7 @@ import { cn } from "@/lib/utils";
 
 export const Route = createFileRoute("/reports/")({
   component: ReportsRoute,
-  head: () => ({ meta: [{ title: "Analyses · Compliance Sentinel" }] }),
+  head: () => ({ meta: [{ title: "Analyses · AI Document Workflow" }] }),
 });
 
 /**

@@ -48,7 +48,7 @@ function typeMeta(t: string) {
 
 export const Route = createFileRoute("/knowledge-base")({
   component: KB,
-  head: () => ({ meta: [{ title: "Knowledge Base · Compliance Sentinel" }] }),
+  head: () => ({ meta: [{ title: "Knowledge Base · AI Document Workflow" }] }),
 });
 
 function KB() {

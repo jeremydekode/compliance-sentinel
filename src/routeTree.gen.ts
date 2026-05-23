@@ -13,6 +13,7 @@ import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as KnowledgeBaseRouteImport } from './routes/knowledge-base'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as ReportsIndexRouteImport } from './routes/reports.index'
+import { Route as SimplifyReportIdRouteImport } from './routes/simplify.$reportId'
 import { Route as ReportsReportIdRouteImport } from './routes/reports.$reportId'
 import { Route as ReportsReportIdPresentRouteImport } from './routes/reports.$reportId.present'
 import { Route as AuthGoogleCallbackRouteImport } from './routes/auth.google.callback'
@@ -37,6 +38,11 @@ const ReportsIndexRoute = ReportsIndexRouteImport.update({
   path: '/reports/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const SimplifyReportIdRoute = SimplifyReportIdRouteImport.update({
+  id: '/simplify/$reportId',
+  path: '/simplify/$reportId',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ReportsReportIdRoute = ReportsReportIdRouteImport.update({
   id: '/reports/$reportId',
   path: '/reports/$reportId',
@@ -58,6 +64,7 @@ export interface FileRoutesByFullPath {
   '/knowledge-base': typeof KnowledgeBaseRoute
   '/settings': typeof SettingsRoute
   '/reports/$reportId': typeof ReportsReportIdRouteWithChildren
+  '/simplify/$reportId': typeof SimplifyReportIdRoute
   '/reports/': typeof ReportsIndexRoute
   '/auth/google/callback': typeof AuthGoogleCallbackRoute
   '/reports/$reportId/present': typeof ReportsReportIdPresentRoute
@@ -67,6 +74,7 @@ export interface FileRoutesByTo {
   '/knowledge-base': typeof KnowledgeBaseRoute
   '/settings': typeof SettingsRoute
   '/reports/$reportId': typeof ReportsReportIdRouteWithChildren
+  '/simplify/$reportId': typeof SimplifyReportIdRoute
   '/reports': typeof ReportsIndexRoute
   '/auth/google/callback': typeof AuthGoogleCallbackRoute
   '/reports/$reportId/present': typeof ReportsReportIdPresentRoute
@@ -77,6 +85,7 @@ export interface FileRoutesById {
   '/knowledge-base': typeof KnowledgeBaseRoute
   '/settings': typeof SettingsRoute
   '/reports/$reportId': typeof ReportsReportIdRouteWithChildren
+  '/simplify/$reportId': typeof SimplifyReportIdRoute
   '/reports/': typeof ReportsIndexRoute
   '/auth/google/callback': typeof AuthGoogleCallbackRoute
   '/reports/$reportId/present': typeof ReportsReportIdPresentRoute
@@ -88,6 +97,7 @@ export interface FileRouteTypes {
     | '/knowledge-base'
     | '/settings'
     | '/reports/$reportId'
+    | '/simplify/$reportId'
     | '/reports/'
     | '/auth/google/callback'
     | '/reports/$reportId/present'
@@ -97,6 +107,7 @@ export interface FileRouteTypes {
     | '/knowledge-base'
     | '/settings'
     | '/reports/$reportId'
+    | '/simplify/$reportId'
     | '/reports'
     | '/auth/google/callback'
     | '/reports/$reportId/present'
@@ -106,6 +117,7 @@ export interface FileRouteTypes {
     | '/knowledge-base'
     | '/settings'
     | '/reports/$reportId'
+    | '/simplify/$reportId'
     | '/reports/'
     | '/auth/google/callback'
     | '/reports/$reportId/present'
@@ -116,6 +128,7 @@ export interface RootRouteChildren {
   KnowledgeBaseRoute: typeof KnowledgeBaseRoute
   SettingsRoute: typeof SettingsRoute
   ReportsReportIdRoute: typeof ReportsReportIdRouteWithChildren
+  SimplifyReportIdRoute: typeof SimplifyReportIdRoute
   ReportsIndexRoute: typeof ReportsIndexRoute
   AuthGoogleCallbackRoute: typeof AuthGoogleCallbackRoute
 }
@@ -148,6 +161,13 @@ declare module '@tanstack/react-router' {
       path: '/reports'
       fullPath: '/reports/'
       preLoaderRoute: typeof ReportsIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/simplify/$reportId': {
+      id: '/simplify/$reportId'
+      path: '/simplify/$reportId'
+      fullPath: '/simplify/$reportId'
+      preLoaderRoute: typeof SimplifyReportIdRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/reports/$reportId': {
@@ -191,6 +211,7 @@ const rootRouteChildren: RootRouteChildren = {
   KnowledgeBaseRoute: KnowledgeBaseRoute,
   SettingsRoute: SettingsRoute,
   ReportsReportIdRoute: ReportsReportIdRouteWithChildren,
+  SimplifyReportIdRoute: SimplifyReportIdRoute,
   ReportsIndexRoute: ReportsIndexRoute,
   AuthGoogleCallbackRoute: AuthGoogleCallbackRoute,
 }

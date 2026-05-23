@@ -1,4 +1,5 @@
 import { GoogleGenAI } from "@google/genai";
+import { addUsage, EMPTY_USAGE, type TokenUsage } from "./pricing";
 import { extractPdfPages, pagesToMarkedText } from "./pdf-pages";
 
 const ai = new GoogleGenAI({ apiKey: process.env.GOOGLE_GENERATIVE_AI_API_KEY || "" });
@@ -1288,4 +1289,145 @@ Output ONLY the amended document HTML. No commentary, no markdown fences.
   let html = (response.text ?? "").trim();
   html = html.replace(/^```html\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "");
   return html;
+}
+
+// ── UC4: Document Simplification ─────────────────────────────────────────────
+
+/** One reviewable simplification edit at a specific place in a document. */
+export interface SimplificationAction {
+  section: string;
+  type: "delete_redundant" | "merge" | "to_bullets" | "plain_english" | "shorten" | "table_restructure";
+  before: string;
+  after: string;
+  rule: string;
+  rationale: string;
+  confidence: number;
+}
+
+/** Splits plain document text into <= maxChars chunks at paragraph (line)
+ *  boundaries, so each chunk holds whole paragraphs. A single oversized line
+ *  (e.g. a flattened table) is hard-split as a last resort. */
+function chunkText(text: string, maxChars: number): string[] {
+  const chunks: string[] = [];
+  let buf = "";
+  const flush = () => { if (buf.trim()) chunks.push(buf); buf = ""; };
+  for (const line of text.split(/\n/)) {
+    if (line.length > maxChars) {
+      flush();
+      for (let i = 0; i < line.length; i += maxChars) chunks.push(line.slice(i, i + maxChars));
+      continue;
+    }
+    if (buf && buf.length + line.length + 1 > maxChars) flush();
+    buf += (buf ? "\n" : "") + line;
+  }
+  flush();
+  return chunks.length > 0 ? chunks : [text];
+}
+
+/** Runs `fn` over `items` with at most `limit` in flight at once. */
+async function mapLimit<T, R>(items: T[], limit: number, fn: (t: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let i = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (i < items.length) { const idx = i++; out[idx] = await fn(items[idx]); }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+/**
+ * DOCUMENT SIMPLIFICATION (UC4). Reads ONE internal document and proposes a
+ * list of concrete, reviewable simplification ACTIONS — plain-English rewrites,
+ * merges, de-duplication, paragraph→bullets, table restructuring. Terminology
+ * standardisation and numbering harmonisation are handled deterministically by
+ * the caller and are NOT produced here. Each action's `before` is a verbatim
+ * span so a downstream locator can anchor it; the caller verifies it against
+ * the source and discards anything that does not match.
+ *
+ * The document is supplied as PLAIN TEXT (not HTML) — ~5x fewer tokens than the
+ * marked-up form — and processed in section-sized chunks run concurrently, so
+ * every part is covered thoroughly. Real token usage is metered and returned.
+ */
+export async function simplifyDocument(
+  doc: { title: string; text: string },
+  opts?: { instruction?: string | null; guidance?: string | null },
+): Promise<{ actions: SimplificationAction[]; usage: TokenUsage }> {
+  const chunks = chunkText(doc.text, 80_000);
+  const results = await mapLimit(chunks, 6, (chunk) =>
+    simplifyDocSegment(doc.title, chunk, opts).catch((e: any) => {
+      console.warn(`simplifyDocument: a segment failed:`, e?.message?.slice(0, 100));
+      return { actions: [] as SimplificationAction[], usage: EMPTY_USAGE };
+    }),
+  );
+  return {
+    actions: results.flatMap((r) => r.actions),
+    usage: results.reduce((acc, r) => addUsage(acc, r.usage), EMPTY_USAGE),
+  };
+}
+
+/** Simplifies ONE section-sized chunk of a document, metering token usage. */
+async function simplifyDocSegment(
+  title: string,
+  text: string,
+  opts?: { instruction?: string | null; guidance?: string | null },
+): Promise<{ actions: SimplificationAction[]; usage: TokenUsage }> {
+  const prompt = `
+# ROLE: DOCUMENT SIMPLIFICATION EDITOR — BANK POLICY & OPERATIONS MANUALS
+
+You are given a SECTION of an internal bank document (plain text, at the bottom
+of this prompt). Produce a list of concrete simplification ACTIONS for this
+section — each one a specific, reviewable edit.
+${opts?.instruction ? `\n# THIS RUN'S SPECIFIC INSTRUCTION (apply in addition to the rules below):\n${opts.instruction}\n` : ""}${guidanceBlock(opts?.guidance)}
+# ACTION TYPES — what to look for:
+- "delete_redundant" — a clause/sentence that repeats something already stated elsewhere. "after" is an empty string.
+- "merge" — two or more nearby points that say the same thing or belong together, combined into one.
+- "to_bullets" — a long prose paragraph that reads more clearly as a bulleted list.
+- "plain_english" — convoluted, legalistic or passive wording rewritten in plain, direct English.
+- "shorten" — a verbose sentence tightened, with no loss of content.
+- "table_restructure" — text that is clearly tabular and would read more clearly as a table; "after" describes the proposed layout.
+Look across ALL of these types, not just rewording. Terminology standardisation should be folded INTO a plain_english or shorten edit (rephrase the sentence and make its wording consistent in the same action). Do NOT produce standalone actions for numbering or cross-reference renumbering — those need a separate deterministic pass.
+
+# ❗ GUARDRAILS — non-negotiable:
+- PRESERVE factual accuracy and meaning. NEVER alter a number, threshold, percentage, date, monetary amount, name, role title, or authority limit.
+- Do NOT invent information. Do NOT introduce any new normative statement ("must", "shall", "may not", "is required to") that is not already in the source.
+- ❌ WORK ONLY FROM THE TEXT BELOW. Never produce an action for a section, heading or sentence that is not literally present in that text. Do NOT pattern-complete the document with topics a bank manual "usually" covers (physical/vault storage, retention schedules, archive rooms, etc.) — if it is not in the text below, it does not exist for you.
+- A "delete_redundant" is valid ONLY when the meaning is genuinely stated elsewhere — never drop a unique obligation, control, or requirement.
+- Simplify the wording, never the substance. Keep a professional tone.
+
+# ❗ "before" IS A VERBATIM QUOTE — you COPY it, you do not WRITE it:
+"before" is matched by an exact text-locator against the real document. Copy a contiguous run of the document text character-for-character — same words, order, spelling, punctuation, numbers. If you cannot copy a clean verbatim span for an action, SKIP that action rather than fabricate one.
+
+# OUTPUT FORMAT (JSON array — return ONLY this):
+[{
+  "section": "<the section / heading this sits under, copied from the document, e.g. 'C.3'>",
+  "type": "delete_redundant" | "merge" | "to_bullets" | "plain_english" | "shorten" | "table_restructure",
+  "before": "<verbatim text copied from the document>",
+  "after": "<the simplified replacement; empty string for delete_redundant>",
+  "rule": "<short label, e.g. 'Plain English', 'Remove redundancy', 'Paragraph to bullets'>",
+  "rationale": "<ONE sentence: what this improves and why it is safe>",
+  "confidence": <integer 0-100 — honest certainty the meaning is fully preserved>
+}]
+
+Work through the WHOLE section and report every genuine simplification you can ground word-for-word in the text above, across all the action types. Do not invent and do not pad with marginal edits — but do not under-report either: a section of dense bank prose usually has real simplifications. If a section genuinely has nothing to simplify, return [].
+
+# DOCUMENT — "${title}":
+${text}
+`;
+  const response = await generateWithFallback({
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    config: { responseMimeType: "application/json", maxOutputTokens: 65536 },
+  });
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const m = (response.usageMetadata ?? {}) as any;
+  const usage: TokenUsage = {
+    inputTokens: m.promptTokenCount ?? 0,
+    outputTokens: m.candidatesTokenCount ?? 0,
+    thinkingTokens: m.thoughtsTokenCount ?? 0,
+    calls: 1,
+  };
+  const out = parseJsonArrayLoose(response.text);
+  if (out.length === 0 && (response.text ?? "").trim()) {
+    console.error(`simplifyDocument: no actions parsed for "${title}":`, (response.text ?? "").slice(0, 300));
+  }
+  return { actions: out as SimplificationAction[], usage };
 }

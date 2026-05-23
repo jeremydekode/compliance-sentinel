@@ -205,6 +205,23 @@ export async function docxToText(buffer: Buffer): Promise<string> {
   return docxToTextFallback(buffer);
 }
 
+/**
+ * Convert a DOCX buffer to HTML — preserving tables (<table>), headings
+ * (<h1>-<h6>) and lists. Document simplification (UC4) needs this structure,
+ * tables especially; flat text extraction loses it. Returns "" on failure so
+ * the caller can fall back to plain text.
+ */
+export async function docxToHtml(buffer: Buffer): Promise<string> {
+  try {
+    const mammoth = await import("mammoth");
+    const result = await mammoth.convertToHtml({ buffer });
+    return (result.value ?? "").trim();
+  } catch (e) {
+    console.warn("[docx-editor] mammoth HTML conversion failed:", (e as Error)?.message);
+    return "";
+  }
+}
+
 /** Synchronous regex-based fallback (less reliable but no deps). */
 export function docxToTextFallback(buffer: Buffer): string {
   const zip = new PizZip(buffer);
@@ -220,4 +237,239 @@ export function docxToTextFallback(buffer: Buffer): string {
     if (text) paragraphs.push(text);
   }
   return paragraphs.join("\n\n");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// UC4 — APPLY SIMPLIFICATION TO DOCX
+// Paragraph-aware sub-text replacement: when `before` is a sentence inside a
+// longer paragraph, the OTHER content in that paragraph is preserved. Each
+// amended paragraph is yellow-highlighted AND wrapped in a Word comment range
+// carrying the original "Before:" text — so reviewers see, in-document, both
+// the new wording (highlighted) and what it replaced (the comment).
+// ════════════════════════════════════════════════════════════════════════════
+
+/** One simplification edit: replace `before` (verbatim from the source text)
+ *  with `after`, and leave a Word comment carrying the original. */
+export type SimplifyDocxEdit = {
+  before: string;
+  after: string;
+  /** Optional context appended after "Before:" in the Word comment. */
+  rationale?: string;
+};
+
+export type SimplifyDocxResult = {
+  buffer: Buffer;
+  appliedCount: number;
+  skipped: { reason: string; before: string }[];
+};
+
+const COMMENTS_CTYPE =
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml";
+const COMMENTS_REL_TYPE =
+  "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments";
+// commentsExtended.xml is what modern Word (2013+) reads to anchor a comment to
+// its text range. Without it, Word shows the comment in the pane but won't draw
+// the link/highlight to the commented text.
+const COMMENTS_EX_CTYPE = "application/vnd.ms-word.commentsExtended+xml";
+const COMMENTS_EX_REL_TYPE =
+  "http://schemas.microsoft.com/office/2011/relationships/commentsExtended";
+
+/** Replace `before` with `after` inside `paraText`. Tolerant of smart-quote
+ *  drift and case differences (a verified `before` may still differ slightly
+ *  from the paragraph's raw text in punctuation glyphs or casing). */
+function tolerantReplace(paraText: string, before: string, after: string): string | null {
+  const q = (s: string) => s.replace(/[‘’]/g, "'").replace(/[“”]/g, '"');
+  const p = q(paraText);
+  const b = q(before);
+  if (!b) return null;
+  // 1. quote-normalised exact substring
+  let at = p.indexOf(b);
+  if (at >= 0) return p.slice(0, at) + after + p.slice(at + b.length);
+  // 2. case-insensitive — same length so indices line up
+  at = p.toLowerCase().indexOf(b.toLowerCase());
+  if (at >= 0) return p.slice(0, at) + after + p.slice(at + b.length);
+  return null;
+}
+
+/** Build a <w:p> with one highlighted run, optionally wrapped in a comment range. */
+function buildHighlightedParaWithComment(text: string, commentId: number | null): string {
+  const lines = text.split(/\r?\n/);
+  const runs = lines
+    .map((line, i) => {
+      const r = `<w:r><w:rPr><w:highlight w:val="yellow"/></w:rPr><w:t xml:space="preserve">${escapeXml(line)}</w:t></w:r>`;
+      return i < lines.length - 1 ? `${r}<w:r><w:br/></w:r>` : r;
+    })
+    .join("");
+  if (commentId === null) return `<w:p>${runs}</w:p>`;
+  return (
+    `<w:p>` +
+    `<w:commentRangeStart w:id="${commentId}"/>` +
+    `${runs}` +
+    `<w:commentRangeEnd w:id="${commentId}"/>` +
+    `<w:r><w:rPr><w:rStyle w:val="CommentReference"/></w:rPr><w:commentReference w:id="${commentId}"/></w:r>` +
+    `</w:p>`
+  );
+}
+
+/** Build one <w:comment> XML entry. The first `<w:p>` inside the comment is
+ *  tagged with `w14:paraId` so commentsExtended.xml can anchor against it. */
+function buildCommentEntry(
+  id: number,
+  content: string,
+  author: string,
+  dateIso: string,
+  paraId: string,
+): string {
+  const lines = content.split(/\r?\n/);
+  const ps = lines
+    .map((line, i) => {
+      const pidAttr = i === 0 ? ` w14:paraId="${paraId}" w14:textId="${paraId}"` : "";
+      return `<w:p${pidAttr}><w:r><w:t xml:space="preserve">${escapeXml(line)}</w:t></w:r></w:p>`;
+    })
+    .join("");
+  const initials =
+    author
+      .split(/\s+/)
+      .map((w) => w[0])
+      .filter(Boolean)
+      .join("")
+      .slice(0, 4)
+      .toUpperCase() || "CS";
+  return `<w:comment w:id="${id}" w:author="${escapeXml(author)}" w:initials="${escapeXml(initials)}" w:date="${dateIso}">${ps}</w:comment>`;
+}
+
+/** Writes word/comments.xml + word/commentsExtended.xml and registers both in
+ *  document.xml.rels and [Content_Types].xml. The commentsExtended part is what
+ *  modern Word reads to actually link the comment to its in-document text range —
+ *  without it, comments show in the pane but the anchor highlight is broken. */
+function attachComments(zip: PizZip, commentEntries: string[], paraIds: string[]): void {
+  if (commentEntries.length === 0) return;
+
+  // 1. word/comments.xml with the full namespace set Word 365 expects.
+  const commentsNs =
+    `xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"` +
+    ` xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"` +
+    ` xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml"` +
+    ` xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"` +
+    ` mc:Ignorable="w14 w15"`;
+  const commentsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:comments ${commentsNs}>${commentEntries.join("")}</w:comments>`;
+  zip.file("word/comments.xml", commentsXml);
+
+  // 2. word/commentsExtended.xml — one <w15:commentEx> per comment, anchored by
+  //    the paraId on the comment's first paragraph. This is what makes the link
+  //    between the comment and the text range visible in Word 2013+.
+  const exEntries = paraIds
+    .map((pid) => `<w15:commentEx w15:paraId="${pid}" w15:done="0"/>`)
+    .join("");
+  const commentsExtendedXml =
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n` +
+    `<w15:commentsEx xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml"` +
+    ` xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"` +
+    ` mc:Ignorable="w14">${exEntries}</w15:commentsEx>`;
+  zip.file("word/commentsExtended.xml", commentsExtendedXml);
+
+  // 3. word/_rels/document.xml.rels — register both relationships.
+  const relsFile = zip.file("word/_rels/document.xml.rels");
+  if (relsFile) {
+    let rels = relsFile.asText();
+    const existingIds = [...rels.matchAll(/Id="rId(\d+)"/g)].map((mm) => Number(mm[1]));
+    let nextId = existingIds.length > 0 ? Math.max(...existingIds) + 1 : 1;
+    if (!rels.includes(COMMENTS_REL_TYPE)) {
+      const rel = `<Relationship Id="rId${nextId++}" Type="${COMMENTS_REL_TYPE}" Target="comments.xml"/>`;
+      rels = rels.replace("</Relationships>", `${rel}</Relationships>`);
+    }
+    if (!rels.includes(COMMENTS_EX_REL_TYPE)) {
+      const rel = `<Relationship Id="rId${nextId++}" Type="${COMMENTS_EX_REL_TYPE}" Target="commentsExtended.xml"/>`;
+      rels = rels.replace("</Relationships>", `${rel}</Relationships>`);
+    }
+    zip.file("word/_rels/document.xml.rels", rels);
+  }
+
+  // 4. [Content_Types].xml — register both parts.
+  const ctFile = zip.file("[Content_Types].xml");
+  if (ctFile) {
+    let ct = ctFile.asText();
+    if (!ct.includes("/word/comments.xml")) {
+      const ovr = `<Override PartName="/word/comments.xml" ContentType="${COMMENTS_CTYPE}"/>`;
+      ct = ct.replace("</Types>", `${ovr}</Types>`);
+    }
+    if (!ct.includes("/word/commentsExtended.xml")) {
+      const ovr = `<Override PartName="/word/commentsExtended.xml" ContentType="${COMMENTS_EX_CTYPE}"/>`;
+      ct = ct.replace("</Types>", `${ovr}</Types>`);
+    }
+    zip.file("[Content_Types].xml", ct);
+  }
+}
+
+/**
+ * Applies UC4 simplification edits to a DOCX, producing an amended .docx where:
+ *  - each changed paragraph keeps its OTHER content (`before` → `after` is a
+ *    sub-paragraph swap, not a whole-paragraph clobber);
+ *  - the changed text is yellow-highlighted so it is visible at a glance;
+ *  - each amended paragraph carries a Word comment with the ORIGINAL "Before:"
+ *    text plus optional rationale, so reviewers see what changed in-document.
+ *
+ * Edits whose `before` cannot be located in any paragraph are SKIPPED and
+ * returned in `skipped` — they are never silently dropped.
+ */
+export function applySimplificationToDocx(
+  sourceBuffer: Buffer,
+  edits: SimplifyDocxEdit[],
+  opts: { author?: string } = {},
+): SimplifyDocxResult {
+  const zip = new PizZip(sourceBuffer);
+  const docFile = zip.file("word/document.xml");
+  if (!docFile) throw new Error("Invalid DOCX: word/document.xml not found");
+  let documentXml = docFile.asText();
+
+  const author = (opts.author ?? "Compliance Sentinel").slice(0, 60);
+  const dateIso = new Date().toISOString();
+  const commentEntries: string[] = [];
+  const paraIds: string[] = []; // one per comment — links commentsExtended.xml back
+
+  let nextCommentId = 0;
+  let appliedCount = 0;
+  const skipped: { reason: string; before: string }[] = [];
+
+  for (const edit of edits) {
+    const before = (edit.before ?? "").trim();
+    if (!before) {
+      skipped.push({ reason: "empty before", before: "" });
+      continue;
+    }
+
+    // Find the first <w:p> whose text contains `before` (tolerantly).
+    const pRegex = /<w:p\b[\s\S]*?<\/w:p>/g;
+    let m: RegExpExecArray | null;
+    let matched = false;
+    while ((m = pRegex.exec(documentXml)) !== null) {
+      const paraText = getParagraphText(m[0]);
+      if (!paraText) continue;
+      const amended = tolerantReplace(paraText, before, edit.after ?? "");
+      if (amended === null) continue;
+
+      const commentId = nextCommentId++;
+      // 8-char hex paraId — unique per comment, matches what commentsExtended uses.
+      const paraId = (commentId + 1).toString(16).padStart(8, "0").toUpperCase();
+      paraIds.push(paraId);
+      const newPara = buildHighlightedParaWithComment(amended, commentId);
+      const commentContent = edit.rationale
+        ? `Before: ${before}\n\n${edit.rationale}`
+        : `Before: ${before}`;
+      commentEntries.push(buildCommentEntry(commentId, commentContent, author, dateIso, paraId));
+
+      documentXml =
+        documentXml.slice(0, m.index) + newPara + documentXml.slice(m.index + m[0].length);
+      appliedCount++;
+      matched = true;
+      break; // next edit re-walks from the start (indices shifted)
+    }
+    if (!matched) skipped.push({ reason: "before not located in any paragraph", before });
+  }
+
+  zip.file("word/document.xml", documentXml);
+  attachComments(zip, commentEntries, paraIds);
+
+  const out = zip.generate({ type: "nodebuffer", compression: "DEFLATE" }) as Buffer;
+  return { buffer: out, appliedCount, skipped };
 }

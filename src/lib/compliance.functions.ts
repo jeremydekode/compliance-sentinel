@@ -1,8 +1,11 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { supabase } from "@/integrations/supabase/client";
-import { chunkDocument, generateAmendedDocument, extractRegulatoryChanges, extractFatfRequirements, mapChangeToSops, routeChangesToSops, analyzeSopAgainstGaps, buildSopTopicMap, generateAnalysisSummary, generateWithFallback } from "./gemini";
-import { applyEditsToDocx, looksLikeDocx, docxToText } from "./docx-editor";
+import { chunkDocument, generateAmendedDocument, extractRegulatoryChanges, extractFatfRequirements, mapChangeToSops, routeChangesToSops, analyzeSopAgainstGaps, buildSopTopicMap, generateAnalysisSummary, generateWithFallback, simplifyDocument } from "./gemini";
+import { applyEditsToDocx, looksLikeDocx, docxToText, docxToHtml, applySimplificationToDocx, type SimplifyDocxEdit } from "./docx-editor";
+import { verifyActions, analyzeStructure, crossCheckSections, DEFAULT_SIMPLIFY_GUIDANCE, initialDecision } from "./simplify";
+import type { VerificationSummary, DocStructure, SectionCrossCheck } from "./simplify";
+import { computeCost, type RunCost } from "./pricing";
 import {
   buildAuthUrl,
   buildRedirectUri,
@@ -90,7 +93,7 @@ export const createReport = createServerFn({ method: "POST" })
     z.object({
       filename: z.string(),
       fileUrl: z.string().nullable(),
-      workspace: z.enum(["rmit", "fatf", "forms"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify"]).default("rmit"),
       customTitle: z.string().optional(),
       notes: z.string().optional(),
       detected: z
@@ -418,7 +421,7 @@ export const createRegulatoryReport = createServerFn({ method: "POST" })
     z.object({
       filename: z.string(),
       fileUrl: z.string().nullable(),
-      workspace: z.enum(["rmit", "fatf", "forms"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify"]).default("rmit"),
       customTitle: z.string().optional(),
       notes: z.string().optional(),
       detected: z
@@ -947,7 +950,18 @@ export const mapRegulatoryChange = createServerFn({ method: "POST" })
         .from("sop_impacts").select("id", { count: "exact", head: true }).eq("report_id", report.id);
       const offset = count ?? 0;
       await supabase.from("sop_impacts").insert(
-        kept.map((m: any, i: number) => ({ ...m, confidence: clampConfidence(m.confidence), report_id: report.id, position: offset + i })),
+        kept.map((m: any, i: number) => {
+          const conf = clampConfidence(m.confidence);
+          return {
+            ...m,
+            confidence: conf,
+            // Auto-approve high-confidence impacts so reviewers only triage the
+            // borderline ones — matches the UC4 simplification rule (>90).
+            status: (conf ?? 0) > 90 ? "approved" : "pending",
+            report_id: report.id,
+            position: offset + i,
+          };
+        }),
       );
     }
     console.log(`[regulatory] change "${change.chapter_ref}" → ${kept.length} impact(s)`);
@@ -1097,7 +1111,18 @@ export const analyzeRegulatorySop = createServerFn({ method: "POST" })
         .from("sop_impacts").select("id", { count: "exact", head: true }).eq("report_id", report.id);
       const offset = count ?? 0;
       await supabase.from("sop_impacts").insert(
-        finalImpacts.map((m: any, i: number) => ({ ...m, confidence: clampConfidence(m.confidence), report_id: report.id, position: offset + i }))
+        finalImpacts.map((m: any, i: number) => {
+          const conf = clampConfidence(m.confidence);
+          return {
+            ...m,
+            confidence: conf,
+            // Auto-approve high-confidence impacts so reviewers only triage the
+            // borderline ones — matches the UC4 simplification rule (>90).
+            status: (conf ?? 0) > 90 ? "approved" : "pending",
+            report_id: report.id,
+            position: offset + i,
+          };
+        })
       );
     }
     console.log(`[regulatory] "${sop.title}" → ${finalImpacts.length} impact(s)`);
@@ -1454,7 +1479,7 @@ export const createSop = createServerFn({ method: "POST" })
       title: z.string().min(2).max(200),
       doc_type: z.enum(["sop", "rmit", "rmit_reg", "fatf", "circular", "it_policy", "policy", "form"]),
       version: z.string().min(1).max(20),
-      workspace: z.enum(["rmit", "fatf", "forms"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify"]).default("rmit"),
       summary: z.string().max(2000).optional(),
       tags: z.array(z.string().max(40)).max(20).optional(),
       file_url: z.string().nullable().optional(),
@@ -1559,7 +1584,7 @@ export const clearWorkspace = createServerFn({ method: "POST" })
   .inputValidator(
     z.object({
       scope: z.enum(["analyses", "kb", "all"]),
-      workspace: z.enum(["rmit", "fatf", "forms"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify"]).default("rmit"),
     })
   )
   .handler(async ({ data }) => {
@@ -1937,7 +1962,7 @@ function escapeHtml(s: string): string {
  * Used to show indexing health in the KB list ("X chunks" or "Not indexed").
  */
 export const getChunkCounts = createServerFn({ method: "GET" })
-  .inputValidator(z.object({ workspace: z.enum(["rmit", "fatf", "forms"]).default("rmit") }))
+  .inputValidator(z.object({ workspace: z.enum(["rmit", "fatf", "forms", "simplify"]).default("rmit") }))
   .handler(async ({ data }) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: sops } = await (supabase as any)
@@ -2179,7 +2204,7 @@ function applyPageOverrides(formId: string, impacts: any[]): any[] {
 // downstream documents in the KB that reference the form.
 export const createFormUpdateReport = createServerFn({ method: "POST" })
   .inputValidator(z.object({
-    workspace: z.enum(["rmit", "fatf", "forms"]).default("forms"),
+    workspace: z.enum(["rmit", "fatf", "forms", "simplify"]).default("forms"),
     formId: z.string().min(1),                  // e.g. "FGROP 037/2016"
     friendlyName: z.string().optional(),         // e.g. "Account Opening Application Form"
     customTitle: z.string().optional(),
@@ -2449,7 +2474,18 @@ export const analyzeDocForForm = createServerFn({ method: "POST" })
         .from("sop_impacts").select("id", { count: "exact", head: true }).eq("report_id", report.id);
       const offset = count ?? 0;
       await supabase.from("sop_impacts").insert(
-        finalImpacts.map((m: any, i: number) => ({ ...m, confidence: clampConfidence(m.confidence), report_id: report.id, position: offset + i }))
+        finalImpacts.map((m: any, i: number) => {
+          const conf = clampConfidence(m.confidence);
+          return {
+            ...m,
+            confidence: conf,
+            // Auto-approve high-confidence impacts so reviewers only triage the
+            // borderline ones — matches the UC4 simplification rule (>90).
+            status: (conf ?? 0) > 90 ? "approved" : "pending",
+            report_id: report.id,
+            position: offset + i,
+          };
+        })
       );
     }
 
@@ -2609,7 +2645,7 @@ Return ONLY the JSON array. No commentary.
 
 // ── Google Drive OAuth + connection management ────────────────────────────────
 
-const workspaceSchema = z.enum(["rmit", "fatf", "forms"]);
+const workspaceSchema = z.enum(["rmit", "fatf", "forms", "simplify"]);
 
 // ── Analysis guidance — user-editable instruction injected into the prompts ───
 
@@ -3207,6 +3243,9 @@ export const writeImpactToDoc = createServerFn({ method: "POST" })
     // comment = Drive comment; insert = add new text after the found statement;
     // replace = swap the found text for the amended text. Both in-doc modes highlight.
     mode: z.enum(["comment", "insert", "replace"]).default("comment"),
+    // Set TRUE to re-apply an impact that was previously inserted/commented —
+    // skips the alreadyApplied short-circuit so the "Re-insert" UX works.
+    force: z.boolean().optional(),
   }))
   .handler(async ({ data }) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -3216,7 +3255,7 @@ export const writeImpactToDoc = createServerFn({ method: "POST" })
       .eq("id", data.impactId)
       .single();
     if (impErr || !imp) throw new Error("Impact not found");
-    if (imp.inserted_at || imp.drive_comment_id) {
+    if (!data.force && (imp.inserted_at || imp.drive_comment_id)) {
       return { alreadyApplied: true, method: "previous" as const };
     }
     if (!imp.sop_id) throw new Error("This impact is not linked to a KB document.");
@@ -3272,6 +3311,10 @@ export const writeImpactToDoc = createServerFn({ method: "POST" })
       anchor: imp.paragraph ?? imp.chapter ?? "",
       newText: docText,
       mode: data.mode === "replace" ? "replace" : "insert",
+      // Track-changes annotation: when replacing, also drop " (was: <original>)"
+      // in strike-through grey right after the amendment so reviewers see what
+      // it displaced. No-op for inserts (no original to strike).
+      originalText: data.mode === "replace" ? (imp.find_text ?? undefined) : undefined,
     });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (supabase as any).from("sop_impacts").update({
@@ -3292,7 +3335,15 @@ export const writeImpactToDoc = createServerFn({ method: "POST" })
  * Draft links are recorded on the report's summary_json.amended_drafts.
  */
 export const generateAmendedDraft = createServerFn({ method: "POST" })
-  .inputValidator(z.object({ reportId: z.string() }))
+  .inputValidator(
+    z.object({
+      reportId: z.string(),
+      // How replaces land in the draft:
+      //  - "trackChanges": original kept in red + strikethrough, new appended yellow.
+      //  - "clean":        original deleted, new inserted yellow (finalised look).
+      renderMode: z.enum(["clean", "trackChanges"]).default("trackChanges"),
+    }),
+  )
   .handler(async ({ data }) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: report } = await (supabase as any)
@@ -3325,24 +3376,43 @@ export const generateAmendedDraft = createServerFn({ method: "POST" })
         .from("sop_documents")
         .select("title, workspace_id, drive_file_id, drive_mime_type, drive_view_url")
         .eq("id", sopId).single();
-      if (!sop?.drive_file_id || sop.drive_mime_type !== "application/vnd.google-apps.document") {
-        skipped.push({ title: sop?.title ?? "Unknown SOP", reason: "not a Google Doc — can't draft a copy" });
+      if (!sop?.drive_file_id) {
+        skipped.push({ title: sop?.title ?? "Unknown SOP", reason: "not synced to Drive — can't draft a copy" });
         continue;
       }
       try {
+        // The render mode is shown in the copy's name so multiple mode-flavoured
+        // drafts can coexist side-by-side in Drive.
+        const modeLabel = data.renderMode === "clean" ? "Clean" : "Track Changes";
+        // Non-Google-Doc sources (PDF / DOCX) get converted to a native Google
+        // Doc on copy — Drive runs OCR/conversion as part of the copy, so the
+        // Docs API can then apply edits the same way as Doc-sourced SOPs. This
+        // is how RMiT-style PDF SOPs get amended drafts. Quality caveats: OCR
+        // on scanned PDFs varies, and complex layouts (multi-column, tables,
+        // footnotes) often degrade on conversion.
+        const needsConversion = sop.drive_mime_type !== "application/vnd.google-apps.document";
         const copy = await copyDriveFile(
           sop.workspace_id, sop.drive_file_id,
-          `${sop.title} — AMENDED DRAFT (pending sign-off) ${stamp}`,
+          `${sop.title} — AMENDED DRAFT — ${modeLabel} (pending sign-off) ${stamp}`,
+          { convertToGoogleDoc: needsConversion },
         );
         const result = await applyImpactsToGoogleDoc(
           sop.workspace_id, copy.id,
-          imps.map((im) => ({
-            findText: im.find_text ?? "",
-            newText: (im.edited_text ?? im.replace_text ?? "").trim(),
-            anchor: im.paragraph ?? im.chapter ?? "",
-            mode: (im.change_type === "insertion" || im.change_type === "new_section" || im.change_type === "contextual")
-              ? "insert" as const : "replace" as const,
-          })),
+          imps.map((im) => {
+            const isInsert =
+              im.change_type === "insertion" ||
+              im.change_type === "new_section" ||
+              im.change_type === "contextual";
+            return {
+              findText: im.find_text ?? "",
+              newText: (im.edited_text ?? im.replace_text ?? "").trim(),
+              anchor: im.paragraph ?? im.chapter ?? "",
+              mode: isInsert ? ("insert" as const) : ("replace" as const),
+              // For replaces in track-changes mode, this is also what gets red+strike.
+              originalText: isInsert ? undefined : (im.find_text ?? undefined),
+            };
+          }),
+          { renderMode: data.renderMode },
         );
         drafts.push({
           sopId, sopTitle: sop.title, draftFileId: copy.id, draftUrl: copy.url,
@@ -3526,4 +3596,337 @@ Return ONLY the JSON array. No commentary, no markdown fences.`;
       newForm: { form_number: newFormNumber, form_name: newFormName, updated_date: newUpdatedDate, base_form_id: baseFormId },
       detectedChanges,
     };
+  });
+
+// ════════════════════════════════════════════════════════════════════════════
+// UC4 — DOCUMENT SIMPLIFICATION
+// One internal document is simplified into a list of reviewable edits. The AI
+// PROPOSES; deterministic code (verifyActions) anchors every proposed `before`
+// span to the real document, so an invented or hallucinated clause is caught
+// and quarantined. Reports live in analysis_reports with workspace_id
+// "simplify"; the whole result is stored in summary_json (no per-action rows in
+// v1). These functions are self-contained — they do not touch the regulatory
+// or forms workflows.
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Creates a simplification report row (lightweight — no analysis yet). The
+ * report page reads `pending_analysis` and kicks off runSimplificationReport,
+ * so the upload screen can navigate away immediately — mirroring
+ * createRegulatoryReport's create-then-run-on-the-page pattern.
+ */
+export const createSimplificationReport = createServerFn({ method: "POST" })
+  .inputValidator(
+    z.object({
+      filename: z.string(),
+      fileUrl: z.string().nullable(),
+      customTitle: z.string().optional(),
+      instruction: z.string().optional(),
+      // Set when the source is a Google Drive file — recorded so the apply step
+      // can copy the original document straight in Drive.
+      driveFileId: z.string().optional(),
+      driveMimeType: z.string().optional(),
+    }),
+  )
+  .handler(async ({ data }) => {
+    if (!data.fileUrl) throw new Error("No file URL provided for simplification");
+    const fallbackName = data.filename.replace(/\.[^.]+$/, "").trim() || data.filename;
+    const displayName = (data.customTitle ?? "").trim() || fallbackName;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report, error } = await (supabase as any)
+      .from("analysis_reports")
+      .insert({
+        title: displayName,
+        policy_name: displayName,
+        status: "pending_validation",
+        source_file_url: data.fileUrl,
+        workspace_id: "simplify",
+        summary_json: {
+          kind: "simplification",
+          instruction: data.instruction?.trim() || null,
+          driveFileId: data.driveFileId ?? null,
+          driveMimeType: data.driveMimeType ?? null,
+          executive: ["Simplification queued — analysing the document…"],
+          // The report page reads this on load and auto-runs the analysis.
+          pending_analysis: true,
+        },
+      })
+      .select("id")
+      .single();
+    if (error || !report) throw new Error(error?.message || "Failed to create simplification report");
+    return { reportId: report.id as string };
+  });
+
+/**
+ * Runs document simplification end to end for one report:
+ *   1. fetch the source file → plain TEXT for the model + HTML for structure;
+ *   2. parse structure (headings / tables / word count);
+ *   3. AI proposes simplification actions (chunked over the WHOLE document);
+ *   4. DETERMINISTIC verification — anchor every `before` to the real document,
+ *      classifying each action verified / review / rejected;
+ *   5. cross-check each action's claimed section against the real heading index.
+ * The full result is stored in analysis_reports.summary_json.
+ */
+export const runSimplificationReport = createServerFn({ method: "POST" })
+  .inputValidator(z.object({ reportId: z.string() }))
+  .handler(async ({ data }) => {
+    const { data: report, error: repErr } = await supabase
+      .from("analysis_reports").select("*").eq("id", data.reportId).single();
+    if (repErr || !report) throw new Error("Report not found");
+    if (!report.source_file_url) throw new Error("Report has no source file — cannot run simplification");
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const prevJson = ((report.summary_json as any) ?? {}) as Record<string, any>;
+    const instruction: string | null = prevJson.instruction ?? null;
+    const title = (report.policy_name as string) ?? "Document";
+
+    let status: "ok" | "failed" = "failed";
+    let errorMsg: string | null = null;
+    let summary: VerificationSummary | null = null;
+    let structure: DocStructure | null = null;
+    let crossCheck: SectionCrossCheck | null = null;
+    let cost: RunCost | null = null;
+
+    try {
+      // 1 — fetch the source file. DOCX is read as plain TEXT for the model
+      // (~5x fewer tokens than HTML) and ALSO as HTML, used only to count
+      // tables/headings for the provenance header. PDF/other → text only.
+      const file = await fetchFile(report.source_file_url);
+      const isDocx = looksLikeDocx(file.mimeType, report.source_file_url);
+      const html = isDocx ? await docxToHtml(file.buffer) : "";
+      let text = isDocx ? await docxToText(file.buffer).catch(() => "") : "";
+      if (!text) {
+        if (file.mimeType === "application/pdf" || /\.pdf($|\?)/i.test(report.source_file_url)) {
+          const { extractPdfPages } = await import("./pdf-pages");
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          text = (await extractPdfPages(file.buffer)).map((p: any) => p.text).join("\n\n");
+        } else {
+          text = file.buffer.toString("utf-8");
+        }
+      }
+      if (!text.trim()) throw new Error("Could not read any text from the uploaded document");
+
+      // 2 — document structure (feeds the provenance header + section check).
+      structure = analyzeStructure(html || text);
+
+      // 3 — AI proposes simplification actions across the whole document. The
+      // simplify workspace's editable Analysis Guidance (Settings → Analysis
+      // Guidance) is folded into the prompt here, so tuning that guidance
+      // changes the rules every subsequent run applies.
+      // No saved guidance yet → fall back to the built-in starter house rules.
+      const guidance = (await fetchAnalysisGuidance("simplify")) || DEFAULT_SIMPLIFY_GUIDANCE;
+      const { actions, usage } = await simplifyDocument({ title, text }, { instruction, guidance });
+      cost = computeCost(usage); // metered even if the run yields nothing
+      if (actions.length === 0) {
+        throw new Error(
+          "No simplification actions were produced — the AI model was likely overloaded or rate-limited. Please re-run.",
+        );
+      }
+
+      // 4 + 5 — deterministic verification and section cross-check.
+      summary = verifyActions(actions, text);
+      crossCheck = crossCheckSections(summary.actions, structure);
+      status = "ok";
+    } catch (e: any) {
+      errorMsg = e?.message?.slice(0, 250) ?? "unknown error";
+      console.warn(`[simplify] run failed for "${title}":`, errorMsg);
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase as any).from("analysis_reports").update({
+      summary_json: {
+        ...prevJson,
+        kind: "simplification",
+        pending_analysis: false,
+        simplification_status: status,
+        simplification_error: errorMsg,
+        structure: structure ?? null,
+        cross_check: crossCheck ?? null,
+        verification: summary
+          ? { total: summary.total, verified: summary.verified, review: summary.review, rejected: summary.rejected }
+          : null,
+        // Each action carries its initial Accept/Reject decision: verified +
+        // confidence > 90 → accepted; quarantined → rejected; else pending.
+        actions: (summary?.actions ?? []).map((a) => ({ ...a, decision: initialDecision(a) })),
+        cost: cost ?? null,
+        last_run_at: new Date().toISOString(),
+      },
+    }).eq("id", report.id);
+
+    return {
+      reportId: report.id as string,
+      status,
+      error: errorMsg,
+      total: summary?.total ?? 0,
+      verified: summary?.verified ?? 0,
+      review: summary?.review ?? 0,
+      rejected: summary?.rejected ?? 0,
+      costUsd: cost?.usd ?? 0,
+    };
+  });
+
+/**
+ * UC4 — records a reviewer's Accept/Reject decision on one simplification
+ * action. Decisions live in summary_json.actions[index].decision. A quarantined
+ * action (the verifier found it is not in the document) can never be accepted.
+ */
+export const setSimplificationDecision = createServerFn({ method: "POST" })
+  .inputValidator(
+    z.object({
+      reportId: z.string(),
+      index: z.number().int().min(0),
+      decision: z.enum(["accepted", "rejected", "pending"]),
+    }),
+  )
+  .handler(async ({ data }) => {
+    const { data: report, error } = await supabase
+      .from("analysis_reports")
+      .select("summary_json")
+      .eq("id", data.reportId)
+      .single();
+    if (error || !report) throw new Error("Report not found");
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sj = ((report.summary_json as any) ?? {}) as Record<string, any>;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const actions: any[] = Array.isArray(sj.actions) ? sj.actions : [];
+    if (data.index >= actions.length) throw new Error("Action index out of range");
+    if (actions[data.index]?.verification?.status === "rejected" && data.decision === "accepted") {
+      throw new Error("A quarantined action cannot be accepted — it was not found in the document.");
+    }
+
+    actions[data.index] = { ...actions[data.index], decision: data.decision };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { error: upErr } = await (supabase as any)
+      .from("analysis_reports")
+      .update({ summary_json: { ...sj, actions } })
+      .eq("id", data.reportId);
+    if (upErr) throw new Error(`Failed to save decision: ${upErr.message}`);
+    return { ok: true };
+  });
+
+/**
+ * UC4 — generates an amended copy of the source document with every accepted
+ * simplification applied (highlighted) and a Word/Drive comment carrying the
+ * original "Before:" text on each amended span. Two paths:
+ *  - Drive source : copies the original in Drive (converting DOCX → Google Doc
+ *                   if needed for anchored comments), then writeToGoogleDoc +
+ *                   createDriveComment per accepted edit. Returns the Drive URL.
+ *  - Local upload : runs applySimplificationToDocx on the original .docx (which
+ *                   does paragraph-aware sub-text replacement + Word comments),
+ *                   uploads the amended .docx to storage, returns a download URL.
+ * Edits whose `before` cannot be located in the document structure are NOT
+ * silently dropped — they are returned in `skipped`.
+ */
+export const applySimplificationReport = createServerFn({ method: "POST" })
+  .inputValidator(z.object({ reportId: z.string() }))
+  .handler(async ({ data }) => {
+    const { data: report, error: repErr } = await supabase
+      .from("analysis_reports")
+      .select("*")
+      .eq("id", data.reportId)
+      .single();
+    if (repErr || !report) throw new Error("Report not found");
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sj = ((report.summary_json as any) ?? {}) as Record<string, any>;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const allActions: any[] = Array.isArray(sj.actions) ? sj.actions : [];
+    const accepted = allActions.filter((a) => a?.decision === "accepted");
+    if (accepted.length === 0) throw new Error("No accepted actions to apply.");
+
+    const title = (report.policy_name as string) ?? "Document";
+    const edits: SimplifyDocxEdit[] = accepted.map((a) => ({
+      before: String(a.before ?? ""),
+      after: String(a.after ?? ""),
+      // The Word/Drive comment carries "Before:" + the rule + a one-line rationale,
+      // so a reviewer reading the amended copy sees what was changed and why.
+      rationale:
+        a.rule || a.rationale
+          ? `${a.rule ?? ""}${a.rule && a.rationale ? " — " : ""}${a.rationale ?? ""}`.trim() || undefined
+          : undefined,
+    }));
+
+    const appliedAt = new Date().toISOString();
+
+    // ── Drive source path ───────────────────────────────────────────────────
+    if (sj.driveFileId) {
+      const copy = await copyDriveFile("simplify", sj.driveFileId, `${title} — simplified`, {
+        convertToGoogleDoc: true,
+      });
+      let applied = 0;
+      const skipped: { reason: string; before: string }[] = [];
+      for (const edit of edits) {
+        try {
+          // The replacement is highlighted AND followed by " (was: <before>)"
+          // in strike-through italic grey — a reliable in-document track-
+          // changes annotation, no Drive comment needed.
+          const r = await writeToGoogleDoc({
+            workspaceId: "simplify",
+            fileId: copy.id,
+            findText: edit.before,
+            anchor: edit.before,
+            newText: edit.after,
+            mode: "replace",
+            originalText: edit.before,
+          });
+          if ((r.occurrences ?? 0) > 0) applied++;
+          else skipped.push({ reason: "text not found in Google Doc", before: edit.before });
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } catch (e: any) {
+          skipped.push({ reason: e?.message?.slice(0, 120) ?? "Drive write error", before: edit.before });
+        }
+      }
+      const apply = {
+        kind: "drive" as const,
+        driveUrl: copy.url,
+        driveFileId: copy.id,
+        appliedCount: applied,
+        totalAccepted: accepted.length,
+        skipped,
+        appliedAt,
+      };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (supabase as any)
+        .from("analysis_reports")
+        .update({ summary_json: { ...sj, apply } })
+        .eq("id", report.id);
+      return apply;
+    }
+
+    // ── Local-upload path ───────────────────────────────────────────────────
+    if (!report.source_file_url) throw new Error("Report has no source file URL");
+    const file = await fetchFile(report.source_file_url);
+    if (!looksLikeDocx(file.mimeType, report.source_file_url)) {
+      throw new Error(
+        "Local apply currently supports DOCX sources only. For PDFs, re-upload as DOCX.",
+      );
+    }
+    const result = applySimplificationToDocx(file.buffer, edits, { author: "Compliance Sentinel" });
+
+    // Upload the amended .docx to storage and surface a download URL.
+    const safeName = title.replace(/[^A-Za-z0-9_.-]+/g, "_").slice(0, 80) || "amended";
+    const path = `simplify/amended-${Date.now()}-${safeName}.docx`;
+    const up = await supabase.storage.from("policies").upload(path, result.buffer, {
+      upsert: false,
+      contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    });
+    if (up.error) throw new Error(`Storage upload failed: ${up.error.message}`);
+    const downloadUrl = supabase.storage.from("policies").getPublicUrl(path).data.publicUrl;
+
+    const apply = {
+      kind: "local" as const,
+      downloadUrl,
+      downloadName: `${safeName}.docx`,
+      appliedCount: result.appliedCount,
+      totalAccepted: accepted.length,
+      skipped: result.skipped,
+      appliedAt,
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase as any)
+      .from("analysis_reports")
+      .update({ summary_json: { ...sj, apply } })
+      .eq("id", report.id);
+    return apply;
   });

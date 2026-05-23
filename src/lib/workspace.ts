@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-export type WorkspaceId = "rmit" | "fatf" | "forms";
+export type WorkspaceId = "rmit" | "fatf" | "forms" | "simplify";
 
 export const WORKSPACES: Record<WorkspaceId, {
   id: WorkspaceId;
@@ -34,6 +34,14 @@ export const WORKSPACES: Record<WorkspaceId, {
     color: "text-amber-700",
     bgColor: "bg-amber-100",
   },
+  simplify: {
+    id: "simplify",
+    name: "Document Simplification",
+    short: "Simplify",
+    tagline: "Plain-English rewrite · Verifiable redline",
+    color: "text-violet-700",
+    bgColor: "bg-violet-100",
+  },
 };
 
 const STORAGE_KEY = "workspace_id";
@@ -42,7 +50,7 @@ let currentWorkspace: WorkspaceId = "rmit";
 
 if (typeof window !== "undefined") {
   const stored = window.localStorage.getItem(STORAGE_KEY);
-  if (stored === "rmit" || stored === "fatf") currentWorkspace = stored;
+  if (stored && stored in WORKSPACES) currentWorkspace = stored as WorkspaceId;
 }
 
 export function setWorkspace(w: WorkspaceId) {

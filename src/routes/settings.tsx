@@ -22,6 +22,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { FolderOpen, RefreshCw } from "lucide-react";
 import { useWorkspace, WORKSPACES } from "@/lib/workspace";
+import { DEFAULT_SIMPLIFY_GUIDANCE } from "@/lib/simplify";
 import { toast } from "sonner";
 
 export const Route = createFileRoute("/settings")({
@@ -86,8 +87,12 @@ function SettingsPage() {
     queryFn: async () => await getGuidance({ data: { workspace } }),
   });
   useEffect(() => {
-    if (guidanceQuery.data) setGuidanceText(guidanceQuery.data.guidance ?? "");
-  }, [guidanceQuery.data]);
+    if (!guidanceQuery.data) return;
+    const saved = (guidanceQuery.data.guidance ?? "").trim();
+    // The Document Simplification workspace shows the built-in starter rules
+    // pre-filled when nothing has been saved yet; other workspaces stay blank.
+    setGuidanceText(saved || (workspace === "simplify" ? DEFAULT_SIMPLIFY_GUIDANCE : ""));
+  }, [guidanceQuery.data, workspace]);
 
   async function saveGuidanceNow() {
     setGuidanceSaving(true);

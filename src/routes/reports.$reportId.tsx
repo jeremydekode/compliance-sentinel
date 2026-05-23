@@ -41,8 +41,14 @@ export const Route = createFileRoute("/reports/$reportId")({
 function ReportPage() {
   const { reportId } = Route.useParams();
   const [role] = useRole();
-  // selectedId: null = Summary view, "<uuid>" = a specific change
+  // selectedId: null = Summary view; in byChange mode it's a change UUID,
+  // in byDocument mode it's the doc-group key (`sopId` or `__nokey_<title>`).
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Left panel grouping: by regulatory change (default) or by affected SOP doc.
+  const [viewMode, setViewMode] = useState<"byChange" | "byDocument">("byChange");
+  // How the amended-draft renders replaces: keep originals red+strike (review),
+  // or delete originals and insert the new text clean (finalised look).
+  const [draftMode, setDraftMode] = useState<"clean" | "trackChanges">("trackChanges");
   const [activeTab, setActiveTab] = useState<"analysis" | "gaps">("analysis");
   const [exporting, setExporting] = useState<null | "xlsx" | "html">(null);
   const [rerunning, setRerunning] = useState(false);
@@ -130,6 +136,27 @@ function ReportPage() {
     return Array.from(map.values()).sort((a, b) => b.impacts.length - a.impacts.length);
   }, [allImpacts, isFormUpdate]);
 
+  // Regulatory By-Document grouping: every affected SOP doc with all impacts
+  // hitting it across every regulatory change. Same shape as UC1's docGroups
+  // so the left-panel tile rendering is shared.
+  const docGroupsRegulatory = useMemo(() => {
+    if (isFormUpdate) return [];
+    const map = new Map<string, { sopId: string | null; sopTitle: string; impacts: any[] }>();
+    for (const imp of allImpacts) {
+      const key = imp.sop_id ?? `__nokey_${imp.sop_title}`;
+      if (!map.has(key)) map.set(key, { sopId: imp.sop_id, sopTitle: imp.sop_title, impacts: [] });
+      map.get(key)!.impacts.push(imp);
+    }
+    return Array.from(map.values()).sort((a, b) => b.impacts.length - a.impacts.length);
+  }, [allImpacts, isFormUpdate]);
+
+  /** Switches the left-panel grouping and resets selection back to Summary. */
+  function switchViewMode(mode: "byChange" | "byDocument") {
+    if (mode === viewMode) return;
+    setViewMode(mode);
+    setSelectedId(null);
+  }
+
   // Kick the analysis once when a freshly created report lands here. The ref
   // guard makes this fire exactly once per mount even as the query refetches.
   useEffect(() => {
@@ -182,6 +209,11 @@ function ReportPage() {
   const showSummary = selectedId === null;
   const selectedChange = showSummary || isFormUpdate ? null : (allChanges.find(c => c.id === selectedId) ?? null);
   const selectedDocGroup = isFormUpdate && !showSummary ? docGroups.find((d) => (d.sopId ?? `__nokey_${d.sopTitle}`) === selectedId) : null;
+  // In regulatory By-Document mode, selectedId is the doc-group key.
+  const selectedDocGroupRegulatory =
+    !isFormUpdate && viewMode === "byDocument" && !showSummary
+      ? docGroupsRegulatory.find((d) => (d.sopId ?? `__nokey_${d.sopTitle}`) === selectedId) ?? null
+      : null;
 
   const impactsForChange = (chapter_ref: string) => {
     const target = (chapter_ref ?? "").trim().toLowerCase();
@@ -366,7 +398,7 @@ function ReportPage() {
     if (!confirm(`Generate an amended draft copy for ${approved} approved impact${approved === 1 ? "" : "s"}?\n\nThis copies each affected SOP and applies the changes to the COPY — the live documents are not touched.`)) return;
     setGeneratingDraft(true);
     try {
-      const r = await genDraft({ data: { reportId } });
+      const r = await genDraft({ data: { reportId, renderMode: draftMode } });
       const made = r.drafts.length;
       toast.success(
         made > 0
@@ -458,13 +490,50 @@ function ReportPage() {
               </Button>
             )}
             {approvedCount > 0 && (
-              <Button size="sm" variant="outline" disabled={generatingDraft}
-                className="h-7 text-xs gap-1.5"
-                onClick={handleGenerateDraft}
-                title="Copy each affected SOP and apply the approved changes to the copy — the live documents are never touched">
-                {generatingDraft ? <Loader2 className="size-3 animate-spin" /> : <FileEdit className="size-3" />}
-                <span className="hidden sm:inline">Generate amended draft</span>
-              </Button>
+              <>
+                {/* Draft mode — Track Changes (review) vs Clean (finalised). */}
+                <div className="hidden md:flex items-center gap-0.5 p-0.5 rounded-md border bg-card h-7">
+                  <button
+                    type="button"
+                    onClick={() => setDraftMode("trackChanges")}
+                    disabled={generatingDraft}
+                    className={cn(
+                      "px-2 h-6 text-[10px] font-bold uppercase tracking-wider rounded transition-colors",
+                      draftMode === "trackChanges"
+                        ? "bg-foreground text-background"
+                        : "text-muted-foreground hover:bg-slate-100 dark:hover:bg-slate-800",
+                    )}
+                    title="Original kept in red strike-through, new in yellow — a track-changes review copy"
+                  >
+                    Track Changes
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDraftMode("clean")}
+                    disabled={generatingDraft}
+                    className={cn(
+                      "px-2 h-6 text-[10px] font-bold uppercase tracking-wider rounded transition-colors",
+                      draftMode === "clean"
+                        ? "bg-foreground text-background"
+                        : "text-muted-foreground hover:bg-slate-100 dark:hover:bg-slate-800",
+                    )}
+                    title="Original removed; new text replaces it highlighted yellow — a finalised draft"
+                  >
+                    Clean
+                  </button>
+                </div>
+                <Button size="sm" variant="outline" disabled={generatingDraft}
+                  className="h-7 text-xs gap-1.5"
+                  onClick={handleGenerateDraft}
+                  title={
+                    draftMode === "clean"
+                      ? "Copy each affected SOP and CLEANLY apply the approved changes to the copy (finalised look) — the live documents are never touched"
+                      : "Copy each affected SOP and apply the approved changes to the copy in TRACK-CHANGES form (original red+strike, new yellow) — the live documents are never touched"
+                  }>
+                  {generatingDraft ? <Loader2 className="size-3 animate-spin" /> : <FileEdit className="size-3" />}
+                  <span className="hidden sm:inline">Generate amended draft</span>
+                </Button>
+              </>
             )}
             <div className="h-4 w-px bg-border mx-0.5" />
             <Button variant="outline" size="sm" disabled={!!exporting} className="h-7 text-xs gap-1.5"
@@ -576,6 +645,35 @@ function ReportPage() {
               </div>
               {/* Change list */}
               <div className="flex-1 overflow-y-auto">
+                {/* By Change / By Document toggle — regulatory workspaces only */}
+                {!isFormUpdate && (
+                  <div className="flex items-center gap-1 p-2 border-b border-slate-200 dark:border-slate-700 bg-slate-50/60 dark:bg-slate-900/30">
+                    <button
+                      type="button"
+                      onClick={() => switchViewMode("byChange")}
+                      className={cn(
+                        "flex-1 text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded transition-colors",
+                        viewMode === "byChange"
+                          ? "bg-foreground text-background shadow-sm"
+                          : "text-muted-foreground hover:bg-slate-200 dark:hover:bg-slate-800",
+                      )}
+                    >
+                      By Change
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => switchViewMode("byDocument")}
+                      className={cn(
+                        "flex-1 text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded transition-colors",
+                        viewMode === "byDocument"
+                          ? "bg-foreground text-background shadow-sm"
+                          : "text-muted-foreground hover:bg-slate-200 dark:hover:bg-slate-800",
+                      )}
+                    >
+                      By Document
+                    </button>
+                  </div>
+                )}
                 {/* Summary pseudo-item */}
                 <button
                   onClick={() => setSelectedId(null)}
@@ -636,6 +734,56 @@ function ReportPage() {
                           </div>
                           <p className="text-[10px] text-muted-foreground leading-snug">
                             {g.impacts.length} edit{g.impacts.length !== 1 ? "s" : ""} to apply
+                          </p>
+                          {!g.sopId && (
+                            <p className="mt-1 text-[9px] font-semibold text-amber-600 inline-flex items-center gap-1">
+                              <AlertTriangle className="size-2.5" /> Not in KB
+                            </p>
+                          )}
+                        </button>
+                      );
+                    })
+                  )
+                ) : viewMode === "byDocument" ? (
+                  docGroupsRegulatory.length === 0 ? (
+                    <div className="px-4 py-8 text-center text-xs text-muted-foreground italic">No affected documents.</div>
+                  ) : (
+                    docGroupsRegulatory.map((g) => {
+                      const key = g.sopId ?? `__nokey_${g.sopTitle}`;
+                      const isSelected = selectedId === key;
+                      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                      const approvedCount = g.impacts.filter((i: any) => i.status === "approved").length;
+                      const allApproved = approvedCount === g.impacts.length && g.impacts.length > 0;
+                      const cleanTitle = (g.sopTitle ?? "").replace(/\s*\(no matching internal doc(?:\s+found)?\)/gi, "").trim();
+                      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                      const changes = new Set(g.impacts.map((i: any) => i.chapter)).size;
+                      return (
+                        <button
+                          key={key}
+                          onClick={() => setSelectedId(key)}
+                          className={cn(
+                            "w-full text-left px-3 py-2.5 border-b border-slate-100 dark:border-slate-800 transition-all",
+                            "hover:bg-white dark:hover:bg-slate-800/60",
+                            isSelected
+                              ? "bg-white dark:bg-slate-800 border-l-[3px] border-l-primary shadow-sm"
+                              : "border-l-[3px] border-l-transparent",
+                            allApproved && !isSelected && "bg-emerald-50/40 dark:bg-emerald-900/10",
+                          )}
+                        >
+                          <div className="flex items-center justify-between gap-2 mb-1">
+                            <span className="font-semibold text-[11px] text-foreground truncate">{cleanTitle}</span>
+                            <span className={cn(
+                              "text-[8px] font-black px-1 py-0.5 rounded inline-flex items-center gap-0.5 shrink-0",
+                              allApproved ? "bg-emerald-100 text-emerald-700" :
+                              approvedCount > 0 ? "bg-blue-100 text-blue-700" :
+                                                  "bg-slate-100 text-slate-600"
+                            )}>
+                              {allApproved ? <CheckCircle2 className="size-2.5" /> : <Circle className="size-2.5" />}
+                              {approvedCount}/{g.impacts.length}
+                            </span>
+                          </div>
+                          <p className="text-[10px] text-muted-foreground leading-snug">
+                            {g.impacts.length} edit{g.impacts.length !== 1 ? "s" : ""} across {changes} change{changes !== 1 ? "s" : ""}
                           </p>
                           {!g.sopId && (
                             <p className="mt-1 text-[9px] font-semibold text-amber-600 inline-flex items-center gap-1">
@@ -731,6 +879,13 @@ function ReportPage() {
                   sopById={sopById}
                   reportId={reportId}
                   formId={summary?.form_id ?? newPolicyName}
+                />
+              ) : selectedDocGroupRegulatory ? (
+                <RegulatoryDocPanel
+                  docGroup={selectedDocGroupRegulatory}
+                  sopDoc={sopById.get(selectedDocGroupRegulatory.sopId ?? "")}
+                  allChanges={allChanges}
+                  reportId={reportId}
                 />
               ) : selectedChange ? (
                 <ChangeDetailPanel
@@ -1341,10 +1496,12 @@ function ImpactCard({
   const alreadyInserted = !!imp.inserted_at || !!imp.drive_comment_id;
 
   async function applyToSource(mode: "comment" | "insert" | "replace") {
-    if (!isFromDrive || alreadyInserted || applying) return;
+    if (!isFromDrive || applying) return;
     setApplying(mode);
     try {
-      const r = await writeToDoc({ data: { impactId: imp.id, mode } });
+      // When the impact has already been applied, send `force` so the server
+      // bypasses the alreadyApplied short-circuit and Re-inserts cleanly.
+      const r = await writeToDoc({ data: { impactId: imp.id, mode, force: alreadyInserted } });
       const hl = "highlighted" in r && r.highlighted ? " — highlighted in yellow" : "";
       const occ = "occurrences" in r && typeof r.occurrences === "number" && r.occurrences > 1
         ? ` (${r.occurrences} locations)` : "";
@@ -1571,39 +1728,37 @@ function ImpactCard({
               className={cn("h-7 text-xs gap-1", currentStatus === "approved" && "text-emerald-700 bg-emerald-50 dark:bg-emerald-900/20")}>
               <CheckCircle2 className="size-3" /> Approve
             </Button>
-            {alreadyInserted ? (
-              <Button size="sm" variant="ghost" disabled
-                className="h-7 text-xs gap-1 text-blue-700 bg-blue-50 dark:bg-blue-900/20">
+            {alreadyInserted && (
+              <span className="inline-flex items-center gap-1 h-7 px-2 text-[10px] font-bold uppercase tracking-wider text-emerald-700 bg-emerald-50 dark:bg-emerald-900/20 rounded-md">
                 <CheckCircle2 className="size-3" /> Applied
-              </Button>
-            ) : (
-              <>
-                <Button size="sm" variant="ghost"
-                  onClick={() => applyToSource("comment")}
-                  disabled={!isFromDrive || !!applying}
-                  title={isFromDrive ? "Add this amendment as a comment in the source document" : "This SOP isn't synced from Drive"}
-                  className="h-7 text-xs gap-1">
-                  {applying === "comment" ? <Loader2 className="size-3 animate-spin" /> : <MessageSquarePlus className="size-3" />}
-                  Comment
-                </Button>
-                <Button size="sm" variant="ghost"
-                  onClick={() => applyToSource("insert")}
-                  disabled={!isFromDrive || !!applying}
-                  title={isFromDrive ? "Insert the amended text into the Google Doc, right after the found statement (highlighted)" : "This SOP isn't synced from Drive"}
-                  className="h-7 text-xs gap-1">
-                  {applying === "insert" ? <Loader2 className="size-3 animate-spin" /> : <FilePlus2 className="size-3" />}
-                  Insert
-                </Button>
-                <Button size="sm" variant="ghost"
-                  onClick={() => applyToSource("replace")}
-                  disabled={!isFromDrive || !!applying}
-                  title={isFromDrive ? "Replace the found text in the Google Doc with the amended text (highlighted)" : "This SOP isn't synced from Drive"}
-                  className="h-7 text-xs gap-1">
-                  {applying === "replace" ? <Loader2 className="size-3 animate-spin" /> : <Replace className="size-3" />}
-                  Replace
-                </Button>
-              </>
+              </span>
             )}
+            {!alreadyInserted && (
+              <Button size="sm" variant="ghost"
+                onClick={() => applyToSource("comment")}
+                disabled={!isFromDrive || !!applying}
+                title={isFromDrive ? "Add this amendment as a comment in the source document" : "This SOP isn't synced from Drive"}
+                className="h-7 text-xs gap-1">
+                {applying === "comment" ? <Loader2 className="size-3 animate-spin" /> : <MessageSquarePlus className="size-3" />}
+                Comment
+              </Button>
+            )}
+            <Button size="sm" variant="ghost"
+              onClick={() => applyToSource("insert")}
+              disabled={!isFromDrive || !!applying}
+              title={isFromDrive ? (alreadyInserted ? "Re-insert the amended text — re-applies to the Google Doc" : "Insert the amended text into the Google Doc, right after the found statement (highlighted)") : "This SOP isn't synced from Drive"}
+              className="h-7 text-xs gap-1">
+              {applying === "insert" ? <Loader2 className="size-3 animate-spin" /> : <FilePlus2 className="size-3" />}
+              {alreadyInserted ? "Re-insert" : "Insert"}
+            </Button>
+            <Button size="sm" variant="ghost"
+              onClick={() => applyToSource("replace")}
+              disabled={!isFromDrive || !!applying}
+              title={isFromDrive ? (alreadyInserted ? "Re-replace — re-runs the swap in the Google Doc" : "Replace the found text in the Google Doc with the amended text (highlighted)") : "This SOP isn't synced from Drive"}
+              className="h-7 text-xs gap-1">
+              {applying === "replace" ? <Loader2 className="size-3 animate-spin" /> : <Replace className="size-3" />}
+              {alreadyInserted ? "Re-replace" : "Replace"}
+            </Button>
             <Button size="sm" variant="ghost" onClick={() => onSetStatus(imp.id, "rejected")}
               className={cn("h-7 text-xs gap-1 text-muted-foreground", currentStatus === "rejected" && "text-slate-500 bg-slate-100 dark:bg-slate-800")}>
               <XCircle className="size-3" /> Reject
@@ -1993,6 +2148,146 @@ function GapTable({ impacts, sopById, reportId }: { impacts: any[]; sopById: Map
           </tbody>
         </table>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Regulatory By-Document panel — shows every amendment hitting one SOP,
+ * grouped by their source regulatory change. Mirrors ChangeDetailPanel's
+ * status-update pattern and re-uses ImpactCard so the per-impact controls
+ * (Approve/Reject/Insert/Re-insert) work identically.
+ */
+function RegulatoryDocPanel({
+  docGroup,
+  sopDoc,
+  allChanges,
+  reportId,
+}: {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  docGroup: { sopId: string | null; sopTitle: string; impacts: any[] };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  sopDoc: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  allChanges: any[];
+  reportId: string;
+}) {
+  const qc = useQueryClient();
+  const upd = useServerFn(updateImpact);
+
+  async function setImpactStatus(id: string, status: "approved" | "rejected" | "routed") {
+    try {
+      await upd({ data: { id, status } });
+      toast.success(`Marked as ${status}`);
+      qc.invalidateQueries({ queryKey: ["impacts", reportId] });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } catch (e: any) {
+      toast.error(e?.message ?? "Failed to update");
+    }
+  }
+
+  // Group this doc's impacts by their source change (chapter_ref).
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const grouped = new Map<string, any[]>();
+  for (const imp of docGroup.impacts) {
+    const chapter = String(imp.chapter ?? "").trim() || "—";
+    if (!grouped.has(chapter)) grouped.set(chapter, []);
+    grouped.get(chapter)!.push(imp);
+  }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const changeByChapter = new Map<string, any>();
+  for (const c of allChanges) changeByChapter.set(c.chapter_ref, c);
+
+  const cleanTitle = (docGroup.sopTitle ?? "")
+    .replace(/\s*\(no matching internal doc(?:\s+found)?\)/gi, "")
+    .trim();
+  const fileUrl = sopDoc?.drive_view_url ?? sopDoc?.file_url ?? null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const approvedCount = docGroup.impacts.filter((i: any) => i.status === "approved").length;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const pendingCount = docGroup.impacts.filter((i: any) => !i.status || i.status === "pending").length;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const rejectedCount = docGroup.impacts.filter((i: any) => i.status === "rejected").length;
+
+  return (
+    <div className="p-6 max-w-[1200px] mx-auto space-y-6">
+      {/* Header */}
+      <div>
+        {fileUrl ? (
+          <a
+            href={fileUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-1.5 text-base font-bold text-primary hover:underline"
+          >
+            <FileText className="size-4 shrink-0" />
+            <span className="truncate">{cleanTitle}</span>
+            <ExternalLink className="size-3 opacity-60 shrink-0" />
+          </a>
+        ) : (
+          <h2 className="text-base font-bold flex items-center gap-1.5">
+            <FileText className="size-4" />
+            {cleanTitle}
+          </h2>
+        )}
+        <p className="text-xs text-muted-foreground mt-1">
+          {docGroup.impacts.length} amendment{docGroup.impacts.length !== 1 ? "s" : ""} from{" "}
+          {grouped.size} regulatory change{grouped.size !== 1 ? "s" : ""}
+        </p>
+        <div className="flex items-center gap-4 mt-2 text-xs text-muted-foreground">
+          <span>
+            <span className="font-black text-emerald-700 tabular-nums">{approvedCount}</span> approved
+          </span>
+          <span>
+            <span className="font-black text-amber-700 tabular-nums">{pendingCount}</span> pending
+          </span>
+          <span>
+            <span className="font-black text-rose-700 tabular-nums">{rejectedCount}</span> rejected
+          </span>
+        </div>
+        {!docGroup.sopId && (
+          <p className="mt-2 inline-flex items-center gap-1 text-xs font-semibold text-amber-700">
+            <AlertTriangle className="size-3.5" /> This SOP isn't in the KB — edits cannot be applied to the source.
+          </p>
+        )}
+      </div>
+
+      {/* Impacts grouped by source change */}
+      {[...grouped.entries()].map(([chapter, imps]) => {
+        const change = changeByChapter.get(chapter);
+        const headline = (change?.change_summary as string)?.trim() || chapter;
+        const impactLevel = change?.impact ?? "low";
+        return (
+          <section key={chapter} className="space-y-3">
+            <div className="flex items-center gap-2 pb-2 border-b border-slate-200 dark:border-slate-700">
+              <span
+                className={cn(
+                  "text-[8px] font-black uppercase tracking-widest px-1.5 py-0.5 rounded shrink-0",
+                  impactLevel === "high"
+                    ? "bg-rose-100 text-rose-700"
+                    : impactLevel === "medium"
+                      ? "bg-amber-100 text-amber-700"
+                      : "bg-emerald-100 text-emerald-700",
+                )}
+              >
+                {impactLevel}
+              </span>
+              <span className="text-sm font-semibold truncate flex-1">{headline}</span>
+              <span className="font-mono text-[10px] text-muted-foreground shrink-0">{chapter}</span>
+            </div>
+            <div className="space-y-3">
+              {imps.map((imp) => (
+                <ImpactCard
+                  key={imp.id}
+                  imp={imp}
+                  sopDoc={sopDoc}
+                  onSetStatus={setImpactStatus}
+                />
+              ))}
+            </div>
+          </section>
+        );
+      })}
     </div>
   );
 }

@@ -23,7 +23,9 @@ import {
   RefreshCw,
 } from "lucide-react";
 import { FormUpdateDialog } from "@/components/form-update-dialog";
+import { SimplifyUploadDialog } from "@/components/simplify-upload-dialog";
 import { formatDate, statusMeta } from "@/lib/format";
+import { formatUsd } from "@/lib/pricing";
 import {
   deleteReport,
   createRegulatoryReport,
@@ -37,9 +39,162 @@ import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 
 export const Route = createFileRoute("/reports/")({
-  component: ReportsList,
+  component: ReportsRoute,
   head: () => ({ meta: [{ title: "Analyses · Compliance Sentinel" }] }),
 });
+
+/**
+ * The /reports route serves every workspace. The Document Simplification (UC4)
+ * workspace has its own self-contained landing — kept separate so the
+ * regulatory / forms list below is never disturbed.
+ */
+function ReportsRoute() {
+  const [workspace] = useWorkspace();
+  return workspace === "simplify" ? <SimplifyReportsList /> : <ReportsList />;
+}
+
+/** UC4 — list of simplified documents + the upload entry point. */
+function SimplifyReportsList() {
+  const qc = useQueryClient();
+  const nav = useNavigate();
+  const remove = useServerFn(deleteReport);
+  const [showUpload, setShowUpload] = useState(false);
+
+  const reports = useQuery({
+    queryKey: ["reports", "all", "simplify"],
+    queryFn: async () => {
+      const { data } = await (supabase as any)
+        .from("analysis_reports")
+        .select("id, title, policy_name, status, created_at, summary_json")
+        .eq("workspace_id", "simplify")
+        .order("created_at", { ascending: false });
+      return data ?? [];
+    },
+  });
+
+  async function handleDelete(e: React.MouseEvent, id: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!confirm("Delete this simplification and all related data?")) return;
+    try {
+      await remove({ data: { id } });
+      toast.success("Simplification deleted");
+      qc.invalidateQueries({ queryKey: ["reports"] });
+    } catch (err: any) {
+      toast.error(err?.message ?? "Failed to delete");
+    }
+  }
+
+  return (
+    <AppShell>
+      <div className="p-8 max-w-[1400px] mx-auto space-y-8">
+        <div className="flex items-end justify-between">
+          <div>
+            <h1 className="text-3xl font-bold tracking-tight">Document Simplification</h1>
+            <p className="text-muted-foreground mt-1 text-lg">
+              Rewrite internal documents in plain English — every edit verified against the source.
+            </p>
+          </div>
+          <Button
+            size="lg"
+            onClick={() => setShowUpload(true)}
+            className="gap-2 h-12 px-6 rounded-xl font-bold bg-violet-600 hover:bg-violet-700 text-white shadow-lg shadow-violet-500/20 active:scale-95"
+          >
+            <Plus className="size-4" /> New Simplification
+          </Button>
+        </div>
+
+        <Card className="p-0 overflow-hidden border-border/50 shadow-sm glass-card">
+          <div className="px-6 py-4 border-b border-border/50 bg-muted/30 flex items-center justify-between">
+            <h2 className="font-bold text-sm uppercase tracking-[0.2em] text-muted-foreground">Simplified Documents</h2>
+            <Badge variant="secondary" className="font-black text-[10px]">{reports.data?.length ?? 0} TOTAL</Badge>
+          </div>
+
+          {reports.isLoading && (
+            <div className="p-12 text-center text-muted-foreground font-medium italic animate-pulse">Loading…</div>
+          )}
+
+          {!reports.isLoading && (reports.data?.length ?? 0) === 0 && (
+            <div className="p-20 text-center">
+              <div className="size-16 bg-muted rounded-full grid place-items-center mx-auto mb-4">
+                <FileText className="size-8 text-muted-foreground" />
+              </div>
+              <h3 className="text-xl font-bold">No documents simplified yet</h3>
+              <p className="text-muted-foreground mt-2 max-w-sm mx-auto">
+                Upload an internal document to generate a verified plain-English redline.
+              </p>
+              <Button onClick={() => setShowUpload(true)} className="mt-6 gap-2 h-11 px-8 rounded-lg font-bold bg-violet-600 hover:bg-violet-700 text-white">
+                <Plus className="size-4" /> New Simplification
+              </Button>
+            </div>
+          )}
+
+          <div className="divide-y divide-border/50">
+            {reports.data?.map((r: any) => {
+              const sj = r.summary_json ?? {};
+              const v = sj.verification;
+              return (
+                <Link
+                  key={r.id}
+                  to="/simplify/$reportId"
+                  params={{ reportId: r.id }}
+                  className="flex items-center justify-between px-6 py-5 hover:bg-violet-500/[0.03] transition-colors group"
+                >
+                  <div className="min-w-0 flex items-center gap-4">
+                    <div className="size-10 rounded-xl grid place-items-center shrink-0 bg-violet-100 transition-transform group-hover:scale-110">
+                      <Sparkles className="size-5 text-violet-700" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="font-bold text-base truncate group-hover:text-violet-700 transition-colors">{r.title}</div>
+                      <div className="flex items-center gap-2 text-xs text-muted-foreground mt-1 font-medium">
+                        {sj.pending_analysis ? (
+                          <span className="text-violet-600 font-semibold">Analysing…</span>
+                        ) : sj.simplification_status === "failed" ? (
+                          <span className="text-rose-600 font-semibold">Run failed</span>
+                        ) : v ? (
+                          <span>
+                            {v.verified} verified · {v.review} review · {v.rejected} quarantined
+                            {sj.cost ? ` · ${formatUsd(sj.cost.usd)}` : ""}
+                          </span>
+                        ) : (
+                          <span>Ready</span>
+                        )}
+                        <span>•</span>
+                        <span>{formatDate(r.created_at)}</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-9 rounded-lg text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
+                      onClick={(e) => handleDelete(e, r.id)}
+                    >
+                      <Trash2 className="size-4" />
+                    </Button>
+                    <div className="size-9 rounded-lg bg-muted grid place-items-center group-hover:bg-violet-600 group-hover:text-white transition-all">
+                      <ArrowRight className="size-4" />
+                    </div>
+                  </div>
+                </Link>
+              );
+            })}
+          </div>
+        </Card>
+      </div>
+
+      <SimplifyUploadDialog
+        open={showUpload}
+        onOpenChange={setShowUpload}
+        onCreated={(reportId) => {
+          qc.invalidateQueries({ queryKey: ["reports"] });
+          nav({ to: "/simplify/$reportId", params: { reportId } });
+        }}
+      />
+    </AppShell>
+  );
+}
 
 function ReportsList() {
   const qc = useQueryClient();

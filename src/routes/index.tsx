@@ -1,5 +1,6 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
+import { useEffect, useState } from "react";
 import { AppShell } from "@/components/app-shell";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -7,19 +8,44 @@ import { Button } from "@/components/ui/button";
 import { supabase } from "@/integrations/supabase/client";
 import { ArrowRight, FileText, AlertTriangle, CheckCircle2, Upload } from "lucide-react";
 import { formatDate, statusMeta } from "@/lib/format";
+import { useWorkspace, type WorkspaceId } from "@/lib/workspace";
 
 export const Route = createFileRoute("/")({ component: Dashboard });
 
 function Dashboard() {
+  // Workspace lives in localStorage — server has no access, so the SSR pass
+  // sees "rmit". Render server-default until mounted, then swap. Same pattern
+  // used in app-shell + settings to avoid React 19 hydration mismatches.
+  const [workspaceActual] = useWorkspace();
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+  const workspace: WorkspaceId = mounted ? workspaceActual : "rmit";
+
+  // Scope the dashboard to the active workspace. Previously this query had no
+  // workspace filter at all — it mixed reports from every workspace and never
+  // refetched when the user switched, so the dashboard looked stuck.
   const reports = useQuery({
-    queryKey: ["reports"],
+    queryKey: ["reports", "dashboard", workspace],
     queryFn: async () => {
-      const { data } = await supabase
+      // The generated Supabase types don't include `workspace_id` yet (it was
+      // added via migration). Cast to any to bypass the stale schema typing,
+      // matching how the rest of the codebase handles workspace-filtered queries.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data } = await (supabase as any)
         .from("analysis_reports")
         .select("id, title, policy_name, status, created_at")
+        .eq("workspace_id", workspace)
         .order("created_at", { ascending: false })
         .limit(10);
-      return data ?? [];
+      // Columns are non-null in DB; match the original generated shape so
+      // downstream string-only consumers (statusMeta, formatDate) compile.
+      return (data ?? []) as Array<{
+        id: string;
+        title: string;
+        policy_name: string;
+        status: string;
+        created_at: string;
+      }>;
     },
   });
 

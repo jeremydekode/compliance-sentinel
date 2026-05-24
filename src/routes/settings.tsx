@@ -54,7 +54,14 @@ function SettingsPage() {
   const [guidanceSaving, setGuidanceSaving] = useState(false);
   const [indexProgress, setIndexProgress] = useState<{ done: number; total: number } | null>(null);
   const [syncPhase, setSyncPhase] = useState<"mirror" | "index" | null>(null);
-  const [workspace] = useWorkspace();
+  const [workspaceActual] = useWorkspace();
+  // Workspace lives in localStorage — server has no access, so it defaults
+  // to "rmit". Render with the server-default until after hydration, then
+  // swap to the real workspace. Prevents a React 19 hydration crash when
+  // the page is hard-refreshed on a non-rmit workspace.
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+  const workspace: WorkspaceId = mounted ? workspaceActual : "rmit";
   const wsName = WORKSPACES[workspace].name;
   const [folderInput, setFolderInput] = useState("");
   const [syncResult, setSyncResult] = useState<any | null>(null);

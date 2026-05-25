@@ -456,8 +456,38 @@ Pick one canonical form per term and use it everywhere. Examples — extend with
 - Cross-reference numbering (Section 4.2.1, Appendix B) — don't renumber.
 - Quoted regulatory citations — never paraphrase.
 
-# TONE
-- Professional and instructional, suitable for an internal bank operations manual.
-- No marketing language ("seamless", "world-class", "best-in-class", "robust", "leverage").
-- No conversational filler ("you'll find that", "as you can see", "of course", "simply", "just").
-- Third-person institutional voice (the Document Owner, staff, the Bank), not "you" or "we" — except where the source already uses them.`;
+# TONE — bank policy register, NOT conversational
+This is an official bank policy / operations document. The output must read like
+formal institutional prose, NOT a user-facing how-to or website copy.
+
+❌ FORBIDDEN — second-person address (NEVER introduce these, EVEN IF the source already uses them — replace with the appropriate institutional subject):
+- "you", "your", "yours", "yourself"
+- "you can", "you may", "you must", "you should", "you will", "you'll", "you'd"
+- "we", "us", "our", "I", "my"
+
+❌ FORBIDDEN — conversational filler:
+- "you'll find that", "as you can see", "of course", "simply", "just", "kindly", "please note that"
+
+❌ FORBIDDEN — marketing language:
+- "seamless", "world-class", "best-in-class", "robust", "leverage", "empower", "streamline", "innovative"
+
+✅ PREFERRED — institutional subjects (use one of these in place of "you/we"):
+- "Staff", "Users", "the Document Owner", "the Bank", "RHB Banking Group", "the Group",
+  "Operations & Methods (O&M)", "Approving Authority", "Business/Functional Units",
+  "the [specific role/committee named in source]"
+- Or use a passive/impersonal construction when no specific subject is implied.
+
+REWRITE EXAMPLES:
+| ❌ Wrong (informal)              | ✅ Right (policy register)                                       |
+| -------------------------------- | ---------------------------------------------------------------- |
+| "You can view this on My1Portal" | "This document is available on My1Portal." OR "Staff may view this document on My1Portal." |
+| "You must obtain approval"       | "Approval must be obtained" OR "The Document Owner must obtain approval" |
+| "You'll find details in Sec. 4"  | "Further details are in Section 4."                              |
+| "We hereby confirm…"             | "The Document Owner confirms…"                                   |
+| "Please ensure you submit…"      | "Submissions must be made…" OR "Staff must submit…"              |
+
+- The source MAY use passive voice ("This document can be viewed…"). DO NOT switch
+  passive to second-person — switch passive to active using an INSTITUTIONAL SUBJECT.
+  Example: source "This document can be viewed…" → after "Staff may view this document…"
+  (NOT "You can view this document…")
+- Professional and instructional throughout.`;

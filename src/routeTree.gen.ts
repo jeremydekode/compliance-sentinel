@@ -10,6 +10,7 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as SettingsRouteImport } from './routes/settings'
+import { Route as LoginRouteImport } from './routes/login'
 import { Route as KnowledgeBaseRouteImport } from './routes/knowledge-base'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as ReportsIndexRouteImport } from './routes/reports.index'
@@ -17,12 +18,18 @@ import { Route as LayoutIndexRouteImport } from './routes/layout.index'
 import { Route as SimplifyReportIdRouteImport } from './routes/simplify.$reportId'
 import { Route as ReportsReportIdRouteImport } from './routes/reports.$reportId'
 import { Route as LayoutJobIdRouteImport } from './routes/layout.$jobId'
+import { Route as AuthCallbackRouteImport } from './routes/auth.callback'
 import { Route as ReportsReportIdPresentRouteImport } from './routes/reports.$reportId.present'
 import { Route as AuthGoogleCallbackRouteImport } from './routes/auth.google.callback'
 
 const SettingsRoute = SettingsRouteImport.update({
   id: '/settings',
   path: '/settings',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const LoginRoute = LoginRouteImport.update({
+  id: '/login',
+  path: '/login',
   getParentRoute: () => rootRouteImport,
 } as any)
 const KnowledgeBaseRoute = KnowledgeBaseRouteImport.update({
@@ -60,6 +67,11 @@ const LayoutJobIdRoute = LayoutJobIdRouteImport.update({
   path: '/layout/$jobId',
   getParentRoute: () => rootRouteImport,
 } as any)
+const AuthCallbackRoute = AuthCallbackRouteImport.update({
+  id: '/auth/callback',
+  path: '/auth/callback',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ReportsReportIdPresentRoute = ReportsReportIdPresentRouteImport.update({
   id: '/present',
   path: '/present',
@@ -74,7 +86,9 @@ const AuthGoogleCallbackRoute = AuthGoogleCallbackRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/knowledge-base': typeof KnowledgeBaseRoute
+  '/login': typeof LoginRoute
   '/settings': typeof SettingsRoute
+  '/auth/callback': typeof AuthCallbackRoute
   '/layout/$jobId': typeof LayoutJobIdRoute
   '/reports/$reportId': typeof ReportsReportIdRouteWithChildren
   '/simplify/$reportId': typeof SimplifyReportIdRoute
@@ -86,7 +100,9 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/knowledge-base': typeof KnowledgeBaseRoute
+  '/login': typeof LoginRoute
   '/settings': typeof SettingsRoute
+  '/auth/callback': typeof AuthCallbackRoute
   '/layout/$jobId': typeof LayoutJobIdRoute
   '/reports/$reportId': typeof ReportsReportIdRouteWithChildren
   '/simplify/$reportId': typeof SimplifyReportIdRoute
@@ -99,7 +115,9 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/knowledge-base': typeof KnowledgeBaseRoute
+  '/login': typeof LoginRoute
   '/settings': typeof SettingsRoute
+  '/auth/callback': typeof AuthCallbackRoute
   '/layout/$jobId': typeof LayoutJobIdRoute
   '/reports/$reportId': typeof ReportsReportIdRouteWithChildren
   '/simplify/$reportId': typeof SimplifyReportIdRoute
@@ -113,7 +131,9 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/knowledge-base'
+    | '/login'
     | '/settings'
+    | '/auth/callback'
     | '/layout/$jobId'
     | '/reports/$reportId'
     | '/simplify/$reportId'
@@ -125,7 +145,9 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/knowledge-base'
+    | '/login'
     | '/settings'
+    | '/auth/callback'
     | '/layout/$jobId'
     | '/reports/$reportId'
     | '/simplify/$reportId'
@@ -137,7 +159,9 @@ export interface FileRouteTypes {
     | '__root__'
     | '/'
     | '/knowledge-base'
+    | '/login'
     | '/settings'
+    | '/auth/callback'
     | '/layout/$jobId'
     | '/reports/$reportId'
     | '/simplify/$reportId'
@@ -150,7 +174,9 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   KnowledgeBaseRoute: typeof KnowledgeBaseRoute
+  LoginRoute: typeof LoginRoute
   SettingsRoute: typeof SettingsRoute
+  AuthCallbackRoute: typeof AuthCallbackRoute
   LayoutJobIdRoute: typeof LayoutJobIdRoute
   ReportsReportIdRoute: typeof ReportsReportIdRouteWithChildren
   SimplifyReportIdRoute: typeof SimplifyReportIdRoute
@@ -166,6 +192,13 @@ declare module '@tanstack/react-router' {
       path: '/settings'
       fullPath: '/settings'
       preLoaderRoute: typeof SettingsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/login': {
+      id: '/login'
+      path: '/login'
+      fullPath: '/login'
+      preLoaderRoute: typeof LoginRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/knowledge-base': {
@@ -217,6 +250,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LayoutJobIdRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/auth/callback': {
+      id: '/auth/callback'
+      path: '/auth/callback'
+      fullPath: '/auth/callback'
+      preLoaderRoute: typeof AuthCallbackRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/reports/$reportId/present': {
       id: '/reports/$reportId/present'
       path: '/present'
@@ -249,7 +289,9 @@ const ReportsReportIdRouteWithChildren = ReportsReportIdRoute._addFileChildren(
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   KnowledgeBaseRoute: KnowledgeBaseRoute,
+  LoginRoute: LoginRoute,
   SettingsRoute: SettingsRoute,
+  AuthCallbackRoute: AuthCallbackRoute,
   LayoutJobIdRoute: LayoutJobIdRoute,
   ReportsReportIdRoute: ReportsReportIdRouteWithChildren,
   SimplifyReportIdRoute: SimplifyReportIdRoute,

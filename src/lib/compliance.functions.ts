@@ -1,6 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
-import { supabase } from "@/integrations/supabase/client";
+import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { supabaseAdmin } from "@/integrations/supabase/client.server";
 import { chunkDocument, generateAmendedDocument, extractRegulatoryChanges, extractFatfRequirements, mapChangeToSops, routeChangesToSops, analyzeSopAgainstGaps, buildSopTopicMap, generateAnalysisSummary, generateWithFallback, simplifyDocument } from "./gemini";
 import { applyEditsToDocx, looksLikeDocx, docxToText, docxToHtml, applySimplificationToDocx, type SimplifyDocxEdit } from "./docx-editor";
 import { verifyActions, analyzeStructure, crossCheckSections, DEFAULT_SIMPLIFY_GUIDANCE, initialDecision } from "./simplify";
@@ -48,6 +49,11 @@ async function policySourceFromFile(
 import { generateEmbedding, generateQueryEmbedding, generateEmbeddingsBatch } from "./embeddings";
 import { REGULATION_FAMILIES, INTERNAL_DOC_TYPES as INTERNAL_DOC_TYPES_CONST, regulatorContext, autoDetectDocMeta } from "./auto-detect";
 
+// Allowed workspace identifiers — shared across every workspace-scoped input
+// validator. Declared up here so server fns defined anywhere in the file can
+// reference it in their .inputValidator() (evaluated at module load).
+const workspaceSchema = z.enum(["rmit", "fatf", "forms", "simplify", "layout"]);
+
 async function fetchFile(url: string): Promise<{ buffer: Buffer; mimeType: string }> {
   // Reject Drive viewer URLs straight away — they return HTML, not the file.
   // (Drive-synced SOPs should now store a Supabase storage URL as file_url,
@@ -88,7 +94,44 @@ async function embedChunksBatched<T extends { content: string }>(
   return chunks.map((c, i) => makeRow(c, vectors[i] ?? []));
 }
 
+/**
+ * Append-only audit write for a workflow transition. Records who/when/what for
+ * every state change on a report. Writes via the SERVICE-ROLE client only —
+ * workflow_events has no client write policy under RLS (it is tamper-resistant:
+ * clients can read history but cannot forge or delete it).
+ *
+ * NEVER throws: a failed audit write must not break the transition the user
+ * requested, so any error is swallowed with a console.warn.
+ */
+async function logWorkflowEvent(
+  reportId: string,
+  event: string,
+  fromStatus: string | null,
+  toStatus: string | null,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  context: { userId?: string; claims?: any },
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  detail?: any,
+): Promise<void> {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { error } = await (supabaseAdmin as any).from("workflow_events").insert({
+      report_id: reportId,
+      event,
+      from_status: fromStatus,
+      to_status: toStatus,
+      actor_id: context.userId ?? null,
+      actor_email: context.claims?.email ?? null,
+      detail: detail ?? null,
+    });
+    if (error) console.warn(`logWorkflowEvent(${event}) failed:`, error.message);
+  } catch (e: any) {
+    console.warn(`logWorkflowEvent(${event}) threw:`, e?.message);
+  }
+}
+
 export const createReport = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(
     z.object({
       filename: z.string(),
@@ -107,7 +150,8 @@ export const createReport = createServerFn({ method: "POST" })
         .optional(),
     })
   )
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     const detected = data.detected;
     const workspace = data.workspace;
     
@@ -202,7 +246,7 @@ export const createReport = createServerFn({ method: "POST" })
       const oldPolicySource = oldPolicy && oldDoc
         ? await policySourceFromFile(oldDoc.title, oldPolicy, oldDoc.file_url)
         : undefined;
-      const analysisGuidance = await fetchAnalysisGuidance(workspace);
+      const analysisGuidance = await fetchAnalysisGuidance(supabase, workspace);
       const extractedChanges = await extractRegulatoryChanges(
         newPolicySource,
         oldPolicySource,
@@ -223,7 +267,7 @@ export const createReport = createServerFn({ method: "POST" })
           sopTextCache.set(sop.id, text);
           if (text && text.trim()) {
             try {
-              topicMap = await buildAndVerifyTopicMap(sop.id, sop.title, text);
+              topicMap = await buildAndVerifyTopicMap(supabase, sop.id, sop.title, text);
               console.log(`[createReport] "${sop.title}" — topic index: ${Object.keys(topicMap).length} topic(s)`);
             } catch (e: any) {
               console.warn(`[createReport] topic-map build failed for "${sop.title}":`, e?.message);
@@ -364,6 +408,7 @@ export const createReport = createServerFn({ method: "POST" })
         // Reuses any text already fetched during the topic-index build above.
         const sopDoc = relevantSops.find((s) => s.id === m.sop_id);
         sopTextCache.set(m.sop_id, sopDoc ? await fetchSopText(sopDoc, workspace) : null);
+        // (fetchSopText reads via Drive API / public file_url — no supabase client needed)
       }
       const srcText = sopTextCache.get(m.sop_id);
       if (!srcText) { verifiedImpacts.push(m); continue; } // couldn't fetch — don't drop
@@ -417,6 +462,7 @@ export const createReport = createServerFn({ method: "POST" })
  * re-run uses, so the upload never chunks and never times out.
  */
 export const createRegulatoryReport = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(
     z.object({
       filename: z.string(),
@@ -435,7 +481,8 @@ export const createRegulatoryReport = createServerFn({ method: "POST" })
         .optional(),
     })
   )
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     if (!data.fileUrl) throw new Error("No file URL provided for analysis");
     const fallbackName = data.filename.replace(/\.[^.]+$/, "").trim() || data.filename;
     const displayName = (data.customTitle ?? "").trim() || fallbackName;
@@ -461,6 +508,75 @@ export const createRegulatoryReport = createServerFn({ method: "POST" })
       .select("id")
       .single();
     if (error || !report) throw new Error(error?.message || "Failed to create report");
+    return { reportId: report.id as string };
+  });
+
+/**
+ * Creates a 'policy_change' workflow report — an internal policy revision that
+ * runs through the same report state machine as regulatory/form reports, but is
+ * discriminated by workflow_type = "policy_change". No AI extraction at create
+ * time: the analyst seeds the report (optionally from a regulatory_changes row)
+ * and the impacts are curated through the normal review flow.
+ */
+export const createPolicyChangeReport = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    z.object({
+      workspace: workspaceSchema,
+      title: z.string().min(1),
+      description: z.string().max(20000).optional(),
+      sourceChangeId: z.string().uuid().optional(),
+    }),
+  )
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    const title = data.title;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report, error } = await (supabase as any)
+      .from("analysis_reports")
+      .insert({
+        title,
+        policy_name: title,
+        status: "pending_validation",
+        workflow_type: "policy_change",
+        workspace_id: data.workspace,
+        source_file_url: null,
+        summary_json: {
+          workflow_type: "policy_change",
+          analyst_notes: data.description ?? null,
+          source_change_id: data.sourceChangeId ?? null,
+        },
+      })
+      .select("id")
+      .single();
+    if (error || !report) throw new Error(error?.message || "Failed to create policy change report");
+
+    // When seeded from a regulatory change, look up that row and create ONE
+    // starter impact so the analyst has a concrete anchor to expand from.
+    if (data.sourceChangeId) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: srcChange } = await (supabase as any)
+        .from("regulatory_changes")
+        .select("chapter_ref")
+        .eq("id", data.sourceChangeId)
+        .maybeSingle();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (supabase as any).from("sop_impacts").insert({
+        report_id: report.id,
+        sop_title: "(policy change) " + title,
+        change_type: "contextual",
+        chapter: srcChange?.chapter_ref ?? null,
+        status: "pending",
+        position: 0,
+      });
+    }
+
+    await logWorkflowEvent(report.id as string, "created", null, "pending_validation", context, {
+      workflow_type: "policy_change",
+      source_change_id: data.sourceChangeId ?? null,
+    });
+
     return { reportId: report.id as string };
   });
 
@@ -589,7 +705,8 @@ async function fetchSopText(
  * the sop_documents row, and returns it.
  */
 async function buildAndVerifyTopicMap(
-  sopId: string, title: string, fullText: string,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  supabase: any, sopId: string, title: string, fullText: string,
 ): Promise<Record<string, string[]>> {
   const raw = await buildSopTopicMap({ title, text: fullText });
   const verified: Record<string, string[]> = {};
@@ -659,8 +776,10 @@ function buildRelevantWindows(fullText: string, maxSeg: number): string[] {
  * mapping runs per-SOP via analyzeRegulatorySop so no single call can time out.
  */
 export const startRegulatoryRerun = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ reportId: z.string() }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     const { data: report, error: repErr } = await supabase
       .from("analysis_reports").select("*").eq("id", data.reportId).single();
     if (repErr || !report) throw new Error("Report not found");
@@ -708,7 +827,7 @@ export const startRegulatoryRerun = createServerFn({ method: "POST" })
     let regulationStatus: "ok" | "failed" = "failed";
     let regulationError: string | null = null;
     try {
-      const guidance = await fetchAnalysisGuidance(workspace);
+      const guidance = await fetchAnalysisGuidance(supabase, workspace);
       if (isFatf) {
         const regFile = await fetchFile(report.source_file_url);
         const regSource = await policySourceFromFile(report.policy_name ?? "regulation", regFile, report.source_file_url);
@@ -814,7 +933,7 @@ export const startRegulatoryRerun = createServerFn({ method: "POST" })
           const routeIdx = await routeChangesToSops(
             requirements.map((c: any) => ({ chapter_ref: c.chapter_ref, change_summary: c.change_summary })),
             readableCat.map((c) => ({ title: c.title, blurb: c.blurb })),
-            await fetchAnalysisGuidance(workspace),
+            await fetchAnalysisGuidance(supabase, workspace),
           );
           for (const [ci, docIdxs] of Object.entries(routeIdx)) {
             const change = insertedChanges[Number(ci)];
@@ -863,8 +982,10 @@ export const startRegulatoryRerun = createServerFn({ method: "POST" })
  * over-triggers. The client runs these in parallel, one per change.
  */
 export const mapRegulatoryChange = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ reportId: z.string(), changeId: z.string() }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: report } = await (supabase as any)
       .from("analysis_reports").select("id, workspace_id, summary_json").eq("id", data.reportId).single();
@@ -909,7 +1030,7 @@ export const mapRegulatoryChange = createServerFn({ method: "POST" })
           text: s.text as string,
           governanceTier: s.governance_tier ?? null,
         })),
-        await fetchAnalysisGuidance(workspaceId),
+        await fetchAnalysisGuidance(supabase, workspaceId),
       );
     } catch (e: any) {
       console.warn(`[regulatory] mapChangeToSops failed for "${change.chapter_ref}":`, e?.message);
@@ -975,8 +1096,10 @@ export const mapRegulatoryChange = createServerFn({ method: "POST" })
  * Gemini call stays within the function time limit. One call per SOP.
  */
 export const analyzeRegulatorySop = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ reportId: z.string(), sopId: z.string() }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: report } = await (supabase as any)
       .from("analysis_reports").select("id, workspace_id, policy_name, source_file_url").eq("id", data.reportId).single();
@@ -1034,7 +1157,7 @@ export const analyzeRegulatorySop = createServerFn({ method: "POST" })
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const allImpacts: any[] = [];
-    const analysisGuidance = await fetchAnalysisGuidance(workspaceId);
+    const analysisGuidance = await fetchAnalysisGuidance(supabase, workspaceId);
     const deadline = Date.now() + 250_000;
     for (const seg of segments) {
       if (Date.now() > deadline) { console.warn(`[regulatory] "${sop.title}" time budget reached`); break; }
@@ -1131,6 +1254,7 @@ export const analyzeRegulatorySop = createServerFn({ method: "POST" })
 
 /** Phase 3 — regenerates the executive summary once all changes are mapped. */
 export const finalizeRegulatoryReport = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({
     reportId: z.string(),
     // Per-SOP outcome from the analysis loop. "failed" = could not be analysed
@@ -1142,7 +1266,8 @@ export const finalizeRegulatoryReport = createServerFn({ method: "POST" })
       impactCount: z.number().optional(),
     })).optional(),
   }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: report } = await (supabase as any)
       .from("analysis_reports").select("*").eq("id", data.reportId).single();
@@ -1215,22 +1340,34 @@ export const finalizeRegulatoryReport = createServerFn({ method: "POST" })
   });
 
 export const requestLegalSignOff = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ reportId: z.string() }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    const { data: before } = await supabase
+      .from("analysis_reports")
+      .select("status")
+      .eq("id", data.reportId)
+      .single();
     const { error } = await supabase
       .from("analysis_reports")
       .update({ status: "pending_legal" })
       .eq("id", data.reportId);
     if (error) throw new Error(error.message);
+    await logWorkflowEvent(
+      data.reportId, "submitted_legal", (before?.status as string | null) ?? null, "pending_legal", context,
+    );
     return { ok: true };
   });
 
 export const finalizeLegalSignOff = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ reportId: z.string() }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     const { data: row } = await supabase
       .from("analysis_reports")
-      .select("summary_json")
+      .select("status, summary_json")
       .eq("id", data.reportId)
       .single();
     const summary = (row?.summary_json ?? {}) as Record<string, unknown>;
@@ -1242,6 +1379,9 @@ export const finalizeLegalSignOff = createServerFn({ method: "POST" })
       })
       .eq("id", data.reportId);
     if (error) throw new Error(error.message);
+    await logWorkflowEvent(
+      data.reportId, "signed_off", (row?.status as string | null) ?? null, "signed_off", context,
+    );
     return { ok: true };
   });
 
@@ -1254,8 +1394,15 @@ function bumpVersion(v: string): string {
 }
 
 export const publishToKB = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ reportId: z.string() }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    const { data: beforeRow } = await supabase
+      .from("analysis_reports")
+      .select("status")
+      .eq("id", data.reportId)
+      .single();
     const { data: impacts } = await supabase
       .from("sop_impacts")
       .select("sop_id, sop_title, edited_text, replace_text, chapter")
@@ -1300,32 +1447,57 @@ export const publishToKB = createServerFn({ method: "POST" })
       .update({ status: "published" })
       .eq("id", data.reportId);
 
+    await logWorkflowEvent(
+      data.reportId, "published", (beforeRow?.status as string | null) ?? null, "published", context,
+    );
+
     return { ok: true, updatedSops: updated };
   });
 
 export const markPendingManual = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ reportId: z.string() }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    const { data: before } = await supabase
+      .from("analysis_reports")
+      .select("status")
+      .eq("id", data.reportId)
+      .single();
     const { error } = await supabase
       .from("analysis_reports")
       .update({ status: "pending_manual" })
       .eq("id", data.reportId);
     if (error) throw new Error(error.message);
+    await logWorkflowEvent(
+      data.reportId, "pending_manual", (before?.status as string | null) ?? null, "pending_manual", context,
+    );
     return { ok: true };
   });
 
 export const confirmManualCompletion = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ reportId: z.string() }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    const { data: before } = await supabase
+      .from("analysis_reports")
+      .select("status")
+      .eq("id", data.reportId)
+      .single();
     const { error } = await supabase
       .from("analysis_reports")
       .update({ status: "published" })
       .eq("id", data.reportId);
     if (error) throw new Error(error.message);
+    await logWorkflowEvent(
+      data.reportId, "published", (before?.status as string | null) ?? null, "published", context,
+    );
     return { ok: true };
   });
 
 export const updateImpact = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(
     z.object({
       id: z.string(),
@@ -1333,10 +1505,30 @@ export const updateImpact = createServerFn({ method: "POST" })
       edited_text: z.string().optional(),
     })
   )
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     const { id, ...rest } = data;
+    // Grab the impact's report + prior status so the audit can record the change.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: prior } = await (supabase as any)
+      .from("sop_impacts")
+      .select("report_id, status")
+      .eq("id", id)
+      .maybeSingle();
     const { error } = await supabase.from("sop_impacts").update(rest).eq("id", id);
     if (error) throw new Error(error.message);
+    // Only audit when a status decision was actually requested, and only when we
+    // could resolve the owning report (workflow_events.report_id is NOT NULL).
+    if (data.status && prior?.report_id) {
+      await logWorkflowEvent(
+        prior.report_id as string,
+        "impact_decided",
+        (prior.status as string | null) ?? null,
+        data.status,
+        context,
+        { impact_id: id, status: data.status },
+      );
+    }
     return { ok: true };
   });
 
@@ -1346,11 +1538,13 @@ export const updateImpact = createServerFn({ method: "POST" })
  * A human triggers it — so there is still a single accountable approve action.
  */
 export const bulkApproveReady = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({
     reportId: z.string(),
     minConfidence: z.number().min(0).max(100).default(90),
   }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: rows, error } = await (supabase as any)
       .from("sop_impacts")
@@ -1364,13 +1558,15 @@ export const bulkApproveReady = createServerFn({ method: "POST" })
   });
 
 export const chatWithReport = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(
     z.object({
       reportId: z.string(),
       message: z.string().min(1).max(4000),
     })
   )
-  .handler(async function* ({ data }) {
+  .handler(async function* ({ data, context }) {
+    const supabase = context.supabase;
     const { data: report } = await supabase
       .from("analysis_reports")
       .select("title, policy_name, summary_json")
@@ -1455,8 +1651,10 @@ ${JSON.stringify(report?.summary_json ?? {}, null, 2)}`;
   });
 
 export const deleteReport = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ id: z.string() }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     await supabase.from("chat_messages").delete().eq("report_id", data.id);
     await supabase.from("sop_impacts").delete().eq("report_id", data.id);
     await supabase.from("regulatory_changes").delete().eq("report_id", data.id);
@@ -1466,14 +1664,17 @@ export const deleteReport = createServerFn({ method: "POST" })
   });
 
 export const deleteSop = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ id: z.string() }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     const { error } = await supabase.from("sop_documents").delete().eq("id", data.id);
     if (error) throw new Error(error.message);
     return { ok: true };
   });
 
 export const createSop = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(
     z.object({
       title: z.string().min(2).max(200),
@@ -1485,7 +1686,8 @@ export const createSop = createServerFn({ method: "POST" })
       file_url: z.string().nullable().optional(),
     })
   )
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     const embedding = await generateEmbedding(`${data.title} ${data.summary || ""}`);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1543,6 +1745,7 @@ export const createSop = createServerFn({ method: "POST" })
   });
 
 export const updateSop = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(
     z.object({
       id: z.string(),
@@ -1553,7 +1756,8 @@ export const updateSop = createServerFn({ method: "POST" })
       file_url: z.string().nullable().optional(),
     })
   )
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     const { data: current, error: readError } = await supabase
       .from("sop_documents")
       .select("version")
@@ -1581,13 +1785,15 @@ export const updateSop = createServerFn({ method: "POST" })
   });
 
 export const clearWorkspace = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(
     z.object({
       scope: z.enum(["analyses", "kb", "all"]),
       workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout"]).default("rmit"),
     })
   )
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     // Scope all deletions to the specified workspace ONLY — never wipe across workspaces.
     if (data.scope === "analyses" || data.scope === "all") {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1623,8 +1829,10 @@ export const clearWorkspace = createServerFn({ method: "POST" })
  * Used to render the "Step 9 · Apply Approved Changes" card.
  */
 export const getAmendableDocuments = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ reportId: z.string() }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     const { data: impacts } = await supabase
       .from("sop_impacts")
       .select("*")
@@ -1670,8 +1878,10 @@ export const getAmendableDocuments = createServerFn({ method: "GET" })
  * Returns the amended HTML for review BEFORE finalizing.
  */
 export const generateDocumentPreview = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ reportId: z.string(), sopId: z.string() }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: sop, error: sopErr } = await (supabase as any)
       .from("sop_documents").select("*").eq("id", data.sopId).single();
@@ -1769,6 +1979,7 @@ export const generateDocumentPreview = createServerFn({ method: "POST" })
  * - Updates impacts: status='applied', applied_in_version=<new version>.
  */
 export const finalizeDocumentAmendment = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({
     reportId: z.string(),
     sopId: z.string(),
@@ -1778,7 +1989,8 @@ export const finalizeDocumentAmendment = createServerFn({ method: "POST" })
     // HTML path: amended HTML body to wrap and save
     amendedHtml: z.string().nullable().optional(),
   }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: oldSop, error: sopErr } = await (supabase as any)
       .from("sop_documents").select("*").eq("id", data.sopId).single();
@@ -1962,8 +2174,10 @@ function escapeHtml(s: string): string {
  * Used to show indexing health in the KB list ("X chunks" or "Not indexed").
  */
 export const getChunkCounts = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout"]).default("rmit") }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: sops } = await (supabase as any)
       .from("sop_documents")
@@ -1990,8 +2204,10 @@ export const getChunkCounts = createServerFn({ method: "GET" })
  * Deletes any existing chunks for that SOP first, then re-indexes.
  */
 export const reindexSop = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ id: z.string() }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: sop, error: sopErr } = await (supabase as any)
       .from("sop_documents")
@@ -2064,6 +2280,7 @@ export const reindexSop = createServerFn({ method: "POST" })
 // We deliberately do NOT accept base64 over the wire — Vercel serverless functions
 // cap request bodies at ~4.5 MB and a typical multi-page form blows past that.
 export const extractFormMetadata = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({
     fileUrl: z.string().url(),
     fileName: z.string().optional(),
@@ -2229,6 +2446,7 @@ function applyPageOverrides(formId: string, impacts: any[]): any[] {
 // Propagates form metadata changes (name, version, date, etc.) across all
 // downstream documents in the KB that reference the form.
 export const createFormUpdateReport = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({
     workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout"]).default("forms"),
     formId: z.string().min(1),                  // e.g. "FGROP 037/2016"
@@ -2242,7 +2460,8 @@ export const createFormUpdateReport = createServerFn({ method: "POST" })
       newValue: z.string().min(1),
     })).min(1).max(20),
   }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     const displayName =
       (data.customTitle ?? "").trim() ||
       `${data.formId} update — ${data.fieldChanges[0].oldValue.slice(0, 20)} → ${data.fieldChanges[0].newValue.slice(0, 20)}`;
@@ -2296,7 +2515,7 @@ export const createFormUpdateReport = createServerFn({ method: "POST" })
       }))
     );
 
-    const docsToAnalyze = await getFormCandidateDocs(data.workspace);
+    const docsToAnalyze = await getFormCandidateDocs(supabase, data.workspace);
     return { reportId: report.id as string, docsToAnalyze };
   });
 
@@ -2306,8 +2525,10 @@ export const createFormUpdateReport = createServerFn({ method: "POST" })
  * to analyze one at a time via analyzeDocForForm.
  */
 export const rerunFormUpdateReport = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ reportId: z.string() }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: report, error } = await (supabase as any)
       .from("analysis_reports").select("*").eq("id", data.reportId).single();
@@ -2342,7 +2563,7 @@ export const rerunFormUpdateReport = createServerFn({ method: "POST" })
       }))
     );
 
-    const docsToAnalyze = await getFormCandidateDocs((report.workspace_id as string) ?? "forms");
+    const docsToAnalyze = await getFormCandidateDocs(supabase, (report.workspace_id as string) ?? "forms");
     return { reportId: report.id as string, docsToAnalyze };
   });
 
@@ -2352,8 +2573,10 @@ export const rerunFormUpdateReport = createServerFn({ method: "POST" })
  * function budget, so a single large document can never make the run time out.
  */
 export const analyzeDocForForm = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ reportId: z.string(), docId: z.string() }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: report } = await (supabase as any)
       .from("analysis_reports").select("*").eq("id", data.reportId).single();
@@ -2524,6 +2747,7 @@ export const analyzeDocForForm = createServerFn({ method: "POST" })
 
 /** Writes the final executive summary once all per-doc analysis calls are done. */
 export const finalizeFormUpdateReport = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({
     reportId: z.string(),
     // Per-document outcome from the analysis loop. "failed" = could not be
@@ -2531,7 +2755,8 @@ export const finalizeFormUpdateReport = createServerFn({ method: "POST" })
     // the form but the AI produced no edit. Both need a manual check.
     coverage: z.array(z.object({ title: z.string(), status: z.string() })).optional(),
   }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: report } = await (supabase as any)
       .from("analysis_reports").select("*").eq("id", data.reportId).single();
@@ -2579,7 +2804,10 @@ export const finalizeFormUpdateReport = createServerFn({ method: "POST" })
   });
 
 /** Lists the policy/SOP documents in ONE workspace that could reference a form. */
-async function getFormCandidateDocs(workspace: string): Promise<{ docId: string; title: string }[]> {
+async function getFormCandidateDocs(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  supabase: any, workspace: string,
+): Promise<{ docId: string; title: string }[]> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const { data } = await (supabase as any)
     .from("sop_documents")
@@ -2671,12 +2899,13 @@ Return ONLY the JSON array. No commentary.
 
 // ── Google Drive OAuth + connection management ────────────────────────────────
 
-const workspaceSchema = z.enum(["rmit", "fatf", "forms", "simplify", "layout"]);
-
 // ── Analysis guidance — user-editable instruction injected into the prompts ───
 
 /** Reads the saved analysis guidance for a workspace (empty string if none). */
-async function fetchAnalysisGuidance(workspace: string): Promise<string> {
+async function fetchAnalysisGuidance(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  supabase: any, workspace: string,
+): Promise<string> {
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: row } = await (supabase as any)
@@ -2689,15 +2918,19 @@ async function fetchAnalysisGuidance(workspace: string): Promise<string> {
 
 /** Settings — read the current analysis guidance for a workspace. */
 export const getAnalysisGuidance = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ workspace: workspaceSchema }))
-  .handler(async ({ data }) => {
-    return { guidance: await fetchAnalysisGuidance(data.workspace) };
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    return { guidance: await fetchAnalysisGuidance(supabase, data.workspace) };
   });
 
 /** Settings — save the analysis guidance for a workspace. */
 export const saveAnalysisGuidance = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ workspace: workspaceSchema, guidance: z.string().max(20000) }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { error } = await (supabase as any).from("analysis_guidance").upsert({
       workspace_id: data.workspace,
@@ -2710,6 +2943,7 @@ export const saveAnalysisGuidance = createServerFn({ method: "POST" })
 
 /** Build the consent URL the browser navigates to when Connect is clicked. */
 export const getGoogleAuthUrl = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({
     workspace: workspaceSchema,
     origin: z.string().url(),
@@ -2728,6 +2962,7 @@ export const getGoogleAuthUrl = createServerFn({ method: "POST" })
 
 /** Handle the OAuth callback: exchange code, fetch email, persist tokens. */
 export const handleGoogleCallback = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({
     code: z.string().min(1),
     state: z.string().min(1),
@@ -2757,6 +2992,7 @@ export const handleGoogleCallback = createServerFn({ method: "POST" })
 
 /** Read connection status for the Settings UI. */
 export const getGoogleConnectionStatus = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ workspace: workspaceSchema }))
   .handler(async ({ data }) => {
     return await getConnection(data.workspace);
@@ -2764,6 +3000,7 @@ export const getGoogleConnectionStatus = createServerFn({ method: "POST" })
 
 /** Disconnect Google for a workspace. */
 export const disconnectGoogle = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ workspace: workspaceSchema }))
   .handler(async ({ data }) => {
     await deleteConnection(data.workspace);
@@ -2774,6 +3011,7 @@ export const disconnectGoogle = createServerFn({ method: "POST" })
 
 /** Save the KB folder for this workspace. Validates the ID exists + is a folder. */
 export const setDriveFolder = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({
     workspace: workspaceSchema,
     folderUrlOrId: z.string().min(1),
@@ -2785,8 +3023,9 @@ export const setDriveFolder = createServerFn({ method: "POST" })
     if (meta.mimeType !== "application/vnd.google-apps.folder") {
       throw new Error(`That Drive ID is a ${meta.mimeType.replace("application/vnd.google-apps.", "")}, not a folder.`);
     }
+    // workspace_google_connections is deny-all under RLS — service role only.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const { error } = await (supabase as any)
+    const { error } = await (supabaseAdmin as any)
       .from("workspace_google_connections")
       .update({ drive_folder_id: folderId, drive_folder_name: meta.name })
       .eq("workspace_id", data.workspace);
@@ -2803,14 +3042,17 @@ export const setDriveFolder = createServerFn({ method: "POST" })
  * Returns counts so the UI can show what happened.
  */
 export const syncDriveFolder = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({
     workspace: workspaceSchema,
     /** Re-process every file regardless of modifiedTime / last_sync_error. */
     force: z.boolean().optional().default(false),
   }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    // workspace_google_connections is deny-all under RLS — service role only.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const { data: conn, error: connErr } = await (supabase as any)
+    const { data: conn, error: connErr } = await (supabaseAdmin as any)
       .from("workspace_google_connections")
       .select("drive_folder_id, drive_folder_name")
       .eq("workspace_id", data.workspace)
@@ -2960,13 +3202,16 @@ export const syncDriveFolder = createServerFn({ method: "POST" })
  * The client then calls mirrorDriveFile once per file.
  */
 export const listDriveFilesToSync = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({
     workspace: workspaceSchema,
     force: z.boolean().optional().default(false),
   }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    // workspace_google_connections is deny-all under RLS — service role only.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const { data: conn, error: connErr } = await (supabase as any)
+    const { data: conn, error: connErr } = await (supabaseAdmin as any)
       .from("workspace_google_connections")
       .select("drive_folder_id, drive_folder_name")
       .eq("workspace_id", data.workspace)
@@ -3017,6 +3262,7 @@ export const listDriveFilesToSync = createServerFn({ method: "POST" })
  * Returns { sopId, title } so the client can queue it for indexing.
  */
 export const mirrorDriveFile = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({
     workspace: workspaceSchema,
     fileId: z.string(),
@@ -3025,7 +3271,8 @@ export const mirrorDriveFile = createServerFn({ method: "POST" })
     modifiedTime: z.string().optional(),
     existingSopId: z.string().optional(),
   }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     const f = { id: data.fileId, name: data.fileName, mimeType: data.mimeType, modifiedTime: data.modifiedTime };
 
     let fileBuffer: Buffer;
@@ -3108,10 +3355,12 @@ export const mirrorDriveFile = createServerFn({ method: "POST" })
 
 /** List files in the workspace's configured Drive folder, for the picker UI. */
 export const listWorkspaceDriveFiles = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ workspace: workspaceSchema }))
   .handler(async ({ data }) => {
+    // workspace_google_connections is deny-all under RLS — service role only.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const { data: conn } = await (supabase as any)
+    const { data: conn } = await (supabaseAdmin as any)
       .from("workspace_google_connections")
       .select("drive_folder_id, drive_folder_name")
       .eq("workspace_id", data.workspace)
@@ -3139,11 +3388,13 @@ export const listWorkspaceDriveFiles = createServerFn({ method: "POST" })
  * Returns { filename, fileUrl } ready to pass into createReport.
  */
 export const importDriveFileForAnalysis = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({
     workspace: workspaceSchema,
     driveFileId: z.string().min(1),
   }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     const meta = await getFileMetadata(data.workspace, data.driveFileId);
     if (!isIndexableMimeType(meta.mimeType)) {
       throw new Error(`Unsupported file type: ${meta.mimeType}`);
@@ -3198,8 +3449,10 @@ export const importDriveFileForAnalysis = createServerFn({ method: "POST" })
  * Idempotent: if drive_comment_id is already set on the impact, returns it.
  */
 export const insertImpactAsDriveComment = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ impactId: z.string().min(1) }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     // 1. Load the impact + its source SOP
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: imp, error: impErr } = await (supabase as any)
@@ -3264,6 +3517,7 @@ export const insertImpactAsDriveComment = createServerFn({ method: "POST" })
  * PDF/DOCX-in-Drive: falls back to a Drive comment, since those can't be edited in place.
  */
 export const writeImpactToDoc = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({
     impactId: z.string().min(1),
     // comment = Drive comment; insert = add new text after the found statement;
@@ -3273,7 +3527,8 @@ export const writeImpactToDoc = createServerFn({ method: "POST" })
     // skips the alreadyApplied short-circuit so the "Re-insert" UX works.
     force: z.boolean().optional(),
   }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: imp, error: impErr } = await (supabase as any)
       .from("sop_impacts")
@@ -3361,6 +3616,7 @@ export const writeImpactToDoc = createServerFn({ method: "POST" })
  * Draft links are recorded on the report's summary_json.amended_drafts.
  */
 export const generateAmendedDraft = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(
     z.object({
       reportId: z.string(),
@@ -3370,7 +3626,8 @@ export const generateAmendedDraft = createServerFn({ method: "POST" })
       renderMode: z.enum(["clean", "trackChanges"]).default("trackChanges"),
     }),
   )
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: report } = await (supabase as any)
       .from("analysis_reports").select("*").eq("id", data.reportId).single();
@@ -3488,11 +3745,13 @@ function deriveBaseFormId(formNumber: string): string {
 }
 
 export const detectFormChanges = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({
     newFileUrl: z.string().url(),
     oldFormSopId: z.string().optional(),
   }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     // 1. Extract metadata from the new file using existing helper
     const newFetched = await fetchFile(data.newFileUrl);
     const newMeta = await (async () => {
@@ -3654,6 +3913,7 @@ Return ONLY the JSON array. No commentary, no markdown fences.`;
  * createRegulatoryReport's create-then-run-on-the-page pattern.
  */
 export const createSimplificationReport = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(
     z.object({
       filename: z.string(),
@@ -3666,7 +3926,8 @@ export const createSimplificationReport = createServerFn({ method: "POST" })
       driveMimeType: z.string().optional(),
     }),
   )
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     if (!data.fileUrl) throw new Error("No file URL provided for simplification");
     const fallbackName = data.filename.replace(/\.[^.]+$/, "").trim() || data.filename;
     const displayName = (data.customTitle ?? "").trim() || fallbackName;
@@ -3706,8 +3967,10 @@ export const createSimplificationReport = createServerFn({ method: "POST" })
  * The full result is stored in analysis_reports.summary_json.
  */
 export const runSimplificationReport = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ reportId: z.string() }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     const { data: report, error: repErr } = await supabase
       .from("analysis_reports").select("*").eq("id", data.reportId).single();
     if (repErr || !report) throw new Error("Report not found");
@@ -3752,7 +4015,7 @@ export const runSimplificationReport = createServerFn({ method: "POST" })
       // Guidance) is folded into the prompt here, so tuning that guidance
       // changes the rules every subsequent run applies.
       // No saved guidance yet → fall back to the built-in starter house rules.
-      const guidance = (await fetchAnalysisGuidance("simplify")) || DEFAULT_SIMPLIFY_GUIDANCE;
+      const guidance = (await fetchAnalysisGuidance(supabase, "simplify")) || DEFAULT_SIMPLIFY_GUIDANCE;
       const { actions, usage } = await simplifyDocument({ title, text }, { instruction, guidance });
       cost = computeCost(usage); // metered even if the run yields nothing
       if (actions.length === 0) {
@@ -3809,6 +4072,7 @@ export const runSimplificationReport = createServerFn({ method: "POST" })
  * action (the verifier found it is not in the document) can never be accepted.
  */
 export const setSimplificationDecision = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(
     z.object({
       reportId: z.string(),
@@ -3816,7 +4080,8 @@ export const setSimplificationDecision = createServerFn({ method: "POST" })
       decision: z.enum(["accepted", "rejected", "pending"]),
     }),
   )
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     const { data: report, error } = await supabase
       .from("analysis_reports")
       .select("summary_json")
@@ -3857,8 +4122,10 @@ export const setSimplificationDecision = createServerFn({ method: "POST" })
  * silently dropped — they are returned in `skipped`.
  */
 export const applySimplificationReport = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ reportId: z.string() }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     const { data: report, error: repErr } = await supabase
       .from("analysis_reports")
       .select("*")
@@ -3976,8 +4243,11 @@ export const applySimplificationReport = createServerFn({ method: "POST" })
 // VISIBLE — so the feature degrades safely when the migration hasn't been run.
 
 /** Returns the per-workspace visibility map. Missing rows default to true. */
-export const getWorkspaceVisibility = createServerFn({ method: "GET" }).handler(
-  async () => {
+export const getWorkspaceVisibility = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(
+  async ({ context }) => {
+    const supabase = context.supabase;
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const { data, error } = await (supabase as any)
@@ -4001,13 +4271,15 @@ export const getWorkspaceVisibility = createServerFn({ method: "GET" }).handler(
 
 /** Sets a workspace's visibility (super-admin action). */
 export const setWorkspaceVisibility = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(
     z.object({
       workspace: workspaceSchema,
       visible: z.boolean(),
     }),
   )
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { error } = await (supabase as any)
       .from("workspace_settings")

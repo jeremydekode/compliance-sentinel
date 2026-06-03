@@ -1,4 +1,4 @@
-import { createFileRoute, Link, notFound } from "@tanstack/react-router";
+import { createFileRoute, Link, notFound, useNavigate } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
 import { useState, useMemo, useEffect, useRef } from "react";
@@ -11,11 +11,12 @@ import { ApprovalWorkflow } from "@/components/approval-workflow";
 import { AmendmentPanel } from "@/components/amendment-panel";
 import { LegalReviewView } from "@/components/legal-review-view";
 import { useRole } from "@/lib/role";
+import { useAuth } from "@/lib/auth";
 import { MD } from "@/components/md";
 import { exportExcel, exportHtmlPresentation } from "@/lib/exports";
 import { impactClasses, formatDate, statusMeta, changeTypeMeta } from "@/lib/format";
 import { sortChangesByPriority, autoBoldExecBullet } from "@/lib/change-utils";
-import { updateImpact, bulkApproveReady, generateAmendedDraft, startRegulatoryRerun, mapRegulatoryChange, finalizeRegulatoryReport, rerunFormUpdateReport, analyzeDocForForm, finalizeFormUpdateReport, writeImpactToDoc } from "@/lib/compliance.functions";
+import { updateImpact, bulkApproveReady, generateAmendedDraft, startRegulatoryRerun, mapRegulatoryChange, finalizeRegulatoryReport, rerunFormUpdateReport, analyzeDocForForm, finalizeFormUpdateReport, writeImpactToDoc, createPolicyChangeReport } from "@/lib/compliance.functions";
 import { cn } from "@/lib/utils";
 import { diffOld, diffNew } from "@/lib/text-diff";
 import {
@@ -24,7 +25,7 @@ import {
   Scale, FileText, AlertCircle, Sparkles, ExternalLink,
   ArrowDownToLine, MoveDown, AlertTriangle, LayoutGrid,
   CircleDot, Circle, RefreshCw, PanelLeftClose, PanelLeftOpen, FileEdit,
-  MessageSquarePlus, FilePlus2, Replace,
+  MessageSquarePlus, FilePlus2, Replace, ShieldPlus, History,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -567,6 +568,11 @@ function ReportPage() {
           <ApprovalWorkflow report={report.data} />
         </div>
 
+        {/* ── Audit history (workflow_events) ────────────────────────── */}
+        <div className="shrink-0">
+          <WorkflowHistory reportId={reportId} />
+        </div>
+
         {/* ── Amended draft copies (versioned — live docs untouched) ──── */}
         {amendedDrafts.length > 0 && (
           <div className="shrink-0 px-4 sm:px-6 pt-2">
@@ -894,6 +900,7 @@ function ReportPage() {
                   oldPolicyName={oldPolicyName}
                   newPolicyName={newPolicyName}
                   reportId={reportId}
+                  workspaceId={(report.data as any)?.workspace_id ?? "rmit"}
                   sopById={sopById}
                 />
               ) : (
@@ -993,6 +1000,72 @@ function RegulatoryAnalyzingView({
 function cleanSopTitle(title: string | null | undefined): string {
   if (!title) return "Unknown document";
   return title.replace(/\s*\(no matching internal doc(?:\s+found)?\)/gi, "").trim();
+}
+
+/** Turns a snake_case event name into a readable phrase ("signed_off" → "Signed off"). */
+function humanizeEvent(event: string | null | undefined): string {
+  const e = (event ?? "").trim();
+  if (!e) return "Event";
+  const spaced = e.replace(/_/g, " ");
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+}
+
+/**
+ * Compact audit trail for a report, sourced from the service-role-written
+ * workflow_events table. Read with the browser supabase client (any authed user
+ * may READ under the role-only RLS). Tolerates an empty or missing table — the
+ * strip simply doesn't render when there's nothing to show.
+ */
+function WorkflowHistory({ reportId }: { reportId: string }) {
+  const events = useQuery({
+    queryKey: ["workflow_events", reportId],
+    queryFn: async () =>
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (supabase as any)
+        .from("workflow_events")
+        .select("event, from_status, to_status, actor_email, detail, created_at")
+        .eq("report_id", reportId)
+        .order("created_at", { ascending: false }),
+  });
+
+  const rows: any[] = events.data?.data ?? [];
+  if (events.isLoading || rows.length === 0) return null;
+
+  return (
+    <details className="px-4 sm:px-6 py-2 border-b bg-card/60">
+      <summary className="flex items-center gap-2 cursor-pointer select-none text-[10px] font-black uppercase tracking-widest text-muted-foreground hover:text-foreground transition-colors">
+        <History className="size-3" /> History
+        <span className="font-semibold normal-case tracking-normal text-muted-foreground/70">({rows.length})</span>
+      </summary>
+      <ul className="mt-2 space-y-1 max-h-44 overflow-y-auto">
+        {rows.map((ev, i) => {
+          const status =
+            ev.from_status && ev.to_status && ev.from_status !== ev.to_status
+              ? `${statusMeta(ev.from_status).label} → ${statusMeta(ev.to_status).label}`
+              : ev.to_status
+                ? statusMeta(ev.to_status).label
+                : null;
+          return (
+            <li key={i} className="flex items-baseline gap-2 text-[11px] leading-snug">
+              <span className="font-semibold text-foreground shrink-0">{ev.actor_email ?? "system"}</span>
+              <span className="text-muted-foreground/50">·</span>
+              <span className="text-foreground/80">{humanizeEvent(ev.event)}</span>
+              {status && (
+                <>
+                  <span className="text-muted-foreground/50">·</span>
+                  <span className="text-muted-foreground">{status}</span>
+                </>
+              )}
+              <span className="text-muted-foreground/50">·</span>
+              <span className="text-muted-foreground tabular-nums shrink-0 ml-auto">
+                {ev.created_at ? formatDate(ev.created_at) : ""}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+    </details>
+  );
 }
 
 export function ExecutiveSummary({ value }: { value: any }) {
@@ -1275,14 +1348,45 @@ function boldClauseRefs(text: string): string {
 }
 
 function ChangeDetailPanel({
-  change, impacts, oldPolicyName, newPolicyName, reportId, sopById,
+  change, impacts, oldPolicyName, newPolicyName, reportId, workspaceId, sopById,
 }: {
-  change: any; impacts: any[]; oldPolicyName: string; newPolicyName: string; reportId: string; sopById: Map<string, any>;
+  change: any; impacts: any[]; oldPolicyName: string; newPolicyName: string; reportId: string; workspaceId: string; sopById: Map<string, any>;
 }) {
   const qc = useQueryClient();
   const upd = useServerFn(updateImpact);
+  const raisePolicyChange = useServerFn(createPolicyChangeReport);
+  const nav = useNavigate();
   const isNew = !change.old_requirement || (change.old_requirement as string).toLowerCase().startsWith("n/a");
   const [showFull, setShowFull] = useState(false);
+  const [raising, setRaising] = useState(false);
+
+  // Role gate — viewers can't raise a policy change. Mounted-gated so SSR and
+  // the first client paint agree before the real role resolves.
+  const auth = useAuth();
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+  const canRaisePolicyChange = mounted && !auth.loading && (auth.role === "member" || auth.role === "super_admin");
+
+  async function handleRaisePolicyChange() {
+    if (raising) return;
+    setRaising(true);
+    try {
+      const { reportId: newId } = await raisePolicyChange({
+        data: {
+          workspace: workspaceId as any,
+          title: "Policy change — " + (change.chapter_ref ?? "manual"),
+          description: change.change_summary ?? change.summary ?? "",
+          sourceChangeId: change.id,
+        },
+      });
+      toast.success("Policy change created");
+      nav({ to: "/reports/$reportId", params: { reportId: newId } });
+    } catch (e: any) {
+      toast.error("Could not raise policy change", { description: e?.message });
+    } finally {
+      setRaising(false);
+    }
+  }
   // Amendments with a concrete clause reference are the priority — sort them up,
   // then by confidence. "General"/unanchored impacts fall to the bottom.
   const sortedImpacts = [...impacts].sort((a: any, b: any) => {
@@ -1323,12 +1427,27 @@ function ChangeDetailPanel({
             <p className="text-sm text-muted-foreground leading-snug max-w-2xl">{change.change_summary}</p>
           )}
         </div>
-        {change.tone_shift && (
-          <div className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-full border bg-card text-xs font-medium text-muted-foreground">
-            <ArrowRightLeft className="size-3 opacity-60" />
-            {change.tone_shift}
-          </div>
-        )}
+        <div className="shrink-0 flex items-center gap-2">
+          {change.tone_shift && (
+            <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full border bg-card text-xs font-medium text-muted-foreground">
+              <ArrowRightLeft className="size-3 opacity-60" />
+              {change.tone_shift}
+            </div>
+          )}
+          {canRaisePolicyChange && (
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={raising}
+              onClick={handleRaisePolicyChange}
+              className="gap-1.5 h-8 text-xs border-primary/30 text-primary hover:bg-primary/5"
+              title="Open an internal policy-change workflow seeded from this regulatory change"
+            >
+              {raising ? <Loader2 className="size-3.5 animate-spin" /> : <ShieldPlus className="size-3.5" />}
+              <span className="hidden sm:inline">Raise Policy Change</span>
+            </Button>
+          )}
+        </div>
       </div>
 
       {/* ── Scrollable body ─────────────────────────────────────── */}

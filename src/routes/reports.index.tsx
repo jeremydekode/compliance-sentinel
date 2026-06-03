@@ -1,11 +1,19 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { AppShell } from "@/components/app-shell";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from "@/components/ui/dialog";
 import { supabase } from "@/integrations/supabase/client";
 import {
   ArrowRight,
@@ -21,6 +29,7 @@ import {
   HardDrive,
   FileText,
   RefreshCw,
+  ShieldPlus,
 } from "lucide-react";
 import { FormUpdateDialog } from "@/components/form-update-dialog";
 import { SimplifyUploadDialog } from "@/components/simplify-upload-dialog";
@@ -31,9 +40,11 @@ import {
   listWorkspaceDriveFiles,
   importDriveFileForAnalysis,
   getGoogleConnectionStatus,
+  createPolicyChangeReport,
 } from "@/lib/compliance.functions";
 import { autoDetectDocMeta, DOC_TYPE_LABEL, type DetectedMeta } from "@/lib/auto-detect";
 import { useWorkspace, WORKSPACES } from "@/lib/workspace";
+import { useAuth } from "@/lib/auth";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 
@@ -201,7 +212,22 @@ function ReportsList() {
   const listDrive = useServerFn(listWorkspaceDriveFiles);
   const importDrive = useServerFn(importDriveFileForAnalysis);
   const getGoogleStatus = useServerFn(getGoogleConnectionStatus);
+  const createPolicyChange = useServerFn(createPolicyChangeReport);
   const nav = useNavigate();
+
+  // Role gate for the "New Policy Change" entry point. Mounted-gated so the
+  // server render (always least-privilege "viewer") matches the first client
+  // paint, then the real role takes over — same pattern as app-shell.
+  const auth = useAuth();
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+  const canRaisePolicyChange = mounted && !auth.loading && (auth.role === "member" || auth.role === "super_admin");
+
+  // Inline "New Policy Change" dialog state.
+  const [showPolicyChange, setShowPolicyChange] = useState(false);
+  const [pcTitle, setPcTitle] = useState("");
+  const [pcDescription, setPcDescription] = useState("");
+  const [pcSubmitting, setPcSubmitting] = useState(false);
 
   const [showUpload, setShowUpload] = useState(false);
   const [showFormUpdate, setShowFormUpdate] = useState(false);
@@ -325,6 +351,26 @@ function ReportsList() {
     }
   }
 
+  async function submitPolicyChange() {
+    const title = pcTitle.trim();
+    if (!title || pcSubmitting) return;
+    setPcSubmitting(true);
+    try {
+      const { reportId } = await createPolicyChange({
+        data: { workspace, title, description: pcDescription.trim() || undefined },
+      });
+      setShowPolicyChange(false);
+      setPcTitle("");
+      setPcDescription("");
+      qc.invalidateQueries({ queryKey: ["reports"] });
+      nav({ to: "/reports/$reportId", params: { reportId } });
+    } catch (e: any) {
+      toast.error("Could not create policy change", { description: e?.message });
+    } finally {
+      setPcSubmitting(false);
+    }
+  }
+
   return (
     <AppShell>
       <div className="p-8 max-w-[1400px] mx-auto space-y-8">
@@ -340,6 +386,16 @@ function ReportsList() {
             </p>
           </div>
           <div className="flex items-center gap-2">
+            {canRaisePolicyChange && (
+              <Button
+                size="lg"
+                variant="outline"
+                onClick={() => setShowPolicyChange(true)}
+                className="gap-2 h-12 px-6 rounded-xl font-bold border-primary/30 text-primary hover:bg-primary/5 active:scale-95"
+              >
+                <ShieldPlus className="size-4" /> New Policy Change
+              </Button>
+            )}
             {workspace === "forms" ? (
               <Button
                 size="lg"
@@ -722,6 +778,62 @@ function ReportsList() {
           nav({ to: "/reports/$reportId", params: { reportId } });
         }}
       />
+
+      {/* New Policy Change — seeds a policy_change workflow report, then opens it. */}
+      <Dialog open={showPolicyChange} onOpenChange={(o) => !pcSubmitting && setShowPolicyChange(o)}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <ShieldPlus className="size-4 text-primary" /> New Policy Change
+            </DialogTitle>
+            <DialogDescription>
+              Start an internal policy revision. It runs through the same review and sign-off workflow as a regulatory analysis.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-1">
+            <div>
+              <label className="block text-[10px] uppercase tracking-widest text-muted-foreground font-bold mb-1.5">
+                Title <span className="text-rose-500">*</span>
+              </label>
+              <input
+                type="text"
+                autoFocus
+                value={pcTitle}
+                onChange={(e) => setPcTitle(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && pcTitle.trim()) {
+                    e.preventDefault();
+                    void submitPolicyChange();
+                  }
+                }}
+                placeholder="e.g. Updated remote-access policy — Q2 revision"
+                className="w-full text-sm font-medium px-3 py-2 rounded-lg border bg-card focus:outline-none focus:ring-1 focus:ring-primary"
+              />
+            </div>
+            <div>
+              <label className="block text-[10px] uppercase tracking-widest text-muted-foreground font-bold mb-1.5">
+                Description <span className="text-muted-foreground/60 font-normal normal-case tracking-normal">(optional)</span>
+              </label>
+              <textarea
+                value={pcDescription}
+                onChange={(e) => setPcDescription(e.target.value)}
+                placeholder="What is changing and why — context for reviewers."
+                rows={4}
+                className="w-full text-xs px-3 py-2 rounded-lg border bg-card focus:outline-none focus:ring-1 focus:ring-primary resize-none"
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" disabled={pcSubmitting} onClick={() => setShowPolicyChange(false)}>
+              Cancel
+            </Button>
+            <Button disabled={!pcTitle.trim() || pcSubmitting} onClick={submitPolicyChange} className="gap-2">
+              {pcSubmitting ? <Loader2 className="size-4 animate-spin" /> : <ShieldPlus className="size-4" />}
+              {pcSubmitting ? "Creating…" : "Create policy change"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </AppShell>
   );
 }

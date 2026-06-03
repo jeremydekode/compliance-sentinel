@@ -2,7 +2,11 @@
 // Used by /auth/google/callback (code exchange) and the Settings server fns
 // (auth URL generation, token refresh, connection lookup).
 
-import { supabase } from "@/integrations/supabase/client";
+// workspace_google_connections is deny-all under RLS (it holds Google refresh
+// tokens) — only the service-role client may read or write it. This module is
+// server-only (it uses the Google client secret), so using supabaseAdmin here
+// is safe and never reaches client code.
+import { supabaseAdmin } from "@/integrations/supabase/client.server";
 
 const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -95,7 +99,7 @@ export async function storeConnection(opts: {
 }): Promise<void> {
   const expiresAt = new Date(Date.now() + opts.expiresIn * 1000).toISOString();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const { error } = await (supabase as any)
+  const { error } = await (supabaseAdmin as any)
     .from("workspace_google_connections")
     .upsert({
       workspace_id: opts.workspace,
@@ -111,7 +115,7 @@ export async function storeConnection(opts: {
 /** Refresh the access token using the stored refresh_token. Returns the new access token. */
 export async function refreshAccessToken(workspaceId: string): Promise<string> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const { data: row, error } = await (supabase as any)
+  const { data: row, error } = await (supabaseAdmin as any)
     .from("workspace_google_connections")
     .select("refresh_token, access_token, access_token_expires_at")
     .eq("workspace_id", workspaceId)
@@ -141,7 +145,7 @@ export async function refreshAccessToken(workspaceId: string): Promise<string> {
   const j = (await r.json()) as TokenResponse;
   const newExpires = new Date(Date.now() + j.expires_in * 1000).toISOString();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  await (supabase as any)
+  await (supabaseAdmin as any)
     .from("workspace_google_connections")
     .update({ access_token: j.access_token, access_token_expires_at: newExpires })
     .eq("workspace_id", workspaceId);
@@ -157,7 +161,7 @@ export async function getConnection(workspaceId: string): Promise<{
   connectedAt?: string;
 }> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const { data: row } = await (supabase as any)
+  const { data: row } = await (supabaseAdmin as any)
     .from("workspace_google_connections")
     .select("google_email, drive_folder_id, drive_folder_name, connected_at")
     .eq("workspace_id", workspaceId)
@@ -175,7 +179,7 @@ export async function getConnection(workspaceId: string): Promise<{
 /** Delete the workspace's Google connection. Idempotent. */
 export async function deleteConnection(workspaceId: string): Promise<void> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  await (supabase as any)
+  await (supabaseAdmin as any)
     .from("workspace_google_connections")
     .delete()
     .eq("workspace_id", workspaceId);

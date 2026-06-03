@@ -1,7 +1,8 @@
-import { Link, useLocation } from "@tanstack/react-router";
-import { LayoutDashboard, FolderOpen, ShieldCheck, FileSearch, Settings, Zap, Scale, UserRound, ChevronDown, PanelLeftClose, PanelLeftOpen, Layers } from "lucide-react";
+import { Link, useLocation, useNavigate } from "@tanstack/react-router";
+import { LayoutDashboard, FolderOpen, ShieldCheck, FileSearch, Settings, Zap, Scale, UserRound, ChevronDown, PanelLeftClose, PanelLeftOpen, Layers, LogOut } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useRole, ROLE_META, type UserRole } from "@/lib/role";
+import { useAuth, signOut, type AppRole } from "@/lib/auth";
 import { useWorkspace, WORKSPACES, type WorkspaceId } from "@/lib/workspace";
 import { useState, useRef, useEffect } from "react";
 import { Briefcase } from "lucide-react";
@@ -147,11 +148,98 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             <WorkspaceSwitcher />
             <div className="h-6 w-px bg-border" />
             <RoleSwitcher />
+            <div className="h-6 w-px bg-border" />
+            <UserMenu />
           </div>
         </header>
 
         <div className="flex-1 min-w-0">{children}</div>
       </main>
+    </div>
+  );
+}
+
+const APP_ROLE_META: Record<AppRole, { label: string; color: string; bg: string }> = {
+  super_admin: { label: "Super Admin", color: "text-amber-700", bg: "bg-amber-100" },
+  member:      { label: "Member",      color: "text-emerald-700", bg: "bg-emerald-100" },
+  viewer:      { label: "Viewer",      color: "text-slate-600", bg: "bg-slate-100" },
+};
+
+// Real signed-in identity (Supabase Auth) — distinct from the cosmetic
+// compliance/legal RoleSwitcher. Shows email + security role + Sign out, or a
+// Sign in link when unauthenticated. Mounted-gated so SSR and the first client
+// paint agree (auth state resolves async on the client only).
+function UserMenu() {
+  const auth = useAuth();
+  const navigate = useNavigate();
+  const [open, setOpen] = useState(false);
+  const [mounted, setMounted] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => setMounted(true), []);
+  useEffect(() => {
+    function onClick(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onClick);
+    return () => document.removeEventListener("mousedown", onClick);
+  }, []);
+
+  // Stable placeholder until the client resolves the session (avoids hydration mismatch).
+  if (!mounted || auth.loading) {
+    return <div className="size-7 rounded-full bg-muted animate-pulse" aria-hidden />;
+  }
+
+  if (!auth.userId) {
+    return (
+      <Link
+        to="/login"
+        className="flex items-center gap-2 px-3 py-1.5 rounded-lg border bg-card text-xs font-medium transition-colors hover:border-primary/40 hover:bg-muted/40"
+      >
+        <UserRound className="size-3.5" />
+        Sign in
+      </Link>
+    );
+  }
+
+  const meta = APP_ROLE_META[auth.role];
+  const initial = (auth.email ?? "?").charAt(0).toUpperCase();
+
+  async function handleSignOut() {
+    setOpen(false);
+    await signOut();
+    navigate({ to: "/login" });
+  }
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="flex items-center gap-2 px-2 py-1 rounded-lg border bg-card text-xs font-medium transition-colors hover:border-primary/40 hover:bg-muted/40"
+      >
+        <span className={cn("size-6 rounded-full grid place-items-center font-bold", meta.bg, meta.color)}>
+          {initial}
+        </span>
+        <ChevronDown className={cn("size-3 text-muted-foreground transition-transform", open && "rotate-180")} />
+      </button>
+
+      {open && (
+        <div className="absolute right-0 mt-2 w-60 rounded-xl border bg-card shadow-lg overflow-hidden z-30">
+          <div className="px-3 py-2.5 border-b bg-muted/30">
+            <div className="text-xs font-semibold truncate">{auth.email}</div>
+            <span className={cn("inline-block mt-1 text-[9px] font-bold uppercase tracking-widest px-1.5 py-0.5 rounded", meta.bg, meta.color)}>
+              {meta.label}
+            </span>
+          </div>
+          <button
+            onClick={handleSignOut}
+            className="w-full text-left px-3 py-2.5 flex items-center gap-2.5 text-xs font-medium hover:bg-muted/40 transition-colors"
+          >
+            <LogOut className="size-3.5 text-muted-foreground" />
+            Sign out
+          </button>
+        </div>
+      )}
     </div>
   );
 }

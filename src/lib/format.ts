@@ -53,6 +53,20 @@ export function statusMeta(status: string) {
   }
 }
 
+// Small badge meta for a report's workflow type. Purely cosmetic; unknown
+// values fall through to the neutral "regulatory" treatment.
+export function workflowTypeMeta(t: string) {
+  switch (t) {
+    case "policy_change":
+      return { label: "Policy Change", className: "text-violet-700 bg-violet-100" };
+    case "form_update":
+      return { label: "Form Update", className: "text-amber-700 bg-amber-100" };
+    case "regulatory":
+    default:
+      return { label: "Regulatory", className: "text-blue-700 bg-blue-100" };
+  }
+}
+
 export function formatDate(d: string | Date) {
   const date = typeof d === "string" ? new Date(d) : d;
   return date.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });

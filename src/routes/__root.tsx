@@ -7,9 +7,15 @@ import {
   HeadContent,
   Scripts,
 } from "@tanstack/react-router";
+import { useEffect, useState } from "react";
 import { Toaster } from "@/components/ui/sonner";
+import { useAuth } from "@/lib/auth";
 
 import appCss from "../styles.css?url";
+
+// Paths that an unauthenticated user is allowed to sit on (the login screen and
+// the OAuth return URLs). Everything else triggers a redirect to /login.
+const PUBLIC_PATHS = new Set(["/login", "/auth/callback", "/auth/google/callback"]);
 
 function NotFoundComponent() {
   return (
@@ -121,8 +127,37 @@ function RootComponent() {
 
   return (
     <QueryClientProvider client={queryClient}>
+      <LoginGate />
       <Outlet />
       <Toaster richColors position="bottom-right" />
     </QueryClientProvider>
   );
+}
+
+/**
+ * Client-only login gate.
+ *
+ * Renders nothing — it just watches the resolved auth state and bounces an
+ * unauthenticated visitor to /login. The gating is deliberately NOT done in a
+ * server-running beforeLoad: the Supabase session lives in the browser, so on
+ * the server `auth.userId` is always null and a server-side guard would redirect
+ * every first paint. We also wait for `mounted` so SSR HTML is unchanged and the
+ * first client paint matches it (no hydration mismatch), and for `!auth.loading`
+ * so we don't redirect before the session has actually resolved.
+ */
+function LoginGate() {
+  const auth = useAuth();
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+
+  useEffect(() => {
+    if (!mounted || auth.loading || auth.userId) return;
+    const path = window.location.pathname;
+    if (PUBLIC_PATHS.has(path)) return;
+    window.location.replace(
+      "/login?redirect=" + encodeURIComponent(window.location.pathname + window.location.search),
+    );
+  }, [mounted, auth.loading, auth.userId]);
+
+  return null;
 }

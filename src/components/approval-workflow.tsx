@@ -1,7 +1,9 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
 import { supabase } from "@/integrations/supabase/client";
+import { useAuth } from "@/lib/auth";
+import { workflowTypeOf, workflowCopy } from "@/lib/workflow-type";
 import {
   requestLegalSignOff,
   finalizeLegalSignOff,
@@ -32,6 +34,21 @@ export function ApprovalWorkflow({ report }: { report: any }) {
   const [legalOpen, setLegalOpen] = useState(false);
   const [execOpen, setExecOpen] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
+
+  // Per-workflow stage copy: policy_change reports read "Policy Review" /
+  // "Approve & Apply"; everything else keeps the original regulatory wording.
+  const wf = workflowTypeOf(report);
+  const copy = workflowCopy(wf);
+
+  // Role gating. Viewers may inspect the workflow but not act on it; members
+  // and super_admins keep the action buttons. We mounted-gate so SSR and the
+  // first client paint agree (auth resolves async on the client) — until then,
+  // and while loading, we assume the least-privilege "viewer" default and hide
+  // the actions. Server-side RLS + server fns remain the real enforcement.
+  const auth = useAuth();
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+  const canAct = mounted && !auth.loading && auth.role !== "viewer";
 
   const impacts = useQuery({
     queryKey: ["impacts", report.id],
@@ -81,7 +98,7 @@ export function ApprovalWorkflow({ report }: { report: any }) {
         <div className="px-4 py-2 flex items-center gap-3 flex-wrap">
           <ShieldCheck className="size-4 text-blue-700 shrink-0" />
           <div className="text-xs font-bold text-blue-900 dark:text-blue-300 whitespace-nowrap">
-            Compliance Review
+            {copy.phaseA}
           </div>
           <div className="h-4 w-px bg-blue-300/50" />
           <div className="flex items-center gap-1.5 text-[11px] flex-wrap">
@@ -91,22 +108,24 @@ export function ApprovalWorkflow({ report }: { report: any }) {
             <span className="px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 border border-slate-200"><span className="font-bold">{stats.rejected}</span> rejected</span>
             <span className="px-1.5 py-0.5 rounded bg-blue-100 text-blue-800 border border-blue-200"><span className="font-bold">{stats.pending}</span> pending</span>
           </div>
-          <div className="ml-auto flex items-center gap-2 shrink-0">
-            {!allReviewed && (
-              <span className="text-[10px] text-blue-900/70 italic hidden lg:inline">
-                Resolve {stats.pending} pending first
-              </span>
-            )}
-            <Button
-              size="sm"
-              onClick={() => setLegalOpen(true)}
-              disabled={!allReviewed || !hasApproved}
-              className="h-7 text-xs gap-1.5"
-            >
-              <Scale className="size-3" />
-              Submit to Legal
-            </Button>
-          </div>
+          {canAct && (
+            <div className="ml-auto flex items-center gap-2 shrink-0">
+              {!allReviewed && (
+                <span className="text-[10px] text-blue-900/70 italic hidden lg:inline">
+                  Resolve {stats.pending} pending first
+                </span>
+              )}
+              <Button
+                size="sm"
+                onClick={() => setLegalOpen(true)}
+                disabled={!allReviewed || !hasApproved}
+                className="h-7 text-xs gap-1.5"
+              >
+                <Scale className="size-3" />
+                {copy.submitCta}
+              </Button>
+            </div>
+          )}
         </div>
 
         <Dialog open={legalOpen} onOpenChange={setLegalOpen}>
@@ -171,23 +190,25 @@ export function ApprovalWorkflow({ report }: { report: any }) {
         <div className="px-4 py-2 flex items-center gap-3 flex-wrap">
           <Scale className="size-4 text-violet-700 shrink-0" />
           <div className="text-xs font-bold text-violet-900 dark:text-violet-300 whitespace-nowrap">
-            Awaiting Legal Sign-Off
+            {copy.legal}
           </div>
           <div className="h-4 w-px bg-violet-300/50" />
           <div className="text-[11px] text-violet-900/80 dark:text-violet-300/80">
             <span className="font-bold">{stats.approved + stats.routed}</span> items queued · Switch to <span className="font-semibold">Head of Legal</span> role to sign off
           </div>
-          <div className="ml-auto shrink-0">
-            <Button
-              size="sm"
-              className="h-7 text-xs gap-1.5"
-              disabled={busy === "fin"}
-              onClick={() => run("fin", () => finLegal({ data: { reportId: report.id } }), "Legal sign-off recorded")}
-            >
-              {busy === "fin" ? <Loader2 className="size-3 animate-spin" /> : <CheckCircle2 className="size-3" />}
-              Record Sign-Off
-            </Button>
-          </div>
+          {canAct && (
+            <div className="ml-auto shrink-0">
+              <Button
+                size="sm"
+                className="h-7 text-xs gap-1.5"
+                disabled={busy === "fin"}
+                onClick={() => run("fin", () => finLegal({ data: { reportId: report.id } }), "Legal sign-off recorded")}
+              >
+                {busy === "fin" ? <Loader2 className="size-3 animate-spin" /> : <CheckCircle2 className="size-3" />}
+                Record Sign-Off
+              </Button>
+            </div>
+          )}
         </div>
       </div>
     );
@@ -200,30 +221,32 @@ export function ApprovalWorkflow({ report }: { report: any }) {
         <div className="px-4 py-2 flex items-center gap-3 flex-wrap">
           <Rocket className="size-4 text-emerald-700 shrink-0" />
           <div className="text-xs font-bold text-emerald-900 dark:text-emerald-300 whitespace-nowrap">
-            Execute &amp; Publish
+            {copy.exec}
           </div>
           <div className="h-4 w-px bg-emerald-300/50" />
           <div className="text-[11px] text-emerald-900/80 dark:text-emerald-300/80">
             Legal signed off · <span className="font-bold">{stats.approved}</span> changes ready to apply
           </div>
-          <div className="ml-auto flex items-center gap-1.5 shrink-0">
-            <Button size="sm" onClick={() => setExecOpen(true)} className="h-7 text-xs gap-1.5">
-              <Rocket className="size-3" /> Execute…
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              className="h-7 text-xs gap-1.5 border-emerald-300 text-emerald-900 hover:bg-emerald-50"
-              disabled={busy === "confirm"}
-              onClick={() =>
-                run("confirm", () => confirmManual({ data: { reportId: report.id } }),
-                  "Manual execution confirmed · report marked as Published")
-              }
-            >
-              {busy === "confirm" ? <Loader2 className="size-3 animate-spin" /> : <CheckCircle2 className="size-3" />}
-              Confirm Manual
-            </Button>
-          </div>
+          {canAct && (
+            <div className="ml-auto flex items-center gap-1.5 shrink-0">
+              <Button size="sm" onClick={() => setExecOpen(true)} className="h-7 text-xs gap-1.5">
+                <Rocket className="size-3" /> Execute…
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 text-xs gap-1.5 border-emerald-300 text-emerald-900 hover:bg-emerald-50"
+                disabled={busy === "confirm"}
+                onClick={() =>
+                  run("confirm", () => confirmManual({ data: { reportId: report.id } }),
+                    "Manual execution confirmed · report marked as Published")
+                }
+              >
+                {busy === "confirm" ? <Loader2 className="size-3 animate-spin" /> : <CheckCircle2 className="size-3" />}
+                Confirm Manual
+              </Button>
+            </div>
+          )}
         </div>
 
         <Dialog open={execOpen} onOpenChange={setExecOpen}>
@@ -328,18 +351,20 @@ export function ApprovalWorkflow({ report }: { report: any }) {
             >
               <FileText className="size-3" /> View Memo
             </Button>
-            <Button
-              size="sm"
-              className="h-7 text-xs gap-1.5"
-              disabled={busy === "confirm"}
-              onClick={() =>
-                run("confirm", () => confirmManual({ data: { reportId: report.id } }),
-                  "Manual execution confirmed · report marked as Published")
-              }
-            >
-              {busy === "confirm" ? <Loader2 className="size-3 animate-spin" /> : <CheckCircle2 className="size-3" />}
-              Confirm Completion
-            </Button>
+            {canAct && (
+              <Button
+                size="sm"
+                className="h-7 text-xs gap-1.5"
+                disabled={busy === "confirm"}
+                onClick={() =>
+                  run("confirm", () => confirmManual({ data: { reportId: report.id } }),
+                    "Manual execution confirmed · report marked as Published")
+                }
+              >
+                {busy === "confirm" ? <Loader2 className="size-3 animate-spin" /> : <CheckCircle2 className="size-3" />}
+                Confirm Completion
+              </Button>
+            )}
           </div>
         </div>
       </div>

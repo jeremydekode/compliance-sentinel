@@ -1,6 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
-import { supabase } from "@/integrations/supabase/client";
+import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import { generateWithFallback } from "@/lib/gemini";
 import { placeFixtures } from "@/lib/layout/rules";
 import { DEFAULT_FRAME_EXTRACTION_PROMPT } from "@/lib/layout/prompt";
@@ -31,8 +31,10 @@ const storeTypeSchema = z.enum(["standard", "small", "kiosk", "cafe"]);
 // ── Create + list ─────────────────────────────────────────────────────
 
 export const createLayoutJob = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ title: z.string().min(1) }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     const { data: row, error } = await (supabase as any)
       .from("layout_jobs")
       .insert({ title: data.title, status: "uploaded" })
@@ -42,18 +44,23 @@ export const createLayoutJob = createServerFn({ method: "POST" })
     return row as LayoutJob;
   });
 
-export const listLayoutJobs = createServerFn({ method: "GET" }).handler(async () => {
-  const { data, error } = await (supabase as any)
-    .from("layout_jobs")
-    .select("*")
-    .order("created_at", { ascending: false });
-  if (error) throw new Error(`Could not list layout jobs: ${error.message}`);
-  return (data ?? []) as LayoutJob[];
-});
+export const listLayoutJobs = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    const supabase = context.supabase;
+    const { data, error } = await (supabase as any)
+      .from("layout_jobs")
+      .select("*")
+      .order("created_at", { ascending: false });
+    if (error) throw new Error(`Could not list layout jobs: ${error.message}`);
+    return (data ?? []) as LayoutJob[];
+  });
 
 export const getLayoutJob = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ jobId: z.string().uuid() }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     const [job, frame, placements] = await Promise.all([
       (supabase as any).from("layout_jobs").select("*").eq("id", data.jobId).single(),
       (supabase as any)
@@ -78,8 +85,10 @@ export const getLayoutJob = createServerFn({ method: "GET" })
   });
 
 export const deleteLayoutJob = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ jobId: z.string().uuid() }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     const { error } = await (supabase as any).from("layout_jobs").delete().eq("id", data.jobId);
     if (error) throw new Error(`Could not delete job: ${error.message}`);
     return { ok: true };
@@ -88,6 +97,7 @@ export const deleteLayoutJob = createServerFn({ method: "POST" })
 // ── Upload sketch (client uploads to Supabase storage, hands us the URL) ──
 
 export const uploadLayoutSketch = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(
     z.object({
       jobId: z.string().uuid(),
@@ -95,7 +105,8 @@ export const uploadLayoutSketch = createServerFn({ method: "POST" })
       mimeType: z.string(),
     }),
   )
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     const { error } = await (supabase as any)
       .from("layout_jobs")
       .update({
@@ -115,8 +126,10 @@ export const uploadLayoutSketch = createServerFn({ method: "POST" })
 // view and amend it without code changes.
 
 export const digitizeLayoutSketch = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ jobId: z.string().uuid() }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     const { data: job, error: jobErr } = await (supabase as any)
       .from("layout_jobs")
       .select("*")
@@ -211,8 +224,10 @@ export const digitizeLayoutSketch = createServerFn({ method: "POST" })
 // ── Frame approval gate ──────────────────────────────────────────────
 
 export const approveLayoutFrame = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ jobId: z.string().uuid() }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     const now = new Date().toISOString();
     await (supabase as any)
       .from("layout_frames")
@@ -229,13 +244,15 @@ export const approveLayoutFrame = createServerFn({ method: "POST" })
 // ── Rules-based fixture placement ─────────────────────────────────────
 
 export const placeLayoutFixtures = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(
     z.object({
       jobId: z.string().uuid(),
       storeType: storeTypeSchema,
     }),
   )
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     const { data: frame, error: frameErr } = await (supabase as any)
       .from("layout_frames")
       .select("*")
@@ -292,13 +309,15 @@ export const placeLayoutFixtures = createServerFn({ method: "POST" })
 // ── Placement review ─────────────────────────────────────────────────
 
 export const setLayoutPlacementStatus = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(
     z.object({
       placementId: z.string().uuid(),
       status: z.enum(["pending", "approved", "rejected"]),
     }),
   )
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     const { error } = await (supabase as any)
       .from("layout_placements")
       .update({ status: data.status })
@@ -308,8 +327,10 @@ export const setLayoutPlacementStatus = createServerFn({ method: "POST" })
   });
 
 export const approveAllLayoutPlacements = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ jobId: z.string().uuid() }))
-  .handler(async ({ data }) => {
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
     await (supabase as any)
       .from("layout_placements")
       .update({ status: "approved" })

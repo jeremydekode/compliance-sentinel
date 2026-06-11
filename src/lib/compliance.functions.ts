@@ -4397,3 +4397,184 @@ export const setWorkspaceVisibility = createServerFn({ method: "POST" })
     if (error) throw new Error(`Failed to save workspace visibility: ${error.message}`);
     return { ok: true };
   });
+
+// ============================================================================
+// ADMIN / TEAM MANAGEMENT (super-admin only)
+// ----------------------------------------------------------------------------
+// Manage WHO may use the app and at what level, and surface last-sign-in. These
+// run as service-role (supabaseAdmin) because they read auth.users and change
+// roles (which the guard trigger would otherwise pin for a normal caller).
+// Because service-role bypasses RLS, every handler FIRST verifies the CALLER is
+// a super_admin — never trust the client.
+// ============================================================================
+
+export type AccessLevel = "none" | "viewer" | "member" | "super_admin";
+
+export interface AppUserRow {
+  id: string | null;          // null = invited email that has never signed in
+  email: string;
+  role: "super_admin" | "member" | "viewer";
+  level: AccessLevel;         // collapsed "access level" for the single picker UI
+  approved: boolean;          // passes is_approved() (role>=member OR allowlisted)
+  signedIn: boolean;
+  lastSignInAt: string | null;
+  createdAt: string | null;
+}
+
+/** Throws unless the calling auth user is a super_admin. */
+async function assertCallerSuperAdmin(userId: string): Promise<void> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const { data, error } = await (supabaseAdmin as any)
+    .from("profiles")
+    .select("role")
+    .eq("id", userId)
+    .maybeSingle();
+  if (error) throw new Error(`Authorization check failed: ${error.message}`);
+  if (!data || data.role !== "super_admin") {
+    throw new Error("Forbidden: this action is restricted to the super admin.");
+  }
+}
+
+function levelFromRole(role: string, approved: boolean): AccessLevel {
+  if (role === "super_admin") return "super_admin";
+  if (role === "member") return "member";
+  return approved ? "viewer" : "none";
+}
+
+/** Lists every account that has signed in (with last-sign-in) plus pending invites. */
+export const listAppUsers = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }): Promise<{ users: AppUserRow[] }> => {
+    await assertCallerSuperAdmin(context.userId);
+
+    // 1. Everyone who has ever signed in — auth.users is service-role only.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const authRes = await (supabaseAdmin as any).auth.admin.listUsers({ perPage: 1000 });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const authUsers: any[] = authRes?.data?.users ?? [];
+
+    // 2. Roles, keyed by user id.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: profs } = await (supabaseAdmin as any)
+      .from("profiles")
+      .select("id, email, role");
+    const roleById = new Map<string, string>();
+    const emailById = new Map<string, string>();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    for (const p of (profs ?? []) as any[]) {
+      roleById.set(p.id, p.role);
+      if (p.email) emailById.set(p.id, String(p.email).toLowerCase());
+    }
+
+    // 3. Allowlist (table may not exist until the lockdown migration — tolerate).
+    const allow = new Set<string>();
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: al } = await (supabaseAdmin as any)
+        .from("login_allowlist")
+        .select("email");
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      for (const r of (al ?? []) as any[]) if (r.email) allow.add(String(r.email).toLowerCase());
+    } catch {
+      /* allowlist not present yet */
+    }
+
+    const rows: AppUserRow[] = [];
+    const seen = new Set<string>();
+
+    for (const u of authUsers) {
+      const emailLc = String(u.email ?? emailById.get(u.id) ?? "").toLowerCase();
+      const role = (roleById.get(u.id) ?? "viewer") as AppUserRow["role"];
+      const approved = role === "super_admin" || role === "member" || allow.has(emailLc);
+      rows.push({
+        id: u.id,
+        email: u.email ?? emailLc,
+        role,
+        level: levelFromRole(role, approved),
+        approved,
+        signedIn: true,
+        lastSignInAt: u.last_sign_in_at ?? null,
+        createdAt: u.created_at ?? null,
+      });
+      if (emailLc) seen.add(emailLc);
+    }
+
+    // 4. Invited-but-never-signed-in emails.
+    for (const emailLc of allow) {
+      if (seen.has(emailLc)) continue;
+      rows.push({
+        id: null,
+        email: emailLc,
+        role: "viewer",
+        level: "viewer",
+        approved: true,
+        signedIn: false,
+        lastSignInAt: null,
+        createdAt: null,
+      });
+    }
+
+    // Most-recent sign-in first; never-signed-in (invites) sink to the bottom.
+    rows.sort((a, b) => {
+      if (a.lastSignInAt && b.lastSignInAt) return a.lastSignInAt < b.lastSignInAt ? 1 : -1;
+      if (a.lastSignInAt) return -1;
+      if (b.lastSignInAt) return 1;
+      return a.email.localeCompare(b.email);
+    });
+
+    return { users: rows };
+  });
+
+/**
+ * Sets a user's access level. Collapses the two underlying concepts (allowlist
+ * membership + role) into one intuitive picker:
+ *   none        -> de-list + role viewer  => is_approved() false => fully blocked
+ *   viewer      -> allowlist + role viewer => read-only
+ *   member      -> allowlist + role member => read + write
+ *   super_admin -> allowlist + role super_admin
+ * Works for invites too: pass an email with no userId to allowlist someone who
+ * hasn't signed in yet (they become a viewer on first login).
+ */
+export const setUserAccess = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    z.object({
+      userId: z.string().uuid().optional(),
+      email: z.string().email(),
+      level: z.enum(["none", "viewer", "member", "super_admin"]),
+    }),
+  )
+  .handler(async ({ data, context }) => {
+    await assertCallerSuperAdmin(context.userId);
+
+    const email = data.email.toLowerCase();
+
+    // Self-lockout guard: a super-admin cannot downgrade their own access.
+    if (data.userId && data.userId === context.userId && data.level !== "super_admin") {
+      throw new Error("You can't change your own access level.");
+    }
+
+    // Allowlist membership: 'none' removes the email; any other level grants it.
+    if (data.level === "none") {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (supabaseAdmin as any).from("login_allowlist").delete().eq("email", email);
+    } else {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (supabaseAdmin as any)
+        .from("login_allowlist")
+        .upsert({ email }, { onConflict: "email" });
+    }
+
+    // Role: only updatable once the user exists (has signed in => has a profile).
+    if (data.userId) {
+      const role = data.level === "none" ? "viewer" : data.level;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { error } = await (supabaseAdmin as any)
+        .from("profiles")
+        .update({ role })
+        .eq("id", data.userId);
+      if (error) throw new Error(`Failed to update role: ${error.message}`);
+    }
+
+    return { ok: true };
+  });

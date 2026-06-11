@@ -8,8 +8,9 @@ import {
   Scripts,
 } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
+import { ShieldAlert } from "lucide-react";
 import { Toaster } from "@/components/ui/sonner";
-import { useAuth } from "@/lib/auth";
+import { useAuth, signOut } from "@/lib/auth";
 
 import appCss from "../styles.css?url";
 
@@ -128,9 +129,64 @@ function RootComponent() {
   return (
     <QueryClientProvider client={queryClient}>
       <LoginGate />
-      <Outlet />
+      <ApprovalGate>
+        <Outlet />
+      </ApprovalGate>
       <Toaster richColors position="bottom-right" />
     </QueryClientProvider>
+  );
+}
+
+/**
+ * Approval gate. A user can authenticate with any Google account, but only
+ * approved accounts (super_admin, member, or an email in login_allowlist) may
+ * USE the app. For a signed-in-but-unapproved account we render a clear
+ * "pending access" screen instead of the app shell (which would otherwise show
+ * an empty, broken-looking UI because RLS returns zero rows).
+ *
+ * Gated on `mounted && !loading` and an EXPLICIT `approved === false`, so the
+ * SSR/first-paint (which assumes approved) never flashes this, and we never
+ * block before the check resolves. Fails open if is_approved() isn't deployed.
+ */
+function ApprovalGate({ children }: { children: React.ReactNode }) {
+  const auth = useAuth();
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+
+  if (mounted && !auth.loading && auth.userId && auth.approved === false) {
+    const path = typeof window !== "undefined" ? window.location.pathname : "";
+    if (!PUBLIC_PATHS.has(path)) return <NotApproved email={auth.email} />;
+  }
+  return <>{children}</>;
+}
+
+function NotApproved({ email }: { email: string | null }) {
+  async function handleSignOut() {
+    await signOut();
+    window.location.replace("/login");
+  }
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-background px-4">
+      <div className="w-full max-w-sm rounded-2xl border bg-card shadow-sm p-8 text-center">
+        <div className="size-12 mx-auto rounded-xl bg-amber-100 grid place-items-center ring-1 ring-amber-200">
+          <ShieldAlert className="size-6 text-amber-600" />
+        </div>
+        <h1 className="font-display text-lg font-bold mt-4">Access pending</h1>
+        <p className="text-sm text-muted-foreground mt-2 leading-relaxed">
+          You're signed in{email ? <> as <span className="font-medium text-foreground">{email}</span></> : null}, but
+          this account hasn't been granted access yet.
+        </p>
+        <p className="text-sm text-muted-foreground mt-2 leading-relaxed">
+          Ask the platform administrator to approve your email, then sign in again.
+        </p>
+        <button
+          onClick={handleSignOut}
+          className="mt-6 w-full rounded-xl border bg-card px-4 py-2.5 text-sm font-medium transition-colors hover:border-primary/40 hover:bg-muted/40"
+        >
+          Sign out
+        </button>
+      </div>
+    </div>
   );
 }
 

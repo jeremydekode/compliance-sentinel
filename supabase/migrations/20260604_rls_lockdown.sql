@@ -18,6 +18,11 @@
 --   a UI concern, not a security boundary. (If true per-workspace isolation is ever
 --   wanted, model it as many-workspace membership — a separate product change.)
 --
+--   PLUS a LOGIN ALLOWLIST gate (section 0b): even READ now requires
+--   public.is_approved() — super_admin, member, or an email in login_allowlist.
+--   A random Google account can authenticate but sees zero rows and is shown a
+--   "pending access" screen by the client.
+--
 -- !!!  DO NOT APPLY THIS UNTIL THE SERVER-FUNCTION CUTOVER IS DEPLOYED  !!!
 --   Every serverFn in src/lib/compliance.functions.ts and src/lib/layout.functions.ts
 --   currently talks to Postgres as the ANON role and only works because of the
@@ -53,6 +58,56 @@ create table if not exists public.workspace_settings (
 );
 
 -- ---------------------------------------------------------------------------
+-- 0b. LOGIN ALLOWLIST — controls WHO may use the app at all (distinct from the
+--     ROLE, which controls what they may DO once in). A signed-in user passes
+--     public.is_approved() only if they are a super_admin, a member, OR their
+--     email is explicitly listed here. Everyone else is DENIED read on every
+--     data table below (real DB boundary) and the client shows them a
+--     "pending access" screen. Seed = jeremy@dekode.ai.
+--
+--     Add a teammate (they can then sign in as a read-only viewer):
+--       insert into public.login_allowlist (email) values ('name@company.com')
+--         on conflict (email) do nothing;
+--     Let them edit too (promote to member):
+--       update public.profiles set role = 'member' where email = 'name@company.com';
+-- ---------------------------------------------------------------------------
+create table if not exists public.login_allowlist (
+  email      text primary key,
+  created_at timestamptz not null default now()
+);
+
+alter table public.login_allowlist enable row level security;
+-- No policies at all => unreachable by anon/authenticated; only service_role
+-- (bypasses RLS) and the SECURITY DEFINER function below can read it.
+
+insert into public.login_allowlist (email)
+values ('jeremy@dekode.ai')
+on conflict (email) do nothing;
+
+-- Approved = super_admin OR member (role already implies access) OR explicitly
+-- allowlisted by email. SECURITY DEFINER + locked search_path so it can read
+-- auth.users and the allowlist regardless of the caller's own RLS.
+create or replace function public.is_approved()
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select
+    public.is_super_admin()
+    or public.current_app_role() = 'member'::public.app_role
+    or exists (
+      select 1
+      from auth.users u
+      join public.login_allowlist l on lower(l.email) = lower(u.email)
+      where u.id = auth.uid()
+    );
+$$;
+
+grant execute on function public.is_approved() to authenticated, anon;
+
+-- ---------------------------------------------------------------------------
 -- 1. DATA TABLES — drop ALL existing policies (robust against unknown/legacy
 --    names: the five "public all" policies AND the orphan sop_chunks policy the
 --    advisor flagged), enable RLS, then add fresh role-only READ + WRITE policies.
@@ -77,9 +132,10 @@ begin
 
     execute format('alter table public.%I enable row level security', t);
 
-    -- READ: any authenticated user. anon is excluded by `to authenticated`.
+    -- READ: any APPROVED authenticated user (allowlisted, member, or super_admin).
+    -- anon is excluded by `to authenticated`; un-approved authed users get 0 rows.
     execute format(
-      'create policy %I on public.%I for select to authenticated using (true)',
+      'create policy %I on public.%I for select to authenticated using (public.is_approved())',
       t || '_read', t
     );
 

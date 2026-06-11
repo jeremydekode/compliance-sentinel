@@ -6,7 +6,8 @@ import { AppShell } from "@/components/app-shell";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { supabase } from "@/integrations/supabase/client";
-import { AlertTriangle, Trash2, CheckCircle2, Loader2, Plug, Unplug, Eye, EyeOff, Briefcase, RotateCcw } from "lucide-react";
+import { useAuth } from "@/lib/auth";
+import { AlertTriangle, Trash2, CheckCircle2, Loader2, Plug, Unplug, Eye, EyeOff, Briefcase, RotateCcw, Users, UserPlus } from "lucide-react";
 import {
   clearWorkspace,
   getGoogleAuthUrl,
@@ -20,6 +21,10 @@ import {
   saveAnalysisGuidance,
   getWorkspaceVisibility,
   setWorkspaceVisibility,
+  listAppUsers,
+  setUserAccess,
+  type AppUserRow,
+  type AccessLevel,
 } from "@/lib/compliance.functions";
 import { Input } from "@/components/ui/input";
 import { FolderOpen, RefreshCw } from "lucide-react";
@@ -308,6 +313,9 @@ function SettingsPage() {
             Other workspaces are unaffected.
           </p>
         </div>
+
+        {/* Super-admin only — renders nothing for everyone else. */}
+        <TeamCard />
 
         <Card className="p-6">
           <div className="flex items-start gap-3">
@@ -677,6 +685,175 @@ function SettingsPage() {
         </Card>
       </div>
     </AppShell>
+  );
+}
+
+const LEVEL_LABEL: Record<AccessLevel, string> = {
+  none: "No access",
+  viewer: "Viewer",
+  member: "Member",
+  super_admin: "Super admin",
+};
+
+/**
+ * Team & Access — super-admin-only control panel. Renders NOTHING for any other
+ * role (defence-in-depth: the server functions also re-check super_admin, and
+ * RLS is the real boundary; hiding the UI is purely cosmetic). Lets the admin
+ * invite emails, change access levels, and see last-sign-in per person.
+ */
+function TeamCard() {
+  const auth = useAuth();
+  const qc = useQueryClient();
+  const listUsers = useServerFn(listAppUsers);
+  const setAccess = useServerFn(setUserAccess);
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+
+  const isSuper = mounted && !auth.loading && auth.role === "super_admin";
+
+  const usersQuery = useQuery({
+    queryKey: ["app_users"],
+    queryFn: () => listUsers(),
+    enabled: isSuper,
+  });
+
+  // Hidden for non-super-admins and until auth resolves (avoids SSR/hydration flash).
+  if (!isSuper) return null;
+
+  async function invite() {
+    const email = inviteEmail.trim().toLowerCase();
+    if (!email) return;
+    setBusyKey("invite");
+    try {
+      await setAccess({ data: { email, level: "viewer" } });
+      toast.success(`Invited ${email}`, { description: "Read-only access on first sign-in." });
+      setInviteEmail("");
+      qc.invalidateQueries({ queryKey: ["app_users"] });
+    } catch (e: any) {
+      toast.error("Could not invite", { description: e?.message });
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
+  async function changeLevel(u: AppUserRow, level: AccessLevel) {
+    setBusyKey(u.email);
+    try {
+      await setAccess({ data: { userId: u.id ?? undefined, email: u.email, level } });
+      toast.success(`${u.email} → ${LEVEL_LABEL[level]}`);
+      qc.invalidateQueries({ queryKey: ["app_users"] });
+    } catch (e: any) {
+      toast.error("Could not update access", { description: e?.message });
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
+  const users = usersQuery.data?.users ?? [];
+
+  return (
+    <Card className="p-6">
+      <div className="flex items-start gap-3">
+        <div className="size-10 rounded-lg bg-primary/10 grid place-items-center shrink-0">
+          <Users className="size-5 text-primary" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <h2 className="font-display text-lg font-semibold">Team &amp; Access</h2>
+          <p className="text-sm text-muted-foreground mt-1">
+            Who can sign in and what they can do — applies across all workspaces.{" "}
+            <span className="font-medium text-foreground">Viewer</span> reads only,{" "}
+            <span className="font-medium text-foreground">Member</span> can edit &amp; run analyses,{" "}
+            <span className="font-medium text-foreground">No access</span> blocks sign-in entirely.
+          </p>
+        </div>
+      </div>
+
+      {/* Invite by email */}
+      <div className="mt-5">
+        <label className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+          Invite by email
+        </label>
+        <div className="mt-1 flex gap-2 max-w-md">
+          <Input
+            type="email"
+            placeholder="name@company.com"
+            value={inviteEmail}
+            onChange={(e) => setInviteEmail(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") invite(); }}
+            disabled={busyKey === "invite"}
+            className="text-sm"
+          />
+          <Button onClick={invite} disabled={busyKey === "invite" || !inviteEmail.trim()} className="gap-1.5 shrink-0">
+            {busyKey === "invite" ? <Loader2 className="size-4 animate-spin" /> : <UserPlus className="size-4" />}
+            Invite
+          </Button>
+        </div>
+        <p className="text-[10px] text-muted-foreground mt-1">
+          They sign in with Google; first login lands them as a read-only Viewer.
+        </p>
+      </div>
+
+      {/* People */}
+      <div className="mt-6">
+        {usersQuery.isLoading ? (
+          <div className="text-xs text-muted-foreground inline-flex items-center gap-2">
+            <Loader2 className="size-3 animate-spin" /> Loading team…
+          </div>
+        ) : usersQuery.error ? (
+          <div className="text-xs text-destructive">
+            Couldn&apos;t load users. {(usersQuery.error as any)?.message}
+          </div>
+        ) : users.length === 0 ? (
+          <div className="text-xs text-muted-foreground">No one has signed in yet.</div>
+        ) : (
+          <div className="rounded-lg border divide-y">
+            {users.map((u) => {
+              const isSelf = !!u.id && u.id === auth.userId;
+              const rowBusy = busyKey === u.email;
+              return (
+                <div key={u.email} className="flex items-center gap-3 px-4 py-3">
+                  <div className="size-8 rounded-full bg-muted grid place-items-center text-xs font-bold shrink-0 uppercase">
+                    {u.email.charAt(0)}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm font-medium truncate flex items-center gap-2">
+                      {u.email}
+                      {isSelf && (
+                        <span className="text-[9px] font-bold uppercase tracking-wider text-primary bg-primary/10 rounded px-1.5 py-0.5">
+                          You
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-[11px] text-muted-foreground">
+                      {u.signedIn
+                        ? u.lastSignInAt
+                          ? `Last seen ${timeAgo(u.lastSignInAt)}`
+                          : "Signed in"
+                        : "Invited · never signed in"}
+                    </div>
+                  </div>
+                  {rowBusy && <Loader2 className="size-4 animate-spin text-muted-foreground shrink-0" />}
+                  <select
+                    value={u.level}
+                    disabled={rowBusy || isSelf}
+                    onChange={(e) => changeLevel(u, e.target.value as AccessLevel)}
+                    title={isSelf ? "You can't change your own access" : undefined}
+                    className="text-xs rounded-md border bg-card px-2 py-1.5 font-medium shrink-0 disabled:opacity-60"
+                  >
+                    <option value="none">No access</option>
+                    <option value="viewer">Viewer</option>
+                    <option value="member">Member</option>
+                    <option value="super_admin">Super admin</option>
+                  </select>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </Card>
   );
 }
 

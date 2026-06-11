@@ -24,10 +24,13 @@ export interface AuthState {
   role: AppRole;           // defaults to least privilege ("viewer")
   workspaceId: string | null;
   jobFunction: string | null; // non-security tag (compliance/legal); UI labels only
+  approved: boolean;       // is this account on the login allowlist (or member/super)?
 }
 
 // Server-default / pre-auth state. MUST be the value the SSR render assumes so
-// first client paint matches it.
+// first client paint matches it. `approved` defaults true so we never flash the
+// "pending access" screen before the check resolves (we only ever act on an
+// EXPLICIT false, and only once loading === false).
 const DEFAULT_STATE: AuthState = {
   loading: true,
   userId: null,
@@ -35,6 +38,7 @@ const DEFAULT_STATE: AuthState = {
   role: "viewer",
   workspaceId: null,
   jobFunction: null,
+  approved: true,
 };
 
 const listeners = new Set<(s: AuthState) => void>();
@@ -68,11 +72,25 @@ async function loadProfile(userId: string, email: string | null) {
   // race before the signup trigger commits), fall back to least privilege.
   // `profiles` is not in the (stale) generated types.ts, so cast like the rest
   // of the codebase does for newer tables (e.g. layout_jobs, analysis_guidance).
-  const { data, error } = await (supabase as any)
-    .from("profiles")
-    .select("role, workspace_id, job_function, email")
-    .eq("id", userId)
-    .maybeSingle();
+  //
+  // In parallel, resolve approval via the SECURITY DEFINER is_approved() RPC.
+  // FAIL-OPEN: if the function doesn't exist yet (before the RLS-lockdown
+  // migration is applied) the RPC returns an error — we treat that as approved
+  // so the app keeps working unchanged until the gate is live.
+  const [profileRes, approvedRes] = await Promise.all([
+    (supabase as any)
+      .from("profiles")
+      .select("role, workspace_id, job_function, email")
+      .eq("id", userId)
+      .maybeSingle(),
+    (supabase as any).rpc("is_approved").then(
+      (r: any) => r,
+      () => ({ data: true, error: null }), // network/throw -> fail open
+    ),
+  ]);
+
+  const approved = approvedRes?.error ? true : approvedRes?.data === true;
+  const { data, error } = profileRes;
 
   if (error || !data) {
     setState({
@@ -82,6 +100,7 @@ async function loadProfile(userId: string, email: string | null) {
       role: "viewer",
       workspaceId: null,
       jobFunction: null,
+      approved,
     });
     return;
   }
@@ -93,6 +112,7 @@ async function loadProfile(userId: string, email: string | null) {
     role: (data.role as AppRole) ?? "viewer",
     workspaceId: data.workspace_id ?? null,
     jobFunction: data.job_function ?? null,
+    approved,
   });
 }
 
@@ -107,7 +127,7 @@ function start() {
     if (session?.user) {
       void loadProfile(session.user.id, session.user.email ?? null);
     } else {
-      setState({ loading: false, userId: null, email: null, role: "viewer", workspaceId: null, jobFunction: null });
+      setState({ loading: false, userId: null, email: null, role: "viewer", workspaceId: null, jobFunction: null, approved: true });
     }
   });
 
@@ -115,7 +135,7 @@ function start() {
     if (session?.user) {
       void loadProfile(session.user.id, session.user.email ?? null);
     } else {
-      setState({ loading: false, userId: null, email: null, role: "viewer", workspaceId: null, jobFunction: null });
+      setState({ loading: false, userId: null, email: null, role: "viewer", workspaceId: null, jobFunction: null, approved: true });
     }
   });
 }

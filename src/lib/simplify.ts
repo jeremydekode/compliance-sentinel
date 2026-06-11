@@ -337,13 +337,13 @@ export function crossCheckSections(
 
 // ── Apply decisions ──────────────────────────────────────────────────────────
 
-/** A verified action with confidence strictly above this is auto-accepted. */
+/** A verified action with confidence at or above this is auto-accepted. */
 export const AUTO_ACCEPT_MIN_CONFIDENCE = 90;
 
 /**
  * The starting Accept/Reject decision for a freshly verified action:
  *  - `rejected`  — the verifier quarantined it (not in the document). Never applied.
- *  - `accepted`  — verified AND confidence > 90: trustworthy on both axes, auto-accepted.
+ *  - `accepted`  — verified AND confidence ≥ 90: trustworthy on both axes, auto-accepted.
  *  - `pending`   — verified-but-lower-confidence, or `review`: a human must decide.
  * Auto-accept deliberately requires the deterministic `verified` status, not just
  * the AI's self-reported confidence — a confident-sounding invention must never apply.
@@ -352,7 +352,7 @@ export function initialDecision(action: VerifiedAction): ActionDecision {
   if (action.verification.status === "rejected") return "rejected";
   if (
     action.verification.status === "verified" &&
-    (action.confidence ?? 0) > AUTO_ACCEPT_MIN_CONFIDENCE
+    (action.confidence ?? 0) >= AUTO_ACCEPT_MIN_CONFIDENCE
   ) {
     return "accepted";
   }
@@ -368,7 +368,7 @@ export function reviewGroup(action: VerifiedAction): ReviewGroup {
   if (action.verification.status === "rejected") return "quarantined";
   if (
     action.verification.status === "verified" &&
-    (action.confidence ?? 0) > AUTO_ACCEPT_MIN_CONFIDENCE
+    (action.confidence ?? 0) >= AUTO_ACCEPT_MIN_CONFIDENCE
   ) {
     return "auto";
   }

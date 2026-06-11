@@ -44,10 +44,19 @@ function escapeXml(s: string): string {
 
 /** Extract concatenated text content of a <w:p>...</w:p> block, ignoring formatting. */
 function getParagraphText(pXml: string): string {
+  // Preserve tabs/line-breaks as whitespace BEFORE extracting runs.
+  const normalised = pXml
+    .replace(/<w:tab\b[^>]*\/?>/g, " ")
+    .replace(/<w:br\b[^>]*\/?>/g, "\n");
   const out: string[] = [];
-  const re = /<w:t[^>]*>([\s\S]*?)<\/w:t>/g;
+  // Match ONLY real text runs: "<w:t>" or "<w:t ...attrs>". Requiring a space or
+  // ">" right after "w:t" prevents false matches on <w:tab/>, <w:tbl>, <w:tc>,
+  // <w:tr> etc. — the old /<w:t[^>]*>/ matched those and captured raw XML as
+  // "text" for tab/form-field/table paragraphs (so their content never reached
+  // the model and `before` failed to anchor on apply).
+  const re = /<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(pXml)) !== null) {
+  while ((m = re.exec(normalised)) !== null) {
     out.push(m[1]);
   }
   // Unescape XML entities so we compare against plain text from the AI
@@ -119,7 +128,7 @@ export function applyEditsToDocx(sourceBuffer: Buffer, edits: DocxEdit[]): DocxE
     }
 
     // Walk paragraphs, find the first match by normalised text
-    const pRegex = /<w:p\b[\s\S]*?<\/w:p>/g;
+    const pRegex = /<w:p\b[^>]*>(?:(?!<w:p\b)[\s\S])*?<\/w:p>/g;
     let matched = false;
     let lastIndex = 0;
     let m: RegExpExecArray | null;
@@ -230,13 +239,197 @@ export function docxToTextFallback(buffer: Buffer): string {
   const xml = docFile.asText();
 
   const paragraphs: string[] = [];
-  const pRegex = /<w:p\b[\s\S]*?<\/w:p>/g;
+  const pRegex = /<w:p\b[^>]*>(?:(?!<w:p\b)[\s\S])*?<\/w:p>/g;
   let m: RegExpExecArray | null;
   while ((m = pRegex.exec(xml)) !== null) {
     const text = getParagraphText(m[0]);
     if (text) paragraphs.push(text);
   }
   return paragraphs.join("\n\n");
+}
+
+/**
+ * Cell-aware extraction for Document Simplification (UC4).
+ *
+ * mammoth's extractRawText flattens tables (tab-joins the cells of a row onto
+ * one line), so cell prose can't be cleanly anchored and the simplifier skips
+ * it. This walks the document IN ORDER and emits each body paragraph and — the
+ * point — each TABLE CELL paragraph as its own clean line, using the SAME
+ * getParagraphText() the apply step uses, so a `before` quoted from here
+ * re-anchors exactly when applySimplificationToDocx() locates the cell's <w:p>.
+ * Tables are wrapped in [TABLE n] … [END TABLE n] marker lines (non-prose, so
+ * the model won't quote them) so it knows which lines are tabular and can
+ * simplify verbose cell prose while leaving labels/codes/numbers/dates alone.
+ *
+ * Note: the apply path is already cell-capable (it walks every <w:p>, including
+ * those inside <w:tc>), so only this extraction needed to change.
+ */
+export function docxToSimplifyText(buffer: Buffer): string {
+  const zip = new PizZip(buffer);
+  const docFile = zip.file("word/document.xml");
+  if (!docFile) return "";
+  const xml = docFile.asText();
+
+  const out: string[] = [];
+  // Match a whole table OR a body paragraph, in document order. The table
+  // alternative consumes its inner <w:p> cells, so they are not double-emitted.
+  const tokenRe = /<w:tbl\b[\s\S]*?<\/w:tbl>|<w:p\b[^>]*>(?:(?!<w:p\b)[\s\S])*?<\/w:p>/g;
+  let tableNo = 0;
+  let m: RegExpExecArray | null;
+  while ((m = tokenRe.exec(xml)) !== null) {
+    const block = m[0];
+    if (block.startsWith("<w:tbl")) {
+      tableNo++;
+      out.push(
+        `\n[TABLE ${tableNo}] — each line below is one table cell. Simplify verbose prose sentences here just like body text; leave labels, codes, reference numbers, dates and short values unchanged.`,
+      );
+      const pRe = /<w:p\b[^>]*>(?:(?!<w:p\b)[\s\S])*?<\/w:p>/g;
+      let pm: RegExpExecArray | null;
+      while ((pm = pRe.exec(block)) !== null) {
+        const t = getParagraphText(pm[0]);
+        if (t) out.push(t);
+      }
+      out.push(`[END TABLE ${tableNo}]\n`);
+    } else {
+      const t = getParagraphText(block);
+      if (t) out.push(t);
+    }
+  }
+  return out.join("\n");
+}
+
+/**
+ * Like docxToSimplifyText, but returns an ORDERED LIST of units — one per body
+ * paragraph and one per table-cell paragraph — for PER-UNIT batched
+ * simplification. Each unit carries the most recent ALL-CAPS heading as its
+ * `section`. The unit text is exactly getParagraphText(<w:p>), so a `before`
+ * derived from a unit anchors 1:1 when applySimplificationToDocx re-locates it.
+ */
+export function docxToSimplifyUnits(buffer: Buffer): { text: string; section: string }[] {
+  const zip = new PizZip(buffer);
+  const docFile = zip.file("word/document.xml");
+  if (!docFile) return [];
+  const xml = docFile.asText();
+  const units: { text: string; section: string }[] = [];
+  let section = "";
+  const tokenRe = /<w:tbl\b[\s\S]*?<\/w:tbl>|<w:p\b[^>]*>(?:(?!<w:p\b)[\s\S])*?<\/w:p>/g;
+  let m: RegExpExecArray | null;
+  while ((m = tokenRe.exec(xml)) !== null) {
+    const block = m[0];
+    const inTable = block.startsWith("<w:tbl");
+    const paras = inTable
+      ? [...block.matchAll(/<w:p\b[^>]*>(?:(?!<w:p\b)[\s\S])*?<\/w:p>/g)].map((x) => x[0])
+      : [block];
+    for (const p of paras) {
+      const t = getParagraphText(p);
+      if (!t) continue;
+      // Track section from short, all-caps body headings (e.g. "APPLICABILITY").
+      if (!inTable && t.length <= 80 && t.length >= 3 && t === t.toUpperCase() && /[A-Z]/.test(t)) {
+        section = t;
+      }
+      units.push({ text: t, section });
+    }
+  }
+  return units;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// UC4 — FIGURES (charts / flowcharts / diagrams embedded as images)
+// Text extraction can't see image content, so figures are extracted here and
+// analysed by the vision model; suggestions come back as Word COMMENTS anchored
+// on the figure (an image can't be redlined in place).
+// ════════════════════════════════════════════════════════════════════════════
+
+export type DocxFigure = {
+  /** rId of the FIRST drawing in document.xml that references this image —
+   *  used to locate the paragraph to anchor the review comment on. */
+  anchorRelId: string;
+  name: string;
+  mimeType: string;
+  dataBase64: string;
+  /** How many times this same image appears in the document (logos repeat). */
+  occurrences: number;
+};
+
+const FIGURE_MIME: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  webp: "image/webp",
+};
+
+/**
+ * Extracts the UNIQUE raster images referenced by word/document.xml, largest
+ * first. Tiny files (icons/logos) and unsupported formats (gif/emf/wmf — the
+ * vision model can't take them) are skipped and counted. Each figure carries
+ * the rId of its first reference so a comment can be anchored on that drawing's
+ * paragraph.
+ */
+export function extractDocxFigures(
+  buffer: Buffer,
+  opts: { maxFigures?: number; minBytes?: number } = {},
+): { figures: DocxFigure[]; skipped: number } {
+  const maxFigures = opts.maxFigures ?? 15;
+  const minBytes = opts.minBytes ?? 8 * 1024;
+  const zip = new PizZip(buffer);
+  const docFile = zip.file("word/document.xml");
+  const relsFile = zip.file("word/_rels/document.xml.rels");
+  if (!docFile || !relsFile) return { figures: [], skipped: 0 };
+  const xml = docFile.asText();
+  const rels = relsFile.asText();
+
+  const relTarget = new Map<string, string>();
+  const relRe = /<Relationship\s[^>]*Id="([^"]+)"[^>]*Target="([^"]+)"[^>]*\/?>/g;
+  let rm: RegExpExecArray | null;
+  while ((rm = relRe.exec(rels)) !== null) relTarget.set(rm[1], rm[2]);
+
+  // Group references by media target so a logo used 300x is analysed once.
+  const byTarget = new Map<string, { relId: string; count: number; name: string }>();
+  const refRe = /<a:blip[^>]*r:embed="([^"]+)"|<v:imagedata[^>]*r:id="([^"]+)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = refRe.exec(xml)) !== null) {
+    const rid = m[1] ?? m[2];
+    const target = relTarget.get(rid);
+    if (!target) continue;
+    const entry = byTarget.get(target);
+    if (entry) {
+      entry.count++;
+    } else {
+      // The drawing's alt-text/name sits in wp:docPr just before the blip.
+      const back = xml.slice(Math.max(0, m.index - 700), m.index);
+      const nm = [...back.matchAll(/<wp:docPr[^>]*name="([^"]*)"/g)].pop()?.[1] ?? "";
+      byTarget.set(target, { relId: rid, count: 1, name: nm });
+    }
+  }
+
+  const all: DocxFigure[] = [];
+  let skipped = 0;
+  for (const [target, info] of byTarget) {
+    const rel = target.replace(/^\//, "").replace(/^(\.\.\/)+/, "");
+    const f = zip.file(rel.startsWith("word/") ? rel : `word/${rel}`);
+    if (!f) {
+      skipped++;
+      continue;
+    }
+    const ext = (rel.split(".").pop() ?? "").toLowerCase();
+    const mime = FIGURE_MIME[ext];
+    const bytes = f.asUint8Array();
+    if (!mime || bytes.length < minBytes) {
+      skipped++;
+      continue;
+    }
+    all.push({
+      anchorRelId: info.relId,
+      name: info.name || rel.split("/").pop() || rel,
+      mimeType: mime,
+      dataBase64: Buffer.from(bytes).toString("base64"),
+      occurrences: info.count,
+    });
+  }
+  all.sort((a, b) => b.dataBase64.length - a.dataBase64.length);
+  const figures = all.slice(0, maxFigures);
+  skipped += all.length - figures.length;
+  return { figures, skipped };
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -255,6 +448,11 @@ export type SimplifyDocxEdit = {
   after: string;
   /** Optional context appended after "Before:" in the Word comment. */
   rationale?: string;
+  /** COMMENT-ONLY edit: no text change — attach `comment` to the paragraph whose
+   *  drawing references `anchorRelId` (figures/charts can't be redlined). */
+  commentOnly?: boolean;
+  anchorRelId?: string;
+  comment?: string;
 };
 
 export type SimplifyDocxResult = {
@@ -289,6 +487,111 @@ function tolerantReplace(paraText: string, before: string, after: string): strin
   at = p.toLowerCase().indexOf(b.toLowerCase());
   if (at >= 0) return p.slice(0, at) + after + p.slice(at + b.length);
   return null;
+}
+
+/** Like tolerantReplace, but returns the match span (indices into the ORIGINAL
+ *  paraText) instead of replacing — used to build a redline. Quote-normalisation
+ *  is 1:1 in length, so indices map straight back to the original text. */
+function tolerantLocate(paraText: string, before: string): { start: number; end: number } | null {
+  const q = (s: string) => s.replace(/[‘’]/g, "'").replace(/[“”]/g, '"');
+  const p = q(paraText);
+  const b = q(before);
+  if (!b) return null;
+  let at = p.indexOf(b);
+  if (at < 0) at = p.toLowerCase().indexOf(b.toLowerCase());
+  if (at < 0) return null;
+  return { start: at, end: at + b.length };
+}
+
+/**
+ * Finds the innermost <w:p>…</w:p> that ENCLOSES position `refIndex` — used to
+ * anchor figure comments, whose drawing paragraph may contain nested textbox
+ * paragraphs (so a leaf-only search misses it). Walks back over candidate
+ * <w:p openers and, for each (nearest first), counts nested opens/closes
+ * forward to find its matching close; the first whose close lies beyond
+ * `refIndex` is the enclosing paragraph. Returns null if none encloses it
+ * (e.g. the ref sits in a header part, not document.xml body).
+ */
+function locateEnclosingParagraph(
+  xml: string,
+  refIndex: number,
+): { start: number; end: number } | null {
+  const openRe = /<w:p\b[^>]*>/g;
+  const opens: number[] = [];
+  let om: RegExpExecArray | null;
+  while ((om = openRe.exec(xml)) !== null) {
+    if (om.index >= refIndex) break;
+    opens.push(om.index);
+  }
+  const tokenRe = /<w:p\b[^>]*>|<\/w:p>/g;
+  for (let i = opens.length - 1; i >= 0; i--) {
+    const start = opens[i];
+    tokenRe.lastIndex = start;
+    let depth = 0;
+    let tm: RegExpExecArray | null;
+    while ((tm = tokenRe.exec(xml)) !== null) {
+      depth += tm[0] === "</w:p>" ? -1 : 1;
+      if (depth === 0) {
+        const end = tm.index + tm[0].length;
+        if (end > refIndex) return { start, end };
+        break; // closed before the ref — try the next-outer candidate
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Build a paragraph as a REDLINE (Word tracked changes): the deleted `before`
+ * span is wrapped in <w:del> (Word renders this as red strikethrough in markup
+ * view; the explicit <w:strike/> + red colour make it unmistakable), and the
+ * new `after` text is wrapped in <w:ins> (Word shows insertions underlined).
+ * Reviewers can Accept/Reject each change in Word's Review pane. Paragraph
+ * properties (<w:pPr> — numbering, style) are preserved.
+ *
+ * For a "delete_redundant" action `after` is empty → a pure deletion (struck
+ * text, nothing inserted).
+ */
+function buildRedlineParagraph(
+  origPXml: string,
+  paraText: string,
+  loc: { start: number; end: number },
+  after: string,
+  delId: number,
+  insId: number,
+  author: string,
+  dateIso: string,
+): string {
+  const pPrMatch = origPXml.match(/<w:pPr\b[\s\S]*?<\/w:pPr>/);
+  const pPr = pPrMatch ? pPrMatch[0] : "";
+  // Inherit the FIRST real text run's properties (font, SIZE, bold, colour…) so
+  // inserted/kept text matches the surrounding text and doesn't balloon past a
+  // flowchart box or table cell. (The paragraph-mark rPr inside <w:pPr> is the
+  // wrong one — we want an actual <w:r>'s rPr.)
+  const rPr = origPXml.match(/<w:r\b[^>]*>\s*(<w:rPr\b[\s\S]*?<\/w:rPr>)/)?.[1] ?? "";
+  const prefix = paraText.slice(0, loc.start);
+  const deleted = paraText.slice(loc.start, loc.end);
+  const suffix = paraText.slice(loc.end);
+
+  const a = escapeXml(author);
+  const textRun = (t: string) =>
+    t ? `<w:r>${rPr}<w:t xml:space="preserve">${escapeXml(t)}</w:t></w:r>` : "";
+  // Deletion keeps the original size/font + an explicit red strikethrough.
+  const delRpr = rPr
+    ? rPr.replace(/<\/w:rPr>$/, `<w:strike/><w:color w:val="FF0000"/></w:rPr>`)
+    : `<w:rPr><w:strike/><w:color w:val="FF0000"/></w:rPr>`;
+  const delRun = deleted
+    ? `<w:del w:id="${delId}" w:author="${a}" w:date="${dateIso}">` +
+      `<w:r>${delRpr}` +
+      `<w:delText xml:space="preserve">${escapeXml(deleted)}</w:delText></w:r></w:del>`
+    : "";
+  // Insertion keeps the original size/font (Word underlines insertions in markup).
+  const insRun = after
+    ? `<w:ins w:id="${insId}" w:author="${a}" w:date="${dateIso}">` +
+      `<w:r>${rPr}<w:t xml:space="preserve">${escapeXml(after)}</w:t></w:r></w:ins>`
+    : "";
+
+  return `<w:p>${pPr}${textRun(prefix)}${delRun}${insRun}${textRun(suffix)}</w:p>`;
 }
 
 /** Build a <w:p> with one highlighted run, optionally wrapped in a comment range. */
@@ -415,23 +718,66 @@ function attachComments(zip: PizZip, commentEntries: string[], paraIds: string[]
 export function applySimplificationToDocx(
   sourceBuffer: Buffer,
   edits: SimplifyDocxEdit[],
-  opts: { author?: string } = {},
+  opts: { author?: string; mode?: "redline" | "highlight" } = {},
 ): SimplifyDocxResult {
   const zip = new PizZip(sourceBuffer);
   const docFile = zip.file("word/document.xml");
   if (!docFile) throw new Error("Invalid DOCX: word/document.xml not found");
   let documentXml = docFile.asText();
 
+  // "redline" = Word tracked changes (red strikethrough deletions + insertions,
+  // Accept/Reject-able). "highlight" = yellow highlight + a Word comment.
+  const mode = opts.mode ?? "redline";
   const author = (opts.author ?? "AI Document Workflow").slice(0, 60);
   const dateIso = new Date().toISOString();
   const commentEntries: string[] = [];
   const paraIds: string[] = []; // one per comment — links commentsExtended.xml back
 
   let nextCommentId = 0;
+  let nextRevId = 1000; // <w:ins>/<w:del> revision ids (kept clear of any in the source)
   let appliedCount = 0;
   const skipped: { reason: string; before: string }[] = [];
 
   for (const edit of edits) {
+    // ── Figure comment: anchor a Word comment on the paragraph containing the
+    // drawing that references anchorRelId. No text change, works in both modes.
+    // NOTE: a drawing's paragraph is often NOT a leaf (the drawing can hold a
+    // textbox with nested <w:p>), so locate the ref position first and walk
+    // outward to its ENCLOSING paragraph. Nested paragraphs live inside runs,
+    // so the enclosing paragraph's direct children are still runs — inserting
+    // comment-range markers at that level stays schema-valid.
+    if (edit.commentOnly && edit.anchorRelId) {
+      const ridEsc = edit.anchorRelId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const refMatch = new RegExp(`(?:r:embed|r:id|r:dm)="${ridEsc}"`).exec(documentXml);
+      const span = refMatch ? locateEnclosingParagraph(documentXml, refMatch.index) : null;
+      if (!span) {
+        skipped.push({ reason: "figure anchor not found", before: edit.anchorRelId });
+        continue;
+      }
+      const para = documentXml.slice(span.start, span.end);
+      const commentId = nextCommentId++;
+      const paraId = (commentId + 1).toString(16).padStart(8, "0").toUpperCase();
+      paraIds.push(paraId);
+      commentEntries.push(
+        buildCommentEntry(commentId, edit.comment ?? edit.after ?? "", author, dateIso, paraId),
+      );
+      // commentRangeStart must come after <w:pPr>, so split open-tag + pPr off.
+      const open = para.match(/^<w:p\b[^>]*>/)?.[0] ?? "<w:p>";
+      const pPr = para.match(/<w:pPr\b[\s\S]*?<\/w:pPr>/)?.[0] ?? "";
+      const head = para.startsWith(open + pPr) ? open + pPr : open;
+      const inner = para.slice(head.length, para.length - "</w:p>".length);
+      const newPara =
+        head +
+        `<w:commentRangeStart w:id="${commentId}"/>` +
+        inner +
+        `<w:commentRangeEnd w:id="${commentId}"/>` +
+        `<w:r><w:rPr><w:rStyle w:val="CommentReference"/></w:rPr><w:commentReference w:id="${commentId}"/></w:r>` +
+        `</w:p>`;
+      documentXml = documentXml.slice(0, span.start) + newPara + documentXml.slice(span.end);
+      appliedCount++;
+      continue;
+    }
+
     const before = (edit.before ?? "").trim();
     if (!before) {
       skipped.push({ reason: "empty before", before: "" });
@@ -439,24 +785,33 @@ export function applySimplificationToDocx(
     }
 
     // Find the first <w:p> whose text contains `before` (tolerantly).
-    const pRegex = /<w:p\b[\s\S]*?<\/w:p>/g;
+    const pRegex = /<w:p\b[^>]*>(?:(?!<w:p\b)[\s\S])*?<\/w:p>/g;
     let m: RegExpExecArray | null;
     let matched = false;
     while ((m = pRegex.exec(documentXml)) !== null) {
       const paraText = getParagraphText(m[0]);
       if (!paraText) continue;
-      const amended = tolerantReplace(paraText, before, edit.after ?? "");
-      if (amended === null) continue;
 
-      const commentId = nextCommentId++;
-      // 8-char hex paraId — unique per comment, matches what commentsExtended uses.
-      const paraId = (commentId + 1).toString(16).padStart(8, "0").toUpperCase();
-      paraIds.push(paraId);
-      const newPara = buildHighlightedParaWithComment(amended, commentId);
-      const commentContent = edit.rationale
-        ? `Before: ${before}\n\n${edit.rationale}`
-        : `Before: ${before}`;
-      commentEntries.push(buildCommentEntry(commentId, commentContent, author, dateIso, paraId));
+      let newPara: string;
+      if (mode === "redline") {
+        const loc = tolerantLocate(paraText, before);
+        if (!loc) continue;
+        newPara = buildRedlineParagraph(
+          m[0], paraText, loc, edit.after ?? "", nextRevId++, nextRevId++, author, dateIso,
+        );
+      } else {
+        const amended = tolerantReplace(paraText, before, edit.after ?? "");
+        if (amended === null) continue;
+        const commentId = nextCommentId++;
+        // 8-char hex paraId — unique per comment, matches what commentsExtended uses.
+        const paraId = (commentId + 1).toString(16).padStart(8, "0").toUpperCase();
+        paraIds.push(paraId);
+        newPara = buildHighlightedParaWithComment(amended, commentId);
+        const commentContent = edit.rationale
+          ? `Before: ${before}\n\n${edit.rationale}`
+          : `Before: ${before}`;
+        commentEntries.push(buildCommentEntry(commentId, commentContent, author, dateIso, paraId));
+      }
 
       documentXml =
         documentXml.slice(0, m.index) + newPara + documentXml.slice(m.index + m[0].length);
@@ -468,7 +823,7 @@ export function applySimplificationToDocx(
   }
 
   zip.file("word/document.xml", documentXml);
-  attachComments(zip, commentEntries, paraIds);
+  if (commentEntries.length > 0) attachComments(zip, commentEntries, paraIds);
 
   const out = zip.generate({ type: "nodebuffer", compression: "DEFLATE" }) as Buffer;
   return { buffer: out, appliedCount, skipped };

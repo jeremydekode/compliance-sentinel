@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-export type WorkspaceId = "rmit" | "fatf" | "forms" | "simplify" | "layout";
+export type WorkspaceId = "rmit" | "fatf" | "forms" | "simplify" | "layout" | "policy";
 
 export const WORKSPACES: Record<WorkspaceId, {
   id: WorkspaceId;
@@ -49,6 +49,14 @@ export const WORKSPACES: Record<WorkspaceId, {
     tagline: "Sketch → digital layout · Rules-based fixture placement",
     color: "text-orange-700",
     bgColor: "bg-orange-100",
+  },
+  policy: {
+    id: "policy",
+    name: "Policy Change",
+    short: "Policy",
+    tagline: "New policy adoption · Impact analysis & rollout",
+    color: "text-rose-700",
+    bgColor: "bg-rose-100",
   },
 };
 

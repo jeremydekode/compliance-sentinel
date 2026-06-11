@@ -2,11 +2,11 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import { supabaseAdmin } from "@/integrations/supabase/client.server";
-import { chunkDocument, generateAmendedDocument, extractRegulatoryChanges, extractFatfRequirements, mapChangeToSops, routeChangesToSops, analyzeSopAgainstGaps, buildSopTopicMap, generateAnalysisSummary, generateWithFallback, simplifyDocument } from "./gemini";
-import { applyEditsToDocx, looksLikeDocx, docxToText, docxToHtml, applySimplificationToDocx, type SimplifyDocxEdit } from "./docx-editor";
+import { chunkDocument, generateAmendedDocument, extractRegulatoryChanges, extractFatfRequirements, mapChangeToSops, routeChangesToSops, analyzeSopAgainstGaps, buildSopTopicMap, generateAnalysisSummary, generateWithFallback, simplifyDocument, simplifyDocumentByUnits, analyzeDocFigures, type FigureReview } from "./gemini";
+import { applyEditsToDocx, looksLikeDocx, docxToText, docxToHtml, docxToSimplifyText, docxToSimplifyUnits, extractDocxFigures, applySimplificationToDocx, type SimplifyDocxEdit } from "./docx-editor";
 import { verifyActions, analyzeStructure, crossCheckSections, DEFAULT_SIMPLIFY_GUIDANCE, initialDecision } from "./simplify";
 import type { VerificationSummary, DocStructure, SectionCrossCheck } from "./simplify";
-import { computeCost, type RunCost } from "./pricing";
+import { computeCost, addUsage, type RunCost } from "./pricing";
 import {
   buildAuthUrl,
   buildRedirectUri,
@@ -52,7 +52,7 @@ import { REGULATION_FAMILIES, INTERNAL_DOC_TYPES as INTERNAL_DOC_TYPES_CONST, re
 // Allowed workspace identifiers — shared across every workspace-scoped input
 // validator. Declared up here so server fns defined anywhere in the file can
 // reference it in their .inputValidator() (evaluated at module load).
-const workspaceSchema = z.enum(["rmit", "fatf", "forms", "simplify", "layout"]);
+const workspaceSchema = z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy"]);
 
 async function fetchFile(url: string): Promise<{ buffer: Buffer; mimeType: string }> {
   // Reject Drive viewer URLs straight away — they return HTML, not the file.
@@ -136,7 +136,7 @@ export const createReport = createServerFn({ method: "POST" })
     z.object({
       filename: z.string(),
       fileUrl: z.string().nullable(),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy"]).default("rmit"),
       customTitle: z.string().optional(),
       notes: z.string().optional(),
       detected: z
@@ -467,7 +467,7 @@ export const createRegulatoryReport = createServerFn({ method: "POST" })
     z.object({
       filename: z.string(),
       fileUrl: z.string().nullable(),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy"]).default("rmit"),
       customTitle: z.string().optional(),
       notes: z.string().optional(),
       detected: z
@@ -1680,7 +1680,7 @@ export const createSop = createServerFn({ method: "POST" })
       title: z.string().min(2).max(200),
       doc_type: z.enum(["sop", "rmit", "rmit_reg", "fatf", "circular", "it_policy", "policy", "form"]),
       version: z.string().min(1).max(20),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy"]).default("rmit"),
       summary: z.string().max(2000).optional(),
       tags: z.array(z.string().max(40)).max(20).optional(),
       file_url: z.string().nullable().optional(),
@@ -1789,7 +1789,7 @@ export const clearWorkspace = createServerFn({ method: "POST" })
   .inputValidator(
     z.object({
       scope: z.enum(["analyses", "kb", "all"]),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy"]).default("rmit"),
     })
   )
   .handler(async ({ data, context }) => {
@@ -2175,7 +2175,7 @@ function escapeHtml(s: string): string {
  */
 export const getChunkCounts = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .inputValidator(z.object({ workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout"]).default("rmit") }))
+  .inputValidator(z.object({ workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy"]).default("rmit") }))
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -2448,7 +2448,7 @@ function applyPageOverrides(formId: string, impacts: any[]): any[] {
 export const createFormUpdateReport = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator(z.object({
-    workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout"]).default("forms"),
+    workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy"]).default("forms"),
     formId: z.string().min(1),                  // e.g. "FGROP 037/2016"
     friendlyName: z.string().optional(),         // e.g. "Account Opening Application Form"
     customTitle: z.string().optional(),
@@ -3924,6 +3924,7 @@ export const createSimplificationReport = createServerFn({ method: "POST" })
       // can copy the original document straight in Drive.
       driveFileId: z.string().optional(),
       driveMimeType: z.string().optional(),
+      mode: z.enum(["thorough", "quick"]).optional(),
     }),
   )
   .handler(async ({ data, context }) => {
@@ -3942,6 +3943,7 @@ export const createSimplificationReport = createServerFn({ method: "POST" })
         workspace_id: "simplify",
         summary_json: {
           kind: "simplification",
+          simplify_mode: data.mode ?? "thorough",
           instruction: data.instruction?.trim() || null,
           driveFileId: data.driveFileId ?? null,
           driveMimeType: data.driveMimeType ?? null,
@@ -3968,7 +3970,7 @@ export const createSimplificationReport = createServerFn({ method: "POST" })
  */
 export const runSimplificationReport = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator(z.object({ reportId: z.string() }))
+  .inputValidator(z.object({ reportId: z.string(), mode: z.enum(["thorough", "quick"]).optional() }))
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
     const { data: report, error: repErr } = await supabase
@@ -3980,6 +3982,10 @@ export const runSimplificationReport = createServerFn({ method: "POST" })
     const prevJson = ((report.summary_json as any) ?? {}) as Record<string, any>;
     const instruction: string | null = prevJson.instruction ?? null;
     const title = (report.policy_name as string) ?? "Document";
+    // "thorough" = per-unit (every paragraph/cell — comprehensive, slower);
+    // "quick" = chunk-based (fast, fewer high-confidence edits). Explicit choice
+    // wins; otherwise reuse the report's last mode; otherwise default thorough.
+    const mode: "thorough" | "quick" = data.mode ?? prevJson.simplify_mode ?? "thorough";
 
     let status: "ok" | "failed" = "failed";
     let errorMsg: string | null = null;
@@ -3987,6 +3993,9 @@ export const runSimplificationReport = createServerFn({ method: "POST" })
     let structure: DocStructure | null = null;
     let crossCheck: SectionCrossCheck | null = null;
     let cost: RunCost | null = null;
+    let figureReviews: FigureReview[] = [];
+    let figuresScanned = 0;
+    let figuresSkipped = 0;
 
     try {
       // 1 — fetch the source file. DOCX is read as plain TEXT for the model
@@ -3995,7 +4004,16 @@ export const runSimplificationReport = createServerFn({ method: "POST" })
       const file = await fetchFile(report.source_file_url);
       const isDocx = looksLikeDocx(file.mimeType, report.source_file_url);
       const html = isDocx ? await docxToHtml(file.buffer) : "";
-      let text = isDocx ? await docxToText(file.buffer).catch(() => "") : "";
+      // Cell-aware extraction: emits each table cell's prose as its own clean,
+      // anchorable line (mammoth's flat extractRawText tab-joins table rows, so
+      // cell prose can't be quoted verbatim and the simplifier skips it). Falls
+      // back to flat text if anything goes wrong. Still plain text (not HTML),
+      // so the ~5x token saving over HTML is preserved.
+      let text = "";
+      if (isDocx) {
+        try { text = docxToSimplifyText(file.buffer); } catch { text = ""; }
+        if (!text) text = await docxToText(file.buffer).catch(() => "");
+      }
       if (!text) {
         if (file.mimeType === "application/pdf" || /\.pdf($|\?)/i.test(report.source_file_url)) {
           const { extractPdfPages } = await import("./pdf-pages");
@@ -4016,7 +4034,20 @@ export const runSimplificationReport = createServerFn({ method: "POST" })
       // changes the rules every subsequent run applies.
       // No saved guidance yet → fall back to the built-in starter house rules.
       const guidance = (await fetchAnalysisGuidance(supabase, "simplify")) || DEFAULT_SIMPLIFY_GUIDANCE;
-      const { actions, usage } = await simplifyDocument({ title, text }, { instruction, guidance });
+      // THOROUGH → per-unit batched: the model evaluates EVERY paragraph & table
+      // cell, batches retry so none silently drop, and `before` is each unit's
+      // exact text so edits anchor cleanly. QUICK → the chunk-based pass (fast,
+      // a curated set). Per-unit units come from DOCX structure; for non-DOCX we
+      // split the extracted text into paragraph units. Either falls back to the
+      // chunk pass if no units can be derived.
+      const units = mode === "thorough"
+        ? (isDocx
+            ? docxToSimplifyUnits(file.buffer)
+            : text.split(/\n+/).map((t) => ({ text: t.trim(), section: "" })).filter((u) => u.text))
+        : [];
+      const { actions, usage } = units.length
+        ? await simplifyDocumentByUnits({ title, units }, { instruction, guidance })
+        : await simplifyDocument({ title, text }, { instruction, guidance });
       cost = computeCost(usage); // metered even if the run yields nothing
       if (actions.length === 0) {
         throw new Error(
@@ -4027,6 +4058,25 @@ export const runSimplificationReport = createServerFn({ method: "POST" })
       // 4 + 5 — deterministic verification and section cross-check.
       summary = verifyActions(actions, text);
       crossCheck = crossCheckSections(summary.actions, structure);
+
+      // 6 — FIGURES: charts/flowcharts embedded as images are invisible to the
+      // text pass, so each unique image goes to the vision model; its suggested
+      // changes become a Word COMMENT anchored on the figure at apply time.
+      // Never fails the run — a figure error just means no figure notes.
+      if (isDocx) {
+        try {
+          const { figures, skipped } = extractDocxFigures(file.buffer);
+          figuresScanned = figures.length;
+          figuresSkipped = skipped;
+          if (figures.length > 0) {
+            const fr = await analyzeDocFigures(title, figures, { guidance });
+            figureReviews = fr.reviews;
+            cost = computeCost(addUsage(usage, fr.usage)); // fold vision tokens into the metered cost
+          }
+        } catch (e: any) {
+          console.warn("[simplify] figure review failed:", e?.message?.slice(0, 120));
+        }
+      }
       status = "ok";
     } catch (e: any) {
       errorMsg = e?.message?.slice(0, 250) ?? "unknown error";
@@ -4038,6 +4088,7 @@ export const runSimplificationReport = createServerFn({ method: "POST" })
       summary_json: {
         ...prevJson,
         kind: "simplification",
+        simplify_mode: mode,
         pending_analysis: false,
         simplification_status: status,
         simplification_error: errorMsg,
@@ -4049,6 +4100,10 @@ export const runSimplificationReport = createServerFn({ method: "POST" })
         // Each action carries its initial Accept/Reject decision: verified +
         // confidence > 90 → accepted; quarantined → rejected; else pending.
         actions: (summary?.actions ?? []).map((a) => ({ ...a, decision: initialDecision(a) })),
+        // Vision review of embedded charts/figures — applied as Word comments.
+        figure_reviews: figureReviews,
+        figures_scanned: figuresScanned,
+        figures_skipped: figuresSkipped,
         cost: cost ?? null,
         last_run_at: new Date().toISOString(),
       },
@@ -4109,6 +4164,47 @@ export const setSimplificationDecision = createServerFn({ method: "POST" })
   });
 
 /**
+ * UC4 — bulk Accept/Pending for simplification actions in one call. Quarantined
+ * actions (not found in the document) are NEVER touched — a confident-sounding
+ * invention must never be auto-applied. Used by the "Accept all" button.
+ */
+export const bulkSetSimplificationDecision = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    z.object({
+      reportId: z.string(),
+      decision: z.enum(["accepted", "pending"]).default("accepted"),
+    }),
+  )
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    const { data: report, error } = await supabase
+      .from("analysis_reports")
+      .select("summary_json")
+      .eq("id", data.reportId)
+      .single();
+    if (error || !report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sj = ((report.summary_json as any) ?? {}) as Record<string, any>;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const actions: any[] = Array.isArray(sj.actions) ? sj.actions : [];
+    let changed = 0;
+    const updated = actions.map((a) => {
+      if (a?.verification?.status === "rejected") return a; // never accept a quarantined edit
+      if (a?.decision === data.decision) return a;
+      changed++;
+      return { ...a, decision: data.decision };
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { error: upErr } = await (supabase as any)
+      .from("analysis_reports")
+      .update({ summary_json: { ...sj, actions: updated } })
+      .eq("id", data.reportId);
+    if (upErr) throw new Error(`Failed to save decisions: ${upErr.message}`);
+    return { changed, total: updated.length };
+  });
+
+/**
  * UC4 — generates an amended copy of the source document with every accepted
  * simplification applied (highlighted) and a Word/Drive comment carrying the
  * original "Before:" text on each amended span. Two paths:
@@ -4138,7 +4234,10 @@ export const applySimplificationReport = createServerFn({ method: "POST" })
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const allActions: any[] = Array.isArray(sj.actions) ? sj.actions : [];
     const accepted = allActions.filter((a) => a?.decision === "accepted");
-    if (accepted.length === 0) throw new Error("No accepted actions to apply.");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const figureReviews: any[] = Array.isArray(sj.figure_reviews) ? sj.figure_reviews : [];
+    if (accepted.length === 0 && figureReviews.length === 0)
+      throw new Error("No accepted actions to apply.");
 
     const title = (report.policy_name as string) ?? "Document";
     const edits: SimplifyDocxEdit[] = accepted.map((a) => ({
@@ -4207,7 +4306,14 @@ export const applySimplificationReport = createServerFn({ method: "POST" })
         "Local apply currently supports DOCX sources only. For PDFs, re-upload as DOCX.",
       );
     }
-    const result = applySimplificationToDocx(file.buffer, edits, { author: "AI Document Workflow" });
+    // Figure reviews ride along as comment-only edits anchored on each figure's
+    // drawing (DOCX path only — the Drive path has no comment plumbing).
+    for (const f of figureReviews) {
+      if (f?.anchorRelId && f?.comment) {
+        edits.push({ before: "", after: "", commentOnly: true, anchorRelId: f.anchorRelId, comment: f.comment });
+      }
+    }
+    const result = applySimplificationToDocx(file.buffer, edits, { author: "AI Document Workflow", mode: "redline" });
 
     // Upload the amended .docx to storage and surface a download URL.
     const safeName = title.replace(/[^A-Za-z0-9_.-]+/g, "_").slice(0, 80) || "amended";

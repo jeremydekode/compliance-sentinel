@@ -61,6 +61,7 @@ export function SimplifyUploadDialog({
   const [customTitle, setCustomTitle] = useState("");
   const [instruction, setInstruction] = useState("");
   const [busy, setBusy] = useState(false);
+  const [mode, setMode] = useState<"thorough" | "quick">("thorough");
 
   const googleConn = useQuery({
     queryKey: ["google_connection", workspace],
@@ -130,6 +131,7 @@ export function SimplifyUploadDialog({
           instruction: instruction.trim() || undefined,
           driveFileId,
           driveMimeType,
+          mode,
         },
       });
       reset();
@@ -359,6 +361,33 @@ export function SimplifyUploadDialog({
               className="w-full text-xs px-3 py-2 rounded-lg border bg-card focus:outline-none focus:ring-1 focus:ring-violet-500 resize-none"
             />
           </section>
+        </div>
+
+        <div className="flex items-center justify-between gap-3 px-1 pb-1">
+          <div className="text-xs">
+            <div className="font-medium">Analysis depth</div>
+            <div className="text-muted-foreground text-[11px]">
+              {mode === "thorough"
+                ? "Evaluate every paragraph & table cell — comprehensive, slower, more API calls."
+                : "Fast pass — a curated set of high-confidence edits."}
+            </div>
+          </div>
+          <div className="flex rounded-lg border overflow-hidden text-xs font-medium shrink-0">
+            <button
+              type="button"
+              onClick={() => setMode("thorough")}
+              className={`px-3 py-1.5 transition-colors ${mode === "thorough" ? "bg-violet-600 text-white" : "bg-card hover:bg-muted/50"}`}
+            >
+              Thorough
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode("quick")}
+              className={`px-3 py-1.5 border-l transition-colors ${mode === "quick" ? "bg-violet-600 text-white" : "bg-card hover:bg-muted/50"}`}
+            >
+              Quick
+            </button>
+          </div>
         </div>
 
         <DialogFooter>

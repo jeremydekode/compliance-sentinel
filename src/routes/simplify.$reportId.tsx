@@ -12,6 +12,7 @@ import { supabase } from "@/integrations/supabase/client";
 import {
   runSimplificationReport,
   setSimplificationDecision,
+  bulkSetSimplificationDecision,
   applySimplificationReport,
 } from "@/lib/compliance.functions";
 import { reviewGroup } from "@/lib/simplify";
@@ -46,6 +47,7 @@ import {
   Wand2,
   Download,
   ExternalLink,
+  Image as ImageIcon,
 } from "lucide-react";
 
 export const Route = createFileRoute("/simplify/$reportId")({
@@ -136,10 +138,13 @@ function SimplifyReportPage() {
   const qc = useQueryClient();
   const runSimplify = useServerFn(runSimplificationReport);
   const saveDecision = useServerFn(setSimplificationDecision);
+  const bulkDecision = useServerFn(bulkSetSimplificationDecision);
   const applyFn = useServerFn(applySimplificationReport);
+  const [bulkBusy, setBulkBusy] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
   const [failed, setFailed] = useState(false);
   const [applying, setApplying] = useState(false);
+  const [mode, setMode] = useState<"thorough" | "quick">("thorough");
   const [localDecisions, setLocalDecisions] = useState<Record<number, ActionDecision>>({});
   const [openGroups, setOpenGroups] = useState<Record<ReviewGroup, boolean>>({
     auto: false,
@@ -182,12 +187,13 @@ function SimplifyReportPage() {
     }
   }
 
-  async function runAnalysis() {
+  async function runAnalysis(runMode?: "thorough" | "quick") {
     setFailed(false);
     setAnalyzing(true);
     startedRef.current = true;
     try {
-      const r = await runSimplify({ data: { reportId } });
+      // No explicit mode (auto-run) → server uses the report's stored mode.
+      const r = await runSimplify({ data: { reportId, ...(runMode ? { mode: runMode } : {}) } });
       setLocalDecisions({}); // decisions are recomputed by the run
       await qc.invalidateQueries({ queryKey: ["simplify_report", reportId] });
       if (r.status !== "ok") setFailed(true);
@@ -195,6 +201,21 @@ function SimplifyReportPage() {
       setFailed(true);
     } finally {
       setAnalyzing(false);
+    }
+  }
+
+  async function acceptAllPending() {
+    if (bulkBusy) return;
+    setBulkBusy(true);
+    try {
+      const r = await bulkDecision({ data: { reportId, decision: "accepted" } });
+      setLocalDecisions({}); // server is now the source of truth
+      await qc.invalidateQueries({ queryKey: ["simplify_report", reportId] });
+      toast.success(`Accepted ${r.changed} edit${r.changed === 1 ? "" : "s"}`);
+    } catch (e: any) {
+      toast.error("Couldn't accept all", { description: e?.message?.slice(0, 160) });
+    } finally {
+      setBulkBusy(false);
     }
   }
 
@@ -215,6 +236,11 @@ function SimplifyReportPage() {
       setApplying(false);
     }
   }
+
+  // Reflect the report's last-used mode in the toggle once it loads.
+  useEffect(() => {
+    if (sj.simplify_mode === "thorough" || sj.simplify_mode === "quick") setMode(sj.simplify_mode);
+  }, [sj.simplify_mode]);
 
   // Auto-run once for a freshly created report.
   useEffect(() => {
@@ -269,6 +295,8 @@ function SimplifyReportPage() {
 
   const structure = sj.structure ?? null;
   const crossCheck = sj.cross_check ?? null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const figureReviews: any[] = Array.isArray(sj.figure_reviews) ? sj.figure_reviews : [];
 
   // Partition by review group, keeping each action's stored index for decisions.
   const indexed = actions.map((action, index) => ({ action, index }));
@@ -302,9 +330,35 @@ function SimplifyReportPage() {
               the source.
             </p>
           </div>
-          <Button variant="outline" onClick={runAnalysis} className="gap-2 shrink-0">
-            <RefreshCw className="size-4" /> Re-run
-          </Button>
+          <div className="flex items-center gap-2 shrink-0">
+            <div className="flex rounded-lg border overflow-hidden text-xs font-medium">
+              <button
+                type="button"
+                onClick={() => setMode("thorough")}
+                title="Evaluate every paragraph and table cell — most comprehensive, slower, more API calls."
+                className={cn(
+                  "px-2.5 py-2 transition-colors",
+                  mode === "thorough" ? "bg-primary text-primary-foreground" : "bg-card hover:bg-muted/50",
+                )}
+              >
+                Thorough
+              </button>
+              <button
+                type="button"
+                onClick={() => setMode("quick")}
+                title="Fast pass — a curated set of high-confidence edits. Far fewer API calls."
+                className={cn(
+                  "px-2.5 py-2 border-l transition-colors",
+                  mode === "quick" ? "bg-primary text-primary-foreground" : "bg-card hover:bg-muted/50",
+                )}
+              >
+                Quick
+              </button>
+            </div>
+            <Button variant="outline" onClick={() => runAnalysis(mode)} className="gap-2">
+              <RefreshCw className="size-4" /> Re-run
+            </Button>
+          </div>
         </div>
 
         {/* provenance strip — cost is intentionally NOT a top-level tile; the
@@ -372,6 +426,49 @@ function SimplifyReportPage() {
           </div>
         )}
 
+        {/* figures & charts — vision review of embedded images. These can't be
+            redlined; suggestions are attached as Word comments on each figure
+            when the amended copy is generated. */}
+        {figureReviews.length > 0 && (
+          <Card className="p-4 space-y-3 glass-card">
+            <div className="flex items-center gap-2">
+              <ImageIcon className="size-4 text-violet-600" />
+              <span className="text-sm font-semibold">
+                Figures &amp; charts · {figureReviews.length} with suggested changes
+              </span>
+              <span className="text-[11px] text-muted-foreground">
+                Images can't be redlined — these will be added as Word comments on each figure in
+                the amended copy.
+              </span>
+            </div>
+            <div className="space-y-3">
+              {figureReviews.map((f: any, fi: number) => (
+                <div key={fi} className="rounded-lg border bg-muted/20 px-3 py-2.5 text-xs space-y-1.5">
+                  <div className="font-medium">
+                    {f.name || `Figure ${fi + 1}`}
+                    {f.figureType ? (
+                      <span className="ml-2 text-[10px] uppercase tracking-wide text-muted-foreground">
+                        {f.figureType}
+                      </span>
+                    ) : null}
+                  </div>
+                  {f.summary ? <div className="text-muted-foreground">{f.summary}</div> : null}
+                  <ul className="space-y-1">
+                    {(f.suggestions ?? []).map((s: any, si: number) => (
+                      <li key={si} className="leading-snug">
+                        {s.where ? <span className="text-muted-foreground">[{s.where}] </span> : null}
+                        <span className="line-through decoration-rose-400 text-rose-700">{s.current}</span>
+                        {" → "}
+                        <span className="text-emerald-700">{s.proposed}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ))}
+            </div>
+          </Card>
+        )}
+
         {/* triage summary */}
         {actions.length > 0 && (
           <div className="flex items-center gap-5 text-xs text-muted-foreground px-1">
@@ -387,6 +484,18 @@ function SimplifyReportPage() {
               <span className="font-black text-rose-700 tabular-nums">{rejectedCount}</span>{" "}
               rejected
             </span>
+            {pendingCount > 0 && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={acceptAllPending}
+                disabled={bulkBusy}
+                className="ml-auto h-7 gap-1.5 text-xs"
+              >
+                {bulkBusy ? <Loader2 className="size-3.5 animate-spin" /> : <Check className="size-3.5" />}
+                Accept all {pendingCount} pending
+              </Button>
+            )}
           </div>
         )}
 

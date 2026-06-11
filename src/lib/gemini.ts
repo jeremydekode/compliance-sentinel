@@ -36,20 +36,28 @@ export async function generateWithFallback(
   const models = FALLBACK_CHAINS[opts?.tier ?? "quality"];
   let lastError: unknown;
   for (const model of models) {
-    // A transient capacity error ("high demand"/503) gets ONE retry on the
-    // SAME model after a short wait — so a momentary overload does not
-    // permanently downgrade the analysis to a weaker fallback model.
-    for (let attempt = 1; attempt <= 2; attempt++) {
+    // A transient capacity/network error ("high demand"/503/429/rate-limit/
+    // RESOURCE_EXHAUSTED/UNAVAILABLE/"fetch failed") gets SEVERAL retries on the
+    // SAME model with exponential backoff — so a momentary overload does not
+    // permanently downgrade to a weaker fallback model, and a flaky network blip
+    // doesn't silently drop the call. Only after exhausting those do we fall
+    // through to the next model in the chain.
+    const CAPACITY_RETRIES = 4; // 3 retries, then fall to next model
+    for (let attempt = 1; attempt <= CAPACITY_RETRIES; attempt++) {
       try {
         return await ai.models.generateContent({ ...params, model });
       } catch (e: any) {
         const msg: string = e?.message ?? "";
-        const capacity = msg.includes("high demand") || msg.includes("overloaded") || msg.includes("503");
+        const capacity =
+          msg.includes("high demand") || msg.includes("overloaded") || msg.includes("503") ||
+          msg.includes("429") || msg.includes("RESOURCE_EXHAUSTED") || msg.includes("UNAVAILABLE") ||
+          msg.includes("rate limit") || msg.includes("fetch failed");
         const notFound = msg.includes("NOT_FOUND") || msg.includes("not found") || msg.includes("404");
-        if (capacity && attempt === 1) {
-          console.warn(`Model ${model} busy (${msg.slice(0, 60)}) — retrying in 5s…`);
+        if (capacity && attempt < CAPACITY_RETRIES) {
+          const wait = 4000 * attempt; // 4s, 8s, 12s
+          console.warn(`Model ${model} busy (${msg.slice(0, 60)}) — retry ${attempt}/${CAPACITY_RETRIES - 1} in ${wait / 1000}s…`);
           lastError = e;
-          await new Promise((r) => setTimeout(r, 5000));
+          await new Promise((r) => setTimeout(r, wait));
           continue;
         }
         if (capacity || notFound) {
@@ -1387,6 +1395,9 @@ ${opts?.instruction ? `\n# THIS RUN'S SPECIFIC INSTRUCTION (apply in addition to
 - "table_restructure" — text that is clearly tabular and would read more clearly as a table; "after" describes the proposed layout.
 Look across ALL of these types, not just rewording. Terminology standardisation should be folded INTO a plain_english or shorten edit (rephrase the sentence and make its wording consistent in the same action). Do NOT produce standalone actions for numbering or cross-reference renumbering — those need a separate deterministic pass.
 
+# TABLE CELLS — analyse these, do not skip them:
+Spans wrapped in "[TABLE n] … [END TABLE n]" markers are table cells, one cell per line. Treat verbose PROSE inside a cell exactly like body prose — simplify it with plain_english / shorten / merge, quoting the cell's text verbatim as "before". Do NOT touch labels, codes, reference numbers, dates, monetary amounts, or short values (a 1-4 word cell has nothing to simplify). NEVER quote a "[TABLE n]" or "[END TABLE n]" marker line as "before".
+
 # ❗ GUARDRAILS — non-negotiable:
 - PRESERVE factual accuracy and meaning. NEVER alter a number, threshold, percentage, date, monetary amount, name, role title, or authority limit.
 - Do NOT invent information. Do NOT introduce any new normative statement ("must", "shall", "may not", "is required to") that is not already in the source.
@@ -1416,7 +1427,7 @@ ${text}
   const response = await generateWithFallback({
     contents: [{ role: "user", parts: [{ text: prompt }] }],
     config: { responseMimeType: "application/json", maxOutputTokens: 65536 },
-  });
+  }, { tier: "fast" }); // flash-lite first: fast + high capacity. Quick mode must NOT wait on the high-demand 3.5-flash.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const m = (response.usageMetadata ?? {}) as any;
   const usage: TokenUsage = {
@@ -1430,4 +1441,243 @@ ${text}
     console.error(`simplifyDocument: no actions parsed for "${title}":`, (response.text ?? "").slice(0, 300));
   }
   return { actions: out as SimplificationAction[], usage };
+}
+
+/** Heuristic pre-filter: is this unit worth sending to the model? Skips short
+ *  labels, codes, pure numbers/dates and all-caps headings, so we don't spend a
+ *  slot on "v1.0" or "Reference No." cells. */
+function isProseCandidate(t: string): boolean {
+  if (!t || t.length < 40) return false;
+  if (t.split(/\s+/).filter(Boolean).length < 7) return false;
+  if (t === t.toUpperCase() && /^[-A-Z0-9 .,&()/'"]+$/.test(t)) return false; // heading / label
+  return true;
+}
+
+/**
+ * PER-UNIT BATCHED SIMPLIFICATION (UC4). Instead of asking the model to "find
+ * simplifications" in a big blob — which returns a curated ~10 per call no matter
+ * the size — this gives it a NUMBERED list of units (paragraphs + table cells)
+ * and asks for a verdict on EACH. Coverage then scales with the document, not
+ * the model's selection bias. `before` is the unit's exact text, so every
+ * accepted edit anchors cleanly (no quarantine). Batches run with bounded
+ * concurrency and each call RETRIES transient failures, so no batch silently
+ * drops the way whole chunks did before.
+ */
+export async function simplifyDocumentByUnits(
+  doc: { title: string; units: { text: string; section: string }[] },
+  opts?: { instruction?: string | null; guidance?: string | null },
+): Promise<{ actions: SimplificationAction[]; usage: TokenUsage }> {
+  const candidates = doc.units.filter((u) => isProseCandidate(u.text));
+  if (candidates.length === 0) return { actions: [], usage: EMPTY_USAGE };
+  const BATCH = 50; // bigger batches = fewer calls = faster (coverage is per-unit, unaffected by batch size)
+  const batches: { text: string; section: string }[][] = [];
+  for (let i = 0; i < candidates.length; i += BATCH) batches.push(candidates.slice(i, i + BATCH));
+  // Concurrency 4 on the FAST tier (flash-lite leads — see simplifyUnitBatch):
+  // flash-lite sits on a much larger capacity pool than 3.5-flash, so 4 parallel
+  // calls are BOTH faster AND less prone to "high demand" than 2 calls on the hot model.
+  const results = await mapLimit(batches, 4, (batch) =>
+    simplifyUnitBatch(doc.title, batch, opts).catch((e: any) => {
+      console.warn(`simplifyDocumentByUnits: a batch failed after retries:`, e?.message?.slice(0, 100));
+      return { actions: [] as SimplificationAction[], usage: EMPTY_USAGE };
+    }),
+  );
+  return {
+    actions: results.flatMap((r) => r.actions),
+    usage: results.reduce((acc, r) => addUsage(acc, r.usage), EMPTY_USAGE),
+  };
+}
+
+/** Evaluates ONE batch of units; the model returns an object per unit it changes.
+ *  Retries transient errors (e.g. "fetch failed", rate limits) up to 3x. */
+async function simplifyUnitBatch(
+  title: string,
+  units: { text: string; section: string }[],
+  opts?: { instruction?: string | null; guidance?: string | null },
+): Promise<{ actions: SimplificationAction[]; usage: TokenUsage }> {
+  const numbered = units.map((u, i) => `${i + 1}. ${u.text}`).join("\n\n");
+  const prompt = `# ROLE: DOCUMENT SIMPLIFICATION — PER-ITEM EVALUATION
+You are given NUMBERED text units (paragraphs and table cells) from the bank document "${title}". EVALUATE EVERY UNIT.
+For each unit that can be made plainer, shorter, or more active WITHOUT changing meaning, numbers, dates, names, defined terms, or the scope of any obligation, output ONE object. If a unit is already clear, or is a heading/label/code/number/date, OMIT it (output nothing for it).
+${opts?.instruction ? `\nThis run's instruction (apply too): ${opts.instruction}\n` : ""}${guidanceBlock(opts?.guidance)}
+# RULES
+- "after" is the simplified version of the WHOLE unit (you rewrite the entire unit, not a span inside it).
+- Preserve EXACTLY: every number, date, %, monetary amount, authority limit, role title, committee name, defined term, system/product name, and cross-reference (e.g. Section 4.2.1, Appendix B).
+- British English. Active voice. Short sentences (<= 20 words). Plain verbs. Keep the formal bank-policy register.
+- confidence is 70-100; if you would score below 70, OMIT the unit instead.
+
+# OUTPUT — return ONLY a JSON array, one object per unit you are CHANGING:
+[{ "i": <unit number>, "type": "plain_english|shorten|merge|to_bullets|delete_redundant", "after": "<simplified whole unit>", "rule": "<short label, e.g. 'Plain English'>", "rationale": "<one sentence>", "confidence": <70-100> }]
+
+# UNITS:
+${numbered}
+`;
+  let response: any = null;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      response = await generateWithFallback({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        config: { responseMimeType: "application/json", maxOutputTokens: 65536 },
+      }, { tier: "fast" }); // flash-lite first (fast + high capacity); falls back to 3.5-flash. Per-unit rewriting is simple enough for the lite model.
+      break;
+    } catch (e: any) {
+      if (attempt >= 3) throw e;
+      await new Promise((r) => setTimeout(r, 2000 * attempt));
+    }
+  }
+  const meta = (response.usageMetadata ?? {}) as any;
+  const usage: TokenUsage = {
+    inputTokens: meta.promptTokenCount ?? 0,
+    outputTokens: meta.candidatesTokenCount ?? 0,
+    thinkingTokens: meta.thoughtsTokenCount ?? 0,
+    calls: 1,
+  };
+  const raw = parseJsonArrayLoose(response.text) as any[];
+  const actions: SimplificationAction[] = [];
+  for (const r of raw) {
+    const idx = Number(r?.i) - 1;
+    if (!Number.isInteger(idx) || idx < 0 || idx >= units.length) continue;
+    const before = units[idx].text;
+    const after = typeof r?.after === "string" ? r.after.trim() : "";
+    if (!after || after === before) continue;
+    actions.push({
+      section: units[idx].section || "",
+      type: (r?.type ?? "plain_english") as SimplificationAction["type"],
+      before,
+      after,
+      rule: typeof r?.rule === "string" ? r.rule : "Plain English",
+      rationale: typeof r?.rationale === "string" ? r.rationale : "",
+      confidence: typeof r?.confidence === "number" ? r.confidence : 80,
+    });
+  }
+  return { actions, usage };
+}
+
+// ── UC4: figure review (vision) ──────────────────────────────────────────────
+
+export interface FigureSuggestion {
+  where: string;
+  current: string;
+  proposed: string;
+  rationale: string;
+}
+
+export interface FigureReview {
+  anchorRelId: string;
+  name: string;
+  figureType: string;
+  summary: string;
+  suggestions: FigureSuggestion[];
+  /** Ready-to-attach Word comment text built from the suggestions. */
+  comment: string;
+}
+
+/**
+ * FIGURE REVIEW (UC4). Charts/flowcharts/diagrams are embedded as images, which
+ * the text pipeline can't see. Each unique figure is shown to the vision model,
+ * which reads the text INSIDE the image and proposes simplifications. Since an
+ * image can't be redlined, the output is a Word COMMENT (anchored on the figure
+ * by the caller) telling a human what should change. Logos/decorative images
+ * are recognised and dropped. Runs on the fast tier with per-call retry.
+ */
+export async function analyzeDocFigures(
+  title: string,
+  figures: { anchorRelId: string; name: string; mimeType: string; dataBase64: string }[],
+  opts?: { guidance?: string | null },
+): Promise<{ reviews: FigureReview[]; usage: TokenUsage }> {
+  const guidance = (opts?.guidance ?? "").slice(0, 2000);
+  const results = await mapLimit(figures, 3, async (fig) => {
+    const prompt = `# FIGURE REVIEW — BANK DOCUMENT SIMPLIFICATION
+The image above is a figure from the bank document "${title}" (figure name: "${fig.name}").
+
+1. If it is a logo, signature, stamp, decorative element, photo, or software-UI screenshot with no policy/process wording → return {"is_content": false} and nothing else matters.
+2. Otherwise (flowchart, process diagram, org chart, decision tree, table rendered as an image, annotated callout):
+   - Read ALL text visible in the image.
+   - Apply the simplification rules to that text: flag verbose, passive, legalistic or redundant wording and propose plainer phrasing. NEVER change numbers, dates, percentages, names, role titles, committee names or defined terms.
+   - This tool cannot edit the image itself — your suggestions will be attached as a Word COMMENT on the figure for a designer to apply manually. Make each suggestion concrete and self-contained.
+${guidance ? `\n# HOUSE RULES (apply on top):\n${guidance}\n` : ""}
+# OUTPUT — return ONLY one JSON object:
+{
+  "is_content": true|false,
+  "figure_type": "<flowchart | process diagram | org chart | table image | other>",
+  "summary": "<one line: what the figure shows>",
+  "suggestions": [{ "where": "<which box/label/arrow>", "current": "<verbatim text in the image>", "proposed": "<simplified wording>", "rationale": "<short>" }]
+}
+If the figure's wording is already clear, return is_content true with an empty suggestions array.`;
+
+    let response: any = null;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        response = await generateWithFallback(
+          {
+            contents: [
+              {
+                role: "user",
+                parts: [
+                  { inlineData: { mimeType: fig.mimeType, data: fig.dataBase64 } },
+                  { text: prompt },
+                ],
+              },
+            ],
+            config: { responseMimeType: "application/json", maxOutputTokens: 8192 },
+          },
+          { tier: "fast" },
+        );
+        break;
+      } catch (e: any) {
+        if (attempt >= 2) {
+          console.warn(`analyzeDocFigures: "${fig.name}" failed:`, e?.message?.slice(0, 80));
+          return null;
+        }
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    }
+    const meta = (response.usageMetadata ?? {}) as any;
+    const usage: TokenUsage = {
+      inputTokens: meta.promptTokenCount ?? 0,
+      outputTokens: meta.candidatesTokenCount ?? 0,
+      thinkingTokens: meta.thoughtsTokenCount ?? 0,
+      calls: 1,
+    };
+    let obj: any = null;
+    const raw = (response.text ?? "").replace(/^```json\s*/i, "").replace(/```\s*$/, "").trim();
+    try {
+      obj = JSON.parse(raw);
+    } catch {
+      const mm = raw.match(/\{[\s\S]*\}/);
+      if (mm) {
+        try {
+          obj = JSON.parse(mm[0]);
+        } catch { /* unparseable — treated as no result */ }
+      }
+    }
+    if (!obj || obj.is_content !== true) return { review: null, usage };
+    const suggestions: FigureSuggestion[] = (Array.isArray(obj.suggestions) ? obj.suggestions : [])
+      .filter((s: any) => s && typeof s.current === "string" && typeof s.proposed === "string" && s.proposed.trim())
+      .map((s: any) => ({
+        where: String(s.where ?? ""),
+        current: String(s.current),
+        proposed: String(s.proposed),
+        rationale: String(s.rationale ?? ""),
+      }));
+    if (suggestions.length === 0) return { review: null, usage };
+    const comment =
+      `AI figure review — this ${obj.figure_type || "figure"} can't be edited automatically; suggested changes:\n` +
+      suggestions
+        .map((s, i) => `${i + 1}. ${s.where ? `[${s.where}] ` : ""}"${s.current}" → "${s.proposed}"${s.rationale ? ` (${s.rationale})` : ""}`)
+        .join("\n");
+    const review: FigureReview = {
+      anchorRelId: fig.anchorRelId,
+      name: fig.name,
+      figureType: String(obj.figure_type ?? "figure"),
+      summary: String(obj.summary ?? ""),
+      suggestions,
+      comment,
+    };
+    return { review, usage };
+  });
+  const ok = results.filter(Boolean) as { review: FigureReview | null; usage: TokenUsage }[];
+  return {
+    reviews: ok.map((r) => r.review).filter(Boolean) as FigureReview[],
+    usage: ok.reduce((acc, r) => addUsage(acc, r.usage), EMPTY_USAGE),
+  };
 }

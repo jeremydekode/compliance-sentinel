@@ -123,6 +123,14 @@ declare
   ];
 begin
   foreach t in array data_tables loop
+    -- Skip tables that don't exist in THIS database (e.g. chat_messages may be
+    -- absent). Lock down only what is actually present; missing tables hold no
+    -- data to expose, and a future CREATE would re-run this migration anyway.
+    if to_regclass(format('public.%I', t)) is null then
+      raise notice 'rls_lockdown: skipping % (table does not exist)', t;
+      continue;
+    end if;
+
     for p in
       select policyname from pg_policies
       where schemaname = 'public' and tablename = t

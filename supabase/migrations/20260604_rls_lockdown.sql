@@ -168,15 +168,21 @@ end $$;
 do $$
 declare p record;
 begin
+  if to_regclass('public.workspace_google_connections') is null then
+    raise notice 'rls_lockdown: skipping workspace_google_connections (does not exist)';
+    return;
+  end if;
+  -- Drop EVERY existing policy (incl. any legacy using(true)) so ZERO policies
+  -- remain, then enable + FORCE RLS => deny-all. Only the service-role key
+  -- (supabaseAdmin) can read/write the Google refresh/access tokens.
   for p in select policyname from pg_policies
            where schemaname = 'public' and tablename = 'workspace_google_connections'
   loop
     execute format('drop policy if exists %I on public.workspace_google_connections', p.policyname);
   end loop;
+  execute 'alter table public.workspace_google_connections enable row level security';
+  execute 'alter table public.workspace_google_connections force row level security';
 end $$;
-
-alter table public.workspace_google_connections enable row level security;
-alter table public.workspace_google_connections force row level security;
 -- (intentionally NO policies created here)
 
 -- ---------------------------------------------------------------------------

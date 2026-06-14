@@ -2,7 +2,8 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import { supabaseAdmin } from "@/integrations/supabase/client.server";
-import { chunkDocument, generateAmendedDocument, extractRegulatoryChanges, extractFatfRequirements, mapChangeToSops, routeChangesToSops, analyzeSopAgainstGaps, buildSopTopicMap, generateAnalysisSummary, generateWithFallback, simplifyDocument, simplifyDocumentByUnits, analyzeDocFigures, type FigureReview } from "./gemini";
+import { chunkDocument, generateAmendedDocument, extractRegulatoryChanges, extractFatfRequirements, mapChangeToSops, routeChangesToSops, analyzeSopAgainstGaps, buildSopTopicMap, generateAnalysisSummary, generateWithFallback, simplifyDocument, simplifyDocumentByUnits, analyzeDocFigures, type FigureReview, analyzeCreditRisk, extractCreditRiskRetrievalQueries, chatCreditRisk } from "./gemini";
+import { attachEvidence } from "./credit-evidence";
 import { applyEditsToDocx, looksLikeDocx, docxToText, docxToHtml, docxToSimplifyText, docxToSimplifyUnits, extractDocxFigures, applySimplificationToDocx, type SimplifyDocxEdit } from "./docx-editor";
 import { verifyActions, analyzeStructure, crossCheckSections, DEFAULT_SIMPLIFY_GUIDANCE, initialDecision } from "./simplify";
 import type { VerificationSummary, DocStructure, SectionCrossCheck } from "./simplify";
@@ -52,7 +53,7 @@ import { REGULATION_FAMILIES, INTERNAL_DOC_TYPES as INTERNAL_DOC_TYPES_CONST, re
 // Allowed workspace identifiers — shared across every workspace-scoped input
 // validator. Declared up here so server fns defined anywhere in the file can
 // reference it in their .inputValidator() (evaluated at module load).
-const workspaceSchema = z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy"]);
+const workspaceSchema = z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk"]);
 
 async function fetchFile(url: string): Promise<{ buffer: Buffer; mimeType: string }> {
   // Reject Drive viewer URLs straight away — they return HTML, not the file.
@@ -136,7 +137,7 @@ export const createReport = createServerFn({ method: "POST" })
     z.object({
       filename: z.string(),
       fileUrl: z.string().nullable(),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk"]).default("rmit"),
       customTitle: z.string().optional(),
       notes: z.string().optional(),
       detected: z
@@ -467,7 +468,7 @@ export const createRegulatoryReport = createServerFn({ method: "POST" })
     z.object({
       filename: z.string(),
       fileUrl: z.string().nullable(),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk"]).default("rmit"),
       customTitle: z.string().optional(),
       notes: z.string().optional(),
       detected: z
@@ -1680,7 +1681,7 @@ export const createSop = createServerFn({ method: "POST" })
       title: z.string().min(2).max(200),
       doc_type: z.enum(["sop", "rmit", "rmit_reg", "fatf", "circular", "it_policy", "policy", "form"]),
       version: z.string().min(1).max(20),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk"]).default("rmit"),
       summary: z.string().max(2000).optional(),
       tags: z.array(z.string().max(40)).max(20).optional(),
       file_url: z.string().nullable().optional(),
@@ -1789,7 +1790,7 @@ export const clearWorkspace = createServerFn({ method: "POST" })
   .inputValidator(
     z.object({
       scope: z.enum(["analyses", "kb", "all"]),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk"]).default("rmit"),
     })
   )
   .handler(async ({ data, context }) => {
@@ -2175,7 +2176,7 @@ function escapeHtml(s: string): string {
  */
 export const getChunkCounts = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .inputValidator(z.object({ workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy"]).default("rmit") }))
+  .inputValidator(z.object({ workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk"]).default("rmit") }))
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -2448,7 +2449,7 @@ function applyPageOverrides(formId: string, impacts: any[]): any[] {
 export const createFormUpdateReport = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator(z.object({
-    workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy"]).default("forms"),
+    workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk"]).default("forms"),
     formId: z.string().min(1),                  // e.g. "FGROP 037/2016"
     friendlyName: z.string().optional(),         // e.g. "Account Opening Application Form"
     customTitle: z.string().optional(),
@@ -4577,4 +4578,362 @@ export const setUserAccess = createServerFn({ method: "POST" })
     }
 
     return { ok: true };
+  });
+
+// ============================================================================
+// CREDIT RISK ALERT — upload a credit application, screen it against the Case
+// knowledge base, store a structured KB-traceable risk report. Mirrors the
+// regulatory create→auto-run pattern; analysis lives in analyzeCreditRisk().
+// ============================================================================
+
+/**
+ * Creates a Credit Risk Alert report from an uploaded credit application.
+ * Lazy: stores the upload + borrower and marks pending_analysis; the report
+ * page auto-starts runCreditRiskAnalysis on load (same pattern as regulatory).
+ */
+export const createCreditRiskReport = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    z.object({
+      filename: z.string(),
+      fileUrl: z.string().nullable(),
+      workspace: workspaceSchema,
+      borrowerName: z.string().min(1).max(200),
+    }),
+  )
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    if (!data.fileUrl) throw new Error("No file URL provided for analysis");
+    const borrower = data.borrowerName.trim();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report, error } = await (supabase as any)
+      .from("analysis_reports")
+      .insert({
+        title: borrower,
+        policy_name: borrower,
+        status: "pending_validation",
+        workflow_type: "credit_risk",
+        source_file_url: data.fileUrl,
+        workspace_id: data.workspace,
+        summary_json: {
+          workflow_type: "credit_risk",
+          borrower_name: borrower,
+          source_filename: data.filename,
+          executive: ["Analysis queued — screening the credit application against the case knowledge base…"],
+          pending_analysis: true,
+        },
+      })
+      .select("id")
+      .single();
+    if (error || !report) throw new Error(error?.message || "Failed to create credit risk report");
+    return { reportId: report.id as string };
+  });
+
+/**
+ * Runs the Credit Risk Alert analysis: extracts the application text, loads the
+ * workspace's Case KB (all cases, capped), calls the analyzer, and stores the
+ * structured result on the report's summary_json.credit_analysis.
+ */
+export const runCreditRiskAnalysis = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(z.object({ reportId: z.string() }))
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+
+    // 1. Load the report.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report, error: repErr } = await (supabase as any)
+      .from("analysis_reports")
+      .select("id, title, source_file_url, workspace_id, summary_json")
+      .eq("id", data.reportId)
+      .single();
+    if (repErr || !report) throw new Error(repErr?.message || "Report not found");
+    if (!report.source_file_url) throw new Error("Report has no source file — cannot analyze");
+    const workspace = (report.workspace_id ?? "credit_risk") as string;
+    const borrowerName = (report.summary_json?.borrower_name ?? report.title ?? "Applicant") as string;
+
+    // Clear the pending flag so the report page doesn't re-trigger.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase as any)
+      .from("analysis_reports")
+      .update({ summary_json: { ...(report.summary_json ?? {}), pending_analysis: false, credit_status: "running" } })
+      .eq("id", report.id);
+
+    try {
+    // 2. Extract the credit application text. Keep per-page text so the evidence
+    //    locator can deep-link the application PDF to the right page.
+    const f = await fetchFile(report.source_file_url);
+    let applicationText = "";
+    let appPages: { page: number; text: string }[] = [];
+    if (looksLikeDocx(f.mimeType, report.source_file_url)) {
+      applicationText = await docxToText(f.buffer);
+    } else if (f.mimeType === "application/pdf" || /\.pdf($|\?)/i.test(report.source_file_url)) {
+      const { extractPdfPages } = await import("./pdf-pages");
+      appPages = await extractPdfPages(f.buffer);
+      applicationText = appPages.map((p) => p.text).join("\n");
+    } else {
+      applicationText = f.buffer.toString("utf-8");
+    }
+    applicationText = applicationText.replace(/\r\n?/g, "\n").trim();
+    if (applicationText.length < 40) {
+      throw new Error("Could not read the credit application — text extraction returned almost nothing.");
+    }
+    const MAX_APP_CHARS = 120_000;
+    if (applicationText.length > MAX_APP_CHARS) applicationText = applicationText.slice(0, MAX_APP_CHARS);
+
+    // 3. Load case-KB metadata for this workspace.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: caseDocs } = await (supabase as any)
+      .from("sop_documents")
+      .select("id, title, summary, file_url")
+      .eq("workspace_id", workspace);
+    const docs = ((caseDocs ?? []) as { id: string; title: string; summary: string | null; file_url: string | null }[]);
+    const titleById = new Map(docs.map((d) => [d.id, d.title] as const));
+    const creditSopIds = new Set(docs.map((d) => d.id));
+
+    // 3a. RETRIEVAL-GROUNDED case selection — pull the borrower's risk signals,
+    //     embed them, and retrieve the genuinely most-similar historical cases.
+    //     (match_sop_chunks isn't workspace-scoped, so over-fetch then filter.)
+    let retrievalUsage = { inputTokens: 0, outputTokens: 0, thinkingTokens: 0, calls: 0 };
+    let retrievalQueries: string[] = [];
+    let relevantIds: string[] = [];
+    try {
+      if (docs.length > 0) {
+        const q = await extractCreditRiskRetrievalQueries(applicationText);
+        retrievalUsage = q.usage;
+        retrievalQueries = q.queries;
+        const seen = new Set<string>();
+        for (const query of q.queries) {
+          const emb = await generateQueryEmbedding(query);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const { data: matched } = await (supabase as any).rpc("match_sop_chunks", {
+            query_embedding: emb,
+            match_threshold: 0.2,
+            match_count: 150,
+          });
+          let added = 0;
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          for (const mrow of ((matched ?? []) as any[])) {
+            if (!creditSopIds.has(mrow.sop_id) || seen.has(mrow.sop_id)) continue;
+            seen.add(mrow.sop_id);
+            relevantIds.push(mrow.sop_id);
+            if (++added >= 3) break; // top-3 NEW cases per risk signal
+          }
+        }
+        relevantIds = relevantIds.slice(0, 16);
+      }
+    } catch (e) {
+      console.warn("[credit] retrieval failed, using full KB:", (e as Error)?.message);
+    }
+    // Fallback to all cases if retrieval surfaced nothing.
+    const kbIds = relevantIds.length ? relevantIds : docs.map((d) => d.id);
+    const availableRefs = kbIds.map((id) => titleById.get(id)).filter(Boolean).join("\n") || "None";
+
+    // 3b. Load chunks for the SELECTED cases → kbContext + evidence map.
+    const chunksByCase = new Map<string, { content: string; page_number: number | null; chapter_ref: string | null }[]>();
+    let kbContext = "No knowledge base documents available.";
+    if (kbIds.length > 0) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: chunkRows } = await (supabase as any)
+        .from("sop_chunks")
+        .select("sop_id, content, page_number, chapter_ref")
+        .in("sop_id", kbIds);
+      const byCase = new Map<string, string[]>();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      for (const c of ((chunkRows ?? []) as any[])) {
+        const title = titleById.get(c.sop_id) ?? "Case";
+        if (!byCase.has(title)) byCase.set(title, []);
+        byCase.get(title)!.push(String(c.content ?? ""));
+        if (!chunksByCase.has(c.sop_id)) chunksByCase.set(c.sop_id, []);
+        chunksByCase.get(c.sop_id)!.push({
+          content: String(c.content ?? ""),
+          page_number: c.page_number ?? null,
+          chapter_ref: c.chapter_ref ?? null,
+        });
+      }
+      // Fall back to the doc summary for any selected case that wasn't chunked.
+      for (const id of kbIds) {
+        const t = titleById.get(id);
+        const d = docs.find((x) => x.id === id);
+        if (t && !byCase.has(t) && d?.summary) byCase.set(t, [d.summary]);
+      }
+      const MAX_KB_CHARS = 200_000;
+      let total = 0;
+      const blocks: string[] = [];
+      for (const [title, parts] of byCase) {
+        const body = parts.join("\n").trim();
+        if (!body) continue;
+        const block = `[${title}]\n${body}`;
+        if (total + block.length > MAX_KB_CHARS) break;
+        total += block.length;
+        blocks.push(block);
+      }
+      if (blocks.length) kbContext = blocks.join("\n\n---\n\n");
+    }
+
+    // 4. Optional per-workspace analysis guidance.
+    let guidance: string | null = null;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: g } = await (supabase as any)
+        .from("analysis_guidance").select("guidance").eq("workspace_id", workspace).maybeSingle();
+      guidance = g?.guidance ?? null;
+    } catch { /* guidance is optional */ }
+
+    // 5. Analyze.
+    const { analysis, usage } = await analyzeCreditRisk({ borrowerName, applicationText, kbContext, availableRefs, guidance });
+
+    // 5b. Locate each finding's source evidence (application page + KB case page)
+    //     so the report's evidence viewer can deep-link and highlight both PDFs.
+    attachEvidence(analysis.riskTable, {
+      appPages,
+      applicationFileUrl: report.source_file_url,
+      caseDocs: docs.map((d) => ({ id: d.id, title: d.title, file_url: d.file_url })),
+      chunksByCase,
+    });
+
+    // 6. Store the structured result.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { error: upErr } = await (supabase as any)
+      .from("analysis_reports")
+      .update({
+        status: "completed",
+        summary_json: {
+          ...(report.summary_json ?? {}),
+          workflow_type: "credit_risk",
+          borrower_name: borrowerName,
+          pending_analysis: false,
+          credit_status: "completed",
+          credit_analysis: analysis,
+          executive: [analysis.applicationSummary || "Credit risk analysis complete."],
+          usage: addUsage(usage, retrievalUsage),
+          retrieval: { queries: retrievalQueries, casesSelected: kbIds.length, used: relevantIds.length > 0 },
+        },
+      })
+      .eq("id", report.id);
+    if (upErr) throw new Error(`Failed to save analysis: ${upErr.message}`);
+
+    return { reportId: report.id as string, analysis };
+    } catch (e: any) {
+      // Persist a durable failure state so a reloaded report page shows Retry
+      // instead of spinning forever.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (supabase as any)
+        .from("analysis_reports")
+        .update({
+          summary_json: {
+            ...(report.summary_json ?? {}),
+            pending_analysis: false,
+            credit_status: "failed",
+            credit_error: String(e?.message ?? e).slice(0, 500),
+          },
+        })
+        .eq("id", report.id);
+      throw e;
+    }
+  });
+
+/**
+ * Conversational Q&A over one Credit Risk report. Grounds the answer in the
+ * report's stored analysis plus KB excerpts retrieved for the question (scoped
+ * to the workspace's case KB via over-fetch + filter on match_sop_chunks).
+ */
+export const askCreditRisk = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    z.object({
+      reportId: z.string(),
+      question: z.string().min(1).max(2000),
+      history: z
+        .array(z.object({ role: z.enum(["user", "assistant"]), content: z.string() }))
+        .max(20)
+        .optional(),
+    }),
+  )
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report } = await (supabase as any)
+      .from("analysis_reports")
+      .select("title, workspace_id, summary_json")
+      .eq("id", data.reportId)
+      .single();
+    if (!report) throw new Error("Report not found");
+    const analysis = report.summary_json?.credit_analysis;
+    if (!analysis) throw new Error("This report has not been analysed yet.");
+    const borrower = report.summary_json?.borrower_name ?? report.title ?? "the borrower";
+    const workspace = report.workspace_id ?? "credit_risk";
+
+    const SEG: Record<string, string> = {
+      management: "Management",
+      cash_flow: "Cash Flow",
+      asset_quality: "Asset Quality",
+      market_industry: "Market/Industry",
+      operational_project: "Operational/Project",
+      fraud_integrity: "Fraud/Integrity",
+      related_party: "Related Party",
+      legal_recovery: "Legal/Recovery",
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const findingsCtx = (analysis.riskTable ?? [])
+      .map(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (f: any) =>
+          `• ${SEG[f.segment] ?? f.segment} — ${String(f.indicator).toUpperCase()}${f.confidence ? ` (${f.confidence}%)` : ""}${f.traceReference ? ` · mirrors ${f.traceReference}` : " · no precedent"}\n  Flag: ${f.headline ?? ""}\n  Detail: ${f.finding ?? ""}${f.traceExcerpt ? `\n  Case lesson: "${f.traceExcerpt}"` : ""}`,
+      )
+      .join("\n");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const policyCtx = (analysis.policyAlerts ?? [])
+      .map((a: any) => `• [${a.status}] ${a.reference}: ${a.description}`)
+      .join("\n");
+    const probeCtx = (analysis.probeQuestions ?? []).map((q: string) => `• ${q}`).join("\n");
+
+    // RAG: retrieve KB chunks relevant to the question, scoped to this workspace.
+    let kbCtx = "";
+    try {
+      const emb = await generateQueryEmbedding(data.question);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: matched } = await (supabase as any).rpc("match_sop_chunks", {
+        query_embedding: emb,
+        match_threshold: 0.2,
+        match_count: 100,
+      });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: docs } = await (supabase as any)
+        .from("sop_documents")
+        .select("id, title")
+        .eq("workspace_id", workspace);
+      const titleById = new Map((docs ?? []).map((d: { id: string; title: string }) => [d.id, d.title]));
+      const ids = new Set((docs ?? []).map((d: { id: string }) => d.id));
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const top = ((matched ?? []) as any[]).filter((mm) => ids.has(mm.sop_id)).slice(0, 6);
+      kbCtx = top.map((mm) => `[${titleById.get(mm.sop_id)}] ${String(mm.content).slice(0, 800)}`).join("\n\n");
+    } catch {
+      /* RAG is best-effort */
+    }
+
+    const contextBlock = `BORROWER: ${borrower}
+OVERALL RISK: ${String(analysis.overallRisk).toUpperCase()}
+
+RISK ASSESSMENT:
+${analysis.riskNarrative || analysis.applicationSummary || "(none)"}
+
+FINDINGS (8 dimensions):
+${findingsCtx || "(none)"}
+
+POLICY ALERTS:
+${policyCtx || "(none)"}
+
+OPEN PROBE QUESTIONS:
+${probeCtx || "(none)"}
+
+KNOWLEDGE-BASE EXCERPTS (retrieved for this question):
+${kbCtx || "(none retrieved)"}`;
+
+    const { answer } = await chatCreditRisk({
+      contextBlock,
+      history: data.history ?? [],
+      question: data.question,
+    });
+    return { answer };
   });

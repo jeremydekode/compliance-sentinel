@@ -18,6 +18,7 @@ import { Route as LayoutIndexRouteImport } from './routes/layout.index'
 import { Route as SimplifyReportIdRouteImport } from './routes/simplify.$reportId'
 import { Route as ReportsReportIdRouteImport } from './routes/reports.$reportId'
 import { Route as LayoutJobIdRouteImport } from './routes/layout.$jobId'
+import { Route as CreditReportIdRouteImport } from './routes/credit.$reportId'
 import { Route as AuthCallbackRouteImport } from './routes/auth.callback'
 import { Route as ReportsReportIdPresentRouteImport } from './routes/reports.$reportId.present'
 import { Route as AuthGoogleCallbackRouteImport } from './routes/auth.google.callback'
@@ -67,6 +68,11 @@ const LayoutJobIdRoute = LayoutJobIdRouteImport.update({
   path: '/layout/$jobId',
   getParentRoute: () => rootRouteImport,
 } as any)
+const CreditReportIdRoute = CreditReportIdRouteImport.update({
+  id: '/credit/$reportId',
+  path: '/credit/$reportId',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const AuthCallbackRoute = AuthCallbackRouteImport.update({
   id: '/auth/callback',
   path: '/auth/callback',
@@ -89,6 +95,7 @@ export interface FileRoutesByFullPath {
   '/login': typeof LoginRoute
   '/settings': typeof SettingsRoute
   '/auth/callback': typeof AuthCallbackRoute
+  '/credit/$reportId': typeof CreditReportIdRoute
   '/layout/$jobId': typeof LayoutJobIdRoute
   '/reports/$reportId': typeof ReportsReportIdRouteWithChildren
   '/simplify/$reportId': typeof SimplifyReportIdRoute
@@ -103,6 +110,7 @@ export interface FileRoutesByTo {
   '/login': typeof LoginRoute
   '/settings': typeof SettingsRoute
   '/auth/callback': typeof AuthCallbackRoute
+  '/credit/$reportId': typeof CreditReportIdRoute
   '/layout/$jobId': typeof LayoutJobIdRoute
   '/reports/$reportId': typeof ReportsReportIdRouteWithChildren
   '/simplify/$reportId': typeof SimplifyReportIdRoute
@@ -118,6 +126,7 @@ export interface FileRoutesById {
   '/login': typeof LoginRoute
   '/settings': typeof SettingsRoute
   '/auth/callback': typeof AuthCallbackRoute
+  '/credit/$reportId': typeof CreditReportIdRoute
   '/layout/$jobId': typeof LayoutJobIdRoute
   '/reports/$reportId': typeof ReportsReportIdRouteWithChildren
   '/simplify/$reportId': typeof SimplifyReportIdRoute
@@ -134,6 +143,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/settings'
     | '/auth/callback'
+    | '/credit/$reportId'
     | '/layout/$jobId'
     | '/reports/$reportId'
     | '/simplify/$reportId'
@@ -148,6 +158,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/settings'
     | '/auth/callback'
+    | '/credit/$reportId'
     | '/layout/$jobId'
     | '/reports/$reportId'
     | '/simplify/$reportId'
@@ -162,6 +173,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/settings'
     | '/auth/callback'
+    | '/credit/$reportId'
     | '/layout/$jobId'
     | '/reports/$reportId'
     | '/simplify/$reportId'
@@ -177,6 +189,7 @@ export interface RootRouteChildren {
   LoginRoute: typeof LoginRoute
   SettingsRoute: typeof SettingsRoute
   AuthCallbackRoute: typeof AuthCallbackRoute
+  CreditReportIdRoute: typeof CreditReportIdRoute
   LayoutJobIdRoute: typeof LayoutJobIdRoute
   ReportsReportIdRoute: typeof ReportsReportIdRouteWithChildren
   SimplifyReportIdRoute: typeof SimplifyReportIdRoute
@@ -250,6 +263,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LayoutJobIdRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/credit/$reportId': {
+      id: '/credit/$reportId'
+      path: '/credit/$reportId'
+      fullPath: '/credit/$reportId'
+      preLoaderRoute: typeof CreditReportIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/auth/callback': {
       id: '/auth/callback'
       path: '/auth/callback'
@@ -292,6 +312,7 @@ const rootRouteChildren: RootRouteChildren = {
   LoginRoute: LoginRoute,
   SettingsRoute: SettingsRoute,
   AuthCallbackRoute: AuthCallbackRoute,
+  CreditReportIdRoute: CreditReportIdRoute,
   LayoutJobIdRoute: LayoutJobIdRoute,
   ReportsReportIdRoute: ReportsReportIdRouteWithChildren,
   SimplifyReportIdRoute: SimplifyReportIdRoute,

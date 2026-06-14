@@ -1681,3 +1681,382 @@ If the figure's wording is already clear, return is_content true with an empty s
     usage: ok.reduce((acc, r) => addUsage(acc, r.usage), EMPTY_USAGE),
   };
 }
+
+// ============================================================================
+// CREDIT RISK ALERT — ported from the WCO "AI Credit Alert" methodology.
+// Analyzes a credit application against a KB of historical post-mortem "Cases"
+// and returns a structured, KB-traceable risk report. Mirrors the WCO system
+// prompt + submit_risk_analysis schema, but runs on this app's Gemini fallback
+// chain via JSON mode (responseMimeType) instead of OpenAI-style tool calls.
+// ============================================================================
+
+export type CreditRiskIndicator = "high" | "probe" | "low";
+
+export type CreditRiskSegment =
+  | "management"
+  | "cash_flow"
+  | "asset_quality"
+  | "market_industry"
+  | "operational_project"
+  | "fraud_integrity"
+  | "related_party"
+  | "legal_recovery";
+
+/** Located source evidence — computed server-side after analysis (see credit-evidence.ts). */
+export interface CreditRiskEvidence {
+  applicationFileUrl?: string; // the credit application PDF (public storage URL)
+  applicationPage?: number;    // page in the application where applicationQuote was found
+  caseDocId?: string;          // sop_documents.id of the cited KB case
+  caseFileUrl?: string;        // the KB case source file (public storage URL)
+  casePage?: number;           // page in the case doc where traceExcerpt lives
+  caseChapter?: string;        // chunk chapter_ref, e.g. "Case 48 - Lessons learnt"
+}
+
+export interface CreditRiskFinding {
+  segment: CreditRiskSegment;
+  indicator: CreditRiskIndicator;
+  headline?: string;        // "<condition/clause that flags it> — <risk impact>" (≤16 words)
+  finding: string;          // "<observation>. This mirrors [Case XX] logic, which warns that ..."
+  traceReference: string;   // EXACT KB case title (may be "" when no precedent genuinely fits)
+  traceExcerpt: string;     // 2-3 sentence quoted lesson from that case ("" when none)
+  confidence?: number;       // 0-100 — strength of the evidence behind this flag
+  applicationQuote?: string; // VERBATIM sentence copied from the application (for source highlighting)
+  matchTerms?: string[];     // key phrases/figures shared by both sides — bolded in the UI + .docx
+  evidence?: CreditRiskEvidence; // located source pages/URLs (added post-analysis)
+}
+
+export interface CreditPolicyAlert {
+  status: "pass" | "fail" | "probe";
+  reference: string;
+  description: string;
+}
+
+export interface CreditRiskAnalysis {
+  applicationSummary: string;
+  riskNarrative: string;   // plain-English prose risk assessment for the reviewer
+  riskTable: CreditRiskFinding[];
+  policyAlerts: CreditPolicyAlert[];
+  edgeCases: { assumptions: string[]; ambiguities: string[] };
+  probeQuestions: string[];
+  referencesUsed: string[];
+  overallRisk: CreditRiskIndicator;
+}
+
+/** Display order + labels for the 8 risk segments (used by the report UI + .docx). */
+export const CREDIT_RISK_SEGMENTS: { key: CreditRiskSegment; label: string }[] = [
+  { key: "management",          label: "Management" },
+  { key: "cash_flow",           label: "Cash Flow" },
+  { key: "asset_quality",       label: "Asset Quality" },
+  { key: "market_industry",     label: "Market / Industry" },
+  { key: "operational_project", label: "Operational / Project" },
+  { key: "fraud_integrity",     label: "Fraud / Integrity" },
+  { key: "related_party",       label: "Related Party" },
+  { key: "legal_recovery",      label: "Legal / Recovery" },
+];
+
+const CREDIT_RISK_SYSTEM = `## ROLE
+You are a Senior Credit Risk Architect & Policy Analyst in the Credit Department — a technical Subject Matter Expert (SME) in credit risk mitigation, specialising in early-warning signals and policy deviations grounded in historical "Lessons Learnt."
+
+## TASK
+Perform a comprehensive risk analysis of an incoming Credit Application by cross-referencing it against the provided Knowledge Base of post-mortem case files and internal credit risk notes.
+
+## STRICT DIRECTIVES
+1. RISK HIGHLIGHTING ONLY — do NOT make an approve/reject decision. Produce a "Risk Radar" for the CD Manager.
+2. SUMMARISE & SIMPLIFY — synthesise a long application into itemised, risk-focused segments.
+3. TRACEABILITY — when a finding cites precedent it MUST use a KB case by its EXACT title from the AVAILABLE REFERENCES list (e.g. "Case 18"), and the finding text follows: describe the observation, then "This mirrors [Case XX] logic, which warns that [the specific lesson]." NEVER invent a case number or cite a title not in AVAILABLE REFERENCES.
+   DO NOT FORCE A MATCH: the AVAILABLE REFERENCES are the cases retrieved as most similar to this borrower. If none of them genuinely mirrors a segment's observation, that is normal — set indicator to "low", traceReference to "", traceExcerpt to "", and state plainly e.g. "No close historical precedent in the knowledge base; aligns with policy." A forced, weak case link is WORSE than an honest "no concern".
+4. TRAFFIC-LIGHT INDICATORS:
+   - "high"  = significant policy mismatch or a clear match to a historical failure.
+   - "probe" = ambiguous data, thin margins, or something needing further verification.
+   - "low"   = aligns with policy, no historical red-flag pattern.
+5. EVIDENCE — for every finding, copy "applicationQuote" VERBATIM from the credit application (exact characters, so it can be located in the source PDF) and list "matchTerms": the specific figures/phrases that prove the parallel between this application and the cited case.
+
+## PROCESSING PIPELINE
+1. Ingestion & summarisation: identify core borrower data, requested facilities, and business model.
+2. Multidimensional extraction across the 8 risk segments: management, cash_flow, asset_quality, market_industry, operational_project, fraud_integrity, related_party, legal_recovery.
+3. Traceability matching: map each finding to a specific KB case by its exact case number.
+4. Policy validation against the credit notes (policy alerts).
+5. Scoring & reporting: an indicator + justification per segment, plus one overall risk.
+
+## OUTPUT — return ONLY a valid JSON object (no markdown fences, no prose) with EXACTLY this shape:
+{
+  "applicationSummary": "3-5 sentence factual summary of the borrower and the facilities requested",
+  "riskNarrative": "Executive summary in MARKDOWN. Open with 1-2 sentences of prose stating the overall verdict and the core reason. Then a line '**Key concerns**' and 3-5 bullets (each starting '- '), where each bullet begins with a **bolded 2-4 word risk label**, then a colon and the specific consequence WITH the real figure. Then a line '**Mitigants & what to probe**' and 2-4 bullets. Plain English, real figures, tight. Must stay consistent with the riskTable.",
+  "riskTable": [
+    {
+      "segment": "one of: management | cash_flow | asset_quality | market_industry | operational_project | fraud_integrity | related_party | legal_recovery",
+      "indicator": "one of: high | probe | low",
+      "confidence": "integer 0-100 — how strong the evidence is: high when a retrieved case closely matches AND the application data is explicit; low when speculative or data is thin",
+      "headline": "<=16-word plain-English flag in the form 'condition — impact': the specific condition or clause in THIS application that triggers the risk, then its consequence. Name the RISK, not raw figures (e.g. 'Operating cash-flow deficit from debtor build-up — acute liquidity strain', 'Refusing contract-financing ring-fence — cash diversion exposure'). For a no-concern dimension, say so plainly.",
+      "finding": "Observation first, then (only if a case genuinely fits): This mirrors [Case XX] logic, which warns that ... — otherwise just the observation + 'No close historical precedent.'",
+      "traceReference": "EXACT case title from AVAILABLE REFERENCES, or \"\" if none genuinely fits",
+      "traceExcerpt": "2-3 sentence quote of the actual lesson from that case, or \"\" if no case cited",
+      "applicationQuote": "A VERBATIM sentence or phrase copied CHARACTER-FOR-CHARACTER from the CREDIT APPLICATION text above that is the primary evidence for this observation. Do NOT paraphrase — copy it exactly so it can be located and highlighted in the source PDF.",
+      "matchTerms": ["3-6 short key terms/figures that appear in BOTH the application and the case lesson and establish the parallel — e.g. \"RM73.3 million\", \"over-concentration\", \"related company\". These will be highlighted on both sides."]
+    }
+  ],
+  "policyAlerts": [
+    { "status": "pass | fail | probe", "reference": "policy / credit-note reference", "description": "what the application does and why it is flagged" }
+  ],
+  "edgeCases": { "assumptions": ["..."], "ambiguities": ["..."] },
+  "probeQuestions": ["3-5 targeted questions for the CD Manager"],
+  "referencesUsed": ["every case title cited above"],
+  "overallRisk": "high | probe | low"
+}
+Output EXACTLY one riskTable row per segment — all 8 segments, in the order listed above.`;
+
+/**
+ * Pass 1 of the retrieval-grounded flow: pull the borrower's salient RISK
+ * SIGNALS out of the application as short search phrases. These are embedded
+ * and used to retrieve the genuinely most-similar historical cases, so the
+ * analyzer cites cases selected by similarity — not free-associated.
+ */
+export async function extractCreditRiskRetrievalQueries(
+  applicationText: string,
+): Promise<{ queries: string[]; usage: TokenUsage }> {
+  const prompt = `You are screening a credit application for risk. List 6-10 SHORT search phrases (5-14 words each) capturing the borrower's most notable RISK SIGNALS — the specific things a credit analyst would look for historical precedent on (e.g. cash-flow deficit & debtor build-up, related-party / single-debtor concentration, keyman or shareholding change, sector/margin pressure for the borrower's industry, facility-structure or working-capital policy deviations, guarantee/security gaps, overbanking). Be concrete to THIS borrower. Output ONLY JSON: {"queries":["phrase", "phrase", ...]}.
+
+## CREDIT APPLICATION
+${applicationText.slice(0, 60000)}`;
+
+  const response = await generateWithFallback(
+    {
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      config: { responseMimeType: "application/json", maxOutputTokens: 1024 },
+    },
+    { tier: "fast" },
+  );
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const m = (response.usageMetadata ?? {}) as any;
+  const usage: TokenUsage = {
+    inputTokens: m.promptTokenCount ?? 0,
+    outputTokens: m.candidatesTokenCount ?? 0,
+    thinkingTokens: m.thoughtsTokenCount ?? 0,
+    calls: 1,
+  };
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let parsed: any = {};
+  try {
+    parsed = JSON.parse(response.text ?? "{}");
+  } catch {
+    const mm = (response.text ?? "").match(/\{[\s\S]*\}/);
+    if (mm) { try { parsed = JSON.parse(mm[0]); } catch { /* keep {} */ } }
+  }
+  const queries = Array.isArray(parsed.queries)
+    ? parsed.queries.filter((q: unknown) => typeof q === "string" && (q as string).trim()).slice(0, 10)
+    : [];
+  return { queries, usage };
+}
+
+/**
+ * Backfill "condition — impact" headlines for findings that don't have one
+ * (e.g. reports analyzed before the field existed), without re-running the
+ * whole analysis. Returns a map of segment → headline.
+ */
+export async function generateCreditHeadlines(
+  items: { segment: string; finding: string }[],
+): Promise<Record<string, string>> {
+  if (!items.length) return {};
+  const list = items.map((it, i) => `${i + 1}. [${it.segment}] ${it.finding}`).join("\n");
+  const prompt = `For each credit-risk finding below, write a HEADLINE: a <=16-word plain-English flag in the form "condition — impact". State the specific condition or clause in the application that triggers the risk, then its consequence. Name the RISK, not raw figures. If a finding is "no concern / no precedent", say so plainly.
+Return ONLY JSON: {"headlines":[{"segment":"<segment key>","headline":"..."}]}.
+
+FINDINGS:
+${list}`;
+
+  const response = await generateWithFallback(
+    {
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      config: { responseMimeType: "application/json", maxOutputTokens: 2048 },
+    },
+    { tier: "fast" },
+  );
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let parsed: any = {};
+  try {
+    parsed = JSON.parse(response.text ?? "{}");
+  } catch {
+    const mm = (response.text ?? "").match(/\{[\s\S]*\}/);
+    if (mm) { try { parsed = JSON.parse(mm[0]); } catch { /* keep {} */ } }
+  }
+  const out: Record<string, string> = {};
+  for (const h of Array.isArray(parsed.headlines) ? parsed.headlines : []) {
+    if (h?.segment && typeof h.headline === "string" && h.headline.trim()) out[h.segment] = h.headline.trim();
+  }
+  return out;
+}
+
+const CREDIT_NARRATIVE_GUIDE = `Write a credit-risk EXECUTIVE SUMMARY in GitHub-flavoured MARKDOWN for a reviewer:
+- Open with 1-2 sentences of prose: the overall verdict and the core reason.
+- Then a line "**Key concerns**" followed by 3-5 bullets (each starting "- "). Begin each bullet with a **bolded 2-4 word risk label**, then a colon and the specific consequence WITH the real figure.
+- Then a line "**Mitigants & what to probe**" followed by 2-4 bullets ("- ").
+Plain English, real figures, tight. Bold only the key label of each bullet (and the verdict word). No '#' headings, no tables.`;
+
+/**
+ * Regenerate just the executive-summary narrative (as markdown) from existing
+ * findings — used to upgrade reports whose narrative predates the markdown format,
+ * without re-running the whole analysis.
+ */
+export async function generateCreditNarrative(args: {
+  borrowerName: string;
+  overallRisk: string;
+  applicationSummary?: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  findings: { segment: string; indicator: string; headline?: string; finding: string; traceReference?: string }[];
+}): Promise<string> {
+  const findingsBlock = args.findings
+    .map(
+      (f) =>
+        `- ${f.segment} [${f.indicator}]${f.traceReference ? ` (mirrors ${f.traceReference})` : ""}: ${f.headline ?? ""} — ${f.finding}`,
+    )
+    .join("\n");
+  const prompt = `${CREDIT_NARRATIVE_GUIDE}
+
+BORROWER: ${args.borrowerName}
+OVERALL RISK: ${args.overallRisk}
+${args.applicationSummary ? `\nAPPLICATION SUMMARY:\n${args.applicationSummary}\n` : ""}
+FINDINGS:
+${findingsBlock}
+
+Output ONLY the markdown summary (no JSON, no code fence).`;
+
+  const response = await generateWithFallback(
+    // Generous cap: the quality tier "thinks", which consumes the output budget —
+    // too low and the visible markdown gets truncated mid-bullet.
+    { contents: [{ role: "user", parts: [{ text: prompt }] }], config: { maxOutputTokens: 8192 } },
+    { tier: "quality" },
+  );
+  return (response.text ?? "").replace(/^```(?:markdown)?\s*|\s*```$/g, "").trim();
+}
+
+/**
+ * Conversational Q&A over a single credit risk report. The caller assembles a
+ * grounded context block (the report's analysis + KB excerpts retrieved for the
+ * question); this turns it into a constrained chat answer.
+ */
+export async function chatCreditRisk(args: {
+  contextBlock: string;
+  history: { role: "user" | "assistant"; content: string }[];
+  question: string;
+}): Promise<{ answer: string; usage: TokenUsage }> {
+  const system = `You are a credit-risk analyst assistant helping a reviewer interrogate ONE credit risk report. Answer the reviewer's question using ONLY the report analysis and knowledge-base excerpts provided below. Rules:
+- Never invent facts, figures, or case names. If something is not in the materials, say so plainly.
+- Cite supporting cases by their EXACT title (e.g. "Case 48").
+- Be concise, specific, and practical — a few sentences or tight bullets. Quote real figures from the analysis where relevant.
+- This is risk highlighting, not an approve/reject decision.
+
+=== REPORT CONTEXT ===
+${args.contextBlock}`;
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const contents: any[] = [
+    { role: "user", parts: [{ text: system }] },
+    { role: "model", parts: [{ text: "Understood — I'll answer only from this report and its cited cases." }] },
+  ];
+  for (const h of args.history.slice(-10)) {
+    contents.push({ role: h.role === "assistant" ? "model" : "user", parts: [{ text: h.content }] });
+  }
+  contents.push({ role: "user", parts: [{ text: args.question }] });
+
+  const response = await generateWithFallback({ contents, config: { maxOutputTokens: 1200 } }, { tier: "fast" });
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const m = (response.usageMetadata ?? {}) as any;
+  return {
+    answer: (response.text ?? "").trim(),
+    usage: {
+      inputTokens: m.promptTokenCount ?? 0,
+      outputTokens: m.candidatesTokenCount ?? 0,
+      thinkingTokens: m.thoughtsTokenCount ?? 0,
+      calls: 1,
+    },
+  };
+}
+
+/**
+ * Analyze a credit application against the KB of historical "Cases".
+ * Faithful port of the WCO analyze-credit edge function onto this app's stack.
+ */
+export async function analyzeCreditRisk(args: {
+  borrowerName: string;
+  applicationText: string;
+  kbContext: string;     // concatenated KB case excerpts, each prefixed with [Case Title]
+  availableRefs: string; // newline list of the EXACT case titles the model may cite
+  guidance?: string | null;
+}): Promise<{ analysis: CreditRiskAnalysis; usage: TokenUsage }> {
+  const guidanceBlock = args.guidance?.trim()
+    ? `\n## ADDITIONAL ANALYST GUIDANCE (apply this emphasis)\n${args.guidance.trim()}\n`
+    : "";
+
+  const userPrompt = `## CREDIT APPLICATION
+Borrower: ${args.borrowerName}
+
+${args.applicationText}
+
+## KNOWLEDGE BASE (historical post-mortem cases & credit risk notes)
+When citing these, traceReference MUST be the EXACT case title from the AVAILABLE REFERENCES list below.
+${args.kbContext || "No knowledge base documents available."}
+
+## AVAILABLE REFERENCES (use these EXACT titles in traceReference — do NOT append any extra text)
+${args.availableRefs || "None"}
+${guidanceBlock}
+Analyze this credit application now. Output ALL 8 risk segments. Every riskTable row's traceReference MUST be an EXACT title from AVAILABLE REFERENCES. Return ONLY the JSON object.`;
+
+  const response = await generateWithFallback({
+    contents: [{ role: "user", parts: [{ text: `${CREDIT_RISK_SYSTEM}\n\n${userPrompt}` }] }],
+    config: { responseMimeType: "application/json", maxOutputTokens: 24576 },
+  }, { tier: "quality" });
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const m = (response.usageMetadata ?? {}) as any;
+  const usage: TokenUsage = {
+    inputTokens: m.promptTokenCount ?? 0,
+    outputTokens: m.candidatesTokenCount ?? 0,
+    thinkingTokens: m.thoughtsTokenCount ?? 0,
+    calls: 1,
+  };
+
+  let parsed: any = {};
+  try {
+    parsed = JSON.parse(response.text ?? "{}");
+  } catch {
+    const mm = (response.text ?? "").match(/\{[\s\S]*\}/);
+    if (mm) { try { parsed = JSON.parse(mm[0]); } catch { /* keep {} */ } }
+  }
+
+  const VALID: CreditRiskIndicator[] = ["high", "probe", "low"];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const rawRows: any[] = Array.isArray(parsed.riskTable) ? parsed.riskTable : [];
+  const analysis: CreditRiskAnalysis = {
+    applicationSummary: typeof parsed.applicationSummary === "string" ? parsed.applicationSummary : "",
+    riskNarrative: typeof parsed.riskNarrative === "string" ? parsed.riskNarrative : "",
+    riskTable: rawRows.map((r) => ({
+      segment: r.segment,
+      indicator: VALID.includes(r.indicator) ? r.indicator : "low",
+      confidence:
+        typeof r.confidence === "number" && isFinite(r.confidence)
+          ? Math.max(0, Math.min(100, Math.round(r.confidence)))
+          : undefined,
+      headline: typeof r.headline === "string" && r.headline.trim() ? r.headline.trim() : undefined,
+      finding: typeof r.finding === "string" ? r.finding : "",
+      traceReference: typeof r.traceReference === "string" ? r.traceReference : "",
+      traceExcerpt: typeof r.traceExcerpt === "string" ? r.traceExcerpt : "",
+      applicationQuote: typeof r.applicationQuote === "string" ? r.applicationQuote : "",
+      matchTerms: Array.isArray(r.matchTerms)
+        ? r.matchTerms.filter((t: unknown) => typeof t === "string" && (t as string).trim()).slice(0, 8)
+        : [],
+    })) as CreditRiskFinding[],
+    policyAlerts: Array.isArray(parsed.policyAlerts) ? parsed.policyAlerts : [],
+    edgeCases: {
+      assumptions: Array.isArray(parsed.edgeCases?.assumptions) ? parsed.edgeCases.assumptions : [],
+      ambiguities: Array.isArray(parsed.edgeCases?.ambiguities) ? parsed.edgeCases.ambiguities : [],
+    },
+    probeQuestions: Array.isArray(parsed.probeQuestions) ? parsed.probeQuestions : [],
+    referencesUsed: Array.isArray(parsed.referencesUsed) ? parsed.referencesUsed : [],
+    overallRisk: VALID.includes(parsed.overallRisk) ? parsed.overallRisk : "probe",
+  };
+
+  return { analysis, usage };
+}

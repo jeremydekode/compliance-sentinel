@@ -30,9 +30,11 @@ import {
   FileText,
   RefreshCw,
   ShieldPlus,
+  ShieldAlert,
 } from "lucide-react";
 import { FormUpdateDialog } from "@/components/form-update-dialog";
 import { SimplifyUploadDialog } from "@/components/simplify-upload-dialog";
+import { CreditUploadDialog } from "@/components/credit-upload-dialog";
 import { formatDate, statusMeta } from "@/lib/format";
 import {
   deleteReport,
@@ -60,7 +62,179 @@ export const Route = createFileRoute("/reports/")({
  */
 function ReportsRoute() {
   const [workspace] = useWorkspace();
-  return workspace === "simplify" ? <SimplifyReportsList /> : <ReportsList />;
+  if (workspace === "simplify") return <SimplifyReportsList />;
+  if (workspace === "credit_risk") return <CreditRiskReportsList />;
+  return <ReportsList />;
+}
+
+/** Credit Risk Alert — list of screened applications + the upload entry point. */
+function CreditRiskReportsList() {
+  const qc = useQueryClient();
+  const nav = useNavigate();
+  const remove = useServerFn(deleteReport);
+  const [showUpload, setShowUpload] = useState(false);
+
+  const reports = useQuery({
+    queryKey: ["reports", "all", "credit_risk"],
+    queryFn: async () => {
+      const { data } = await (supabase as any)
+        .from("analysis_reports")
+        .select("id, title, policy_name, status, created_at, summary_json")
+        .eq("workspace_id", "credit_risk")
+        .order("created_at", { ascending: false });
+      return data ?? [];
+    },
+  });
+
+  async function handleDelete(e: React.MouseEvent, id: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!confirm("Delete this credit risk analysis and all related data?")) return;
+    try {
+      await remove({ data: { id } });
+      toast.success("Analysis deleted");
+      qc.invalidateQueries({ queryKey: ["reports"] });
+    } catch (err: any) {
+      toast.error(err?.message ?? "Failed to delete");
+    }
+  }
+
+  const indicatorMeta: Record<string, { label: string; classes: string }> = {
+    high: { label: "High risk", classes: "bg-rose-100 text-rose-800 border-rose-200" },
+    probe: { label: "Probe", classes: "bg-amber-100 text-amber-800 border-amber-200" },
+    low: { label: "Low risk", classes: "bg-emerald-100 text-emerald-800 border-emerald-200" },
+  };
+
+  return (
+    <AppShell>
+      <div className="p-8 max-w-[1400px] mx-auto space-y-8">
+        <div className="flex items-end justify-between">
+          <div>
+            <h1 className="text-3xl font-bold tracking-tight">Credit Risk Alert</h1>
+            <p className="text-muted-foreground mt-1 text-lg">
+              Screen credit applications across 8 risk dimensions — every flag traced to a historical
+              case in the knowledge base.
+            </p>
+          </div>
+          <Button
+            size="lg"
+            onClick={() => setShowUpload(true)}
+            className="gap-2 h-12 px-6 rounded-xl font-bold bg-red-600 hover:bg-red-700 text-white shadow-lg shadow-red-500/20 active:scale-95"
+          >
+            <Plus className="size-4" /> New Credit Risk Analysis
+          </Button>
+        </div>
+
+        <Card className="p-0 overflow-hidden border-border/50 shadow-sm glass-card">
+          <div className="px-6 py-4 border-b border-border/50 bg-muted/30 flex items-center justify-between">
+            <h2 className="font-bold text-sm uppercase tracking-[0.2em] text-muted-foreground">
+              Screened Applications
+            </h2>
+            <Badge variant="secondary" className="font-black text-[10px]">
+              {reports.data?.length ?? 0} TOTAL
+            </Badge>
+          </div>
+
+          {reports.isLoading && (
+            <div className="p-12 text-center text-muted-foreground font-medium italic animate-pulse">
+              Loading…
+            </div>
+          )}
+
+          {!reports.isLoading && (reports.data?.length ?? 0) === 0 && (
+            <div className="p-20 text-center">
+              <div className="size-16 bg-muted rounded-full grid place-items-center mx-auto mb-4">
+                <ShieldAlert className="size-8 text-muted-foreground" />
+              </div>
+              <h3 className="text-xl font-bold">No applications screened yet</h3>
+              <p className="text-muted-foreground mt-2 max-w-sm mx-auto">
+                Upload a credit application to flag risks against the internal case knowledge base.
+              </p>
+              <Button
+                onClick={() => setShowUpload(true)}
+                className="mt-6 gap-2 h-11 px-8 rounded-lg font-bold bg-red-600 hover:bg-red-700 text-white"
+              >
+                <Plus className="size-4" /> New Credit Risk Analysis
+              </Button>
+            </div>
+          )}
+
+          <div className="divide-y divide-border/50">
+            {reports.data?.map((r: any) => {
+              const sj = r.summary_json ?? {};
+              const analysis = sj.credit_analysis;
+              const im = analysis ? indicatorMeta[analysis.overallRisk] ?? indicatorMeta.probe : null;
+              return (
+                <Link
+                  key={r.id}
+                  to="/credit/$reportId"
+                  params={{ reportId: r.id }}
+                  className="flex items-center justify-between px-6 py-5 hover:bg-red-500/[0.03] transition-colors group"
+                >
+                  <div className="min-w-0 flex items-center gap-4">
+                    <div className="size-10 rounded-xl grid place-items-center shrink-0 bg-red-100 transition-transform group-hover:scale-110">
+                      <ShieldAlert className="size-5 text-red-700" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="font-bold text-base truncate group-hover:text-red-700 transition-colors">
+                        {r.title}
+                      </div>
+                      <div className="flex items-center gap-2 text-xs text-muted-foreground mt-1 font-medium">
+                        {sj.pending_analysis ? (
+                          <span className="text-red-600 font-semibold">Analysing…</span>
+                        ) : sj.credit_status === "failed" ? (
+                          <span className="text-rose-600 font-semibold">Run failed</span>
+                        ) : analysis ? (
+                          <span>
+                            {analysis.referencesUsed?.length ?? 0} case
+                            {(analysis.referencesUsed?.length ?? 0) === 1 ? "" : "s"} referenced
+                          </span>
+                        ) : (
+                          <span>Ready</span>
+                        )}
+                        <span>•</span>
+                        <span>{formatDate(r.created_at)}</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-3 shrink-0">
+                    {im && (
+                      <Badge
+                        variant="outline"
+                        className={cn("font-black text-[10px] uppercase tracking-widest px-2", im.classes)}
+                      >
+                        {im.label}
+                      </Badge>
+                    )}
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-9 rounded-lg text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
+                      onClick={(e) => handleDelete(e, r.id)}
+                    >
+                      <Trash2 className="size-4" />
+                    </Button>
+                    <div className="size-9 rounded-lg bg-muted grid place-items-center group-hover:bg-red-600 group-hover:text-white transition-all">
+                      <ArrowRight className="size-4" />
+                    </div>
+                  </div>
+                </Link>
+              );
+            })}
+          </div>
+        </Card>
+      </div>
+
+      <CreditUploadDialog
+        open={showUpload}
+        onOpenChange={setShowUpload}
+        onCreated={(reportId) => {
+          qc.invalidateQueries({ queryKey: ["reports"] });
+          nav({ to: "/credit/$reportId", params: { reportId } });
+        }}
+      />
+    </AppShell>
+  );
 }
 
 /** UC4 — list of simplified documents + the upload entry point. */

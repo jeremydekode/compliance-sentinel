@@ -32,9 +32,10 @@ import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import {
   ArrowLeft,
-  ArrowRight,
-  ChevronDown,
   MessageSquare,
+  ChevronDown,
+  Activity,
+  Newspaper,
   Loader2,
   AlertTriangle,
   RefreshCw,
@@ -112,6 +113,12 @@ const ALERT_META: Record<
   probe: { label: "Probe", classes: "bg-amber-100 text-amber-800 border-amber-200", icon: CircleDot },
 };
 
+const FIN_SEV: Record<"high" | "medium" | "low", { dot: string }> = {
+  high: { dot: "bg-rose-500" },
+  medium: { dot: "bg-amber-500" },
+  low: { dot: "bg-slate-400" },
+};
+
 // ── helpers ────────────────────────────────────────────────────────────────
 
 /** Strip the noisy "Hong Leong Bank Berhad Mail Fwd/Re" prefix from KB titles. */
@@ -172,6 +179,56 @@ const NARRATIVE_MD: any = {
   strong: ({ children }: any) => <strong className="font-semibold text-foreground">{children}</strong>,
   em: ({ children }: any) => <em className="italic">{children}</em>,
 };
+
+/** Calm, readable section heading (sentence case) — replaces all-caps eyebrows. */
+function SectionHeading({
+  icon: Icon,
+  children,
+  sub,
+}: {
+  icon?: React.ComponentType<{ className?: string }>;
+  children: React.ReactNode;
+  sub?: string;
+}) {
+  return (
+    <div className="flex items-center gap-2 flex-wrap">
+      <h2 className="font-bold text-base tracking-tight flex items-center gap-2">
+        {Icon && <Icon className="size-4 text-red-600 shrink-0" />}
+        {children}
+      </h2>
+      {sub && <span className="text-xs text-muted-foreground">{sub}</span>}
+    </div>
+  );
+}
+
+/** Small inline tag showing where a mitigation comes from. */
+function MitigationTag({
+  source,
+  reference,
+}: {
+  source: "case" | "policy" | "best_practice";
+  reference?: string;
+}) {
+  const cls =
+    source === "case"
+      ? "bg-blue-50 text-blue-700 border-blue-200"
+      : source === "policy"
+        ? "bg-amber-50 text-amber-800 border-amber-200"
+        : "bg-slate-50 text-slate-600 border-slate-200";
+  const label =
+    source === "case"
+      ? reference
+        ? cleanCaseTitle(reference)
+        : "case"
+      : source === "policy"
+        ? reference || "policy"
+        : "best practice";
+  return (
+    <Badge variant="outline" className={cn("text-[9px] font-medium align-middle ml-0.5", cls)}>
+      {label}
+    </Badge>
+  );
+}
 
 // ── page ─────────────────────────────────────────────────────────────────────
 
@@ -301,12 +358,12 @@ function CreditReportPage() {
   });
   const shown = ordered.filter((o) => filter === "all" || (o.finding?.indicator ?? "low") === filter);
 
-  // Split the markdown summary into two balanced columns: lead + key concerns
-  // on the left, mitigants/probe on the right (controlled, unlike CSS columns).
+  // For the recap: the prose verdict (lead, before the "Key concerns" list) +
+  // a structured pairing of each flagged concern with its mitigation plan.
   const narrative = analysis.riskNarrative || "";
-  const mIdx = narrative.search(/\n\*\*\s*Mitigant/i);
-  const narrLeft = mIdx > 0 ? narrative.slice(0, mIdx).trim() : narrative;
-  const narrRight = mIdx > 0 ? narrative.slice(mIdx).trim() : "";
+  const kIdx = narrative.search(/\n\*\*\s*Key concern/i);
+  const narrLead = kIdx > 0 ? narrative.slice(0, kIdx).trim() : narrative;
+  const concerns = ordered.filter((o) => o.finding && (o.finding.indicator ?? "low") !== "low");
 
   const overall = IND_META[analysis.overallRisk] ?? IND_META.probe;
   const usage: TokenUsage | undefined = sj.usage;
@@ -405,15 +462,12 @@ function CreditReportPage() {
           />
         </div>
 
-        {/* executive summary */}
-        <Card className="p-5 glass-card">
-          <div className="flex items-center gap-2 mb-2">
-            <Quote className="size-4 text-red-600" />
-            <h2 className="font-bold text-sm uppercase tracking-[0.15em] text-muted-foreground">
-              Executive Summary
-            </h2>
-          </div>
-          <p className="text-sm leading-relaxed whitespace-pre-wrap">{analysis.applicationSummary || "—"}</p>
+        {/* application overview — the factual borrower/facilities summary */}
+        <Card className="p-5 glass-card space-y-2">
+          <SectionHeading icon={FileText}>Application overview</SectionHeading>
+          <p className="text-sm leading-relaxed whitespace-pre-wrap text-foreground/90">
+            {analysis.applicationSummary || "—"}
+          </p>
         </Card>
 
         {/* risk radar — side-by-side findings */}
@@ -422,7 +476,7 @@ function CreditReportPage() {
             <div className="flex items-center gap-2">
               <h2 className="font-bold text-lg tracking-tight">Risk Radar</h2>
               <span className="text-xs text-muted-foreground">
-                · sorted by severity — open a row to see the application vs. the case it mirrors
+                · sorted by severity — click a risk for the detail; view source for the PDFs
               </span>
             </div>
             {filter !== "all" && (
@@ -435,24 +489,78 @@ function CreditReportPage() {
             )}
           </div>
           <div className="space-y-2">
-            {shown.map(({ key, label, finding }, i) => (
-              <TriageRow
-                key={key}
-                label={label}
-                finding={finding}
-                defaultOpen={i === 0}
-                onView={() => finding && setSelected(finding)}
-              />
+            {shown.map(({ key, label, finding }) => (
+              <TriageRow key={key} label={label} finding={finding} onView={() => finding && setSelected(finding)} />
             ))}
           </div>
         </div>
 
+        {/* financial checks — forensic anomalies/inconsistencies in the statements */}
+        {(analysis.financialAnomalies?.length ?? 0) > 0 && (
+          <Card className="p-5 glass-card space-y-3">
+            <SectionHeading icon={Activity} sub="inconsistencies & anomalies in the financial statements">
+              Financial checks
+            </SectionHeading>
+            <div className="space-y-2">
+              {analysis.financialAnomalies!.map((a, i) => (
+                <div key={i} className="flex items-start gap-3 rounded-lg border bg-muted/20 px-3 py-2.5">
+                  <span
+                    className={cn("size-2 rounded-full mt-1.5 shrink-0", (FIN_SEV[a.severity] ?? FIN_SEV.medium).dot)}
+                    title={`${a.severity} severity`}
+                  />
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-semibold text-sm">{a.label}</span>
+                      <Badge variant="outline" className="text-[9px] uppercase tracking-wide bg-muted/50 text-muted-foreground">
+                        {a.category}
+                      </Badge>
+                    </div>
+                    <p className="text-sm text-muted-foreground mt-0.5 leading-snug">{a.detail}</p>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </Card>
+        )}
+
+        {/* adverse news — external negative screening (Google Search grounded) */}
+        {analysis.adverseNews && (analysis.adverseNews.summary || (analysis.adverseNews.sources?.length ?? 0) > 0) && (
+          <Card className="p-5 glass-card space-y-3">
+            <SectionHeading icon={Newspaper} sub="external web / news screening">
+              Adverse news screening
+            </SectionHeading>
+            {analysis.adverseNews.summary && (
+              <div className="text-sm leading-relaxed text-foreground/90">
+                <Markdown components={NARRATIVE_MD}>{analysis.adverseNews.summary}</Markdown>
+              </div>
+            )}
+            {(analysis.adverseNews.sources?.length ?? 0) > 0 && (
+              <div className="space-y-1 pt-2 border-t">
+                <div className="text-[10px] uppercase tracking-widest font-bold text-muted-foreground">Sources</div>
+                <ul className="space-y-0.5">
+                  {analysis.adverseNews.sources.slice(0, 8).map((s, i) => (
+                    <li key={i} className="text-xs min-w-0">
+                      <a
+                        href={s.uri}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-blue-600 hover:underline inline-flex items-center gap-1 max-w-full"
+                      >
+                        <ExternalLink className="size-3 shrink-0" />
+                        <span className="truncate">{s.title}</span>
+                      </a>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </Card>
+        )}
+
         {/* policy alerts */}
         {analysis.policyAlerts.length > 0 && (
           <Card className="p-5 glass-card space-y-3">
-            <h2 className="font-bold text-sm uppercase tracking-[0.15em] text-muted-foreground">
-              Policy &amp; Credit-Note Alerts
-            </h2>
+            <SectionHeading icon={ShieldCheck}>Policy &amp; credit-note alerts</SectionHeading>
             <div className="space-y-2">
               {analysis.policyAlerts.map((a, i) => {
                 const am = ALERT_META[a.status] ?? ALERT_META.probe;
@@ -492,12 +600,7 @@ function CreditReportPage() {
         {/* probe questions */}
         {analysis.probeQuestions.length > 0 && (
           <Card className="p-5 glass-card space-y-3">
-            <div className="flex items-center gap-2">
-              <HelpCircle className="size-4 text-red-600" />
-              <h2 className="font-bold text-sm uppercase tracking-[0.15em] text-muted-foreground">
-                Questions for the CD Manager
-              </h2>
-            </div>
+            <SectionHeading icon={HelpCircle}>Questions for the CD Manager</SectionHeading>
             <ol className="space-y-2">
               {analysis.probeQuestions.map((q, i) => (
                 <li key={i} className="flex items-start gap-3 text-sm">
@@ -514,9 +617,7 @@ function CreditReportPage() {
         {/* references */}
         {analysis.referencesUsed.length > 0 && (
           <Card className="p-5 glass-card space-y-3">
-            <h2 className="font-bold text-sm uppercase tracking-[0.15em] text-muted-foreground">
-              References Used
-            </h2>
+            <SectionHeading icon={ScrollText}>References used</SectionHeading>
             <div className="flex flex-wrap gap-1.5">
               {analysis.referencesUsed.map((r, i) => (
                 <Badge key={i} variant="outline" className="bg-blue-50 text-blue-700 border-blue-200 font-semibold">
@@ -528,30 +629,64 @@ function CreditReportPage() {
           </Card>
         )}
 
-        {/* overall recap — the executive brief, as a closing summary */}
+        {/* overall recap — verdict prose, then each concern paired with its mitigation plan */}
         {narrative && (
-          <Card className="p-5 glass-card space-y-3">
-            <div className="flex items-center gap-2">
-              <Quote className="size-4 text-red-600" />
-              <h2 className="font-bold text-sm uppercase tracking-[0.15em] text-muted-foreground">
-                Overall recap
-              </h2>
-            </div>
-            <div
-              className={cn(
-                "text-[15px] leading-relaxed text-foreground/90",
-                narrRight ? "grid md:grid-cols-2 gap-x-12 gap-y-1 items-start" : "",
-              )}
-            >
-              <div>
-                <Markdown components={NARRATIVE_MD}>{narrLeft}</Markdown>
+          <Card className="p-5 glass-card space-y-4">
+            <SectionHeading icon={Quote}>Overall recap</SectionHeading>
+            {narrLead && (
+              <div className="text-[15px] leading-relaxed text-foreground/90 max-w-3xl">
+                <Markdown components={NARRATIVE_MD}>{narrLead}</Markdown>
               </div>
-              {narrRight && (
-                <div>
-                  <Markdown components={NARRATIVE_MD}>{narrRight}</Markdown>
+            )}
+
+            {concerns.length > 0 && (
+              <div className="space-y-2">
+                <div className="text-xs font-semibold text-muted-foreground">
+                  Key concerns &amp; mitigation plan
                 </div>
-              )}
-            </div>
+                <div className="rounded-lg border overflow-hidden">
+                  <div className="hidden sm:grid grid-cols-[1fr_1.25fr] gap-4 px-3.5 py-2 bg-muted/40 text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                    <span>Concern</span>
+                    <span>Mitigation plan</span>
+                  </div>
+                  <div className="divide-y">
+                    {concerns.map(({ key, label, finding }) => {
+                      const im = IND_META[finding!.indicator];
+                      const mits = finding!.mitigations ?? [];
+                      return (
+                        <div key={key} className="grid sm:grid-cols-[1fr_1.25fr] gap-1.5 sm:gap-4 px-3.5 py-3">
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2 text-sm font-semibold">
+                              <span className={cn("size-1.5 rounded-full shrink-0", im.dot)} />
+                              {label}
+                            </div>
+                            <p className="text-xs text-muted-foreground mt-1 leading-snug">
+                              {finding!.headline || splitFinding(finding!.finding).observation}
+                            </p>
+                          </div>
+                          {mits.length > 0 ? (
+                            <ul className="space-y-1.5">
+                              {mits.map((mi, i) => (
+                                <li key={i} className="flex items-start gap-1.5 text-[13px] leading-snug">
+                                  <CheckCircle2 className="size-3.5 text-emerald-600 mt-0.5 shrink-0" />
+                                  <span>
+                                    {mi.action} <MitigationTag source={mi.source} reference={mi.reference} />
+                                  </span>
+                                </li>
+                              ))}
+                            </ul>
+                          ) : (
+                            <span className="text-xs text-muted-foreground italic">
+                              Mitigation pending — re-run to generate.
+                            </span>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            )}
           </Card>
         )}
 
@@ -689,117 +824,134 @@ function TriageRow({
   label,
   finding,
   onView,
-  defaultOpen,
 }: {
   label: string;
   finding?: CreditRiskFinding;
   onView: () => void;
-  defaultOpen?: boolean;
 }) {
-  const [open, setOpen] = useState(!!defaultOpen);
+  const [open, setOpen] = useState(false);
   const indicator = finding?.indicator ?? "low";
   const m = IND_META[indicator];
   const { observation, lesson } = finding ? splitFinding(finding.finding) : { observation: "", lesson: "" };
   const caseLabel = finding?.traceReference ? cleanCaseTitle(finding.traceReference) : "";
   const hasSource = !!(finding?.evidence?.applicationFileUrl || finding?.evidence?.caseFileUrl);
-  const gist = finding?.headline || observation || "No KB-referenced concern surfaced for this dimension.";
+  // Show the detail ("what we found") in the row itself — the risk readable at a
+  // glance. Why-it-matters, the case it mirrors, and the source live in expand.
+  const detail = observation || finding?.headline || "No KB-referenced concern surfaced for this dimension.";
+  const terms = (finding?.matchTerms ?? []).filter(Boolean);
+  const mitigations = finding?.mitigations ?? [];
 
   return (
     <Card className={cn("p-0 overflow-hidden glass-card", indicator === "low" && !open && "opacity-75")}>
-      {/* matrix row — click to expand */}
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
-        className="w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-muted/30 transition-colors"
+        className="w-full grid grid-cols-[3.5rem_2.25rem_11.5rem_minmax(0,1fr)_1rem_1rem] gap-3 items-start px-4 py-3 text-left hover:bg-muted/30 transition-colors"
       >
         <Badge
           variant="outline"
-          className={cn("font-bold text-[10px] uppercase tracking-wide shrink-0 w-[54px] justify-center", m.classes)}
+          className={cn("font-bold text-[10px] uppercase tracking-wide w-[54px] justify-center mt-0.5", m.classes)}
         >
           {m.label}
         </Badge>
-        <span className="text-[11px] text-muted-foreground tabular-nums w-8 shrink-0 text-right" title="Evidence confidence">
+        <span className="text-[11px] text-muted-foreground tabular-nums text-right mt-1" title="Evidence confidence">
           {typeof finding?.confidence === "number" ? `${finding.confidence}%` : ""}
         </span>
-        <span className="font-bold text-sm shrink-0 whitespace-nowrap">{label}</span>
-        <span className="flex-1 text-[13px] text-foreground/80 truncate min-w-0">{gist}</span>
-        {finding?.traceReference ? (
-          <Badge
-            variant="outline"
-            className="bg-blue-50 text-blue-700 border-blue-200 text-[10px] shrink-0 hidden md:inline-flex"
-          >
-            {caseLabel}
-          </Badge>
-        ) : (
-          <span className="text-[10px] text-muted-foreground/70 shrink-0 hidden md:inline">no precedent</span>
-        )}
-        <ChevronDown className={cn("size-4 text-muted-foreground shrink-0 transition-transform", open && "rotate-180")} />
+        <span className="font-bold text-sm truncate mt-0.5">{label}</span>
+        <span className="text-[13px] text-foreground/85 leading-snug line-clamp-2 min-w-0">{detail}</span>
+        <span
+          className="mt-0.5 text-blue-500"
+          title={finding?.traceReference ? `Mirrors ${finding.traceReference} — expand for details` : undefined}
+        >
+          {finding?.traceReference ? <BookOpen className="size-4" /> : null}
+        </span>
+        <ChevronDown
+          className={cn("size-4 text-muted-foreground transition-transform mt-0.5", open && "rotate-180")}
+        />
       </button>
 
-      {/* expanded — impact first, then the side-by-side evidence (compact) */}
       {open && (
-        <div className="border-t">
-          {lesson && (
-            <div className="flex items-start gap-2 px-3.5 py-2 bg-amber-50/60 border-b border-amber-100/70 text-xs text-amber-950/80 leading-snug">
-              <AlertTriangle className="size-3.5 mt-0.5 shrink-0 text-amber-600" />
-              <span>
-                <span className="font-semibold">Why it matters: </span>
-                {lesson}
-              </span>
+        <div className="border-t bg-muted/10 px-4 py-3.5 space-y-3 text-sm">
+          <ul className="space-y-2.5 leading-relaxed">
+            {lesson && (
+              <li className="flex gap-2.5">
+                <span className="size-1.5 rounded-full bg-amber-500 mt-[7px] shrink-0" />
+                <span>
+                  <span className="font-semibold">Why it matters: </span>
+                  {lesson}
+                </span>
+              </li>
+            )}
+            <li className="flex gap-2.5">
+              <span
+                className={cn(
+                  "size-1.5 rounded-full mt-[7px] shrink-0",
+                  finding?.traceReference ? "bg-blue-500" : "bg-muted-foreground/40",
+                )}
+              />
+              {finding?.traceReference ? (
+                <span>
+                  <span className="font-semibold text-blue-800">
+                    Mirrors {caseLabel}
+                    {finding.evidence?.casePage != null ? ` (p.${finding.evidence.casePage})` : ""}:{" "}
+                  </span>
+                  <span className="italic text-blue-950/80">“{finding.traceExcerpt}”</span>
+                </span>
+              ) : (
+                <span>
+                  <span className="font-semibold">Precedent: </span>
+                  <span className="text-muted-foreground">
+                    No close historical case — flagged on the application alone.
+                  </span>
+                </span>
+              )}
+            </li>
+          </ul>
+
+          {mitigations.length > 0 && (
+            <div className="space-y-1.5 rounded-lg bg-emerald-50/50 px-3 py-2.5">
+              <div className="flex items-center gap-1.5 text-xs font-semibold text-emerald-800">
+                <ShieldCheck className="size-3.5" /> Recommended mitigations
+              </div>
+              <ul className="space-y-1.5">
+                {mitigations.map((mi, i) => (
+                  <li key={i} className="flex items-start gap-2">
+                    <CheckCircle2 className="size-3.5 text-emerald-600 mt-0.5 shrink-0" />
+                    <span>
+                      {mi.action} <MitigationTag source={mi.source} reference={mi.reference} />
+                    </span>
+                  </li>
+                ))}
+              </ul>
             </div>
           )}
 
-          <div className="grid sm:grid-cols-[1fr_auto_1fr]">
-            <div className="px-3.5 py-3 min-w-0">
-              <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground font-semibold mb-1">
-                <FileText className="size-3.5" /> In this application
-                {hasSource && (
-                  <button
-                    type="button"
-                    onClick={onView}
-                    className="ml-auto inline-flex items-center gap-1 text-[11px] font-medium text-blue-600 hover:text-blue-700"
-                  >
-                    <FileSearch className="size-3" /> View source
-                  </button>
-                )}
-              </div>
-              <p className="text-sm leading-relaxed">
-                {observation ? (
-                  <Highlighted text={observation} terms={finding?.matchTerms} />
-                ) : (
-                  <span className="text-muted-foreground">No KB-referenced concern surfaced for this dimension.</span>
-                )}
-              </p>
+          {terms.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-[10px] uppercase tracking-widest font-bold text-muted-foreground mr-1">
+                Key signals
+              </span>
+              {terms.map((t, i) => (
+                <Badge key={i} variant="outline" className="text-[10px] bg-muted/50 font-medium">
+                  {t}
+                </Badge>
+              ))}
             </div>
+          )}
 
-            <div className="hidden sm:flex flex-col items-center justify-center px-1 text-muted-foreground/50">
-              <div className="w-px flex-1 bg-border" />
-              <ArrowRight className="size-4 my-1" />
-              <span className="text-[10px]">mirrors</span>
-              <div className="w-px flex-1 bg-border" />
-            </div>
-
-            {finding?.traceReference ? (
-              <div className="px-3.5 py-3 min-w-0 border-t sm:border-t-0 sm:border-l border-blue-100 bg-blue-50/40">
-                <div className="flex items-center gap-1.5 text-[11px] text-blue-700 font-semibold mb-1">
-                  <BookOpen className="size-3.5" />
-                  <span className="truncate" title={finding.traceReference}>
-                    Precedent · {caseLabel}
-                  </span>
-                  {finding.evidence?.casePage != null && (
-                    <span className="ml-auto text-[10px] text-blue-600/80 shrink-0">p.{finding.evidence.casePage}</span>
-                  )}
-                </div>
-                <p className="text-sm leading-snug text-blue-950/80 [font-family:var(--font-serif,_Georgia,_serif)] italic">
-                  “<Highlighted text={finding.traceExcerpt} terms={finding.matchTerms} />”
-                </p>
-              </div>
-            ) : (
-              <div className="px-3.5 py-3 border-t sm:border-t-0 sm:border-l text-xs text-muted-foreground italic flex items-center">
-                No close historical precedent — flagged on the application alone.
-              </div>
-            )}
-          </div>
+          {hasSource && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={(e) => {
+                e.stopPropagation();
+                onView();
+              }}
+              className="h-7 gap-1.5 text-xs border-blue-200 text-blue-700 hover:bg-blue-50"
+            >
+              <FileSearch className="size-3.5" /> View source on PDF
+            </Button>
+          )}
         </div>
       )}
     </Card>
@@ -962,7 +1114,10 @@ function EdgeCard({
   const dot = tone === "amber" ? "bg-amber-500" : "bg-slate-400";
   return (
     <Card className="p-5 glass-card space-y-3">
-      <h2 className="font-bold text-sm uppercase tracking-[0.15em] text-muted-foreground">{title}</h2>
+      <h2 className="font-bold text-base tracking-tight flex items-center gap-2">
+        <span className={cn("size-2 rounded-full shrink-0", dot)} />
+        {title}
+      </h2>
       <ul className="space-y-1.5">
         {items.map((it, i) => (
           <li key={i} className="flex items-start gap-2.5 text-sm">

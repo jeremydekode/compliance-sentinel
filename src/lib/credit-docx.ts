@@ -263,6 +263,72 @@ function buildDocumentXml(analysis: CreditRiskAnalysis, meta: CreditDocxMeta): s
   body.push(table(`<w:tr>${headerCells}</w:tr>${dataRows}`, COLS));
   body.push(EMPTY_PARA);
 
+  // Recommended mitigations (per flagged risk).
+  const withMit = CREDIT_RISK_SEGMENTS.map(({ key, label }) => ({ label, f: byKey.get(key) })).filter(
+    (x) => (x.f?.mitigations?.length ?? 0) > 0,
+  );
+  if (withMit.length) {
+    body.push(heading("Recommended Mitigations"));
+    for (const { label, f } of withMit) {
+      body.push(para(run(label, { b: true, sz: 20, color: "0F172A" }), { spaceBefore: 80, spaceAfter: 20 }));
+      for (const mi of f!.mitigations!) {
+        const tag =
+          mi.source === "case"
+            ? `  [${mi.reference ?? "case"}]`
+            : mi.source === "policy"
+              ? `  [${mi.reference ?? "policy"}]`
+              : "  [best practice]";
+        body.push(
+          para(run("•  ", { sz: 20 }) + run(mi.action, { sz: 20 }) + run(tag, { sz: 16, color: "64748B" }), {
+            indentLeft: 360,
+            hanging: 240,
+            spaceAfter: 30,
+          }),
+        );
+      }
+    }
+    body.push(EMPTY_PARA);
+  }
+
+  // Financial checks — anomalies / inconsistencies in the statements.
+  if (analysis.financialAnomalies?.length) {
+    body.push(heading("Financial Checks — Anomalies & Inconsistencies"));
+    for (const a of analysis.financialAnomalies) {
+      body.push(
+        para(
+          run("•  ", { sz: 20 }) +
+            run(`${a.label} `, { b: true, sz: 20 }) +
+            run(`[${a.severity.toUpperCase()} · ${a.category}] `, { sz: 14, color: "94A3B8" }) +
+            run(a.detail, { sz: 20 }),
+          { indentLeft: 360, hanging: 240, spaceAfter: 40 },
+        ),
+      );
+    }
+    body.push(EMPTY_PARA);
+  }
+
+  // Adverse news screening.
+  if (analysis.adverseNews && (analysis.adverseNews.summary || (analysis.adverseNews.sources?.length ?? 0) > 0)) {
+    body.push(heading("Adverse News Screening"));
+    for (const raw of (analysis.adverseNews.summary || "").split(/\n/)) {
+      const line = raw.trim();
+      if (!line) continue;
+      const b = line.match(/^[-*]\s+(.*)$/);
+      if (b) {
+        body.push(para(run("•  ", { sz: 20 }) + mdRuns(b[1], { sz: 20 }), { indentLeft: 360, hanging: 240, spaceAfter: 30 }));
+      } else {
+        body.push(para(mdRuns(line, { sz: 20 }), { spaceAfter: 40 }));
+      }
+    }
+    if (analysis.adverseNews.sources?.length) {
+      body.push(para(run("Sources", { b: true, sz: 16, color: "64748B" }), { spaceBefore: 60, spaceAfter: 20 }));
+      for (const s of analysis.adverseNews.sources.slice(0, 8)) {
+        body.push(para(run(`•  ${s.title}`, { sz: 16, color: "1D4ED8" }), { indentLeft: 360, spaceAfter: 16 }));
+      }
+    }
+    body.push(EMPTY_PARA);
+  }
+
   // Policy & credit-note alerts.
   body.push(heading("Policy & Credit-Note Alerts"));
   if (analysis.policyAlerts.length === 0) {

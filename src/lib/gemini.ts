@@ -1712,6 +1712,13 @@ export interface CreditRiskEvidence {
   caseChapter?: string;        // chunk chapter_ref, e.g. "Case 48 - Lessons learnt"
 }
 
+/** A recommended mitigation action for a risk, tagged with where it's drawn from. */
+export interface CreditMitigation {
+  action: string;                                // concrete, actionable measure
+  source: "case" | "policy" | "best_practice";   // KB case recommendation, internal policy, or industry best practice
+  reference?: string;                            // case/policy title when source is case/policy
+}
+
 export interface CreditRiskFinding {
   segment: CreditRiskSegment;
   indicator: CreditRiskIndicator;
@@ -1722,6 +1729,7 @@ export interface CreditRiskFinding {
   confidence?: number;       // 0-100 — strength of the evidence behind this flag
   applicationQuote?: string; // VERBATIM sentence copied from the application (for source highlighting)
   matchTerms?: string[];     // key phrases/figures shared by both sides — bolded in the UI + .docx
+  mitigations?: CreditMitigation[]; // recommended mitigation actions (added post-analysis)
   evidence?: CreditRiskEvidence; // located source pages/URLs (added post-analysis)
 }
 
@@ -1729,6 +1737,21 @@ export interface CreditPolicyAlert {
   status: "pass" | "fail" | "probe";
   reference: string;
   description: string;
+}
+
+/** A flagged inconsistency or anomaly in the application's financial statements. */
+export interface FinancialAnomaly {
+  label: string;                                                              // short title (≤8 words)
+  category: "spike" | "tax" | "ratio" | "reconciliation" | "liquidity" | "other";
+  severity: "high" | "medium" | "low";
+  detail: string;                                                             // 1-2 sentences WITH the figures
+}
+
+/** Result of an external adverse-news / negative screening (Google Search grounded). */
+export interface AdverseNewsResult {
+  summary: string;                              // markdown briefing of findings (or "none found")
+  sources: { title: string; uri: string }[];    // web sources cited by the grounded search
+  foundConcerns: boolean;                       // whether material adverse items surfaced
 }
 
 export interface CreditRiskAnalysis {
@@ -1740,6 +1763,8 @@ export interface CreditRiskAnalysis {
   probeQuestions: string[];
   referencesUsed: string[];
   overallRisk: CreditRiskIndicator;
+  financialAnomalies?: FinancialAnomaly[]; // forensic checks on the statements (added post-analysis)
+  adverseNews?: AdverseNewsResult;          // external negative-news screening (added post-analysis)
 }
 
 /** Display order + labels for the 8 risk segments (used by the report UI + .docx). */
@@ -1930,6 +1955,208 @@ Output ONLY the markdown summary (no JSON, no code fence).`;
     { tier: "quality" },
   );
   return (response.text ?? "").replace(/^```(?:markdown)?\s*|\s*```$/g, "").trim();
+}
+
+/**
+ * Generate recommended mitigation actions for the flagged risks (high/probe).
+ * Prefers measures grounded in the cited cases' "Lessons learnt & recommendations";
+ * falls back to industry best practice when the KB offers nothing specific.
+ * Returns a map of segment → mitigations.
+ */
+export async function generateCreditMitigations(args: {
+  borrowerName: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  findings: { segment: string; indicator: string; finding: string; traceReference?: string }[];
+  kbContext: string;
+}): Promise<Record<string, CreditMitigation[]>> {
+  const flagged = args.findings.filter((f) => f.indicator !== "low");
+  if (!flagged.length) return {};
+  const findingsBlock = flagged
+    .map(
+      (f, i) =>
+        `${i + 1}. [${f.segment}] (${f.indicator})${f.traceReference ? ` — mirrors ${f.traceReference}` : ""}: ${f.finding}`,
+    )
+    .join("\n");
+
+  const prompt = `You are a credit-risk mitigation advisor. For EACH risk finding below, propose 1-3 CONCRETE, actionable measures the bank could impose to mitigate it (e.g. covenants, security/charge, facility structure, conditions precedent, monitoring, guarantees).
+RULES:
+- PREFER measures grounded in the knowledge base's "Lessons learnt and recommendations" for the cited case → set "source":"case" and "reference" to the EXACT case title.
+- If an internal credit policy/note clearly applies → "source":"policy" with its reference.
+- If the knowledge base offers nothing specific → give a sound INDUSTRY BEST PRACTICE → "source":"best_practice" (no reference).
+- Be specific to THIS borrower and risk. No generic filler. Each action ≤ 30 words.
+
+Return ONLY JSON: {"mitigations":[{"segment":"<segment key>","items":[{"action":"...","source":"case|policy|best_practice","reference":"..."}]}]}.
+
+BORROWER: ${args.borrowerName}
+
+RISK FINDINGS:
+${findingsBlock}
+
+KNOWLEDGE BASE (historical cases incl. their recommendations):
+${args.kbContext.slice(0, 120000)}`;
+
+  const response = await generateWithFallback(
+    {
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      config: { responseMimeType: "application/json", maxOutputTokens: 8192 },
+    },
+    { tier: "quality" },
+  );
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let parsed: any = {};
+  try {
+    parsed = JSON.parse(response.text ?? "{}");
+  } catch {
+    const mm = (response.text ?? "").match(/\{[\s\S]*\}/);
+    if (mm) { try { parsed = JSON.parse(mm[0]); } catch { /* keep {} */ } }
+  }
+  const VALID_SRC = ["case", "policy", "best_practice"];
+  const out: Record<string, CreditMitigation[]> = {};
+  for (const row of Array.isArray(parsed.mitigations) ? parsed.mitigations : []) {
+    if (!row?.segment || !Array.isArray(row.items)) continue;
+    const items: CreditMitigation[] = [];
+    for (const it of row.items) {
+      if (!it || typeof it.action !== "string" || !it.action.trim()) continue;
+      items.push({
+        action: it.action.trim(),
+        source: VALID_SRC.includes(it.source) ? it.source : "best_practice",
+        reference: typeof it.reference === "string" && it.reference.trim() ? it.reference.trim() : undefined,
+      });
+    }
+    if (items.length) out[row.segment] = items.slice(0, 3);
+  }
+  return out;
+}
+
+/**
+ * Forensic financial pass: flag inconsistencies and anomalies in the
+ * application's financial statements (spikes, tax oddities, off-norm activity
+ * ratios, reconciliation gaps, management-vs-audited discrepancies).
+ */
+export async function detectFinancialAnomalies(args: {
+  borrowerName: string;
+  applicationText: string;
+}): Promise<{ anomalies: FinancialAnomaly[]; usage: TokenUsage }> {
+  const prompt = `You are a forensic credit analyst reviewing the financial statements in a credit application. Flag INCONSISTENCIES and ANOMALIES in the numbers — be specific and cite the ACTUAL figures. Look for:
+- Sudden spikes/drops year-on-year (revenue, PBT/PAT, trade debtors, borrowings, inventory, NTA).
+- Unusual tax patterns (effective tax rate far from statutory, little/no tax despite high profit, deferred-tax oddities).
+- Activity ratios out of norm (debtor days, creditor days, inventory days, working-capital cycle, asset turnover, gearing).
+- Reconciliation gaps (paper profit vs operating cash flow, revenue vs receivables growth, equity vs retained earnings, related-party balances that don't tie).
+- Management-account vs audited discrepancies; unfinalised or "pending adjustment" figures.
+
+For EACH anomaly return: "label" (≤8 words), "category" (spike|tax|ratio|reconciliation|liquidity|other), "severity" (high|medium|low), "detail" (1-2 sentences WITH the figures). Order most-severe first. If the statements genuinely look clean, return an empty array.
+
+Return ONLY JSON: {"anomalies":[{"label":"...","category":"...","severity":"...","detail":"..."}]}.
+
+BORROWER: ${args.borrowerName}
+CREDIT APPLICATION (financial statements within):
+${args.applicationText.slice(0, 120000)}`;
+
+  const response = await generateWithFallback(
+    {
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      config: { responseMimeType: "application/json", maxOutputTokens: 8192 },
+    },
+    { tier: "quality" },
+  );
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const m = (response.usageMetadata ?? {}) as any;
+  const usage: TokenUsage = {
+    inputTokens: m.promptTokenCount ?? 0,
+    outputTokens: m.candidatesTokenCount ?? 0,
+    thinkingTokens: m.thoughtsTokenCount ?? 0,
+    calls: 1,
+  };
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let parsed: any = {};
+  try {
+    parsed = JSON.parse(response.text ?? "{}");
+  } catch {
+    const mm = (response.text ?? "").match(/\{[\s\S]*\}/);
+    if (mm) { try { parsed = JSON.parse(mm[0]); } catch { /* keep {} */ } }
+  }
+  const CATS = ["spike", "tax", "ratio", "reconciliation", "liquidity", "other"];
+  const SEV = ["high", "medium", "low"];
+  const anomalies: FinancialAnomaly[] = (Array.isArray(parsed.anomalies) ? parsed.anomalies : [])
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    .filter((a: any) => a && typeof a.label === "string" && typeof a.detail === "string")
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    .map((a: any) => ({
+      label: a.label.trim(),
+      category: CATS.includes(a.category) ? a.category : "other",
+      severity: SEV.includes(a.severity) ? a.severity : "medium",
+      detail: a.detail.trim(),
+    }))
+    .slice(0, 10);
+  return { anomalies, usage };
+}
+
+/**
+ * External adverse-news / negative screening via Gemini's Google Search
+ * grounding. Searches the borrower + key entities for litigation, insolvency,
+ * fraud, regulatory action, and negative press; returns a grounded briefing
+ * with source links. Uses the existing Gemini key (no separate search API).
+ */
+export async function searchAdverseNews(args: {
+  borrowerName: string;
+  entities?: string[];
+  context?: string;
+}): Promise<{ result: AdverseNewsResult; usage: TokenUsage }> {
+  const targets = [args.borrowerName, ...(args.entities ?? [])].map((t) => t.trim()).filter(Boolean);
+  const prompt = `You are a credit-risk analyst running an ADVERSE-NEWS / negative screening check. Using web search, look for MATERIAL adverse information about these entities and their key people:
+${targets.map((t) => `- ${t}`).join("\n")}
+${args.context ? `\nContext (to identify the right entities/people): ${args.context}\n` : ""}
+Search specifically for: litigation / lawsuits, winding-up / insolvency / default, fraud or financial crime, regulatory or enforcement action, criminal charges, major operational failures, or significant negative press bearing on creditworthiness.
+
+Write a concise MARKDOWN briefing:
+- First line: the overall finding — exactly one of "Material adverse news found", "No material adverse news found", or "Inconclusive".
+- Then 0-6 bullets, each: **entity** — what was found, the date, and why it matters to credit risk.
+- Only CREDIBLE, on-point items — no speculation or padding. If nothing material is found, say so and note what was checked.`;
+
+  const models = ["gemini-3.5-flash", "gemini-2.5-flash"];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let response: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let lastErr: any;
+  for (const model of models) {
+    try {
+      response = await ai.models.generateContent({
+        model,
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        config: { tools: [{ googleSearch: {} }], maxOutputTokens: 2048 },
+      });
+      break;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  if (!response) throw lastErr ?? new Error("Adverse-news search failed");
+
+  const summary = (response.text ?? "").trim();
+  const sources: { title: string; uri: string }[] = [];
+  const seen = new Set<string>();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  for (const c of (response.candidates?.[0]?.groundingMetadata?.groundingChunks ?? []) as any[]) {
+    const uri = c?.web?.uri;
+    if (uri && !seen.has(uri)) {
+      seen.add(uri);
+      sources.push({ title: String(c?.web?.title ?? uri), uri: String(uri) });
+    }
+  }
+  const foundConcerns = /material adverse news found/i.test(summary) && !/no material adverse/i.test(summary);
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const m = (response.usageMetadata ?? {}) as any;
+  const usage: TokenUsage = {
+    inputTokens: m.promptTokenCount ?? 0,
+    outputTokens: m.candidatesTokenCount ?? 0,
+    thinkingTokens: m.thoughtsTokenCount ?? 0,
+    calls: 1,
+  };
+  return { result: { summary, sources, foundConcerns }, usage };
 }
 
 /**

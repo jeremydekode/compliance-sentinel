@@ -2,7 +2,7 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import { supabaseAdmin } from "@/integrations/supabase/client.server";
-import { chunkDocument, generateAmendedDocument, extractRegulatoryChanges, extractFatfRequirements, mapChangeToSops, routeChangesToSops, analyzeSopAgainstGaps, buildSopTopicMap, generateAnalysisSummary, generateWithFallback, simplifyDocument, simplifyDocumentByUnits, analyzeDocFigures, type FigureReview, analyzeCreditRisk, extractCreditRiskRetrievalQueries, chatCreditRisk } from "./gemini";
+import { chunkDocument, generateAmendedDocument, extractRegulatoryChanges, extractFatfRequirements, mapChangeToSops, routeChangesToSops, analyzeSopAgainstGaps, buildSopTopicMap, generateAnalysisSummary, generateWithFallback, simplifyDocument, simplifyDocumentByUnits, analyzeDocFigures, type FigureReview, analyzeCreditRisk, extractCreditRiskRetrievalQueries, chatCreditRisk, generateCreditMitigations, detectFinancialAnomalies, searchAdverseNews } from "./gemini";
 import { attachEvidence } from "./credit-evidence";
 import { applyEditsToDocx, looksLikeDocx, docxToText, docxToHtml, docxToSimplifyText, docxToSimplifyUnits, extractDocxFigures, applySimplificationToDocx, type SimplifyDocxEdit } from "./docx-editor";
 import { verifyActions, analyzeStructure, crossCheckSections, DEFAULT_SIMPLIFY_GUIDANCE, initialDecision } from "./simplify";
@@ -4791,6 +4791,31 @@ export const runCreditRiskAnalysis = createServerFn({ method: "POST" })
       caseDocs: docs.map((d) => ({ id: d.id, title: d.title, file_url: d.file_url })),
       chunksByCase,
     });
+
+    // 5c. Recommend mitigations per flagged risk (KB recommendations + best practice).
+    try {
+      const mit = await generateCreditMitigations({ borrowerName, findings: analysis.riskTable, kbContext });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      for (const f of analysis.riskTable as any[]) if (mit[f.segment]) f.mitigations = mit[f.segment];
+    } catch (e) {
+      console.warn("[credit] mitigation pass failed:", (e as Error)?.message);
+    }
+
+    // 5d. Forensic financial-statement anomaly detection on the application.
+    try {
+      const fin = await detectFinancialAnomalies({ borrowerName, applicationText });
+      analysis.financialAnomalies = fin.anomalies;
+    } catch (e) {
+      console.warn("[credit] financial anomaly pass failed:", (e as Error)?.message);
+    }
+
+    // 5e. External adverse-news / negative screening (Gemini Google Search grounding).
+    try {
+      const news = await searchAdverseNews({ borrowerName, context: analysis.applicationSummary });
+      analysis.adverseNews = news.result;
+    } catch (e) {
+      console.warn("[credit] adverse-news search failed:", (e as Error)?.message);
+    }
 
     // 6. Store the structured result.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

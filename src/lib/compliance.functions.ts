@@ -2,7 +2,7 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import { supabaseAdmin } from "@/integrations/supabase/client.server";
-import { chunkDocument, generateAmendedDocument, extractRegulatoryChanges, extractFatfRequirements, mapChangeToSops, routeChangesToSops, analyzeSopAgainstGaps, buildSopTopicMap, generateAnalysisSummary, generateWithFallback, simplifyDocument, simplifyDocumentByUnits, analyzeDocFigures, type FigureReview, analyzeCreditRisk, extractCreditRiskRetrievalQueries, chatCreditRisk, generateCreditMitigations, detectFinancialAnomalies, searchAdverseNews } from "./gemini";
+import { chunkDocument, generateAmendedDocument, extractRegulatoryChanges, extractFatfRequirements, mapChangeToSops, routeChangesToSops, analyzeSopAgainstGaps, buildSopTopicMap, generateAnalysisSummary, generateWithFallback, simplifyDocument, simplifyDocumentByUnits, detectDocumentDuplication, summarizeDocument, analyzeDocFigures, type FigureReview, analyzeCreditRisk, extractCreditRiskRetrievalQueries, chatCreditRisk, generateCreditMitigations, detectFinancialAnomalies, searchAdverseNews } from "./gemini";
 import { attachEvidence } from "./credit-evidence";
 import { applyEditsToDocx, looksLikeDocx, docxToText, docxToHtml, docxToSimplifyText, docxToSimplifyUnits, extractDocxFigures, applySimplificationToDocx, type SimplifyDocxEdit } from "./docx-editor";
 import { verifyActions, analyzeStructure, crossCheckSections, DEFAULT_SIMPLIFY_GUIDANCE, initialDecision } from "./simplify";
@@ -3997,6 +3997,7 @@ export const runSimplificationReport = createServerFn({ method: "POST" })
     let figureReviews: FigureReview[] = [];
     let figuresScanned = 0;
     let figuresSkipped = 0;
+    let documentSummary = "";
 
     try {
       // 1 — fetch the source file. DOCX is read as plain TEXT for the model
@@ -4046,9 +4047,24 @@ export const runSimplificationReport = createServerFn({ method: "POST" })
             ? docxToSimplifyUnits(file.buffer)
             : text.split(/\n+/).map((t) => ({ text: t.trim(), section: "" })).filter((u) => u.text))
         : [];
-      const { actions, usage } = units.length
-        ? await simplifyDocumentByUnits({ title, units }, { instruction, guidance })
-        : await simplifyDocument({ title, text }, { instruction, guidance });
+      // Per-unit/chunk simplification + a whole-document de-duplication pass run
+      // together; de-dup catches the cross-section repeats the slice-based pass can't see.
+      const [main, dedup, docSum] = await Promise.all([
+        units.length
+          ? simplifyDocumentByUnits({ title, units }, { instruction, guidance })
+          : simplifyDocument({ title, text }, { instruction, guidance }),
+        detectDocumentDuplication({ title, text }, { guidance }).catch((e: any) => {
+          console.warn("[simplify] de-dup pass failed:", e?.message?.slice(0, 120));
+          return { actions: [], usage: { inputTokens: 0, outputTokens: 0, thinkingTokens: 0, calls: 0 } };
+        }),
+        summarizeDocument({ title, text }, { guidance }).catch((e: any) => {
+          console.warn("[simplify] summary pass failed:", e?.message?.slice(0, 120));
+          return { summary: "", usage: { inputTokens: 0, outputTokens: 0, thinkingTokens: 0, calls: 0 } };
+        }),
+      ]);
+      const actions = [...main.actions, ...dedup.actions];
+      documentSummary = docSum.summary;
+      const usage = addUsage(addUsage(main.usage, dedup.usage), docSum.usage);
       cost = computeCost(usage); // metered even if the run yields nothing
       if (actions.length === 0) {
         throw new Error(
@@ -4095,6 +4111,7 @@ export const runSimplificationReport = createServerFn({ method: "POST" })
         simplification_error: errorMsg,
         structure: structure ?? null,
         cross_check: crossCheck ?? null,
+        document_summary: documentSummary || null,
         verification: summary
           ? { total: summary.total, verified: summary.verified, review: summary.review, rejected: summary.rejected }
           : null,

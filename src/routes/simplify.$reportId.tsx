@@ -26,6 +26,7 @@ import { formatDate } from "@/lib/format";
 import { formatUsd, formatTokens, GEMINI_PRICE, type RunCost } from "@/lib/pricing";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
+import Markdown from "react-markdown";
 import {
   ArrowLeft,
   Loader2,
@@ -47,6 +48,7 @@ import {
   Wand2,
   Download,
   ExternalLink,
+  Copy,
   Image as ImageIcon,
 } from "lucide-react";
 
@@ -83,6 +85,31 @@ const TYPE_META: Record<string, { label: string; classes: string }> = {
     classes: "bg-teal-100 text-teal-800 border-teal-200",
   },
 };
+
+/** Edit-type filter tabs for quick navigation. "Streamline" groups the
+ *  structural-tightening / de-duplication edit types. */
+const EDIT_TABS: { key: string; label: string; types: string[] | null }[] = [
+  { key: "all", label: "All", types: null },
+  { key: "duplicates", label: "Duplicates", types: ["delete_redundant", "merge"] },
+  { key: "streamline", label: "Streamline", types: ["delete_redundant", "merge", "to_bullets"] },
+  { key: "shorten", label: "Shorten", types: ["shorten"] },
+  { key: "plain_english", label: "Plain English", types: ["plain_english"] },
+  { key: "tables", label: "Tables", types: ["table_restructure"] },
+];
+
+/** Cross-section de-duplication carries rule "De-duplication". */
+const isDedup = (a: { rule?: string }) => a.rule === "De-duplication";
+
+/** Whether an action belongs under a filter tab. De-dup gets its OWN "Duplicates"
+ *  tab and is excluded from "Streamline" so the two reading modes stay distinct. */
+function inTab(key: string, a: { type: string; rule?: string }): boolean {
+  if (key === "all") return true;
+  if (key === "duplicates") return isDedup(a);
+  if (key === "streamline")
+    return !isDedup(a) && ["delete_redundant", "merge", "to_bullets"].includes(a.type);
+  const tab = EDIT_TABS.find((t) => t.key === key);
+  return tab?.types ? tab.types.includes(a.type) : true;
+}
 
 const STATUS_META: Record<VerificationStatus, { label: string; classes: string; dot: string }> = {
   verified: {
@@ -151,6 +178,9 @@ function SimplifyReportPage() {
     review: true,
     quarantined: false,
   });
+  const [typeFilter, setTypeFilter] = useState<string>("all");
+  const [figuresOpen, setFiguresOpen] = useState(false);
+  const [summaryOpen, setSummaryOpen] = useState(true);
   const startedRef = useRef(false);
 
   const report = useQuery({
@@ -361,6 +391,40 @@ function SimplifyReportPage() {
           </div>
         </div>
 
+        {/* document summary — executive overview of the whole document, up top */}
+        {sj.document_summary && (
+          <Collapsible open={summaryOpen} onOpenChange={setSummaryOpen}>
+            <Card className="p-0 overflow-hidden glass-card">
+              <CollapsibleTrigger asChild>
+                <button
+                  type="button"
+                  className="w-full px-5 py-4 flex items-center justify-between gap-3 hover:bg-muted/30 transition-colors text-left"
+                >
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className="size-9 rounded-lg grid place-items-center shrink-0 border border-violet-200 bg-violet-50/60 text-violet-700">
+                      <FileText className="size-4" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="font-bold text-sm">Document summary</div>
+                      <div className="text-xs text-muted-foreground">
+                        What this document covers — at a glance, before the edits.
+                      </div>
+                    </div>
+                  </div>
+                  <ChevronDown
+                    className={cn("size-4 text-muted-foreground shrink-0 transition-transform", summaryOpen && "rotate-180")}
+                  />
+                </button>
+              </CollapsibleTrigger>
+              <CollapsibleContent>
+                <div className="border-t border-border/50 px-5 py-4 text-sm leading-relaxed [&_strong]:font-semibold [&_ul]:list-disc [&_ul]:pl-5 [&_ul]:my-1.5 [&_ul]:space-y-1 [&_p]:mb-2 [&_p:last-child]:mb-0">
+                  <Markdown>{sj.document_summary}</Markdown>
+                </div>
+              </CollapsibleContent>
+            </Card>
+          </Collapsible>
+        )}
+
         {/* provenance strip — cost is intentionally NOT a top-level tile; the
             run cost lives behind the ⓘ on Analysed to keep the surface clean. */}
         <Card className="p-0 overflow-hidden glass-card">
@@ -426,49 +490,6 @@ function SimplifyReportPage() {
           </div>
         )}
 
-        {/* figures & charts — vision review of embedded images. These can't be
-            redlined; suggestions are attached as Word comments on each figure
-            when the amended copy is generated. */}
-        {figureReviews.length > 0 && (
-          <Card className="p-4 space-y-3 glass-card">
-            <div className="flex items-center gap-2">
-              <ImageIcon className="size-4 text-violet-600" />
-              <span className="text-sm font-semibold">
-                Figures &amp; charts · {figureReviews.length} with suggested changes
-              </span>
-              <span className="text-[11px] text-muted-foreground">
-                Images can't be redlined — these will be added as Word comments on each figure in
-                the amended copy.
-              </span>
-            </div>
-            <div className="space-y-3">
-              {figureReviews.map((f: any, fi: number) => (
-                <div key={fi} className="rounded-lg border bg-muted/20 px-3 py-2.5 text-xs space-y-1.5">
-                  <div className="font-medium">
-                    {f.name || `Figure ${fi + 1}`}
-                    {f.figureType ? (
-                      <span className="ml-2 text-[10px] uppercase tracking-wide text-muted-foreground">
-                        {f.figureType}
-                      </span>
-                    ) : null}
-                  </div>
-                  {f.summary ? <div className="text-muted-foreground">{f.summary}</div> : null}
-                  <ul className="space-y-1">
-                    {(f.suggestions ?? []).map((s: any, si: number) => (
-                      <li key={si} className="leading-snug">
-                        {s.where ? <span className="text-muted-foreground">[{s.where}] </span> : null}
-                        <span className="line-through decoration-rose-400 text-rose-700">{s.current}</span>
-                        {" → "}
-                        <span className="text-emerald-700">{s.proposed}</span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              ))}
-            </div>
-          </Card>
-        )}
-
         {/* triage summary */}
         {actions.length > 0 && (
           <div className="flex items-center gap-5 text-xs text-muted-foreground px-1">
@@ -509,25 +530,121 @@ function SimplifyReportPage() {
           />
         )}
 
-        {/* the three collapsible review groups */}
+        {/* review groups with edit-type filter tabs for quick navigation */}
         {actions.length === 0 ? (
           <Card className="p-16 text-center text-sm text-muted-foreground glass-card">
             No simplification actions were produced.
           </Card>
         ) : (
           <div className="space-y-3">
-            {GROUP_ORDER.map((grp) => (
-              <ReviewSection
-                key={grp}
-                group={grp}
-                items={groups[grp]}
-                open={openGroups[grp]}
-                onOpenChange={(o) => setOpenGroups((g) => ({ ...g, [grp]: o }))}
+            <div className="flex items-center gap-1.5 flex-wrap px-1">
+              {EDIT_TABS.map((tab) => {
+                const count = indexed.filter((x) => inTab(tab.key, x.action)).length;
+                const active = typeFilter === tab.key;
+                return (
+                  <button
+                    key={tab.key}
+                    type="button"
+                    onClick={() => setTypeFilter(tab.key)}
+                    disabled={tab.key !== "all" && count === 0}
+                    className={cn(
+                      "px-3 py-1.5 rounded-lg text-xs font-medium transition-colors inline-flex items-center gap-1.5",
+                      active ? "bg-violet-600 text-white" : "bg-card border hover:bg-muted/50",
+                      tab.key !== "all" && count === 0 && "opacity-40 cursor-default",
+                    )}
+                  >
+                    {tab.label}
+                    <span className={cn("tabular-nums text-[11px]", active ? "text-white/80" : "text-muted-foreground")}>
+                      {count}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+            {typeFilter === "duplicates" ? (
+              <DedupClusters
+                items={indexed.filter((x) => isDedup(x.action))}
                 decisionOf={decisionOf}
                 onDecide={decide}
               />
-            ))}
+            ) : (
+              GROUP_ORDER.map((grp) => {
+                const items = groups[grp].filter((x) => inTab(typeFilter, x.action));
+                if (typeFilter !== "all" && items.length === 0) return null;
+                return (
+                  <ReviewSection
+                    key={grp}
+                    group={grp}
+                    items={items}
+                    open={typeFilter !== "all" ? true : openGroups[grp]}
+                    onOpenChange={(o) => setOpenGroups((g) => ({ ...g, [grp]: o }))}
+                    decisionOf={decisionOf}
+                    onDecide={decide}
+                  />
+                );
+              })
+            )}
           </div>
+        )}
+
+        {/* figure & chart amendments — distinct from text redlines (applied as Word
+            comments); collapsed, at the bottom so the apply flow stays reachable up top */}
+        {figureReviews.length > 0 && (
+          <Collapsible open={figuresOpen} onOpenChange={setFiguresOpen}>
+            <Card className="p-0 overflow-hidden glass-card">
+              <CollapsibleTrigger asChild>
+                <button
+                  type="button"
+                  className="w-full px-5 py-4 flex items-center justify-between gap-3 hover:bg-muted/30 transition-colors text-left"
+                >
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className="size-9 rounded-lg grid place-items-center shrink-0 border border-violet-200 bg-violet-50/60 text-violet-700">
+                      <ImageIcon className="size-4" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="font-bold text-sm">
+                        Figure &amp; chart amendments{" "}
+                        <span className="text-muted-foreground font-medium tabular-nums">· {figureReviews.length}</span>
+                      </div>
+                      <div className="text-xs text-muted-foreground">
+                        Images can't be redlined — added as Word comments on each figure in the amended copy.
+                      </div>
+                    </div>
+                  </div>
+                  <ChevronDown
+                    className={cn("size-4 text-muted-foreground shrink-0 transition-transform", figuresOpen && "rotate-180")}
+                  />
+                </button>
+              </CollapsibleTrigger>
+              <CollapsibleContent>
+                <div className="border-t border-border/50 p-4 space-y-3">
+                  {figureReviews.map((f: any, fi: number) => (
+                    <div key={fi} className="rounded-lg border bg-muted/20 px-3 py-2.5 text-xs space-y-1.5">
+                      <div className="font-medium">
+                        {f.name || `Figure ${fi + 1}`}
+                        {f.figureType ? (
+                          <span className="ml-2 text-[10px] uppercase tracking-wide text-muted-foreground">
+                            {f.figureType}
+                          </span>
+                        ) : null}
+                      </div>
+                      {f.summary ? <div className="text-muted-foreground">{f.summary}</div> : null}
+                      <ul className="space-y-1">
+                        {(f.suggestions ?? []).map((s: any, si: number) => (
+                          <li key={si} className="leading-snug">
+                            {s.where ? <span className="text-muted-foreground">[{s.where}] </span> : null}
+                            <span className="line-through decoration-rose-400 text-rose-700">{s.current}</span>
+                            {" → "}
+                            <span className="text-emerald-700">{s.proposed}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  ))}
+                </div>
+              </CollapsibleContent>
+            </Card>
+          </Collapsible>
         )}
       </div>
     </AppShell>
@@ -665,114 +782,91 @@ function ApplyCard({
   onApply: () => void;
   apply: ApplyResult | undefined;
 }) {
+  const [open, setOpen] = useState(false);
   const disabled = applying || acceptedCount === 0;
-  return (
-    <Card className="p-5 border-violet-200/60 glass-card">
-      <div className="flex items-start justify-between gap-4 flex-wrap">
-        <div className="min-w-0 flex-1 min-w-[260px]">
-          <div className="font-bold text-sm flex items-center gap-2">
-            <Wand2 className="size-4 text-violet-600" /> Generate amended copy
-          </div>
-          <p className="text-xs text-muted-foreground mt-1">
-            Applies the <span className="font-bold text-foreground">{acceptedCount}</span> accepted
-            change{acceptedCount === 1 ? "" : "s"} to a copy of the source — every replacement
-            highlighted, with a Word/Drive comment carrying the original "Before:" text.
-          </p>
-          {apply && (
-            <div className="mt-3 text-xs space-y-1.5">
-              <div className="flex items-center gap-2 flex-wrap">
-                <Badge
-                  variant="outline"
-                  className="bg-emerald-50 text-emerald-800 border-emerald-200 font-bold text-[10px]"
-                >
-                  Applied {apply.appliedCount} / {apply.totalAccepted}
-                </Badge>
-                {apply.skipped?.length > 0 && (
-                  <Badge
-                    variant="outline"
-                    className="bg-amber-50 text-amber-800 border-amber-200 font-bold text-[10px]"
-                  >
-                    {apply.skipped.length} skipped
-                  </Badge>
-                )}
-                {apply.appliedAt && (
-                  <span className="text-muted-foreground">
-                    — {formatDate(apply.appliedAt)}
-                  </span>
-                )}
-              </div>
-              {apply.skipped?.length > 0 && (
-                <details className="text-[11px] text-muted-foreground">
-                  <summary className="cursor-pointer hover:text-foreground select-none">
-                    Show edits the locator couldn't anchor
-                  </summary>
-                  <ul className="mt-1 ml-4 list-disc space-y-0.5">
-                    {apply.skipped
-                      .slice(0, 12)
-                      .map((s: { reason: string; before?: string }, i: number) => (
-                        <li key={i}>
-                          "{(s.before ?? "").slice(0, 80)}…" — {s.reason}
-                        </li>
-                      ))}
-                  </ul>
-                </details>
-              )}
-            </div>
-          )}
-        </div>
-        <div className="flex items-center gap-2 shrink-0">
-          {apply ? (
+  const actionButtons = apply ? (
+    <>
+      <Button asChild className="gap-2 bg-violet-600 hover:bg-violet-700 text-white">
+        <a
+          href={apply.kind === "drive" ? apply.driveUrl : apply.downloadUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          download={apply.kind === "local" ? apply.downloadName : undefined}
+        >
+          {apply.kind === "drive" ? (
             <>
-              <Button
-                asChild
-                className="gap-2 bg-violet-600 hover:bg-violet-700 text-white"
-              >
-                <a
-                  href={apply.kind === "drive" ? apply.driveUrl : apply.downloadUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  download={apply.kind === "local" ? apply.downloadName : undefined}
-                >
-                  {apply.kind === "drive" ? (
-                    <>
-                      <ExternalLink className="size-4" /> Open in Drive
-                    </>
-                  ) : (
-                    <>
-                      <Download className="size-4" /> Download .docx
-                    </>
-                  )}
-                </a>
-              </Button>
-              <Button
-                variant="outline"
-                onClick={onApply}
-                disabled={disabled}
-                className="gap-2"
-              >
-                {applying ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
-                Re-apply
-              </Button>
+              <ExternalLink className="size-4" /> Open in Drive
             </>
           ) : (
-            <Button
-              onClick={onApply}
-              disabled={disabled}
-              className="gap-2 bg-violet-600 hover:bg-violet-700 text-white"
-            >
-              {applying ? (
-                <>
-                  <Loader2 className="size-4 animate-spin" /> Generating…
-                </>
-              ) : (
-                <>
-                  <Wand2 className="size-4" /> Generate amended copy
-                </>
-              )}
-            </Button>
+            <>
+              <Download className="size-4" /> Download .docx
+            </>
+          )}
+        </a>
+      </Button>
+      <Button variant="outline" onClick={onApply} disabled={disabled} className="gap-2">
+        {applying ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+        Re-apply
+      </Button>
+    </>
+  ) : (
+    <Button onClick={onApply} disabled={disabled} className="gap-2 bg-violet-600 hover:bg-violet-700 text-white">
+      {applying ? (
+        <>
+          <Loader2 className="size-4 animate-spin" /> Generating…
+        </>
+      ) : (
+        <>
+          <Wand2 className="size-4" /> Generate amended copy
+        </>
+      )}
+    </Button>
+  );
+
+  // Sticky + collapsible: the bar (with the Download/Generate action) stays
+  // pinned and visible while you scroll the amendments; details collapse.
+  return (
+    <Card className="p-0 border-violet-200/60 glass-card sticky top-4 z-20 overflow-hidden">
+      <div className="flex items-center gap-3 px-4 py-3">
+        <button type="button" onClick={() => setOpen((o) => !o)} className="flex items-center gap-2 min-w-0 flex-1 text-left">
+          <Wand2 className="size-4 text-violet-600 shrink-0" />
+          <span className="font-bold text-sm shrink-0">Generate amended copy</span>
+          {apply && (
+            <Badge variant="outline" className="bg-emerald-50 text-emerald-800 border-emerald-200 font-bold text-[10px] shrink-0">
+              Applied {apply.appliedCount}/{apply.totalAccepted}
+            </Badge>
+          )}
+          <span className="text-xs text-muted-foreground truncate hidden sm:inline">
+            · {acceptedCount} accepted change{acceptedCount === 1 ? "" : "s"} to apply
+          </span>
+          <ChevronDown className={cn("size-4 text-muted-foreground shrink-0 transition-transform", open && "rotate-180")} />
+        </button>
+        <div className="flex items-center gap-2 shrink-0">{actionButtons}</div>
+      </div>
+      {open && (
+        <div className="px-4 pb-4 pt-3 border-t bg-muted/10 text-xs space-y-2">
+          <p className="text-muted-foreground">
+            Applies the <span className="font-bold text-foreground">{acceptedCount}</span> accepted change
+            {acceptedCount === 1 ? "" : "s"} to a copy of the source — every replacement highlighted, with a
+            Word/Drive comment carrying the original "Before:" text.
+          </p>
+          {apply?.appliedAt && <div className="text-muted-foreground">Last applied {formatDate(apply.appliedAt)}</div>}
+          {apply?.skipped?.length > 0 && (
+            <details className="text-[11px] text-muted-foreground">
+              <summary className="cursor-pointer hover:text-foreground select-none">
+                Show {apply.skipped.length} edit(s) the locator couldn't anchor
+              </summary>
+              <ul className="mt-1 ml-4 list-disc space-y-0.5">
+                {apply.skipped.slice(0, 12).map((s: { reason: string; before?: string }, i: number) => (
+                  <li key={i}>
+                    "{(s.before ?? "").slice(0, 80)}…" — {s.reason}
+                  </li>
+                ))}
+              </ul>
+            </details>
           )}
         </div>
-      </div>
+      )}
     </Card>
   );
 }
@@ -859,6 +953,83 @@ function ReviewSection({
   );
 }
 
+/** Parse a canonical "Section X" from a de-dup rationale — a fallback cluster key
+ *  for items produced before the model emitted a `group` topic. */
+function dedupSectionKey(rationale?: string): string | null {
+  if (!rationale) return null;
+  const m = rationale.match(/Section\s+([A-Za-z]?\.?\d[\d.]*)/i);
+  return m ? `Section ${m[1].replace(/\.$/, "")}` : null;
+}
+
+/** Cross-section duplicates, clustered by topic so related copies sit together —
+ *  one glance shows "this content is repeated in N places, kept in its home section". */
+function DedupClusters({
+  items,
+  decisionOf,
+  onDecide,
+}: {
+  items: { action: VerifiedAction; index: number }[];
+  decisionOf: (index: number, action: VerifiedAction) => ActionDecision;
+  onDecide: (index: number, action: VerifiedAction, decision: ActionDecision) => void;
+}) {
+  if (items.length === 0) {
+    return (
+      <Card className="p-12 text-center text-sm text-muted-foreground glass-card">
+        No cross-section duplications found.
+      </Card>
+    );
+  }
+  // Cluster by topic (the model's `group`); preserve first-seen order.
+  const order: string[] = [];
+  const byTopic = new Map<string, { action: VerifiedAction; index: number }[]>();
+  for (const it of items) {
+    const key =
+      it.action.group?.trim() || dedupSectionKey(it.action.rationale) || "Other duplications";
+    if (!byTopic.has(key)) {
+      byTopic.set(key, []);
+      order.push(key);
+    }
+    byTopic.get(key)!.push(it);
+  }
+  return (
+    <div className="space-y-3">
+      <p className="text-xs text-muted-foreground px-1">
+        Same content repeated across sections, grouped by topic — each copy is removed from one
+        place and kept in its canonical section.
+      </p>
+      {order.map((topic) => {
+        const members = byTopic.get(topic)!;
+        return (
+          <Card key={topic} className="p-0 overflow-hidden glass-card">
+            <div className="px-5 py-3.5 border-b border-border/60 bg-rose-50/40 flex items-center gap-2.5">
+              <div className="size-7 rounded-md grid place-items-center shrink-0 border border-rose-200 bg-white text-rose-600">
+                <Copy className="size-3.5" />
+              </div>
+              <div className="min-w-0">
+                <div className="font-semibold text-sm truncate">{topic}</div>
+                <div className="text-[11px] text-muted-foreground">
+                  {members.length} duplicate cop{members.length > 1 ? "ies" : "y"} — removed, kept in
+                  its source section
+                </div>
+              </div>
+            </div>
+            <div className="divide-y divide-border/50">
+              {members.map(({ action, index }) => (
+                <ChangeRow
+                  key={index}
+                  action={action}
+                  decision={decisionOf(index, action)}
+                  onDecide={(d) => onDecide(index, action, d)}
+                />
+              ))}
+            </div>
+          </Card>
+        );
+      })}
+    </div>
+  );
+}
+
 function ChangeRow({
   action,
   decision,
@@ -868,13 +1039,19 @@ function ChangeRow({
   decision: ActionDecision;
   onDecide: (d: ActionDecision) => void;
 }) {
-  const tm = TYPE_META[action.type] ?? {
-    label: action.type,
-    classes: "bg-muted text-foreground border-border",
-  };
+  // Cross-section de-dup carries rule "De-duplication" — badge it consistently as
+  // "Duplicate" so it reads distinct from per-unit, within-sentence "Remove redundancy".
+  const tm =
+    action.rule === "De-duplication"
+      ? { label: "Duplicate", classes: "bg-rose-100 text-rose-800 border-rose-200" }
+      : TYPE_META[action.type] ?? {
+          label: action.type,
+          classes: "bg-muted text-foreground border-border",
+        };
   const status = action.verification?.status ?? "review";
   const sm = STATUS_META[status];
   const isDelete = action.type === "delete_redundant";
+  const isDedupAction = isDedup(action);
   const locked = status === "rejected"; // quarantined — cannot be accepted
 
   return (
@@ -914,27 +1091,48 @@ function ChangeRow({
           </div>
         </div>
 
-        {/* before → after */}
+        {/* before → after — for de-dup, this reads as "duplicate removed" → "original kept here" */}
         <div className="space-y-2">
           <div className="rounded-lg border border-rose-200/70 bg-rose-50/50 px-3 py-2">
             <div className="text-[9px] uppercase tracking-widest font-black text-rose-700/70 mb-0.5">
-              Before
+              {isDedupAction ? "Duplicate — removed" : "Before"}
             </div>
             <p className="text-sm text-rose-950/80 whitespace-pre-wrap break-words">
               {action.before || "—"}
             </p>
           </div>
           <div className="rounded-lg border border-emerald-200/70 bg-emerald-50/50 px-3 py-2">
-            <div className="text-[9px] uppercase tracking-widest font-black text-emerald-700/70 mb-0.5">
-              After
-            </div>
-            <p className="text-sm text-emerald-950/80 whitespace-pre-wrap break-words">
-              {isDelete && !action.after ? (
-                <span className="italic text-emerald-700/60">— clause removed —</span>
+            <div className="text-[9px] uppercase tracking-widest font-black text-emerald-700/70 mb-0.5 flex items-center gap-1">
+              {isDedupAction ? (
+                <>
+                  <Check className="size-2.5" />
+                  Original — kept{action.keptSection ? ` in ${action.keptSection}` : " in source section"}
+                </>
               ) : (
-                action.after || "—"
+                "After"
               )}
-            </p>
+            </div>
+            {isDedupAction ? (
+              action.keptExcerpt ? (
+                <p className="text-sm text-emerald-950/80 whitespace-pre-wrap break-words">
+                  {action.keptExcerpt}
+                </p>
+              ) : (
+                <p className="text-sm text-emerald-700/70 italic">
+                  {action.keptSection
+                    ? `Retained in ${action.keptSection}.`
+                    : "Retained elsewhere in the document."}
+                </p>
+              )
+            ) : (
+              <p className="text-sm text-emerald-950/80 whitespace-pre-wrap break-words">
+                {isDelete && !action.after ? (
+                  <span className="italic text-emerald-700/60">— clause removed —</span>
+                ) : (
+                  action.after || "—"
+                )}
+              </p>
+            )}
           </div>
         </div>
 

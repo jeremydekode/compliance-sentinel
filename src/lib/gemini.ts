@@ -1310,6 +1310,14 @@ export interface SimplificationAction {
   rule: string;
   rationale: string;
   confidence: number;
+  /** De-dup only: short topic label shared by all copies of the SAME duplicated
+   *  content, so the UI can cluster related duplicates together. */
+  group?: string;
+  /** De-dup only: the section/heading where the ORIGINAL (kept) occurrence lives. */
+  keptSection?: string;
+  /** De-dup only: a verbatim excerpt of the ORIGINAL (kept) occurrence — shows the
+   *  reviewer what the removed copy was duplicated FROM. Verified in-doc or dropped. */
+  keptExcerpt?: string;
 }
 
 /** Splits plain document text into <= maxChars chunks at paragraph (line)
@@ -1395,6 +1403,12 @@ ${opts?.instruction ? `\n# THIS RUN'S SPECIFIC INSTRUCTION (apply in addition to
 - "table_restructure" — text that is clearly tabular and would read more clearly as a table; "after" describes the proposed layout.
 Look across ALL of these types, not just rewording. Terminology standardisation should be folded INTO a plain_english or shorten edit (rephrase the sentence and make its wording consistent in the same action). Do NOT produce standalone actions for numbering or cross-reference renumbering — those need a separate deterministic pass.
 
+# DE-DUPLICATION & STREAMLINING — actively hunt repeated information:
+- Scan for information DUPLICATED where it should not be: a point already made earlier, a defined term re-explained, the same instruction stated in both prose and a following bullet, near-identical adjacent sentences, or a caveat repeated.
+- Use "delete_redundant" when a passage adds nothing the reader hasn't already been told (here or in an earlier, clearly-dedicated place); use "merge" when two overlapping passages should become one.
+- Streamline over-detailed prose: keep the single clearest statement of an idea and cut or compress the rest with "shorten". Preserve every UNIQUE obligation, control, number, definition and cross-reference — only remove genuine repetition.
+- If you are not certain the information genuinely survives elsewhere, use "shorten" rather than deleting.
+
 # TABLE CELLS — analyse these, do not skip them:
 Spans wrapped in "[TABLE n] … [END TABLE n]" markers are table cells, one cell per line. Treat verbose PROSE inside a cell exactly like body prose — simplify it with plain_english / shorten / merge, quoting the cell's text verbatim as "before". Do NOT touch labels, codes, reference numbers, dates, monetary amounts, or short values (a 1-4 word cell has nothing to simplify). NEVER quote a "[TABLE n]" or "[END TABLE n]" marker line as "before".
 
@@ -1463,6 +1477,143 @@ function isProseCandidate(t: string): boolean {
  * concurrency and each call RETRIES transient failures, so no batch silently
  * drops the way whole chunks did before.
  */
+/**
+ * Whole-document DE-DUPLICATION pass. The per-unit/chunk simplifier only ever
+ * sees a slice at a time, so it cannot detect the SAME requirement/definition/
+ * instruction stated in different sections. This pass reads the FULL document in
+ * one call and emits delete_redundant / merge actions (verbatim `before`) for
+ * genuine cross-section duplication. Runs alongside the chosen mode; its actions
+ * go through the same verifier and surface under the "Streamline" tab.
+ */
+export async function detectDocumentDuplication(
+  doc: { title: string; text: string },
+  opts?: { guidance?: string | null },
+): Promise<{ actions: SimplificationAction[]; usage: TokenUsage }> {
+  // Scan the whole document (Gemini flash handles large context); only very large
+  // manuals get truncated. De-dup needs full-doc visibility to spot cross-section repeats.
+  const text = (doc.text ?? "").slice(0, 350000);
+  if (text.trim().length < 200) return { actions: [], usage: EMPTY_USAGE };
+
+  const prompt = `# ROLE: WHOLE-DOCUMENT DE-DUPLICATION
+You are given the FULL text of the bank document "${doc.title}". Find information DUPLICATED ACROSS THE DOCUMENT where it should not be — the SAME requirement, instruction, definition, statement or caveat repeated in two or more places (commonly once in an overview/objectives/scope section and again in a detailed section).
+
+For EACH genuine cross-section duplication:
+- Decide which occurrence to KEEP (usually the one in the most specific / dedicated section) and which to REMOVE.
+- Emit a "delete_redundant" whose "before" is the VERBATIM text of the occurrence to REMOVE (copied character-for-character from the document), with "after" = "". In "rationale", name where the information is retained (e.g. "Duplicate of Section 3.2 — retained there").
+- OR a "merge" when two overlapping passages should become one: "before" = the verbatim passage to replace, "after" = the single merged version.
+- Set "group" to a SHORT topic label (3-6 words) naming WHAT is duplicated (e.g. "Dormant account activation SLA", "Document change-history headers"). CRITICAL: when the SAME content is repeated in several places, give EVERY one of those items the IDENTICAL "group" string — this is how related copies are clustered together. Distinct duplications get distinct groups.
+- Set "keptSection" to the section/heading where the ORIGINAL (kept) occurrence lives (e.g. "D.9.17 Activation of Dormant Account").
+- Set "keptExcerpt" to a VERBATIM excerpt (one or two sentences) of that ORIGINAL kept occurrence, copied character-for-character from the document — this shows the reviewer exactly what the removed copy was duplicated FROM. Copy it exactly; if you cannot copy a clean span, use "".
+
+# BE EXHAUSTIVE
+Scan the WHOLE document end to end and report EVERY genuine duplication — there are usually SEVERAL, not one. Common patterns: identical change-history / version rows repeated; a definition or naming convention stated in an overview section AND again in a detail section; the same procedure, eligibility rule, or caveat written in two places; a paragraph echoed near-verbatim later. Do NOT stop after the first find; keep going to the end.
+
+# RULES
+- Flag ONLY genuine duplication where the information GENUINELY SURVIVES in the kept occurrence. Never remove a unique obligation, control, number, threshold, definition, or cross-reference.
+- "before" is matched by an exact text locator — COPY it verbatim (same words, order, punctuation, numbers). If you cannot copy a clean contiguous span, SKIP it.
+- Do NOT flag mere topic similarity — only true restatement of the same content.
+- Preserve numbers, dates, names and defined terms.
+${guidanceBlock(opts?.guidance)}
+# OUTPUT — return ONLY a JSON array (empty array if no genuine duplication):
+[{ "section": "<section/heading of the REMOVED occurrence>", "type": "delete_redundant" | "merge", "before": "<verbatim text to remove/replace>", "after": "<empty string for delete_redundant; merged text for merge>", "rule": "De-duplication", "group": "<short topic shared by all copies of the same duplicated content>", "keptSection": "<section/heading where the ORIGINAL kept occurrence lives>", "keptExcerpt": "<verbatim excerpt of the ORIGINAL kept occurrence>", "rationale": "<where the information is retained>", "confidence": <integer 70-100> }]
+
+# DOCUMENT — "${doc.title}":
+${text}
+`;
+
+  const response = await generateWithFallback(
+    {
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      config: { responseMimeType: "application/json", maxOutputTokens: 32768 },
+    },
+    { tier: "quality" },
+  );
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const meta = (response.usageMetadata ?? {}) as any;
+  const usage: TokenUsage = {
+    inputTokens: meta.promptTokenCount ?? 0,
+    outputTokens: meta.candidatesTokenCount ?? 0,
+    thinkingTokens: meta.thoughtsTokenCount ?? 0,
+    calls: 1,
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const raw = parseJsonArrayLoose(response.text) as any[];
+  // Normalised whole-doc text, used to verify the model's "kept" excerpt is real
+  // (it must actually exist in the document — otherwise we drop it, never show a fabricated source).
+  const normCheck = (s: string) =>
+    s.toLowerCase().replace(/[‘’“”]/g, "'").replace(/[^a-z0-9]+/g, " ").trim();
+  const docCheck = normCheck(text);
+  const actions: SimplificationAction[] = [];
+  for (const r of raw) {
+    if (!r || typeof r.before !== "string" || !r.before.trim()) continue;
+    const type = r.type === "merge" ? "merge" : "delete_redundant";
+    const keptRaw = typeof r.keptExcerpt === "string" ? r.keptExcerpt.trim() : "";
+    const keptNorm = keptRaw ? normCheck(keptRaw) : "";
+    // Verbatim if the whole excerpt is in the doc; tolerate a trimmed tail by also
+    // accepting a solid (>=12-word) prefix match.
+    const keptVerbatim =
+      !!keptNorm &&
+      (docCheck.includes(keptNorm) ||
+        docCheck.includes(keptNorm.split(" ").slice(0, 14).join(" ")));
+    actions.push({
+      section: typeof r.section === "string" ? r.section : "",
+      type,
+      before: r.before,
+      after: type === "delete_redundant" ? "" : typeof r.after === "string" ? r.after : "",
+      rule: typeof r.rule === "string" && r.rule.trim() ? r.rule.trim() : "De-duplication",
+      rationale: typeof r.rationale === "string" ? r.rationale : "",
+      confidence:
+        typeof r.confidence === "number" ? Math.max(0, Math.min(100, Math.round(r.confidence))) : 80,
+      group: typeof r.group === "string" && r.group.trim() ? r.group.trim() : undefined,
+      keptSection:
+        typeof r.keptSection === "string" && r.keptSection.trim() ? r.keptSection.trim() : undefined,
+      keptExcerpt: keptVerbatim ? keptRaw : undefined,
+    });
+  }
+  return { actions, usage };
+}
+
+/**
+ * Whole-document EXECUTIVE SUMMARY — orients a reviewer who can't read a 30k-word,
+ * hundreds-of-tables manual: what it governs, scope, the processes it covers, the
+ * material controls, and housekeeping. Markdown; grounded only in the text.
+ */
+export async function summarizeDocument(
+  doc: { title: string; text: string },
+  opts?: { guidance?: string | null },
+): Promise<{ summary: string; usage: TokenUsage }> {
+  const text = (doc.text ?? "").slice(0, 350000);
+  if (text.trim().length < 200) return { summary: "", usage: EMPTY_USAGE };
+
+  const prompt = `# ROLE: EXECUTIVE DOCUMENT SUMMARY
+Summarize the document "${doc.title}" for a reviewer who must understand it FAST. Ground everything ONLY in the text — use the real section names, figures and dates. Output MARKDOWN with these exact bold headings:
+
+**Purpose** — 1-2 sentences: what this document governs and who uses it.
+**Scope** — what it covers, and any explicit exclusions.
+**Key processes** — 6-12 bullets naming the main procedures/sections it covers (e.g. "Dormant account activation", "FD/CMD-i pledge"), each a few words.
+**Notable controls & thresholds** — 3-6 bullets of the most material obligations, approvals, limits or risk controls, with the figures where the text states them.
+**Document housekeeping** — version, effective date, owner; note anything unusual (e.g. an unusually long change history).
+
+Tight, plain English, no padding. Do not invent — if something isn't in the text, omit it.
+${guidanceBlock(opts?.guidance)}
+# DOCUMENT — "${doc.title}":
+${text}`;
+
+  const response = await generateWithFallback(
+    { contents: [{ role: "user", parts: [{ text: prompt }] }], config: { maxOutputTokens: 4096 } },
+    { tier: "quality" },
+  );
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const m = (response.usageMetadata ?? {}) as any;
+  const usage: TokenUsage = {
+    inputTokens: m.promptTokenCount ?? 0,
+    outputTokens: m.candidatesTokenCount ?? 0,
+    thinkingTokens: m.thoughtsTokenCount ?? 0,
+    calls: 1,
+  };
+  return { summary: (response.text ?? "").replace(/^```(?:markdown)?\s*|\s*```$/g, "").trim(), usage };
+}
+
 export async function simplifyDocumentByUnits(
   doc: { title: string; units: { text: string; section: string }[] },
   opts?: { instruction?: string | null; guidance?: string | null },

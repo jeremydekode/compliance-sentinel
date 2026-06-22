@@ -425,6 +425,12 @@ export const DEFAULT_SIMPLIFY_GUIDANCE = `DOCUMENT SIMPLIFICATION — RHB HOUSE 
 10. Definite-article inconsistency around defined terms.
     - Pick one form per document: either "the Document Owner" or "Document Owner". Standardise.
 
+# DE-DUPLICATION & STREAMLINING — remove information repeated where it shouldn't be
+- Flag content that restates something already established: a definition re-explained, a procedure repeated across an overview and a detail section, a point made in prose AND again in the following bullet list, near-identical adjacent clauses.
+- Use delete_redundant when the repeat adds nothing; use merge when two overlapping passages should be combined into one.
+- Streamline detail: where the same idea is spelled out at length, keep the single clearest statement and cut or compress the rest. Preserve every UNIQUE obligation, control, number, threshold, definition and cross-reference — only remove genuine repetition.
+- Only delete when the information genuinely survives elsewhere; if unsure, shorten instead.
+
 # STYLE — direction of every rewrite
 - Active voice (named subject does the action).
 - Short sentences (≤ 25 words). Split if there are 3+ clauses joined by "and".

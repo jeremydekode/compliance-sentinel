@@ -53,7 +53,7 @@ import { REGULATION_FAMILIES, INTERNAL_DOC_TYPES as INTERNAL_DOC_TYPES_CONST, re
 // Allowed workspace identifiers — shared across every workspace-scoped input
 // validator. Declared up here so server fns defined anywhere in the file can
 // reference it in their .inputValidator() (evaluated at module load).
-const workspaceSchema = z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk"]);
+const workspaceSchema = z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk", "credit_risk_demo"]);
 
 async function fetchFile(url: string): Promise<{ buffer: Buffer; mimeType: string }> {
   // Reject Drive viewer URLs straight away — they return HTML, not the file.
@@ -137,7 +137,7 @@ export const createReport = createServerFn({ method: "POST" })
     z.object({
       filename: z.string(),
       fileUrl: z.string().nullable(),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk", "credit_risk_demo"]).default("rmit"),
       customTitle: z.string().optional(),
       notes: z.string().optional(),
       detected: z
@@ -468,7 +468,7 @@ export const createRegulatoryReport = createServerFn({ method: "POST" })
     z.object({
       filename: z.string(),
       fileUrl: z.string().nullable(),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk", "credit_risk_demo"]).default("rmit"),
       customTitle: z.string().optional(),
       notes: z.string().optional(),
       detected: z
@@ -1681,7 +1681,7 @@ export const createSop = createServerFn({ method: "POST" })
       title: z.string().min(2).max(200),
       doc_type: z.enum(["sop", "rmit", "rmit_reg", "fatf", "circular", "it_policy", "policy", "form"]),
       version: z.string().min(1).max(20),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk", "credit_risk_demo"]).default("rmit"),
       summary: z.string().max(2000).optional(),
       tags: z.array(z.string().max(40)).max(20).optional(),
       file_url: z.string().nullable().optional(),
@@ -1790,7 +1790,7 @@ export const clearWorkspace = createServerFn({ method: "POST" })
   .inputValidator(
     z.object({
       scope: z.enum(["analyses", "kb", "all"]),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk", "credit_risk_demo"]).default("rmit"),
     })
   )
   .handler(async ({ data, context }) => {
@@ -2176,7 +2176,7 @@ function escapeHtml(s: string): string {
  */
 export const getChunkCounts = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .inputValidator(z.object({ workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk"]).default("rmit") }))
+  .inputValidator(z.object({ workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk", "credit_risk_demo"]).default("rmit") }))
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -2216,18 +2216,32 @@ export const reindexSop = createServerFn({ method: "POST" })
       .eq("id", data.id)
       .single();
     if (sopErr || !sop) throw new Error("SOP not found");
-    if (!sop.file_url) throw new Error("SOP has no source file — cannot re-index");
+    if (!sop.file_url && !sop.drive_file_id) throw new Error("SOP has no source file — cannot re-index");
 
     // Forms workspace docs are compared directly — no chunking needed.
     if (sop.workspace_id === "forms") {
       return { chunkCount: 0, message: "Forms workspace — no indexing required" };
     }
 
-    const file = await fetchFile(sop.file_url);
-    const isDocx = looksLikeDocx(file.mimeType, sop.file_url);
-    const allChunks = isDocx
-      ? chunkDocxText(await docxToText(file.buffer))
-      : await chunkDocument({ name: sop.title, buffer: file.buffer, mimeType: file.mimeType });
+    let allChunks: Array<{ content: string; chapter_ref?: string; page_number?: number }>;
+    if (sop.drive_file_id) {
+      if (sop.drive_mime_type === "application/vnd.google-apps.document") {
+        const text = await exportGoogleDocAsText(sop.workspace_id, sop.drive_file_id);
+        allChunks = chunkDocxText(text);
+      } else {
+        const buf = await downloadFile(sop.workspace_id, sop.drive_file_id);
+        const isDocx = looksLikeDocx(sop.drive_mime_type ?? "", sop.title ?? "");
+        allChunks = isDocx
+          ? chunkDocxText(await docxToText(buf))
+          : await chunkDocument({ name: sop.title, buffer: buf, mimeType: sop.drive_mime_type ?? "application/pdf" });
+      }
+    } else {
+      const file = await fetchFile(sop.file_url);
+      const isDocx = looksLikeDocx(file.mimeType, sop.file_url);
+      allChunks = isDocx
+        ? chunkDocxText(await docxToText(file.buffer))
+        : await chunkDocument({ name: sop.title, buffer: file.buffer, mimeType: file.mimeType });
+    }
 
     if (allChunks.length === 0) {
       return { chunkCount: 0, message: "No text extracted from the source file" };
@@ -2449,7 +2463,7 @@ function applyPageOverrides(formId: string, impacts: any[]): any[] {
 export const createFormUpdateReport = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator(z.object({
-    workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk"]).default("forms"),
+    workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk", "credit_risk_demo"]).default("forms"),
     formId: z.string().min(1),                  // e.g. "FGROP 037/2016"
     friendlyName: z.string().optional(),         // e.g. "Account Opening Application Form"
     customTitle: z.string().optional(),
@@ -2812,11 +2826,11 @@ async function getFormCandidateDocs(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const { data } = await (supabase as any)
     .from("sop_documents")
-    .select("id, title, file_url, doc_type")
+    .select("id, title, file_url, drive_file_id, doc_type")
     .eq("workspace_id", workspace)
-    .in("doc_type", ["sop", "it_policy", "policy"]);
+    .in("doc_type", ["sop", "it_policy", "policy", "circular", "rmit_reg", "fatf"]);
   return ((data ?? []) as any[])
-    .filter((d) => !!d.file_url)
+    .filter((d) => !!d.file_url || !!d.drive_file_id)
     .map((d) => ({ docId: d.id as string, title: d.title as string }));
 }
 

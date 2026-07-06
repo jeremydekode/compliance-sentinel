@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-export type WorkspaceId = "rmit" | "fatf" | "forms" | "simplify" | "layout" | "policy" | "credit_risk";
+export type WorkspaceId = "rmit" | "fatf" | "forms" | "simplify" | "layout" | "policy" | "credit_risk" | "credit_risk_demo";
 
 export const WORKSPACES: Record<WorkspaceId, {
   id: WorkspaceId;
@@ -65,6 +65,14 @@ export const WORKSPACES: Record<WorkspaceId, {
     tagline: "Credit application screening · KB-referenced risk flags",
     color: "text-red-700",
     bgColor: "bg-red-100",
+  },
+  credit_risk_demo: {
+    id: "credit_risk_demo",
+    name: "Credit Risk Demo",
+    short: "CR Demo",
+    tagline: "Demo environment · Mocked data · Safe to show",
+    color: "text-orange-700",
+    bgColor: "bg-orange-100",
   },
 };
 

@@ -26,6 +26,7 @@ import {
   ArrowDownToLine, MoveDown, AlertTriangle, LayoutGrid,
   CircleDot, Circle, RefreshCw, PanelLeftClose, PanelLeftOpen, FileEdit,
   MessageSquarePlus, FilePlus2, Replace, ShieldPlus, History,
+  ChevronDown, Download,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -463,18 +464,17 @@ function ReportPage() {
       <div className="flex flex-col overflow-hidden" style={{ height: "calc(100vh - 3.5rem)" }}>
 
         {/* ── Top strip ─────────────────────────────────────────────── */}
-        <div className="shrink-0 px-4 sm:px-6 py-2.5 border-b bg-card flex items-center justify-between gap-4">
-          <div className="min-w-0 flex-1">
-            <Link to="/reports" className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground mb-0.5 transition-colors">
-              <ArrowLeft className="size-3" /> All Analyses
+        <div className="shrink-0 px-4 sm:px-6 py-1.5 border-b bg-card flex items-center justify-between gap-3">
+          <div className="min-w-0 flex-1 flex items-center gap-2 overflow-hidden">
+            <Link to="/reports" className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors shrink-0">
+              <ArrowLeft className="size-3" /><span className="hidden sm:inline"> All</span>
             </Link>
-            <div className="flex items-center gap-2 flex-wrap">
-              <h1 className="font-display font-bold text-base leading-tight truncate">{report.data.title}</h1>
-              <Badge variant="outline" className={cn("text-[10px]", s.classes)}>{s.label}</Badge>
-              <span className="text-xs text-muted-foreground hidden sm:inline">{formatDate(report.data.created_at)}</span>
-            </div>
+            <span className="text-muted-foreground/30 text-xs hidden sm:inline">/</span>
+            <h1 className="font-display font-bold text-sm leading-tight truncate">{report.data.title}</h1>
+            <Badge variant="outline" className={cn("text-[10px] shrink-0", s.classes)}>{s.label}</Badge>
+            <span className="text-[11px] text-muted-foreground hidden lg:inline shrink-0">{formatDate(report.data.created_at)}</span>
           </div>
-          <div className="flex items-center gap-1.5 shrink-0">
+          <div className="flex items-center gap-1 shrink-0">
             <Button variant="outline" size="sm" disabled={rerunning} className="h-7 text-xs gap-1.5"
               onClick={handleRerun}
               title={isFormUpdate ? "Re-run form propagation with the latest engine" : "Re-run AI analysis on this report (replaces current changes)"}>
@@ -537,15 +537,15 @@ function ReportPage() {
               </>
             )}
             <div className="h-4 w-px bg-border mx-0.5" />
-            <Button variant="outline" size="sm" disabled={!!exporting} className="h-7 text-xs gap-1.5"
+            <Button variant="outline" size="sm" disabled={!!exporting} className="h-7 px-2"
+              title="Export presentation (HTML)"
               onClick={() => runExport("html", () => exportHtmlPresentation(report.data, allChanges, allImpacts))}>
               {exporting === "html" ? <Loader2 className="size-3 animate-spin" /> : <Presentation className="size-3" />}
-              <span className="hidden sm:inline">Export</span>
             </Button>
-            <Button variant="outline" size="sm" disabled={!!exporting} className="h-7 text-xs gap-1.5"
+            <Button variant="outline" size="sm" disabled={!!exporting} className="h-7 px-2"
+              title="Export to Excel"
               onClick={() => runExport("xlsx", () => exportExcel(report.data, allChanges, allImpacts))}>
               {exporting === "xlsx" ? <Loader2 className="size-3 animate-spin" /> : <FileSpreadsheet className="size-3" />}
-              <span className="hidden sm:inline">Excel</span>
             </Button>
           </div>
         </div>
@@ -1032,7 +1032,7 @@ function WorkflowHistory({ reportId }: { reportId: string }) {
   if (events.isLoading || rows.length === 0) return null;
 
   return (
-    <details className="px-4 sm:px-6 py-2 border-b bg-card/60">
+    <details className="px-4 sm:px-6 py-1 border-b bg-card/60">
       <summary className="flex items-center gap-2 cursor-pointer select-none text-[10px] font-black uppercase tracking-widest text-muted-foreground hover:text-foreground transition-colors">
         <History className="size-3" /> History
         <span className="font-semibold normal-case tracking-normal text-muted-foreground/70">({rows.length})</span>
@@ -1561,39 +1561,77 @@ function ChangeDetailPanel({
   );
 }
 
-/** Versioned amended-draft copies — links to the original and the draft for side-by-side review. */
+/** Versioned amended-draft copies — collapsible, with Drive links or DOCX download. */
 function AmendedDraftPanel({ drafts }: { drafts: any[] }) {
+  const [open, setOpen] = useState(false);
   if (!drafts || drafts.length === 0) return null;
+  const isDriveUrl = (url: string) =>
+    /docs\.google\.com|drive\.google\.com/.test(url ?? "");
   return (
-    <div className="rounded-lg border border-violet-200 bg-violet-50/60 dark:bg-violet-950/20 dark:border-violet-900 px-4 py-3">
-      <div className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider text-violet-800 dark:text-violet-300">
-        <FileEdit className="size-3.5" /> Amended draft copies
-        <span className="font-normal normal-case text-violet-700/70 dark:text-violet-400/70">
-          · compare against the original, then sign off — the live SOPs are untouched
+    <div className="rounded-lg border border-violet-200 bg-violet-50/60 dark:bg-violet-950/20 dark:border-violet-900 overflow-hidden">
+      {/* ── Header / toggle ── */}
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex items-center gap-2 px-4 py-2.5 text-left hover:bg-violet-100/50 dark:hover:bg-violet-900/30 transition-colors"
+      >
+        <FileEdit className="size-3.5 text-violet-700 dark:text-violet-300 shrink-0" />
+        <span className="text-[11px] font-bold uppercase tracking-wider text-violet-800 dark:text-violet-300">
+          Amended draft copies
         </span>
-      </div>
-      <div className="mt-2 space-y-1.5">
-        {drafts.map((d: any, i: number) => (
-          <div key={i} className="flex items-center justify-between gap-3 rounded-md border bg-card px-3 py-2 text-xs">
-            <span className="font-medium truncate min-w-0">{cleanSopTitle(d.sopTitle)}</span>
-            <div className="flex items-center gap-3 shrink-0">
-              <span className="text-[10px] text-muted-foreground">
-                {d.applied}/{d.impactCount} change{d.impactCount === 1 ? "" : "s"} applied
-              </span>
-              {d.originalUrl && (
-                <a href={d.originalUrl} target="_blank" rel="noreferrer"
-                  className="inline-flex items-center gap-1 text-muted-foreground hover:text-foreground hover:underline underline-offset-2">
-                  <ExternalLink className="size-3 opacity-60" /> Original
-                </a>
-              )}
-              <a href={d.draftUrl} target="_blank" rel="noreferrer"
-                className="inline-flex items-center gap-1 font-semibold text-violet-700 dark:text-violet-300 hover:underline underline-offset-2">
-                <ExternalLink className="size-3 opacity-70" /> Amended draft
-              </a>
-            </div>
-          </div>
-        ))}
-      </div>
+        <span className="text-[11px] font-normal normal-case text-violet-700/60 dark:text-violet-400/60">
+          · {drafts.length} doc{drafts.length !== 1 ? "s" : ""}{open ? " — compare against the original, then sign off" : ""}
+        </span>
+        <ChevronDown className={cn(
+          "size-3.5 text-violet-600 dark:text-violet-400 ml-auto shrink-0 transition-transform duration-200",
+          open && "rotate-180"
+        )} />
+      </button>
+
+      {/* ── Rows ── */}
+      {open && (
+        <div className="px-3 pb-3 space-y-1.5">
+          {drafts.map((d: any, i: number) => {
+            const driveOriginal = d.originalUrl && isDriveUrl(d.originalUrl);
+            const driveDraft = d.draftUrl && isDriveUrl(d.draftUrl);
+            return (
+              <div key={i} className="flex items-center justify-between gap-3 rounded-md border bg-card px-3 py-2 text-xs">
+                <span className="font-medium truncate min-w-0">{cleanSopTitle(d.sopTitle)}</span>
+                <div className="flex items-center gap-3 shrink-0">
+                  <span className="text-[10px] text-muted-foreground">
+                    {d.applied}/{d.impactCount} change{d.impactCount === 1 ? "" : "s"} applied
+                  </span>
+                  {d.originalUrl && (
+                    driveOriginal ? (
+                      <a href={d.originalUrl} target="_blank" rel="noreferrer"
+                        className="inline-flex items-center gap-1 text-muted-foreground hover:text-foreground hover:underline underline-offset-2">
+                        <ExternalLink className="size-3 opacity-60" /> Original
+                      </a>
+                    ) : (
+                      <a href={d.originalUrl} download
+                        className="inline-flex items-center gap-1 text-muted-foreground hover:text-foreground hover:underline underline-offset-2">
+                        <Download className="size-3 opacity-60" /> Original
+                      </a>
+                    )
+                  )}
+                  {d.draftUrl && (
+                    driveDraft ? (
+                      <a href={d.draftUrl} target="_blank" rel="noreferrer"
+                        className="inline-flex items-center gap-1 font-semibold text-violet-700 dark:text-violet-300 hover:underline underline-offset-2">
+                        <ExternalLink className="size-3 opacity-70" /> Amended draft
+                      </a>
+                    ) : (
+                      <a href={d.draftUrl} download
+                        className="inline-flex items-center gap-1 font-semibold text-violet-700 dark:text-violet-300 hover:underline underline-offset-2">
+                        <Download className="size-3 opacity-70" /> Download draft
+                      </a>
+                    )
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }

@@ -1388,7 +1388,7 @@ async function simplifyDocSegment(
   opts?: { instruction?: string | null; guidance?: string | null },
 ): Promise<{ actions: SimplificationAction[]; usage: TokenUsage }> {
   const prompt = `
-# ROLE: DOCUMENT SIMPLIFICATION EDITOR — BANK POLICY & OPERATIONS MANUALS
+# ROLE: DOCUMENT SIMPLIFICATION EDITOR — BANK POLICY & OPERATIONS MANUALS (RHB HOUSE RULES)
 
 You are given a SECTION of an internal bank document (plain text, at the bottom
 of this prompt). Produce a list of concrete simplification ACTIONS for this
@@ -1403,11 +1403,29 @@ ${opts?.instruction ? `\n# THIS RUN'S SPECIFIC INSTRUCTION (apply in addition to
 - "table_restructure" — text that is clearly tabular and would read more clearly as a table; "after" describes the proposed layout.
 Look across ALL of these types, not just rewording. Terminology standardisation should be folded INTO a plain_english or shorten edit (rephrase the sentence and make its wording consistent in the same action). Do NOT produce standalone actions for numbering or cross-reference renumbering — those need a separate deterministic pass.
 
+# VERBOSITY PATTERNS — actively hunt every one of these:
+1. Nominalisations → plain verbs ("make a decision" → "decide", "provide an indication" → "indicate").
+2. Passive → active ("approval is to be obtained from X" → "obtain approval from X").
+3. Filler phrases → drop ("in order to" → "to", "in the event that" → "if", "at this point in time" → "now").
+4. Doublets → one word ("rules and regulations" → "rules", "policies and procedures" → "policies").
+5. Modal stacks → tighten ("shall be required to" → "must", "is required to ensure that" → "must ensure").
+6. Expletive constructions → direct subject ("There is a requirement for branches to submit" → "Branches must submit", "It is necessary for the manager to approve" → "The manager must approve").
+7. Throat-clearing preambles → drop the preamble, keep the point ("It should be noted that X" → "X", "For the avoidance of doubt, X" → "X", "It is important to highlight that X" → "X").
+8. Role-title alternates → condense ("the Branch Manager or in his/her absence the Deputy Branch Manager" → "the Branch Manager (or Deputy in their absence)").
+9. Redundant qualifiers → drop ("absolutely necessary" → "necessary", "completely eliminate" → "eliminate").
+10. Prose lists (3+ items) → bullets.
+11. Long cross-references → abbreviate ("refer to Section 3.2.1(a)(ii)" → "see Section 3.2.1").
+12. Sentences over 20 words → split or shorten.
+13. Tautologies → one word ("past history" → "history", "final outcome" → "outcome", "end result" → "result").
+
 # DE-DUPLICATION & STREAMLINING — actively hunt repeated information:
 - Scan for information DUPLICATED where it should not be: a point already made earlier, a defined term re-explained, the same instruction stated in both prose and a following bullet, near-identical adjacent sentences, or a caveat repeated.
 - Use "delete_redundant" when a passage adds nothing the reader hasn't already been told (here or in an earlier, clearly-dedicated place); use "merge" when two overlapping passages should become one.
 - Streamline over-detailed prose: keep the single clearest statement of an idea and cut or compress the rest with "shorten". Preserve every UNIQUE obligation, control, number, definition and cross-reference — only remove genuine repetition.
 - If you are not certain the information genuinely survives elsewhere, use "shorten" rather than deleting.
+
+# COVERAGE — density check:
+Work through the ENTIRE section sentence by sentence, including table cells. Assume nearly every sentence of formal bank prose can be tightened. A section of ≥100 words of dense prose should yield ≥3 actions — if you find fewer, re-read more carefully. Only skip a sentence that is already as short, plain, and direct as it can possibly be.
 
 # TABLE CELLS — analyse these, do not skip them:
 Spans wrapped in "[TABLE n] … [END TABLE n]" markers are table cells, one cell per line. Treat verbose PROSE inside a cell exactly like body prose — simplify it with plain_english / shorten / merge, quoting the cell's text verbatim as "before". Do NOT touch labels, codes, reference numbers, dates, monetary amounts, or short values (a 1-4 word cell has nothing to simplify). NEVER quote a "[TABLE n]" or "[END TABLE n]" marker line as "before".
@@ -1419,8 +1437,19 @@ Spans wrapped in "[TABLE n] … [END TABLE n]" markers are table cells, one cell
 - A "delete_redundant" is valid ONLY when the meaning is genuinely stated elsewhere — never drop a unique obligation, control, or requirement.
 - Simplify the wording, never the substance. Keep a professional tone.
 
+# SELF-CHECK before emitting each action:
+1. Does "after" preserve every number, date, %, threshold, and named role verbatim?
+2. Does "after" NOT add or remove any obligation or permission not in "before"?
+3. Can I quote "before" character-for-character from the text below?
+If any answer is NO → fix or skip.
+
 # ❗ "before" IS A VERBATIM QUOTE — you COPY it, you do not WRITE it:
 "before" is matched by an exact text-locator against the real document. Copy a contiguous run of the document text character-for-character — same words, order, spelling, punctuation, numbers. If you cannot copy a clean verbatim span for an action, SKIP that action rather than fabricate one.
+
+# CONFIDENCE:
+- 90-100: wording-only change, meaning and scope fully identical — auto-applies.
+- 70-89: substantive rewrite worth a reviewer's glance — still emit it.
+- Below 70: skip.
 
 # OUTPUT FORMAT (JSON array — return ONLY this):
 [{
@@ -1646,15 +1675,31 @@ async function simplifyUnitBatch(
   opts?: { instruction?: string | null; guidance?: string | null },
 ): Promise<{ actions: SimplificationAction[]; usage: TokenUsage }> {
   const numbered = units.map((u, i) => `${i + 1}. ${u.text}`).join("\n\n");
-  const prompt = `# ROLE: DOCUMENT SIMPLIFICATION — PER-ITEM EVALUATION
+  const prompt = `# ROLE: DOCUMENT SIMPLIFICATION — PER-ITEM EVALUATION (RHB HOUSE RULES)
 You are given NUMBERED text units (paragraphs and table cells) from the bank document "${title}". EVALUATE EVERY UNIT.
 For each unit that can be made plainer, shorter, or more active WITHOUT changing meaning, numbers, dates, names, defined terms, or the scope of any obligation, output ONE object. If a unit is already clear, or is a heading/label/code/number/date, OMIT it (output nothing for it).
 ${opts?.instruction ? `\nThis run's instruction (apply too): ${opts.instruction}\n` : ""}${guidanceBlock(opts?.guidance)}
+# VERBOSITY PATTERNS — hunt for every one in each unit:
+1. Nominalisations → verbs ("make a decision" → "decide", "provide an indication" → "indicate").
+2. Passive → active ("approval is to be obtained from X" → "obtain approval from X").
+3. Fillers → drop ("in order to" → "to", "in the event that" → "if", "at this point in time" → "now").
+4. Doublets → one word ("rules and regulations" → "rules", "policies and procedures" → "policies").
+5. Modal stacks → tighten ("shall be required to" → "must", "is required to ensure" → "must ensure").
+6. Expletive constructions → direct subject ("There is a requirement for branches to submit" → "Branches must submit").
+7. Throat-clearing preambles → drop ("It should be noted that X" → "X", "For the avoidance of doubt, X" → "X").
+8. Role-title alternates → condense ("the Manager or in his/her absence the Deputy" → "the Manager (or Deputy in their absence)").
+9. Redundant qualifiers → drop ("absolutely necessary" → "necessary").
+10. Prose list (3+ items) → bullets.
+11. Long cross-refs → abbreviate ("refer to Section 3.2.1(a)(ii)" → "see Section 3.2.1").
+12. Sentences > 20 words → split or tighten.
+13. Tautologies → one word ("past history" → "history", "final outcome" → "outcome").
+
 # RULES
 - "after" is the simplified version of the WHOLE unit (you rewrite the entire unit, not a span inside it).
 - Preserve EXACTLY: every number, date, %, monetary amount, authority limit, role title, committee name, defined term, system/product name, and cross-reference (e.g. Section 4.2.1, Appendix B).
 - British English. Active voice. Short sentences (<= 20 words). Plain verbs. Keep the formal bank-policy register.
 - confidence is 70-100; if you would score below 70, OMIT the unit instead.
+- SELF-CHECK before each object: does "after" preserve all numbers/dates/obligations AND NOT add any new ones? If no → fix or omit.
 
 # OUTPUT — return ONLY a JSON array, one object per unit you are CHANGING:
 [{ "i": <unit number>, "type": "plain_english|shorten|merge|to_bullets|delete_redundant", "after": "<simplified whole unit>", "rule": "<short label, e.g. 'Plain English'>", "rationale": "<one sentence>", "confidence": <70-100> }]

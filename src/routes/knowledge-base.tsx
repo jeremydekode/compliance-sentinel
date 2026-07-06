@@ -109,7 +109,7 @@ function KB() {
   }
 
   async function handleReindexAllPdfs() {
-    const docs = (sops.data ?? []).filter((s: any) => !!s.file_url);
+    const docs = (sops.data ?? []).filter((s: any) => !!s.file_url || !!s.drive_file_id);
     if (docs.length === 0) {
       toast.info("No documents with source files to re-index in this workspace");
       return;
@@ -365,7 +365,7 @@ function KB() {
                           variant="ghost"
                           className="size-8"
                           title="Re-index (re-chunk + re-embed)"
-                          disabled={!s.file_url || reindexing === s.id}
+                          disabled={(!s.file_url && !s.drive_file_id) || reindexing === s.id}
                           onClick={() => handleReindex(s.id, s.title)}
                         >
                           {reindexing === s.id ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}

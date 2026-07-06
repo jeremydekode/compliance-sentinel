@@ -63,7 +63,7 @@ export const Route = createFileRoute("/reports/")({
 function ReportsRoute() {
   const [workspace] = useWorkspace();
   if (workspace === "simplify") return <SimplifyReportsList />;
-  if (workspace === "credit_risk") return <CreditRiskReportsList />;
+  if (workspace === "credit_risk" || workspace === "credit_risk_demo") return <CreditRiskReportsList />;
   return <ReportsList />;
 }
 
@@ -73,14 +73,15 @@ function CreditRiskReportsList() {
   const nav = useNavigate();
   const remove = useServerFn(deleteReport);
   const [showUpload, setShowUpload] = useState(false);
+  const [workspace] = useWorkspace();
 
   const reports = useQuery({
-    queryKey: ["reports", "all", "credit_risk"],
+    queryKey: ["reports", "all", workspace],
     queryFn: async () => {
       const { data } = await (supabase as any)
         .from("analysis_reports")
         .select("id, title, policy_name, status, created_at, summary_json")
-        .eq("workspace_id", "credit_risk")
+        .eq("workspace_id", workspace)
         .order("created_at", { ascending: false });
       return data ?? [];
     },

@@ -22,7 +22,8 @@
       "Bash(cd \"/Users/jeremyteh/Downloads/Compliance Sentinel\" && grep -n \"Re-run\\\\|handleRerun\\\\|rerunReport\" 'src/routes/reports.$reportId.tsx' | head -10)",
       "Bash(cd \"/Users/jeremyteh/Downloads/Compliance Sentinel\" && grep -n \"SOP Gap Register\\\\|isFormUpdate\" 'src/routes/reports.$reportId.tsx' | head -10)",
       "Bash(cd \"/Users/jeremyteh/Downloads/Compliance Sentinel\" && grep -n \"workspace_id\\\\|workspace ===\\\\|useWorkspace\" src/routes/reports.index.tsx src/routes/knowledge-base.tsx 'src/routes/reports.$reportId.tsx' src/components/legal-review-view.tsx src/components/form-update-dialog.tsx 2>&1 | head -25)",
-      "Bash(cd \"/Users/jeremyteh/Downloads/Compliance Sentinel\" && grep -n \"rerunning\\\\|rerunReport\\\\|useServerFn\\(rerun\" 'src/routes/reports.$reportId.tsx' | head -5)"
+      "Bash(cd \"/Users/jeremyteh/Downloads/Compliance Sentinel\" && grep -n \"rerunning\\\\|rerunReport\\\\|useServerFn\\(rerun\" 'src/routes/reports.$reportId.tsx' | head -5)",
+      "Bash(npx vercel *)"
     ]
   }
 }

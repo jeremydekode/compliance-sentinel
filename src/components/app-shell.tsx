@@ -1,5 +1,5 @@
 import { Link, useLocation, useNavigate } from "@tanstack/react-router";
-import { LayoutDashboard, FolderOpen, ShieldCheck, FileSearch, Settings, Zap, Scale, UserRound, ChevronDown, PanelLeftClose, PanelLeftOpen, Layers, LogOut } from "lucide-react";
+import { LayoutDashboard, FolderOpen, ShieldCheck, FileSearch, Settings, Zap, Scale, UserRound, ChevronDown, PanelLeftClose, PanelLeftOpen, Layers, LogOut, ClipboardList, Library } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useRole, ROLE_META, type UserRole } from "@/lib/role";
 import { useAuth, signOut, type AppRole } from "@/lib/auth";
@@ -10,18 +10,37 @@ import { useQuery } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
 import { getWorkspaceVisibility } from "@/lib/compliance.functions";
 
-const BASE_NAV = [
-  { to: "/", label: "Dashboard", icon: LayoutDashboard },
-  { to: "/knowledge-base", label: "Knowledge Base", icon: FolderOpen },
-  { to: "/reports", label: "Analyses", icon: FileSearch },
-  { to: "/settings", label: "Settings", icon: Settings },
-] as const;
+type NavItem = { to: string; label: string; icon: React.ElementType; match?: (p: string) => boolean };
 
-const LAYOUT_NAV = [
-  { to: "/", label: "Dashboard", icon: LayoutDashboard },
+// DMS = the document-AI workflows. Legal CMS = the legal matter/contract product.
+// Each is its own group in the sidebar; Settings is shared at the bottom.
+const DMS_NAV: NavItem[] = [
+  { to: "/", label: "Dashboard", icon: LayoutDashboard, match: (p) => p === "/" },
+  { to: "/knowledge-base", label: "Knowledge base", icon: FolderOpen },
+  { to: "/reports", label: "Analyses", icon: FileSearch },
+];
+// The "layout" workspace swaps the DMS group for its own tools.
+const DMS_LAYOUT_NAV: NavItem[] = [
+  { to: "/", label: "Dashboard", icon: LayoutDashboard, match: (p) => p === "/" },
   { to: "/layout", label: "Layouts", icon: Layers },
-  { to: "/settings", label: "Settings", icon: Settings },
-] as const;
+];
+const LEGAL_NAV: NavItem[] = [
+  { to: "/legal", label: "Dashboard", icon: LayoutDashboard, match: (p) => p === "/legal" },
+  {
+    to: "/legal/requests", label: "Requests", icon: ClipboardList,
+    // Requests owns the operational matter views: the queue, intake, matter detail, co-pilot.
+    match: (p) =>
+      p.startsWith("/legal/requests") || p === "/legal/new" || p.startsWith("/legal/review") ||
+      /^\/legal\/(?!requests|repository|new|review)[^/]+/.test(p),
+  },
+  { to: "/legal/repository", label: "Repository", icon: Library, match: (p) => p.startsWith("/legal/repository") },
+];
+const SETTINGS_ITEM: NavItem = { to: "/settings", label: "Settings", icon: Settings };
+
+function navActive(item: NavItem, pathname: string): boolean {
+  if (item.match) return item.match(pathname);
+  return item.to === "/" ? pathname === "/" : pathname.startsWith(item.to);
+}
 
 const SIDEBAR_KEY = "sidebar_collapsed";
 
@@ -34,10 +53,12 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   // mismatch when the layout nav has different anchors/icons than base.
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
-  const NAV = mounted && ws === "layout" ? LAYOUT_NAV : BASE_NAV;
-  const currentNav = NAV.find((n) =>
-    n.to === "/" ? loc.pathname === "/" : loc.pathname.startsWith(n.to)
-  );
+  const dmsNav = mounted && ws === "layout" ? DMS_LAYOUT_NAV : DMS_NAV;
+  const NAV_GROUPS = [
+    { label: "DMS", items: dmsNav },
+    { label: "Legal CMS", items: LEGAL_NAV },
+  ];
+  const currentNav = [...dmsNav, ...LEGAL_NAV, SETTINGS_ITEM].find((n) => navActive(n, loc.pathname));
 
   const [collapsed, setCollapsed] = useState(false);
   useEffect(() => {
@@ -87,29 +108,26 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </button>
         </div>
 
-        {/* Nav */}
-        <nav className={cn("flex-1 space-y-0.5 pt-4", collapsed ? "p-2" : "p-3")}>
-          {NAV.map((n) => {
-            const active =
-              n.to === "/" ? loc.pathname === "/" : loc.pathname.startsWith(n.to);
-            return (
-              <Link
-                key={n.to}
-                to={n.to}
-                title={collapsed ? n.label : undefined}
-                className={cn(
-                  "flex items-center rounded-xl text-sm transition-all duration-150 font-medium",
-                  collapsed ? "justify-center px-2 py-2.5" : "gap-3 px-3 py-2.5",
-                  active
-                    ? "bg-sidebar-accent text-sidebar-accent-foreground shadow-sm"
-                    : "text-sidebar-foreground/60 hover:bg-sidebar-accent/40 hover:text-sidebar-foreground"
-                )}
-              >
-                <n.icon className={cn("size-4 shrink-0", active ? "opacity-100" : "opacity-60")} />
-                {!collapsed && <>{n.label}{active && (<span className="ml-auto size-1.5 rounded-full bg-sidebar-primary" />)}</>}
-              </Link>
-            );
-          })}
+        {/* Nav — grouped by product (DMS / Legal CMS), Settings pinned below */}
+        <nav className={cn("flex-1 overflow-y-auto pt-4", collapsed ? "p-2" : "p-3")}>
+          {NAV_GROUPS.map((group, gi) => (
+            <div key={group.label} className={cn(gi > 0 && (collapsed ? "mt-2 pt-2 border-t border-sidebar-border/60" : "mt-4"))}>
+              {!collapsed && (
+                <div className="px-3 pb-1.5 text-[10px] font-bold uppercase tracking-widest text-sidebar-foreground/35">
+                  {group.label}
+                </div>
+              )}
+              <div className="space-y-0.5">
+                {group.items.map((n) => (
+                  <NavRow key={n.to} item={n} active={navActive(n, loc.pathname)} collapsed={collapsed} />
+                ))}
+              </div>
+            </div>
+          ))}
+
+          <div className={cn("mt-4 pt-2 border-t border-sidebar-border")}>
+            <NavRow item={SETTINGS_ITEM} active={navActive(SETTINGS_ITEM, loc.pathname)} collapsed={collapsed} />
+          </div>
         </nav>
 
         {/* Footer */}
@@ -156,6 +174,25 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <div className="flex-1 min-w-0">{children}</div>
       </main>
     </div>
+  );
+}
+
+function NavRow({ item, active, collapsed }: { item: NavItem; active: boolean; collapsed: boolean }) {
+  return (
+    <Link
+      to={item.to}
+      title={collapsed ? item.label : undefined}
+      className={cn(
+        "flex items-center rounded-xl text-sm transition-all duration-150 font-medium",
+        collapsed ? "justify-center px-2 py-2.5" : "gap-3 px-3 py-2.5",
+        active
+          ? "bg-sidebar-accent text-sidebar-accent-foreground shadow-sm"
+          : "text-sidebar-foreground/60 hover:bg-sidebar-accent/40 hover:text-sidebar-foreground"
+      )}
+    >
+      <item.icon className={cn("size-4 shrink-0", active ? "opacity-100" : "opacity-60")} />
+      {!collapsed && <>{item.label}{active && (<span className="ml-auto size-1.5 rounded-full bg-sidebar-primary" />)}</>}
+    </Link>
   );
 }
 

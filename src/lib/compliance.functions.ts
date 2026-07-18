@@ -2,11 +2,13 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import { supabaseAdmin } from "@/integrations/supabase/client.server";
-import { chunkDocument, generateAmendedDocument, extractRegulatoryChanges, extractFatfRequirements, mapChangeToSops, routeChangesToSops, analyzeSopAgainstGaps, buildSopTopicMap, generateAnalysisSummary, generateWithFallback, simplifyDocument, simplifyDocumentByUnits, detectDocumentDuplication, summarizeDocument, analyzeDocFigures, type FigureReview, analyzeCreditRisk, extractCreditRiskRetrievalQueries, chatCreditRisk, generateCreditMitigations, detectFinancialAnomalies, searchAdverseNews } from "./gemini";
+import { chunkDocument, generateAmendedDocument, extractRegulatoryChanges, extractFatfRequirements, mapChangeToSops, routeChangesToSops, analyzeSopAgainstGaps, buildSopTopicMap, generateAnalysisSummary, generateWithFallback, simplifyDocument, simplifyDocumentByUnits, detectDocumentDuplication, summarizeDocument, analyzeDocFigures, type FigureReview, analyzeCreditRisk, extractCreditRiskRetrievalQueries, chatCreditRisk, generateCreditMitigations, detectFinancialAnomalies, searchAdverseNews, AVAILABLE_MODELS, getDefaultModel, clearDefaultModelCache } from "./gemini";
 import { attachEvidence } from "./credit-evidence";
-import { applyEditsToDocx, looksLikeDocx, docxToText, docxToHtml, docxToSimplifyText, docxToSimplifyUnits, extractDocxFigures, applySimplificationToDocx, type SimplifyDocxEdit } from "./docx-editor";
-import { verifyActions, analyzeStructure, crossCheckSections, DEFAULT_SIMPLIFY_GUIDANCE, initialDecision } from "./simplify";
+import { applyEditsToDocx, looksLikeDocx, docxToText, docxToHtml, docxToSimplifyText, docxToSimplifyUnits, docxToStructuredUnits, extractDocxFigures, applySimplificationToDocx, rebuildDocxBody, type SimplifyDocxEdit } from "./docx-editor";
+import { verifyActions, analyzeStructure, crossCheckSections, DEFAULT_SIMPLIFY_GUIDANCE, AGGRESSIVE_SIMPLIFY_ADDENDUM, initialDecision } from "./simplify";
 import type { VerificationSummary, DocStructure, SectionCrossCheck } from "./simplify";
+import { runAuditPipeline, countFindings, generateRestructured, generateDocumentFromBrief, DEFAULT_RECOMMEND_GUIDANCE, type Finding, type ClaimUnit } from "./recommend";
+import { getCallerTenant, assertRowTenant, ALL_TENANT_FEATURES } from "./tenant.functions";
 import { computeCost, addUsage, type RunCost } from "./pricing";
 import {
   buildAuthUrl,
@@ -53,7 +55,11 @@ import { REGULATION_FAMILIES, INTERNAL_DOC_TYPES as INTERNAL_DOC_TYPES_CONST, re
 // Allowed workspace identifiers — shared across every workspace-scoped input
 // validator. Declared up here so server fns defined anywhere in the file can
 // reference it in their .inputValidator() (evaluated at module load).
-const workspaceSchema = z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk", "credit_risk_demo"]);
+const workspaceSchema = z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo"]);
+
+// Guidance rows are keyed by workspace_id, plus synthetic sub-keys for flows
+// that need a second editable prompt within one workspace (v2 recommendation).
+const guidanceKeySchema = z.union([workspaceSchema, z.literal("simplify_v2_recommend")]);
 
 async function fetchFile(url: string): Promise<{ buffer: Buffer; mimeType: string }> {
   // Reject Drive viewer URLs straight away — they return HTML, not the file.
@@ -137,7 +143,7 @@ export const createReport = createServerFn({ method: "POST" })
     z.object({
       filename: z.string(),
       fileUrl: z.string().nullable(),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk", "credit_risk_demo"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo"]).default("rmit"),
       customTitle: z.string().optional(),
       notes: z.string().optional(),
       detected: z
@@ -155,7 +161,8 @@ export const createReport = createServerFn({ method: "POST" })
     const supabase = context.supabase;
     const detected = data.detected;
     const workspace = data.workspace;
-    
+    const { tenantId } = await getCallerTenant(context.userId);
+
     // 1. Fetch the newly uploaded policy
     if (!data.fileUrl) throw new Error("No file URL provided for analysis");
     const newPolicy = await fetchFile(data.fileUrl);
@@ -170,6 +177,7 @@ export const createReport = createServerFn({ method: "POST" })
       .from("sop_documents")
       .select("*")
       .eq("workspace_id", workspace)
+      .eq("tenant_id", tenantId)
       .in("doc_type", oldDocTypes)
       .neq("version", detected?.version ?? "")
       .order("created_at", { ascending: false })
@@ -221,6 +229,7 @@ export const createReport = createServerFn({ method: "POST" })
           .from("sop_documents")
           .select("*")
           .eq("workspace_id", workspace)
+          .eq("tenant_id", tenantId)
           .in("id", sopIds)
           .in("doc_type", INTERNAL_DOC_TYPES);
         relevantSops = (sopDocs ?? []) as any[];
@@ -233,6 +242,7 @@ export const createReport = createServerFn({ method: "POST" })
           .from("sop_documents")
           .select("*")
           .eq("workspace_id", workspace)
+          .eq("tenant_id", tenantId)
           .in("doc_type", INTERNAL_DOC_TYPES);
         relevantSops = (allSops ?? []) as any[];
       }
@@ -468,7 +478,7 @@ export const createRegulatoryReport = createServerFn({ method: "POST" })
     z.object({
       filename: z.string(),
       fileUrl: z.string().nullable(),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk", "credit_risk_demo"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo"]).default("rmit"),
       customTitle: z.string().optional(),
       notes: z.string().optional(),
       detected: z
@@ -784,6 +794,9 @@ export const startRegulatoryRerun = createServerFn({ method: "POST" })
     const { data: report, error: repErr } = await supabase
       .from("analysis_reports").select("*").eq("id", data.reportId).single();
     if (repErr || !report) throw new Error("Report not found");
+    const { tenantId } = await getCallerTenant(context.userId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, tenantId);
     if (!report.source_file_url) throw new Error("Report has no source file URL — cannot rerun");
 
     const detected = (report.summary_json as any)?.detected ?? null;
@@ -816,6 +829,7 @@ export const startRegulatoryRerun = createServerFn({ method: "POST" })
         .from("sop_documents")
         .select("id, title, file_url, drive_file_id, drive_mime_type, created_at")
         .eq("workspace_id", workspace)
+        .eq("tenant_id", tenantId)
         .eq("doc_type", docType)
         .order("created_at", { ascending: false });
       baseline = ((priorRows ?? []) as any[]).find((r) => r.file_url !== report.source_file_url) ?? null;
@@ -909,6 +923,7 @@ export const startRegulatoryRerun = createServerFn({ method: "POST" })
         .from("sop_documents")
         .select("id, title, file_url, drive_file_id, drive_mime_type")
         .eq("workspace_id", workspace)
+        .eq("tenant_id", tenantId)
         .in("doc_type", INTERNAL_DOC_TYPES);
       // Catalogue: title + opening-scope blurb for each internal document.
       const catalogue = await Promise.all(
@@ -989,8 +1004,10 @@ export const mapRegulatoryChange = createServerFn({ method: "POST" })
     const supabase = context.supabase;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: report } = await (supabase as any)
-      .from("analysis_reports").select("id, workspace_id, summary_json").eq("id", data.reportId).single();
+      .from("analysis_reports").select("id, workspace_id, summary_json, tenant_id").eq("id", data.reportId).single();
     if (!report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, (await getCallerTenant(context.userId)).tenantId);
     const workspaceId = (report.workspace_id as string) ?? "rmit";
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1103,13 +1120,18 @@ export const analyzeRegulatorySop = createServerFn({ method: "POST" })
     const supabase = context.supabase;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: report } = await (supabase as any)
-      .from("analysis_reports").select("id, workspace_id, policy_name, source_file_url").eq("id", data.reportId).single();
+      .from("analysis_reports").select("id, workspace_id, policy_name, source_file_url, tenant_id").eq("id", data.reportId).single();
     if (!report) throw new Error("Report not found");
+    const { tenantId } = await getCallerTenant(context.userId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, tenantId);
     if (!report.source_file_url) return { sopId: data.sopId, title: "?", impactCount: 0, status: "failed" as const };
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: sop } = await (supabase as any)
-      .from("sop_documents").select("id, title, file_url, drive_file_id, drive_mime_type, governance_tier").eq("id", data.sopId).single();
+      .from("sop_documents").select("id, title, file_url, drive_file_id, drive_mime_type, governance_tier, tenant_id").eq("id", data.sopId).single();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((sop as any)?.tenant_id, tenantId);
     if (!sop || (!sop.file_url && !sop.drive_file_id)) return { sopId: data.sopId, title: sop?.title ?? "?", impactCount: 0, status: "failed" as const };
 
     // STAGE 2 — check this SOP against the Stage-1 GAP LIST. The gaps (the
@@ -1274,6 +1296,8 @@ export const finalizeRegulatoryReport = createServerFn({ method: "POST" })
       .from("analysis_reports").select("*").eq("id", data.reportId).single();
     if (!report) throw new Error("Report not found");
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, (await getCallerTenant(context.userId)).tenantId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: changes } = await (supabase as any)
       .from("regulatory_changes").select("*").eq("report_id", report.id).order("position");
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1345,11 +1369,14 @@ export const requestLegalSignOff = createServerFn({ method: "POST" })
   .inputValidator(z.object({ reportId: z.string() }))
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
-    const { data: before } = await supabase
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: before } = await (supabase as any)
       .from("analysis_reports")
-      .select("status")
+      .select("status, tenant_id")
       .eq("id", data.reportId)
       .single();
+    if (!before) throw new Error("Report not found");
+    assertRowTenant(before.tenant_id, (await getCallerTenant(context.userId)).tenantId);
     const { error } = await supabase
       .from("analysis_reports")
       .update({ status: "pending_legal" })
@@ -1366,11 +1393,14 @@ export const finalizeLegalSignOff = createServerFn({ method: "POST" })
   .inputValidator(z.object({ reportId: z.string() }))
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
-    const { data: row } = await supabase
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: row } = await (supabase as any)
       .from("analysis_reports")
-      .select("status, summary_json")
+      .select("status, summary_json, tenant_id")
       .eq("id", data.reportId)
       .single();
+    if (!row) throw new Error("Report not found");
+    assertRowTenant(row.tenant_id, (await getCallerTenant(context.userId)).tenantId);
     const summary = (row?.summary_json ?? {}) as Record<string, unknown>;
     const { error } = await supabase
       .from("analysis_reports")
@@ -1399,11 +1429,14 @@ export const publishToKB = createServerFn({ method: "POST" })
   .inputValidator(z.object({ reportId: z.string() }))
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
-    const { data: beforeRow } = await supabase
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: beforeRow } = await (supabase as any)
       .from("analysis_reports")
-      .select("status")
+      .select("status, tenant_id")
       .eq("id", data.reportId)
       .single();
+    if (!beforeRow) throw new Error("Report not found");
+    assertRowTenant(beforeRow.tenant_id, (await getCallerTenant(context.userId)).tenantId);
     const { data: impacts } = await supabase
       .from("sop_impacts")
       .select("sop_id, sop_title, edited_text, replace_text, chapter")
@@ -1460,11 +1493,14 @@ export const markPendingManual = createServerFn({ method: "POST" })
   .inputValidator(z.object({ reportId: z.string() }))
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
-    const { data: before } = await supabase
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: before } = await (supabase as any)
       .from("analysis_reports")
-      .select("status")
+      .select("status, tenant_id")
       .eq("id", data.reportId)
       .single();
+    if (!before) throw new Error("Report not found");
+    assertRowTenant(before.tenant_id, (await getCallerTenant(context.userId)).tenantId);
     const { error } = await supabase
       .from("analysis_reports")
       .update({ status: "pending_manual" })
@@ -1481,11 +1517,14 @@ export const confirmManualCompletion = createServerFn({ method: "POST" })
   .inputValidator(z.object({ reportId: z.string() }))
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
-    const { data: before } = await supabase
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: before } = await (supabase as any)
       .from("analysis_reports")
-      .select("status")
+      .select("status, tenant_id")
       .eq("id", data.reportId)
       .single();
+    if (!before) throw new Error("Report not found");
+    assertRowTenant(before.tenant_id, (await getCallerTenant(context.userId)).tenantId);
     const { error } = await supabase
       .from("analysis_reports")
       .update({ status: "published" })
@@ -1516,6 +1555,14 @@ export const updateImpact = createServerFn({ method: "POST" })
       .select("report_id, status")
       .eq("id", id)
       .maybeSingle();
+    if (!prior) throw new Error("Impact not found");
+    // Tenant boundary: the impact's owning report must belong to the caller.
+    if (prior.report_id) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: impReport } = await (supabase as any)
+        .from("analysis_reports").select("tenant_id").eq("id", prior.report_id).maybeSingle();
+      assertRowTenant(impReport?.tenant_id, (await getCallerTenant(context.userId)).tenantId);
+    }
     const { error } = await supabase.from("sop_impacts").update(rest).eq("id", id);
     if (error) throw new Error(error.message);
     // Only audit when a status decision was actually requested, and only when we
@@ -1546,6 +1593,12 @@ export const bulkApproveReady = createServerFn({ method: "POST" })
   }))
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
+    // Tenant boundary: a report id from another tenant behaves like a 404.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: repRow } = await (supabase as any)
+      .from("analysis_reports").select("tenant_id").eq("id", data.reportId).maybeSingle();
+    if (!repRow) throw new Error("Report not found");
+    assertRowTenant(repRow.tenant_id, (await getCallerTenant(context.userId)).tenantId);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: rows, error } = await (supabase as any)
       .from("sop_impacts")
@@ -1568,11 +1621,14 @@ export const chatWithReport = createServerFn({ method: "POST" })
   )
   .handler(async function* ({ data, context }) {
     const supabase = context.supabase;
-    const { data: report } = await supabase
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report } = await (supabase as any)
       .from("analysis_reports")
-      .select("title, policy_name, summary_json")
+      .select("title, policy_name, summary_json, tenant_id")
       .eq("id", data.reportId)
       .single();
+    if (!report) throw new Error("Report not found");
+    assertRowTenant(report.tenant_id, (await getCallerTenant(context.userId)).tenantId);
     const { data: changes } = await supabase
       .from("regulatory_changes")
       .select("chapter_ref, change_summary, impact, new_requirement")
@@ -1656,6 +1712,13 @@ export const deleteReport = createServerFn({ method: "POST" })
   .inputValidator(z.object({ id: z.string() }))
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
+    // Tenant boundary: a report id from another tenant behaves like a 404 —
+    // never delete across the wall.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: row } = await (supabase as any)
+      .from("analysis_reports").select("tenant_id").eq("id", data.id).maybeSingle();
+    if (!row) throw new Error("Report not found");
+    assertRowTenant(row.tenant_id, (await getCallerTenant(context.userId)).tenantId);
     await supabase.from("chat_messages").delete().eq("report_id", data.id);
     await supabase.from("sop_impacts").delete().eq("report_id", data.id);
     await supabase.from("regulatory_changes").delete().eq("report_id", data.id);
@@ -1669,6 +1732,13 @@ export const deleteSop = createServerFn({ method: "POST" })
   .inputValidator(z.object({ id: z.string() }))
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
+    // Tenant boundary: a document id from another tenant behaves like a 404 —
+    // never delete across the wall.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: row } = await (supabase as any)
+      .from("sop_documents").select("tenant_id").eq("id", data.id).maybeSingle();
+    if (!row) throw new Error("Document not found");
+    assertRowTenant(row.tenant_id, (await getCallerTenant(context.userId)).tenantId);
     const { error } = await supabase.from("sop_documents").delete().eq("id", data.id);
     if (error) throw new Error(error.message);
     return { ok: true };
@@ -1681,7 +1751,7 @@ export const createSop = createServerFn({ method: "POST" })
       title: z.string().min(2).max(200),
       doc_type: z.enum(["sop", "rmit", "rmit_reg", "fatf", "circular", "it_policy", "policy", "form"]),
       version: z.string().min(1).max(20),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk", "credit_risk_demo"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo"]).default("rmit"),
       summary: z.string().max(2000).optional(),
       tags: z.array(z.string().max(40)).max(20).optional(),
       file_url: z.string().nullable().optional(),
@@ -1759,12 +1829,14 @@ export const updateSop = createServerFn({ method: "POST" })
   )
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
-    const { data: current, error: readError } = await supabase
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: current, error: readError } = await (supabase as any)
       .from("sop_documents")
-      .select("version")
+      .select("version, tenant_id")
       .eq("id", data.id)
       .single();
     if (readError || !current) throw new Error(readError?.message || "SOP not found");
+    assertRowTenant(current.tenant_id, (await getCallerTenant(context.userId)).tenantId);
 
     const nextVersion = bumpVersion(String(current.version ?? "1.0"));
     const embedding = await generateEmbedding(`${data.title} ${data.summary || ""}`);
@@ -1790,34 +1862,36 @@ export const clearWorkspace = createServerFn({ method: "POST" })
   .inputValidator(
     z.object({
       scope: z.enum(["analyses", "kb", "all"]),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk", "credit_risk_demo"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo"]).default("rmit"),
     })
   )
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
-    // Scope all deletions to the specified workspace ONLY — never wipe across workspaces.
+    // Scope all deletions to the specified workspace AND the caller's tenant —
+    // never wipe across workspaces, and never touch another tenant's rows.
+    const { tenantId } = await getCallerTenant(context.userId);
     if (data.scope === "analyses" || data.scope === "all") {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const { data: reports } = await (supabase as any)
-        .from("analysis_reports").select("id").eq("workspace_id", data.workspace);
+        .from("analysis_reports").select("id").eq("workspace_id", data.workspace).eq("tenant_id", tenantId);
       const reportIds = (reports ?? []).map((r: any) => r.id);
       if (reportIds.length > 0) {
         await supabase.from("sop_impacts").delete().in("report_id", reportIds);
         await supabase.from("regulatory_changes").delete().in("report_id", reportIds);
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        await (supabase as any).from("analysis_reports").delete().eq("workspace_id", data.workspace);
+        await (supabase as any).from("analysis_reports").delete().in("id", reportIds);
       }
     }
     if (data.scope === "kb" || data.scope === "all") {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const { data: docs } = await (supabase as any)
-        .from("sop_documents").select("id").eq("workspace_id", data.workspace);
+        .from("sop_documents").select("id").eq("workspace_id", data.workspace).eq("tenant_id", tenantId);
       const docIds = (docs ?? []).map((d: any) => d.id);
       if (docIds.length > 0) {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         await (supabase as any).from("sop_chunks").delete().in("sop_id", docIds);
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        await (supabase as any).from("sop_documents").delete().eq("workspace_id", data.workspace);
+        await (supabase as any).from("sop_documents").delete().in("id", docIds);
       }
     }
     return { ok: true };
@@ -1834,6 +1908,12 @@ export const getAmendableDocuments = createServerFn({ method: "GET" })
   .inputValidator(z.object({ reportId: z.string() }))
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
+    // Tenant boundary: a report id from another tenant behaves like a 404.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: repRow } = await (supabase as any)
+      .from("analysis_reports").select("tenant_id").eq("id", data.reportId).maybeSingle();
+    if (!repRow) throw new Error("Report not found");
+    assertRowTenant(repRow.tenant_id, (await getCallerTenant(context.userId)).tenantId);
     const { data: impacts } = await supabase
       .from("sop_impacts")
       .select("*")
@@ -1887,6 +1967,13 @@ export const generateDocumentPreview = createServerFn({ method: "POST" })
     const { data: sop, error: sopErr } = await (supabase as any)
       .from("sop_documents").select("*").eq("id", data.sopId).single();
     if (sopErr || !sop) throw new Error("SOP not found");
+    const { tenantId } = await getCallerTenant(context.userId);
+    assertRowTenant(sop.tenant_id, tenantId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: repRow } = await (supabase as any)
+      .from("analysis_reports").select("tenant_id").eq("id", data.reportId).maybeSingle();
+    if (!repRow) throw new Error("Report not found");
+    assertRowTenant(repRow.tenant_id, tenantId);
     if (!sop.file_url) throw new Error("SOP has no source file — cannot amend");
 
     const { data: impacts } = await supabase
@@ -1996,6 +2083,13 @@ export const finalizeDocumentAmendment = createServerFn({ method: "POST" })
     const { data: oldSop, error: sopErr } = await (supabase as any)
       .from("sop_documents").select("*").eq("id", data.sopId).single();
     if (sopErr || !oldSop) throw new Error("SOP not found");
+    const { tenantId } = await getCallerTenant(context.userId);
+    assertRowTenant(oldSop.tenant_id, tenantId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: repRow } = await (supabase as any)
+      .from("analysis_reports").select("tenant_id").eq("id", data.reportId).maybeSingle();
+    if (!repRow) throw new Error("Report not found");
+    assertRowTenant(repRow.tenant_id, tenantId);
 
     const nextVersion = bumpVersion(oldSop.version ?? "1.0");
     const safeTitle = (oldSop.title ?? "document").replace(/[^A-Za-z0-9._-]+/g, "_");
@@ -2176,14 +2270,16 @@ function escapeHtml(s: string): string {
  */
 export const getChunkCounts = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .inputValidator(z.object({ workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk", "credit_risk_demo"]).default("rmit") }))
+  .inputValidator(z.object({ workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo"]).default("rmit") }))
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
+    const { tenantId } = await getCallerTenant(context.userId);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: sops } = await (supabase as any)
       .from("sop_documents")
       .select("id")
-      .eq("workspace_id", data.workspace);
+      .eq("workspace_id", data.workspace)
+      .eq("tenant_id", tenantId);
     if (!sops?.length) return { counts: {} as Record<string, number> };
 
     const sopIds = sops.map((s: any) => s.id);
@@ -2216,6 +2312,7 @@ export const reindexSop = createServerFn({ method: "POST" })
       .eq("id", data.id)
       .single();
     if (sopErr || !sop) throw new Error("SOP not found");
+    assertRowTenant(sop.tenant_id, (await getCallerTenant(context.userId)).tenantId);
     if (!sop.file_url && !sop.drive_file_id) throw new Error("SOP has no source file — cannot re-index");
 
     // Forms workspace docs are compared directly — no chunking needed.
@@ -2463,7 +2560,7 @@ function applyPageOverrides(formId: string, impacts: any[]): any[] {
 export const createFormUpdateReport = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator(z.object({
-    workspace: z.enum(["rmit", "fatf", "forms", "simplify", "layout", "policy", "credit_risk", "credit_risk_demo"]).default("forms"),
+    workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo"]).default("forms"),
     formId: z.string().min(1),                  // e.g. "FGROP 037/2016"
     friendlyName: z.string().optional(),         // e.g. "Account Opening Application Form"
     customTitle: z.string().optional(),
@@ -2530,7 +2627,7 @@ export const createFormUpdateReport = createServerFn({ method: "POST" })
       }))
     );
 
-    const docsToAnalyze = await getFormCandidateDocs(supabase, data.workspace);
+    const docsToAnalyze = await getFormCandidateDocs(supabase, data.workspace, (await getCallerTenant(context.userId)).tenantId);
     return { reportId: report.id as string, docsToAnalyze };
   });
 
@@ -2548,6 +2645,8 @@ export const rerunFormUpdateReport = createServerFn({ method: "POST" })
     const { data: report, error } = await (supabase as any)
       .from("analysis_reports").select("*").eq("id", data.reportId).single();
     if (error || !report) throw new Error("Report not found");
+    const { tenantId } = await getCallerTenant(context.userId);
+    assertRowTenant(report.tenant_id, tenantId);
 
     const summary = (report.summary_json ?? {}) as any;
     if (!summary.uc1_form_update) {
@@ -2578,7 +2677,7 @@ export const rerunFormUpdateReport = createServerFn({ method: "POST" })
       }))
     );
 
-    const docsToAnalyze = await getFormCandidateDocs(supabase, (report.workspace_id as string) ?? "forms");
+    const docsToAnalyze = await getFormCandidateDocs(supabase, (report.workspace_id as string) ?? "forms", tenantId);
     return { reportId: report.id as string, docsToAnalyze };
   });
 
@@ -2596,6 +2695,8 @@ export const analyzeDocForForm = createServerFn({ method: "POST" })
     const { data: report } = await (supabase as any)
       .from("analysis_reports").select("*").eq("id", data.reportId).single();
     if (!report) throw new Error("Report not found");
+    const { tenantId } = await getCallerTenant(context.userId);
+    assertRowTenant(report.tenant_id, tenantId);
     const summary = (report.summary_json ?? {}) as any;
     const formId: string = summary.form_id ?? report.policy_name;
     const friendlyName: string | null = summary.friendly_name ?? null;
@@ -2603,10 +2704,11 @@ export const analyzeDocForForm = createServerFn({ method: "POST" })
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: doc } = await (supabase as any)
-      .from("sop_documents").select("id, title, file_url, workspace_id, drive_file_id, drive_mime_type").eq("id", data.docId).single();
+      .from("sop_documents").select("id, title, file_url, workspace_id, drive_file_id, drive_mime_type, tenant_id").eq("id", data.docId).single();
     if (!doc || (!doc.file_url && !doc.drive_file_id)) {
       return { docId: data.docId, title: doc?.title ?? "?", impactCount: 0, status: "failed" as const, referenceHits: 0 };
     }
+    assertRowTenant(doc.tenant_id, tenantId);
 
     // Search terms: form ID + friendly name + core name + each old value
     const coreFormName = deriveCoreFormName(friendlyName);
@@ -2776,6 +2878,8 @@ export const finalizeFormUpdateReport = createServerFn({ method: "POST" })
     const { data: report } = await (supabase as any)
       .from("analysis_reports").select("*").eq("id", data.reportId).single();
     if (!report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, (await getCallerTenant(context.userId)).tenantId);
     const summary = (report.summary_json ?? {}) as any;
     const formId: string = summary.form_id ?? report.policy_name;
     const fieldChanges: any[] = summary.field_changes ?? [];
@@ -2821,13 +2925,14 @@ export const finalizeFormUpdateReport = createServerFn({ method: "POST" })
 /** Lists the policy/SOP documents in ONE workspace that could reference a form. */
 async function getFormCandidateDocs(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  supabase: any, workspace: string,
+  supabase: any, workspace: string, tenantId: string,
 ): Promise<{ docId: string; title: string }[]> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const { data } = await (supabase as any)
     .from("sop_documents")
     .select("id, title, file_url, drive_file_id, doc_type")
     .eq("workspace_id", workspace)
+    .eq("tenant_id", tenantId)
     .in("doc_type", ["sop", "it_policy", "policy", "circular", "rmit_reg", "fatf"]);
   return ((data ?? []) as any[])
     .filter((d) => !!d.file_url || !!d.drive_file_id)
@@ -2934,7 +3039,7 @@ async function fetchAnalysisGuidance(
 /** Settings — read the current analysis guidance for a workspace. */
 export const getAnalysisGuidance = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .inputValidator(z.object({ workspace: workspaceSchema }))
+  .inputValidator(z.object({ workspace: guidanceKeySchema }))
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
     return { guidance: await fetchAnalysisGuidance(supabase, data.workspace) };
@@ -2943,7 +3048,7 @@ export const getAnalysisGuidance = createServerFn({ method: "GET" })
 /** Settings — save the analysis guidance for a workspace. */
 export const saveAnalysisGuidance = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator(z.object({ workspace: workspaceSchema, guidance: z.string().max(20000) }))
+  .inputValidator(z.object({ workspace: guidanceKeySchema, guidance: z.string().max(20000) }))
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -3083,11 +3188,13 @@ export const syncDriveFolder = createServerFn({ method: "POST" })
 
     // Preload existing sop_documents rows for these Drive files (one query, not N)
     const driveIds = indexable.map((f) => f.id);
+    const { tenantId } = await getCallerTenant(context.userId);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: existingRows } = driveIds.length > 0 ? await (supabase as any)
       .from("sop_documents")
       .select("id, drive_file_id, drive_modified_time, last_sync_error")
       .eq("workspace_id", data.workspace)
+      .eq("tenant_id", tenantId)
       .in("drive_file_id", driveIds) : { data: [] };
     const existingByFileId = new Map<string, any>();
     for (const r of existingRows ?? []) existingByFileId.set(r.drive_file_id, r);
@@ -3238,11 +3345,13 @@ export const listDriveFilesToSync = createServerFn({ method: "POST" })
     const skipped = files.filter((f) => !isIndexableMimeType(f.mimeType));
 
     const driveIds = indexable.map((f) => f.id);
+    const { tenantId } = await getCallerTenant(context.userId);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: existingRows } = driveIds.length > 0 ? await (supabase as any)
       .from("sop_documents")
       .select("id, drive_file_id, drive_modified_time, last_sync_error")
       .eq("workspace_id", data.workspace)
+      .eq("tenant_id", tenantId)
       .in("drive_file_id", driveIds) : { data: [] };
     const existingByFileId = new Map<string, any>();
     for (const r of existingRows ?? []) existingByFileId.set(r.drive_file_id, r);
@@ -3352,6 +3461,12 @@ export const mirrorDriveFile = createServerFn({ method: "POST" })
 
     let sopId: string;
     if (data.existingSopId) {
+      // Tenant boundary: an existing sop id from another tenant behaves like a 404.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: existingRow } = await (supabase as any)
+        .from("sop_documents").select("tenant_id").eq("id", data.existingSopId).maybeSingle();
+      if (!existingRow) throw new Error("Document not found");
+      assertRowTenant(existingRow.tenant_id, (await getCallerTenant(context.userId)).tenantId);
       sopId = data.existingSopId;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await (supabase as any).from("sop_documents").update(sopRow).eq("id", sopId);
@@ -3486,10 +3601,11 @@ export const insertImpactAsDriveComment = createServerFn({ method: "POST" })
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: sop, error: sopErr } = await (supabase as any)
       .from("sop_documents")
-      .select("workspace_id, title, drive_file_id, drive_mime_type")
+      .select("workspace_id, title, drive_file_id, drive_mime_type, tenant_id")
       .eq("id", imp.sop_id)
       .single();
     if (sopErr || !sop) throw new Error("Source SOP not found");
+    assertRowTenant(sop.tenant_id, (await getCallerTenant(context.userId)).tenantId);
     if (!sop.drive_file_id) {
       throw new Error("This SOP wasn't synced from Drive — there's no source file to comment on. Re-add the doc through the Drive folder if you want comments to flow back.");
     }
@@ -3559,10 +3675,11 @@ export const writeImpactToDoc = createServerFn({ method: "POST" })
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: sop, error: sopErr } = await (supabase as any)
       .from("sop_documents")
-      .select("workspace_id, title, drive_file_id, drive_mime_type")
+      .select("workspace_id, title, drive_file_id, drive_mime_type, tenant_id")
       .eq("id", imp.sop_id)
       .single();
     if (sopErr || !sop) throw new Error("Source SOP not found");
+    assertRowTenant(sop.tenant_id, (await getCallerTenant(context.userId)).tenantId);
     if (!sop.drive_file_id) {
       throw new Error("This SOP wasn't synced from Drive — re-add it through the Drive folder to enable edits.");
     }
@@ -3647,6 +3764,8 @@ export const generateAmendedDraft = createServerFn({ method: "POST" })
     const { data: report } = await (supabase as any)
       .from("analysis_reports").select("*").eq("id", data.reportId).single();
     if (!report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, (await getCallerTenant(context.userId)).tenantId);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: impactRows } = await (supabase as any)
@@ -3804,13 +3923,15 @@ Return ONLY JSON: {"form_number":"...","updated_date":"...","form_name":"..."}.`
     // 2. Find the matching old form in the Internal Forms KB
     const baseFormId = newFormNumber ? deriveBaseFormId(newFormNumber) : null;
     let oldForm: any = null;
+    const { tenantId } = await getCallerTenant(context.userId);
     if (data.oldFormSopId) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const { data: r } = await (supabase as any)
         .from("sop_documents")
-        .select("id, title, file_url, doc_type, workspace_id")
+        .select("id, title, file_url, doc_type, workspace_id, tenant_id")
         .eq("id", data.oldFormSopId)
         .maybeSingle();
+      if (r) assertRowTenant(r.tenant_id, tenantId);
       oldForm = r;
     } else if (baseFormId) {
       // Try a relaxed title match — handle "FGROP 037/2016" vs "FGROP_037_2016"
@@ -3821,6 +3942,7 @@ Return ONLY JSON: {"form_number":"...","updated_date":"...","form_name":"..."}.`
         .from("sop_documents")
         .select("id, title, file_url, doc_type, workspace_id")
         .eq("workspace_id", "forms")
+        .eq("tenant_id", tenantId)
         .order("created_at", { ascending: false });
       oldForm = (candidates ?? []).find((c: any) => {
         const flatTitle = (c.title ?? "").replace(/[^A-Za-z0-9]/g, "");
@@ -3991,6 +4113,8 @@ export const runSimplificationReport = createServerFn({ method: "POST" })
     const { data: report, error: repErr } = await supabase
       .from("analysis_reports").select("*").eq("id", data.reportId).single();
     if (repErr || !report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, (await getCallerTenant(context.userId)).tenantId);
     if (!report.source_file_url) throw new Error("Report has no source file — cannot run simplification");
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -4079,7 +4203,7 @@ export const runSimplificationReport = createServerFn({ method: "POST" })
       const actions = [...main.actions, ...dedup.actions];
       documentSummary = docSum.summary;
       const usage = addUsage(addUsage(main.usage, dedup.usage), docSum.usage);
-      cost = computeCost(usage); // metered even if the run yields nothing
+      cost = computeCost(usage, await getDefaultModel()); // metered even if the run yields nothing
       if (actions.length === 0) {
         throw new Error(
           "No simplification actions were produced — the AI model was likely overloaded or rate-limited. Please re-run.",
@@ -4102,7 +4226,7 @@ export const runSimplificationReport = createServerFn({ method: "POST" })
           if (figures.length > 0) {
             const fr = await analyzeDocFigures(title, figures, { guidance });
             figureReviews = fr.reviews;
-            cost = computeCost(addUsage(usage, fr.usage)); // fold vision tokens into the metered cost
+            cost = computeCost(addUsage(usage, fr.usage), await getDefaultModel()); // fold vision tokens into the metered cost
           }
         } catch (e: any) {
           console.warn("[simplify] figure review failed:", e?.message?.slice(0, 120));
@@ -4169,12 +4293,15 @@ export const setSimplificationDecision = createServerFn({ method: "POST" })
   )
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
-    const { data: report, error } = await supabase
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report, error } = await (supabase as any)
       .from("analysis_reports")
-      .select("summary_json")
+      .select("summary_json, tenant_id")
       .eq("id", data.reportId)
       .single();
     if (error || !report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, (await getCallerTenant(context.userId)).tenantId);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const sj = ((report.summary_json as any) ?? {}) as Record<string, any>;
@@ -4210,12 +4337,15 @@ export const bulkSetSimplificationDecision = createServerFn({ method: "POST" })
   )
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
-    const { data: report, error } = await supabase
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report, error } = await (supabase as any)
       .from("analysis_reports")
-      .select("summary_json")
+      .select("summary_json, tenant_id")
       .eq("id", data.reportId)
       .single();
     if (error || !report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, (await getCallerTenant(context.userId)).tenantId);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const sj = ((report.summary_json as any) ?? {}) as Record<string, any>;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -4260,6 +4390,8 @@ export const applySimplificationReport = createServerFn({ method: "POST" })
       .eq("id", data.reportId)
       .single();
     if (repErr || !report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, (await getCallerTenant(context.userId)).tenantId);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const sj = ((report.summary_json as any) ?? {}) as Record<string, any>;
@@ -4374,6 +4506,839 @@ export const applySimplificationReport = createServerFn({ method: "POST" })
     return apply;
   });
 
+// ============================================================================
+// SIMPLIFY V2 — three-mode workspace (simplify / recommend / recommend_edit).
+// ----------------------------------------------------------------------------
+// A separate workspace so the proven v1 simplify flow stays untouched as a
+// backup. "simplify" mode reuses the same analysis engine; "recommend" runs the
+// whole-document quality audit (recommend.ts); "recommend_edit" adds a gated
+// second stage that regenerates the document from accepted findings while
+// preserving the original DOCX package (logo/headers/styles).
+// Reports: analysis_reports rows, workspace_id "simplify_v2",
+// summary_json.kind "simplification_v2" + workflow_mode discriminator.
+// The v1 decision serverFns (setSimplificationDecision / bulk) are reused for
+// v2 simplify-mode actions — they operate purely on summary_json.actions.
+// ============================================================================
+
+const v2WorkflowModeSchema = z.enum(["simplify", "recommend", "recommend_edit"]);
+
+/**
+ * SCAN-FIRST INTAKE ("plan mode"): a cheap, fast look at a freshly uploaded
+ * document BEFORE any deep analysis — structure stats plus a sampled read that
+ * surfaces 3-5 concrete observations and recommends an intent. The upload
+ * dialog shows this as a plan card and asks the user to choose the action
+ * (find gaps / light simplify / max simplify / full redraft) instead of
+ * dumping 70 proposed changes on them unprompted.
+ */
+export const scanDocumentV2 = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(z.object({ fileUrl: z.string().url() }))
+  .handler(async ({ data }) => {
+    const src = await readV2Source(data.fileUrl);
+    const words = src.text.split(/\s+/).filter(Boolean).length;
+    const stats = {
+      words,
+      estPages: Math.max(1, Math.round(words / 450)),
+      sections: src.structure.sections.length,
+      tables: src.structure.tableCount,
+    };
+
+    const sample = src.text.slice(0, 25_000);
+    const prompt = `# ROLE: RAPID DOCUMENT TRIAGE for a bank operations/policy document.
+Read the excerpt below (the document's opening ~${Math.min(25, stats.estPages)} pages of ${stats.estPages}) and produce a quick quality triage.
+
+# OUTPUT — ONLY one JSON object:
+{
+  "observations": ["<3-5 short, concrete one-liners about THIS document — verbosity level, repetition, structure quality, clarity of ownership, anything a reviewer should know. Be specific, not generic.>"],
+  "recommended": "recommend | simplify_light | simplify_max | redraft",
+  "rationale": "<one sentence: why that action fits this document>"
+}
+
+# MEANING OF THE ACTIONS
+- recommend: run a quality AUDIT first (gaps, contradictions, incomplete steps) — right when the document's correctness is the concern.
+- simplify_light: propose plain-language edits — right when it's basically sound but wordy.
+- simplify_max: aggressive shrink — right when it's heavily bloated/repetitive.
+- redraft: automatic audit + restructure — right when it's structurally degraded beyond spot fixes.
+
+# EXCERPT:
+${sample}
+`;
+    let observations: string[] = [];
+    let recommended = "recommend";
+    let rationale = "";
+    try {
+      const response = await generateWithFallback({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        config: { responseMimeType: "application/json", maxOutputTokens: 4096 },
+      }, { tier: "fast" });
+      const parsed = JSON.parse(String(response.text ?? "{}"));
+      if (Array.isArray(parsed.observations)) observations = parsed.observations.map(String).slice(0, 5);
+      if (["recommend", "simplify_light", "simplify_max", "redraft"].includes(parsed.recommended)) recommended = parsed.recommended;
+      if (typeof parsed.rationale === "string") rationale = parsed.rationale;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } catch (e: any) {
+      console.warn("[simplify_v2] scan failed:", e?.message?.slice(0, 120));
+      observations = ["Quick scan unavailable — the document stats below are exact; pick the action that matches your goal."];
+    }
+    return { stats, observations, recommended, rationale };
+  });
+
+export const createSimplifyV2Report = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    z.object({
+      filename: z.string(),
+      fileUrl: z.string().nullable(),
+      customTitle: z.string().optional(),
+      instruction: z.string().optional(),
+      workflowMode: v2WorkflowModeSchema,
+      simplifyMode: z.enum(["thorough", "quick"]).optional(),
+      // "max" = aggressive page-reduction profile (simplify mode only).
+      simplifyProfile: z.enum(["standard", "max"]).optional(),
+      // Rudy's fully-automatic redraft: after the audit completes, the report
+      // page auto-accepts verified findings and generates the restructured doc.
+      redraftAuto: z.boolean().optional(),
+    }),
+  )
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    if (!data.fileUrl) throw new Error("No file URL provided");
+    const fallbackName = data.filename.replace(/\.[^.]+$/, "").trim() || data.filename;
+    const displayName = (data.customTitle ?? "").trim() || fallbackName;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report, error } = await (supabase as any)
+      .from("analysis_reports")
+      .insert({
+        title: displayName,
+        policy_name: displayName,
+        status: "pending_validation",
+        source_file_url: data.fileUrl,
+        workspace_id: "simplify_v2",
+        summary_json: {
+          kind: "simplification_v2",
+          workflow_mode: data.workflowMode,
+          simplify_mode: data.simplifyMode ?? "thorough",
+          simplify_profile: data.simplifyProfile ?? "standard",
+          redraft_auto: data.redraftAuto === true,
+          instruction: data.instruction?.trim() || null,
+          executive: ["Queued — analysing the document…"],
+          pending_analysis: true,
+        },
+      })
+      .select("id")
+      .single();
+    if (error || !report) throw new Error(error?.message || "Failed to create report");
+    return { reportId: report.id as string };
+  });
+
+/**
+ * CREATE FROM BRIEF — drafts a brand-new document in the bank's house
+ * structure, packaged inside a DONOR document's DOCX template (logo, headers,
+ * styles). Lazy create-then-run: this inserts the pending row; the report page
+ * auto-runs runSimplifyV2Report, which does the actual generation.
+ */
+export const createDocFromBriefReport = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    z.object({
+      title: z.string().min(3).max(160),
+      docType: z.string().min(2).max(60),
+      brief: z.string().min(20).max(8000),
+      donorReportId: z.string(),
+    }),
+  )
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    const { tenantId, features } = await getCallerTenant(context.userId);
+    if (!features.includes("create_document")) {
+      throw new Error("Document creation is not enabled for your organisation.");
+    }
+    // Donor must be the caller's tenant's document with a DOCX source.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: donor } = await (supabase as any)
+      .from("analysis_reports")
+      .select("id, title, source_file_url, tenant_id")
+      .eq("id", data.donorReportId)
+      .maybeSingle();
+    if (!donor || (donor.tenant_id && donor.tenant_id !== tenantId)) throw new Error("Template document not found");
+    if (!donor.source_file_url || !looksLikeDocx(null, donor.source_file_url)) {
+      throw new Error("The template document must be a DOCX file.");
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report, error } = await (supabase as any)
+      .from("analysis_reports")
+      .insert({
+        title: data.title.trim(),
+        policy_name: data.title.trim(),
+        status: "pending_validation",
+        source_file_url: donor.source_file_url, // the donor package
+        workspace_id: "simplify_v2",
+        summary_json: {
+          kind: "simplification_v2",
+          workflow_mode: "create",
+          doc_brief: {
+            title: data.title.trim(),
+            docType: data.docType.trim(),
+            brief: data.brief.trim(),
+            donorReportId: donor.id,
+            donorTitle: donor.title,
+          },
+          executive: ["Queued — drafting the document…"],
+          pending_analysis: true,
+        },
+      })
+      .select("id")
+      .single();
+    if (error || !report) throw new Error(error?.message || "Failed to create report");
+    return { reportId: report.id as string };
+  });
+
+/** Shared v2 preamble: fetch the source file and derive text/units/structure. */
+async function readV2Source(sourceFileUrl: string): Promise<{
+  isDocx: boolean;
+  text: string;
+  units: { text: string; section: string }[];
+  structure: DocStructure;
+  buffer: Buffer;
+}> {
+  const file = await fetchFile(sourceFileUrl);
+  const isDocx = looksLikeDocx(file.mimeType, sourceFileUrl);
+  const html = isDocx ? await docxToHtml(file.buffer) : "";
+  let text = "";
+  if (isDocx) {
+    try { text = docxToSimplifyText(file.buffer); } catch { text = ""; }
+    if (!text) text = await docxToText(file.buffer).catch(() => "");
+  }
+  if (!text) {
+    if (file.mimeType === "application/pdf" || /\.pdf($|\?)/i.test(sourceFileUrl)) {
+      const { extractPdfPages } = await import("./pdf-pages");
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      text = (await extractPdfPages(file.buffer)).map((p: any) => p.text).join("\n\n");
+    } else {
+      text = file.buffer.toString("utf-8");
+    }
+  }
+  if (!text.trim()) throw new Error("Could not read any text from the uploaded document");
+  const units = isDocx
+    ? docxToSimplifyUnits(file.buffer)
+    : text.split(/\n+/).map((t) => ({ text: t.trim(), section: "" })).filter((u) => u.text);
+  return { isDocx, text, units, structure: analyzeStructure(html || text), buffer: file.buffer };
+}
+
+/**
+ * Runs the analysis stage for a v2 report, branching on workflow_mode:
+ *  - simplify        → same engine as v1 (per-unit/chunk + de-dup + summary +
+ *                      figure review), guidance key "simplify_v2".
+ *  - recommend /
+ *    recommend_edit  → whole-document quality audit (multi-pass, evidence-
+ *                      verified findings), guidance key "simplify_v2_recommend".
+ *                      Claims are stored for the later restructure stage.
+ */
+export const runSimplifyV2Report = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(z.object({
+    reportId: z.string(),
+    simplifyMode: z.enum(["thorough", "quick"]).optional(),
+  }))
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    const { data: report, error: repErr } = await supabase
+      .from("analysis_reports").select("*").eq("id", data.reportId).single();
+    if (repErr || !report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, (await getCallerTenant(context.userId)).tenantId);
+    if (!report.source_file_url) throw new Error("Report has no source file");
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const prevJson = ((report.summary_json as any) ?? {}) as Record<string, any>;
+    const workflowMode: string = prevJson.workflow_mode ?? "simplify";
+    const instruction: string | null = prevJson.instruction ?? null;
+    const title = (report.policy_name as string) ?? "Document";
+
+    let status: "ok" | "failed" = "failed";
+    let errorMsg: string | null = null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const patch: Record<string, any> = {};
+
+    try {
+      // ── CREATE-FROM-BRIEF: no source analysis — generate into the donor
+      // package. Handled before readV2Source (the "source" is just the donor).
+      if (workflowMode === "create") {
+        const briefMeta = prevJson.doc_brief ?? {};
+        const guidance = (await fetchAnalysisGuidance(supabase, "simplify_v2"))
+          || (await fetchAnalysisGuidance(supabase, "simplify"))
+          || DEFAULT_SIMPLIFY_GUIDANCE;
+        const gen = await generateDocumentFromBrief(
+          String(briefMeta.title ?? title),
+          String(briefMeta.docType ?? "policy"),
+          String(briefMeta.brief ?? ""),
+          guidance,
+        );
+        const donorFile = await fetchFile(report.source_file_url);
+        const buffer = rebuildDocxBody(donorFile.buffer, gen.sections, { author: "AI Document Workflow" });
+        const safeName = title.replace(/[^A-Za-z0-9_.-]+/g, "_").slice(0, 80) || "draft";
+        const path = `simplify-v2/created-${Date.now()}-${safeName}.docx`;
+        const up = await supabase.storage.from("policies").upload(path, buffer, {
+          upsert: false,
+          contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        });
+        if (up.error) throw new Error(`Storage upload failed: ${up.error.message}`);
+        patch.created = {
+          downloadUrl: supabase.storage.from("policies").getPublicUrl(path).data.publicUrl,
+          downloadName: `${safeName}.docx`,
+          outline: gen.sections.map((s) => ({ heading: s.heading, level: s.level })),
+          generatedAt: new Date().toISOString(),
+        };
+        patch.cost = computeCost(gen.usage, await getDefaultModel());
+        status = "ok";
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        await (supabase as any).from("analysis_reports").update({
+          summary_json: {
+            ...prevJson,
+            ...patch,
+            kind: "simplification_v2",
+            workflow_mode: workflowMode,
+            pending_analysis: false,
+            simplification_status: status,
+            simplification_error: null,
+            last_run_at: new Date().toISOString(),
+          },
+        }).eq("id", report.id);
+        return { reportId: report.id as string, status, error: null };
+      }
+
+      const src = await readV2Source(report.source_file_url);
+      patch.structure = src.structure;
+
+      if (workflowMode === "simplify") {
+        const mode: "thorough" | "quick" = data.simplifyMode ?? prevJson.simplify_mode ?? "thorough";
+        let guidance = (await fetchAnalysisGuidance(supabase, "simplify_v2"))
+          || (await fetchAnalysisGuidance(supabase, "simplify"))
+          || DEFAULT_SIMPLIFY_GUIDANCE;
+        // "max" profile — the aggressive page-reduction addendum rides on top
+        // of whatever guidance is configured.
+        if (prevJson.simplify_profile === "max") guidance = `${guidance}\n${AGGRESSIVE_SIMPLIFY_ADDENDUM}`;
+        const [main, dedup, docSum] = await Promise.all([
+          mode === "thorough" && src.units.length
+            ? simplifyDocumentByUnits({ title, units: src.units }, { instruction, guidance })
+            : simplifyDocument({ title, text: src.text }, { instruction, guidance }),
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          detectDocumentDuplication({ title, text: src.text }, { guidance }).catch((e: any) => {
+            console.warn("[simplify_v2] de-dup pass failed:", e?.message?.slice(0, 120));
+            return { actions: [], usage: { inputTokens: 0, outputTokens: 0, thinkingTokens: 0, calls: 0 } };
+          }),
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          summarizeDocument({ title, text: src.text }, { guidance }).catch((e: any) => {
+            console.warn("[simplify_v2] summary pass failed:", e?.message?.slice(0, 120));
+            return { summary: "", usage: { inputTokens: 0, outputTokens: 0, thinkingTokens: 0, calls: 0 } };
+          }),
+        ]);
+        const actions = [...main.actions, ...dedup.actions];
+        let usage = addUsage(addUsage(main.usage, dedup.usage), docSum.usage);
+        if (actions.length === 0) {
+          throw new Error("No simplification actions were produced — the model was likely overloaded. Please re-run.");
+        }
+        const summary = verifyActions(actions, src.text);
+        patch.simplify_mode = mode;
+        patch.document_summary = docSum.summary || null;
+        patch.cross_check = crossCheckSections(summary.actions, src.structure);
+        patch.verification = { total: summary.total, verified: summary.verified, review: summary.review, rejected: summary.rejected };
+        patch.actions = summary.actions.map((a) => ({ ...a, decision: initialDecision(a) }));
+        // Figure review rides along exactly like v1 — comments on apply.
+        if (src.isDocx) {
+          try {
+            const { figures, skipped } = extractDocxFigures(src.buffer);
+            patch.figures_scanned = figures.length;
+            patch.figures_skipped = skipped;
+            if (figures.length > 0) {
+              const fr = await analyzeDocFigures(title, figures, { guidance });
+              patch.figure_reviews = fr.reviews;
+              usage = addUsage(usage, fr.usage);
+            }
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          } catch (e: any) {
+            console.warn("[simplify_v2] figure review failed:", e?.message?.slice(0, 120));
+          }
+        }
+        patch.cost = computeCost(usage, await getDefaultModel());
+      } else {
+        // recommend / recommend_edit — the whole-document quality audit.
+        const guidance = (await fetchAnalysisGuidance(supabase, "simplify_v2_recommend")) || DEFAULT_RECOMMEND_GUIDANCE;
+        const [audit, docSum] = await Promise.all([
+          runAuditPipeline(title, src.text, src.units, src.structure, guidance),
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          summarizeDocument({ title, text: src.text }, { guidance }).catch((e: any) => {
+            console.warn("[simplify_v2] summary pass failed:", e?.message?.slice(0, 120));
+            return { summary: "", usage: { inputTokens: 0, outputTokens: 0, thinkingTokens: 0, calls: 0 } };
+          }),
+        ]);
+        patch.document_summary = docSum.summary || null;
+        patch.findings = audit.findings;
+        // Claims feed the restructure stage's content-preservation check.
+        patch.claims = audit.claims;
+        patch.audit = {
+          status: "ok",
+          claimCount: audit.claims.length,
+          clusterCount: audit.clusterCount,
+          counts: countFindings(audit.findings),
+        };
+        patch.cost = computeCost(addUsage(audit.usage, docSum.usage), await getDefaultModel());
+      }
+      status = "ok";
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } catch (e: any) {
+      errorMsg = e?.message?.slice(0, 250) ?? "unknown error";
+      console.warn(`[simplify_v2] run failed for "${title}":`, errorMsg);
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase as any).from("analysis_reports").update({
+      summary_json: {
+        ...prevJson,
+        // A re-run INVALIDATES prior outputs: stale exports/restructures from
+        // the previous action/finding set must not survive next to fresh
+        // results (and a lingering restructure{} would block redraft_auto).
+        apply: null,
+        restructure: null,
+        ...patch,
+        kind: "simplification_v2",
+        workflow_mode: workflowMode,
+        pending_analysis: false,
+        simplification_status: status,
+        simplification_error: errorMsg,
+        last_run_at: new Date().toISOString(),
+      },
+    }).eq("id", report.id);
+
+    return { reportId: report.id as string, status, error: errorMsg };
+  });
+
+/** Records a reviewer's Accept/Dismiss decision on one audit finding (by id). */
+export const setV2FindingDecision = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    z.object({
+      reportId: z.string(),
+      findingId: z.string(),
+      decision: z.enum(["accepted", "dismissed", "pending"]),
+    }),
+  )
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report, error } = await (supabase as any)
+      .from("analysis_reports").select("summary_json, tenant_id").eq("id", data.reportId).single();
+    if (error || !report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, (await getCallerTenant(context.userId)).tenantId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sj = ((report.summary_json as any) ?? {}) as Record<string, any>;
+    const findings: Finding[] = Array.isArray(sj.findings) ? sj.findings : [];
+    const idx = findings.findIndex((f) => f?.id === data.findingId);
+    if (idx < 0) throw new Error("Finding not found");
+    if (findings[idx].verification?.status === "rejected" && data.decision === "accepted") {
+      throw new Error("A quarantined finding cannot be accepted — its evidence was not found in the document.");
+    }
+    findings[idx] = { ...findings[idx], decision: data.decision };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { error: upErr } = await (supabase as any)
+      .from("analysis_reports")
+      .update({ summary_json: { ...sj, findings } })
+      .eq("id", data.reportId);
+    if (upErr) throw new Error(`Failed to save decision: ${upErr.message}`);
+    return { ok: true };
+  });
+
+/** Edits a finding's suggested fix (reviewer refinement before accepting).
+ *  The edited text is what the restructure stage will implement. */
+export const updateV2FindingFix = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    z.object({
+      reportId: z.string(),
+      findingId: z.string(),
+      suggestedFix: z.string().min(1).max(4000),
+    }),
+  )
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report, error } = await (supabase as any)
+      .from("analysis_reports").select("summary_json, tenant_id").eq("id", data.reportId).single();
+    if (error || !report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, (await getCallerTenant(context.userId)).tenantId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sj = ((report.summary_json as any) ?? {}) as Record<string, any>;
+    const findings: Finding[] = Array.isArray(sj.findings) ? sj.findings : [];
+    const idx = findings.findIndex((f) => f?.id === data.findingId);
+    if (idx < 0) throw new Error("Finding not found");
+    findings[idx] = {
+      ...findings[idx],
+      suggestedFix: data.suggestedFix.trim(),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ...( { fixEditedAt: new Date().toISOString() } as any ),
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { error: upErr } = await (supabase as any)
+      .from("analysis_reports")
+      .update({ summary_json: { ...sj, findings } })
+      .eq("id", data.reportId);
+    if (upErr) throw new Error(`Failed to save fix: ${upErr.message}`);
+    return { ok: true };
+  });
+
+/** Edits a simplify-mode action's replacement text ("after"). The reviewer's
+ *  wording is what export applies; marked edited for transparency. */
+export const updateV2ActionAfter = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    z.object({
+      reportId: z.string(),
+      index: z.number().int().min(0),
+      after: z.string().max(8000),
+    }),
+  )
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report, error } = await (supabase as any)
+      .from("analysis_reports").select("summary_json, tenant_id").eq("id", data.reportId).single();
+    if (error || !report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, (await getCallerTenant(context.userId)).tenantId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sj = ((report.summary_json as any) ?? {}) as Record<string, any>;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const actions: any[] = Array.isArray(sj.actions) ? sj.actions : [];
+    if (data.index >= actions.length) throw new Error("Action index out of range");
+    actions[data.index] = {
+      ...actions[data.index],
+      after: data.after,
+      afterEditedAt: new Date().toISOString(),
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { error: upErr } = await (supabase as any)
+      .from("analysis_reports")
+      .update({ summary_json: { ...sj, actions } })
+      .eq("id", data.reportId);
+    if (upErr) throw new Error(`Failed to save edit: ${upErr.message}`);
+    return { ok: true };
+  });
+
+/** Bulk Accept/Dismiss/Pending over findings — optionally scoped to ids.
+ *  Quarantined findings are never touched. */
+export const bulkSetV2FindingDecision = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    z.object({
+      reportId: z.string(),
+      decision: z.enum(["accepted", "dismissed", "pending"]),
+      findingIds: z.array(z.string()).optional(),
+    }),
+  )
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report, error } = await (supabase as any)
+      .from("analysis_reports").select("summary_json, tenant_id").eq("id", data.reportId).single();
+    if (error || !report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, (await getCallerTenant(context.userId)).tenantId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sj = ((report.summary_json as any) ?? {}) as Record<string, any>;
+    const findings: Finding[] = Array.isArray(sj.findings) ? sj.findings : [];
+    const scope = data.findingIds ? new Set(data.findingIds) : null;
+    let changed = 0;
+    const updated = findings.map((f) => {
+      if (scope && !scope.has(f.id)) return f;
+      if (f.verification?.status === "rejected") return f;
+      if (f.decision === data.decision) return f;
+      changed++;
+      return { ...f, decision: data.decision };
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { error: upErr } = await (supabase as any)
+      .from("analysis_reports")
+      .update({ summary_json: { ...sj, findings: updated } })
+      .eq("id", data.reportId);
+    if (upErr) throw new Error(`Failed to save decisions: ${upErr.message}`);
+    return { changed, total: updated.length };
+  });
+
+/**
+ * V2 simplify-mode export. Applies accepted actions to the ORIGINAL docx:
+ *  - "annotated" → Word tracked changes + a rationale comment per change, so a
+ *    recipient opens it in Word and reviews native Accept/Reject revisions.
+ *  - "clean"     → plain replacement, no markup — the final copy.
+ * Both preserve the original package (logo, headers, styles) because the edit
+ * engine mutates only matching paragraph runs in word/document.xml.
+ */
+export const applySimplifyV2Report = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(z.object({
+    reportId: z.string(),
+    exportMode: z.enum(["clean", "annotated"]),
+  }))
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    const { data: report, error: repErr } = await supabase
+      .from("analysis_reports").select("*").eq("id", data.reportId).single();
+    if (repErr || !report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, (await getCallerTenant(context.userId)).tenantId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sj = ((report.summary_json as any) ?? {}) as Record<string, any>;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const allActions: any[] = Array.isArray(sj.actions) ? sj.actions : [];
+    const accepted = allActions.filter((a) => a?.decision === "accepted");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const figureReviews: any[] = Array.isArray(sj.figure_reviews) ? sj.figure_reviews : [];
+    if (accepted.length === 0) throw new Error("No accepted actions to apply.");
+    if (!report.source_file_url) throw new Error("Report has no source file URL");
+
+    const file = await fetchFile(report.source_file_url);
+    if (!looksLikeDocx(file.mimeType, report.source_file_url)) {
+      throw new Error("Export currently supports DOCX sources only. For PDFs, re-upload as DOCX.");
+    }
+
+    const title = (report.policy_name as string) ?? "Document";
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const edits: SimplifyDocxEdit[] = accepted.map((a: any) => ({
+      before: String(a.before ?? ""),
+      after: String(a.after ?? ""),
+      rationale:
+        a.rule || a.rationale
+          ? `${a.rule ?? ""}${a.rule && a.rationale ? " — " : ""}${a.rationale ?? ""}`.trim() || undefined
+          : undefined,
+    }));
+    // Figure comments only make sense on the annotated copy.
+    if (data.exportMode === "annotated") {
+      for (const f of figureReviews) {
+        if (f?.anchorRelId && f?.comment) {
+          edits.push({ before: "", after: "", commentOnly: true, anchorRelId: f.anchorRelId, comment: f.comment });
+        }
+      }
+    }
+
+    const result = applySimplificationToDocx(file.buffer, edits, {
+      author: "AI Document Workflow",
+      mode: data.exportMode === "clean" ? "clean" : "redline",
+      redlineComments: data.exportMode === "annotated",
+    });
+
+    const safeName = title.replace(/[^A-Za-z0-9_.-]+/g, "_").slice(0, 80) || "amended";
+    const path = `simplify-v2/${data.exportMode}-${Date.now()}-${safeName}.docx`;
+    const up = await supabase.storage.from("policies").upload(path, result.buffer, {
+      upsert: false,
+      contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    });
+    if (up.error) throw new Error(`Storage upload failed: ${up.error.message}`);
+    const downloadUrl = supabase.storage.from("policies").getPublicUrl(path).data.publicUrl;
+
+    const apply = {
+      ...(sj.apply ?? {}),
+      kind: "local" as const,
+      [data.exportMode === "clean" ? "cleanUrl" : "annotatedUrl"]: downloadUrl,
+      [`${data.exportMode}Name`]: `${safeName}-${data.exportMode}.docx`,
+      appliedCount: result.appliedCount,
+      totalAccepted: accepted.length,
+      skipped: result.skipped,
+      appliedAt: new Date().toISOString(),
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase as any)
+      .from("analysis_reports")
+      .update({ summary_json: { ...sj, apply } })
+      .eq("id", report.id);
+    return apply;
+  });
+
+/**
+ * Recommend & Edit stage 2 — regenerates the document from accepted findings.
+ * Produces a CLEAN restructured docx (original package preserved: logo/headers/
+ * styles; body rebuilt) plus an ANNOTATED companion whose section headings
+ * carry Word comments listing the changes made there. Content preservation is
+ * verified by bidirectional claim coverage with a capped repair loop; residual
+ * losses are reported honestly, never hidden.
+ */
+export const generateRestructuredV2Document = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(z.object({ reportId: z.string() }))
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    const { data: report, error: repErr } = await supabase
+      .from("analysis_reports").select("*").eq("id", data.reportId).single();
+    if (repErr || !report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, (await getCallerTenant(context.userId)).tenantId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sj = ((report.summary_json as any) ?? {}) as Record<string, any>;
+    if (sj.workflow_mode !== "recommend_edit") {
+      throw new Error("Restructure generation is only available in Recommend & Edit mode.");
+    }
+    const findings: Finding[] = Array.isArray(sj.findings) ? sj.findings : [];
+    const accepted = findings.filter((f) => f?.decision === "accepted");
+    if (accepted.length === 0) throw new Error("Accept at least one finding before generating.");
+    if (!report.source_file_url) throw new Error("Report has no source file URL");
+
+    const file = await fetchFile(report.source_file_url);
+    if (!looksLikeDocx(file.mimeType, report.source_file_url)) {
+      throw new Error("Restructure currently supports DOCX sources only. For PDFs, re-upload as DOCX.");
+    }
+
+    const title = (report.policy_name as string) ?? "Document";
+    // Table-aware extraction so the redraft reproduces tables as real tables
+    // instead of flattening them into loose paragraphs.
+    const units = docxToStructuredUnits(file.buffer);
+    const claims: ClaimUnit[] = Array.isArray(sj.claims) ? sj.claims : [];
+    const simplifyGuidance = (await fetchAnalysisGuidance(supabase, "simplify_v2"))
+      || (await fetchAnalysisGuidance(supabase, "simplify"))
+      || DEFAULT_SIMPLIFY_GUIDANCE;
+
+    const result = await generateRestructured(title, units, claims, accepted, simplifyGuidance);
+
+    // Per-section change notes → Word comments on the annotated copy.
+    const sectionComments: Record<string, string> = {};
+    for (const c of result.changeReport) {
+      const line = `${c.findingId}: ${c.summary}${c.before ? `\nBefore: ${c.before}` : ""}`;
+      sectionComments[c.section] = sectionComments[c.section]
+        ? `${sectionComments[c.section]}\n\n${line}` : line;
+    }
+
+    const cleanBuffer = rebuildDocxBody(file.buffer, result.sections, { author: "AI Document Workflow" });
+    const annotatedBuffer = rebuildDocxBody(file.buffer, result.sections, {
+      author: "AI Document Workflow",
+      sectionComments,
+    });
+
+    const safeName = title.replace(/[^A-Za-z0-9_.-]+/g, "_").slice(0, 80) || "restructured";
+    const stamp = Date.now();
+    const uploads: { key: "downloadUrl" | "annotatedUrl"; path: string; buffer: Buffer }[] = [
+      { key: "downloadUrl", path: `simplify-v2/restructured-${stamp}-${safeName}.docx`, buffer: cleanBuffer },
+      { key: "annotatedUrl", path: `simplify-v2/restructured-${stamp}-${safeName}-annotated.docx`, buffer: annotatedBuffer },
+    ];
+    const urls: Record<string, string> = {};
+    for (const u of uploads) {
+      const up = await supabase.storage.from("policies").upload(u.path, u.buffer, {
+        upsert: false,
+        contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      });
+      if (up.error) throw new Error(`Storage upload failed: ${up.error.message}`);
+      urls[u.key] = supabase.storage.from("policies").getPublicUrl(u.path).data.publicUrl;
+    }
+
+    const restructure = {
+      downloadUrl: urls.downloadUrl,
+      annotatedUrl: urls.annotatedUrl,
+      downloadName: `${safeName}-restructured.docx`,
+      generatedAt: new Date().toISOString(),
+      changeReport: result.changeReport,
+      preservation: result.preservation,
+      cost: computeCost(result.usage, await getDefaultModel()),
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase as any)
+      .from("analysis_reports")
+      .update({ summary_json: { ...sj, restructure } })
+      .eq("id", report.id);
+    return restructure;
+  });
+
+// ── Demo seeding — clone generic demo content into a tenant (super-admin) ────
+
+/** Lists a source tenant's clonable content (titles only) for the seed dialog. */
+export const listSeedableContent = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(z.object({ sourceTenant: z.string().min(1).max(40).default("rhb") }))
+  .handler(async ({ data, context }) => {
+    await assertCallerSuperAdmin(context.userId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const [reportsRes, sopsRes] = await Promise.all([
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (supabaseAdmin as any)
+        .from("analysis_reports")
+        .select("id, title, workspace_id, workflow_type, created_at")
+        .eq("tenant_id", data.sourceTenant)
+        .order("created_at", { ascending: false })
+        .limit(200),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (supabaseAdmin as any)
+        .from("sop_documents")
+        .select("id, title, workspace_id, doc_type, created_at")
+        .eq("tenant_id", data.sourceTenant)
+        .order("created_at", { ascending: false })
+        .limit(200),
+    ]);
+    return {
+      reports: reportsRes.data ?? [],
+      sops: sopsRes.data ?? [],
+    };
+  });
+
+/**
+ * Clones the selected reports and KB documents (WITH their embedding chunks)
+ * into the target tenant, entirely inside Postgres via clone_demo_to_tenant.
+ * Storage files are shared by URL — nothing is re-uploaded or re-embedded.
+ */
+export const seedTenantDemo = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    z.object({
+      targetTenant: z.string().min(1).max(40),
+      reportIds: z.array(z.string().uuid()).max(200).default([]),
+      sopIds: z.array(z.string().uuid()).max(200).default([]),
+    }),
+  )
+  .handler(async ({ data, context }) => {
+    await assertCallerSuperAdmin(context.userId);
+    if (data.reportIds.length === 0 && data.sopIds.length === 0) {
+      throw new Error("Select at least one document or report to clone.");
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: result, error } = await (supabaseAdmin as any).rpc("clone_demo_to_tenant", {
+      p_report_ids: data.reportIds,
+      p_sop_ids: data.sopIds,
+      p_target: data.targetTenant,
+    });
+    if (error) throw new Error(`Clone failed: ${error.message}`);
+    return result as { reports: number; sops: number; chunks: number; target: string };
+  });
+
+// ── AI model settings — the admin-picked default model (Settings → AI Model).
+// The picked model always leads the quality chain; fallbacks apply on failure.
+
+export const getModelSettings = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data } = await (supabaseAdmin as any)
+      .from("app_settings").select("value").eq("key", "default_model").maybeSingle();
+    const m = data?.value?.model;
+    return {
+      model: typeof m === "string" && (AVAILABLE_MODELS as readonly string[]).includes(m)
+        ? m
+        : AVAILABLE_MODELS[1], // gemini-3.5-flash — the built-in default
+      available: [...AVAILABLE_MODELS],
+    };
+  });
+
+export const setModelSettings = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(z.object({ model: z.enum(AVAILABLE_MODELS) }))
+  .handler(async ({ data, context }) => {
+    await assertCallerSuperAdmin(context.userId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { error } = await (supabaseAdmin as any).from("app_settings").upsert({
+      key: "default_model",
+      value: { model: data.model },
+      updated_at: new Date().toISOString(),
+    });
+    if (error) throw new Error(`Failed to save model setting: ${error.message}`);
+    clearDefaultModelCache();
+    return { ok: true };
+  });
+
 // ── Workspace visibility (master toggle) ─────────────────────────────────────
 // A super-admin can flip workspaces on/off here without touching deploy. The
 // workspace switcher reads this and hides any workspace marked invisible. If
@@ -4451,6 +5416,7 @@ export interface AppUserRow {
   signedIn: boolean;
   lastSignInAt: string | null;
   createdAt: string | null;
+  tenantId: string;           // branding tenant (see public.tenants); "default" if unset
 }
 
 /** Throws unless the calling auth user is a super_admin. */
@@ -4485,28 +5451,33 @@ export const listAppUsers = createServerFn({ method: "GET" })
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const authUsers: any[] = authRes?.data?.users ?? [];
 
-    // 2. Roles, keyed by user id.
+    // 2. Roles + tenant, keyed by user id.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: profs } = await (supabaseAdmin as any)
       .from("profiles")
-      .select("id, email, role");
+      .select("id, email, role, tenant_id");
     const roleById = new Map<string, string>();
     const emailById = new Map<string, string>();
+    const tenantById = new Map<string, string>();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     for (const p of (profs ?? []) as any[]) {
       roleById.set(p.id, p.role);
+      tenantById.set(p.id, p.tenant_id ?? "default");
       if (p.email) emailById.set(p.id, String(p.email).toLowerCase());
     }
 
     // 3. Allowlist (table may not exist until the lockdown migration — tolerate).
-    const allow = new Set<string>();
+    // Maps email -> tenant_id so invited-but-never-signed-in rows can show it too.
+    const allow = new Map<string, string>();
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const { data: al } = await (supabaseAdmin as any)
         .from("login_allowlist")
-        .select("email");
+        .select("email, tenant_id");
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      for (const r of (al ?? []) as any[]) if (r.email) allow.add(String(r.email).toLowerCase());
+      for (const r of (al ?? []) as any[]) {
+        if (r.email) allow.set(String(r.email).toLowerCase(), r.tenant_id ?? "default");
+      }
     } catch {
       /* allowlist not present yet */
     }
@@ -4527,12 +5498,13 @@ export const listAppUsers = createServerFn({ method: "GET" })
         signedIn: true,
         lastSignInAt: u.last_sign_in_at ?? null,
         createdAt: u.created_at ?? null,
+        tenantId: tenantById.get(u.id) ?? "default",
       });
       if (emailLc) seen.add(emailLc);
     }
 
     // 4. Invited-but-never-signed-in emails.
-    for (const emailLc of allow) {
+    for (const [emailLc, tenantId] of allow) {
       if (seen.has(emailLc)) continue;
       rows.push({
         id: null,
@@ -4543,6 +5515,7 @@ export const listAppUsers = createServerFn({ method: "GET" })
         signedIn: false,
         lastSignInAt: null,
         createdAt: null,
+        tenantId,
       });
     }
 
@@ -4574,6 +5547,7 @@ export const setUserAccess = createServerFn({ method: "POST" })
       userId: z.string().uuid().optional(),
       email: z.string().email(),
       level: z.enum(["none", "viewer", "member", "super_admin"]),
+      tenantId: z.string().optional(), // branding tenant; omitted = leave unchanged
     }),
   )
   .handler(async ({ data, context }) => {
@@ -4591,24 +5565,161 @@ export const setUserAccess = createServerFn({ method: "POST" })
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await (supabaseAdmin as any).from("login_allowlist").delete().eq("email", email);
     } else {
+      const allowlistRow: Record<string, string> = { email };
+      if (data.tenantId) allowlistRow.tenant_id = data.tenantId;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await (supabaseAdmin as any)
         .from("login_allowlist")
-        .upsert({ email }, { onConflict: "email" });
+        .upsert(allowlistRow, { onConflict: "email" });
     }
 
-    // Role: only updatable once the user exists (has signed in => has a profile).
+    // Role/tenant: only updatable once the user exists (has signed in => has a profile).
     if (data.userId) {
       const role = data.level === "none" ? "viewer" : data.level;
+      const profileUpdate: Record<string, string> = { role };
+      if (data.tenantId) profileUpdate.tenant_id = data.tenantId;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const { error } = await (supabaseAdmin as any)
         .from("profiles")
-        .update({ role })
+        .update(profileUpdate)
         .eq("id", data.userId);
       if (error) throw new Error(`Failed to update role: ${error.message}`);
     }
 
     return { ok: true };
+  });
+
+// ============================================================================
+// TENANTS — branding config for re-skinning the app per external prospect
+// (e.g. RHB). Deliberately NOT a data/RLS boundary: every tenant's users see
+// every workspace, exactly as today (see 20260716_tenant_branding.sql). Only
+// affects name/tagline/logo/colors.
+// ============================================================================
+
+export interface TenantRow {
+  slug: string;
+  name: string;
+  tagline: string | null;
+  logoUrl: string | null;
+  colorPrimary: string | null;
+  colorSidebar: string | null;
+  colorSidebarPrimary: string | null;
+  colorSidebarAccent: string | null;
+  /** Enabled feature keys (workspace ids + legal_cms/rudy/create_document). */
+  features: string[];
+}
+
+// select("*") so reads tolerate schema drift (features arrived in a later
+// migration than the branding columns).
+const TENANT_COLUMNS = "*";
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function toTenantRow(r: any): TenantRow {
+  return {
+    slug: r.slug,
+    name: r.name,
+    tagline: r.tagline ?? null,
+    logoUrl: r.logo_url ?? null,
+    colorPrimary: r.color_primary ?? null,
+    colorSidebar: r.color_sidebar ?? null,
+    colorSidebarPrimary: r.color_sidebar_primary ?? null,
+    colorSidebarAccent: r.color_sidebar_accent ?? null,
+    features: Array.isArray(r.features) ? r.features : [...ALL_TENANT_FEATURES],
+  };
+}
+
+/** Lists every tenant (super-admin only — the admin UI). */
+export const listTenants = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }): Promise<{ tenants: TenantRow[] }> => {
+    await assertCallerSuperAdmin(context.userId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data, error } = await (supabaseAdmin as any)
+      .from("tenants")
+      .select(TENANT_COLUMNS)
+      .order("slug");
+    if (error) throw new Error(`Failed to list tenants: ${error.message}`);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return { tenants: ((data ?? []) as any[]).map(toTenantRow) };
+  });
+
+const tenantInputSchema = z.object({
+  slug: z.string().min(1).max(40).regex(/^[a-z0-9_-]+$/, "lowercase letters, numbers, - or _ only"),
+  name: z.string().min(1).max(120),
+  tagline: z.string().max(160).optional(),
+  logoUrl: z.string().url().optional().or(z.literal("")),
+  colorPrimary: z.string().max(80).optional().or(z.literal("")),
+  colorSidebar: z.string().max(80).optional().or(z.literal("")),
+  colorSidebarPrimary: z.string().max(80).optional().or(z.literal("")),
+  colorSidebarAccent: z.string().max(80).optional().or(z.literal("")),
+  // Per-tenant capability toggles. Optional so branding-only saves (and
+  // pre-migration clients) don't clobber a tenant's feature set.
+  features: z.array(z.enum(ALL_TENANT_FEATURES)).optional(),
+});
+
+function tenantUpsertPayload(data: z.infer<typeof tenantInputSchema>) {
+  return {
+    slug: data.slug,
+    name: data.name,
+    tagline: data.tagline || null,
+    logo_url: data.logoUrl || null,
+    color_primary: data.colorPrimary || null,
+    color_sidebar: data.colorSidebar || null,
+    color_sidebar_primary: data.colorSidebarPrimary || null,
+    color_sidebar_accent: data.colorSidebarAccent || null,
+    ...(data.features ? { features: data.features } : {}),
+  };
+}
+
+/** Creates a new tenant (super-admin only). */
+export const createTenant = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(tenantInputSchema)
+  .handler(async ({ data, context }) => {
+    await assertCallerSuperAdmin(context.userId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { error } = await (supabaseAdmin as any)
+      .from("tenants")
+      .insert(tenantUpsertPayload(data));
+    if (error) throw new Error(`Failed to create tenant: ${error.message}`);
+    return { ok: true };
+  });
+
+/** Updates an existing tenant's branding (super-admin only). */
+export const updateTenant = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(tenantInputSchema)
+  .handler(async ({ data, context }) => {
+    await assertCallerSuperAdmin(context.userId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { error } = await (supabaseAdmin as any)
+      .from("tenants")
+      .update(tenantUpsertPayload(data))
+      .eq("slug", data.slug);
+    if (error) throw new Error(`Failed to update tenant: ${error.message}`);
+    return { ok: true };
+  });
+
+/**
+ * Public branding lookup by slug — used by the pre-login screen to preview a
+ * tenant's look before the visitor has authenticated (e.g. /login?org=rhb).
+ * Deliberately NO auth middleware: branding is non-sensitive, and the real
+ * tenant a signed-in user gets always comes from their own profile, never
+ * from this call — this is cosmetic-only. Uses supabaseAdmin so it works
+ * independently of the `tenants` RLS policy and is explicit about being
+ * intentionally public.
+ */
+export const getTenantBranding = createServerFn({ method: "GET" })
+  .inputValidator(z.object({ slug: z.string().min(1).max(40) }))
+  .handler(async ({ data }): Promise<{ tenant: TenantRow | null }> => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: row, error } = await (supabaseAdmin as any)
+      .from("tenants")
+      .select(TENANT_COLUMNS)
+      .eq("slug", data.slug)
+      .maybeSingle();
+    if (error || !row) return { tenant: null };
+    return { tenant: toTenantRow(row) };
   });
 
 // ============================================================================
@@ -4675,10 +5786,12 @@ export const runCreditRiskAnalysis = createServerFn({ method: "POST" })
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: report, error: repErr } = await (supabase as any)
       .from("analysis_reports")
-      .select("id, title, source_file_url, workspace_id, summary_json")
+      .select("id, title, source_file_url, workspace_id, summary_json, tenant_id")
       .eq("id", data.reportId)
       .single();
     if (repErr || !report) throw new Error(repErr?.message || "Report not found");
+    const { tenantId } = await getCallerTenant(context.userId);
+    assertRowTenant(report.tenant_id, tenantId);
     if (!report.source_file_url) throw new Error("Report has no source file — cannot analyze");
     const workspace = (report.workspace_id ?? "credit_risk") as string;
     const borrowerName = (report.summary_json?.borrower_name ?? report.title ?? "Applicant") as string;
@@ -4712,12 +5825,14 @@ export const runCreditRiskAnalysis = createServerFn({ method: "POST" })
     const MAX_APP_CHARS = 120_000;
     if (applicationText.length > MAX_APP_CHARS) applicationText = applicationText.slice(0, MAX_APP_CHARS);
 
-    // 3. Load case-KB metadata for this workspace.
+    // 3. Load case-KB metadata for this workspace (caller's tenant only — this
+    // id-set is also what tenant-scopes the match_sop_chunks RAG results).
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: caseDocs } = await (supabase as any)
       .from("sop_documents")
       .select("id, title, summary, file_url")
-      .eq("workspace_id", workspace);
+      .eq("workspace_id", workspace)
+      .eq("tenant_id", tenantId);
     const docs = ((caseDocs ?? []) as { id: string; title: string; summary: string | null; file_url: string | null }[]);
     const titleById = new Map(docs.map((d) => [d.id, d.title] as const));
     const creditSopIds = new Set(docs.map((d) => d.id));
@@ -4911,10 +6026,12 @@ export const askCreditRisk = createServerFn({ method: "POST" })
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { data: report } = await (supabase as any)
       .from("analysis_reports")
-      .select("title, workspace_id, summary_json")
+      .select("title, workspace_id, summary_json, tenant_id")
       .eq("id", data.reportId)
       .single();
     if (!report) throw new Error("Report not found");
+    const { tenantId } = await getCallerTenant(context.userId);
+    assertRowTenant(report.tenant_id, tenantId);
     const analysis = report.summary_json?.credit_analysis;
     if (!analysis) throw new Error("This report has not been analysed yet.");
     const borrower = report.summary_json?.borrower_name ?? report.title ?? "the borrower";
@@ -4954,11 +6071,14 @@ export const askCreditRisk = createServerFn({ method: "POST" })
         match_threshold: 0.2,
         match_count: 100,
       });
+      // Tenant-scoped id-set: this filter is what keeps the global
+      // match_sop_chunks results inside the caller's tenant.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const { data: docs } = await (supabase as any)
         .from("sop_documents")
         .select("id, title")
-        .eq("workspace_id", workspace);
+        .eq("workspace_id", workspace)
+        .eq("tenant_id", tenantId);
       const titleById = new Map((docs ?? []).map((d: { id: string; title: string }) => [d.id, d.title]));
       const ids = new Set((docs ?? []).map((d: { id: string }) => d.id));
       // eslint-disable-next-line @typescript-eslint/no-explicit-any

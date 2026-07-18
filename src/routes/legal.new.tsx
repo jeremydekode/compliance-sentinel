@@ -10,12 +10,15 @@ import { supabase } from "@/integrations/supabase/client";
 import { toast } from "sonner";
 import {
   createLegalMatter,
+  createTemplateRequest,
   legalIntakeChat,
   attachLegalDocument,
   reviewLegalDocument,
   MATTER_TYPES,
 } from "@/lib/legal.functions";
-import { LEGAL_TEMPLATES, fillTemplate, downloadDoc, type LegalTemplate } from "@/lib/legal.templates";
+import { LEGAL_TEMPLATES, fillTemplate, htmlToPlainText, downloadDoc, type LegalTemplate } from "@/lib/legal.templates";
+import { RoleSwitcher } from "@/components/legal-widgets";
+import { maskDemoEmail } from "@/lib/legal.functions";
 import {
   ArrowLeft,
   Scale,
@@ -71,6 +74,7 @@ function NewLegalMatter() {
   const createFn = useServerFn(createLegalMatter);
   const attachFn = useServerFn(attachLegalDocument);
   const reviewFn = useServerFn(reviewLegalDocument);
+  const createTemplateFn = useServerFn(createTemplateRequest);
 
   const [phase, setPhase] = useState<string | null>(null);
 
@@ -79,13 +83,50 @@ function NewLegalMatter() {
   const [requestorEmail, setRequestorEmail] = useState("");
   useEffect(() => {
     if (auth.email && !requestorEmail) {
-      setRequestorEmail(auth.email);
+      setRequestorEmail(maskDemoEmail(auth.email));
       if (!requestorName) {
         const prefix = auth.email.split("@")[0];
         setRequestorName(prefix.split(/[._-]/).map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join(" "));
       }
     }
   }, [auth.email]);
+
+  // Every self-service template download is tracked as a real matter + document —
+  // otherwise the file leaves the system with zero record, and there'd be nowhere
+  // to attach the counterparty's markup if they send changes back.
+  async function trackTemplate(t: LegalTemplate, html: string): Promise<any> {
+    // Guard the narrow race where a template is clicked before auth.email has
+    // resolved into requestorEmail — createTemplateRequest requires a valid
+    // email, so fail with a clear message rather than a raw validation error.
+    if (!requestorEmail.trim()) throw new Error("Still loading your profile — try again in a moment.");
+    const blob = new Blob([html], { type: "application/msword" });
+    const path = `legal/${Date.now()}-${t.fileName}`;
+    const up = await supabase.storage.from("policies").upload(path, blob, {
+      upsert: false,
+      contentType: "application/msword",
+    });
+    if (up.error) throw new Error(up.error.message);
+    const fileUrl = supabase.storage.from("policies").getPublicUrl(path).data.publicUrl;
+    const matter: any = await createTemplateFn({
+      data: {
+        template_id:     t.id,
+        template_name:   t.name,
+        matter_type:     t.matter_type,
+        file_name:       t.fileName,
+        file_url:        fileUrl,
+        mime_type:       "application/msword",
+        size_bytes:      blob.size,
+        plain_text:      htmlToPlainText(html),
+        requestor_name:  requestorName,
+        requestor_email: requestorEmail,
+      },
+    });
+    // Land the user on the matter that was just created — the download already
+    // fired, and staying on the chat page leaves them with no obvious next step.
+    queryClient.invalidateQueries({ queryKey: ["legal-matters"] });
+    navigate({ to: "/legal/$matterId", params: { matterId: matter.id } });
+    return matter;
+  }
 
   async function openRequest(payload: DraftPayload, files: File[]) {
     setPhase("Opening request — AI screening, routing & triage…");
@@ -171,6 +212,7 @@ function NewLegalMatter() {
               <ClipboardList className="size-3" /> Form
             </button>
           </div>
+          <RoleSwitcher />
         </div>
 
         {/* Busy overlay while opening request */}
@@ -188,6 +230,8 @@ function NewLegalMatter() {
             requestorName={requestorName}
             requestorEmail={requestorEmail}
             onOpenRequest={openRequest}
+            onTrackTemplate={trackTemplate}
+            onSwitchToForm={() => setMode("form")}
           />
         ) : (
           <FormIntake
@@ -227,10 +271,14 @@ function ChatIntake({
   requestorName,
   requestorEmail,
   onOpenRequest,
+  onTrackTemplate,
+  onSwitchToForm,
 }: {
   requestorName: string;
   requestorEmail: string;
   onOpenRequest: (payload: DraftPayload, files: File[]) => Promise<void>;
+  onTrackTemplate: (t: LegalTemplate, html: string) => Promise<any>;
+  onSwitchToForm: () => void;
 }) {
   const chatFn = useServerFn(legalIntakeChat);
   const [messages, setMessages] = useState<ChatMsg[]>([GREETING]);
@@ -292,7 +340,7 @@ function ChatIntake({
               </div>
               {/* Action cards */}
               {m.action?.type === "offer_template" && (
-                <TemplateCard templateId={m.action.template_id} />
+                <TemplateCard templateId={m.action.template_id} onTrackTemplate={onTrackTemplate} />
               )}
               {m.action?.type === "propose_request" && (
                 <DraftCard
@@ -318,17 +366,25 @@ function ChatIntake({
 
           {/* Starter suggestions on fresh chat */}
           {messages.length === 1 && !sending && (
-            <div className="flex flex-wrap gap-1.5 pl-9">
-              {STARTERS.map((s) => (
-                <button
-                  key={s}
-                  onClick={() => send(s)}
-                  className="rounded-full border bg-card px-3 py-1.5 text-[11px] text-muted-foreground hover:text-foreground hover:border-indigo-300 transition-colors"
-                >
-                  {s}
+            <>
+              <div className="flex flex-wrap gap-1.5 pl-9">
+                {STARTERS.map((s) => (
+                  <button
+                    key={s}
+                    onClick={() => send(s)}
+                    className="rounded-full border bg-card px-3 py-1.5 text-[11px] text-muted-foreground hover:text-foreground hover:border-indigo-300 transition-colors"
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
+              <p className="pl-9 text-[11px] text-muted-foreground/70">
+                Prefer clicking through fields instead of chatting?{" "}
+                <button onClick={onSwitchToForm} className="text-indigo-600 dark:text-indigo-400 hover:underline font-medium">
+                  Switch to Form
                 </button>
-              ))}
-            </div>
+              </p>
+            </>
           )}
           <div ref={bottomRef} />
         </div>
@@ -367,10 +423,30 @@ function ChatIntake({
 
 /** Self-service drafting wizard (Route A) rendered inline in the chat — the
     chatbot-as-drafting-wizard: collect customized answers, generate the contract. */
-function TemplateCard({ templateId }: { templateId: string }) {
+function TemplateCard({ templateId, onTrackTemplate }: {
+  templateId: string;
+  onTrackTemplate: (t: LegalTemplate, html: string) => Promise<any>;
+}) {
   const t = LEGAL_TEMPLATES.find((x) => x.id === templateId);
   const [wizard, setWizard] = useState(false);
+  const [downloading, setDownloading] = useState(false);
   if (!t) return null;
+
+  async function downloadBlank() {
+    if (!t) return;
+    setDownloading(true);
+    const html = fillTemplate(t, {});
+    downloadDoc(html, t.fileName);
+    try {
+      const matter = await onTrackTemplate(t, html);
+      toast.success(`${t.fileName} downloaded — tracked as ${matter.reference_number ?? "a new request"}`);
+    } catch (e: any) {
+      toast.warning(`${t.fileName} downloaded, but couldn't create a tracked record: ${e?.message ?? "unknown error"}`);
+    } finally {
+      setDownloading(false);
+    }
+  }
+
   return (
     <div className="ml-9 mt-2 rounded-xl border border-emerald-200/60 dark:border-emerald-900 bg-emerald-50/40 dark:bg-emerald-950/20 p-3.5 max-w-[92%]">
       <div className="flex items-start gap-3">
@@ -392,13 +468,14 @@ function TemplateCard({ templateId }: { templateId: string }) {
               <Button
                 size="sm" variant="ghost"
                 className="h-7 text-[11px] gap-1.5 text-emerald-700 dark:text-emerald-300"
-                onClick={() => { downloadDoc(fillTemplate(t, {}), t.fileName); toast.success(`${t.fileName} downloaded (blank)`); }}
+                disabled={downloading}
+                onClick={downloadBlank}
               >
-                <FileDown className="size-3" /> Blank template
+                {downloading ? <Loader2 className="size-3 animate-spin" /> : <FileDown className="size-3" />} Blank template
               </Button>
             </div>
           ) : (
-            <TemplateWizard t={t} onClose={() => setWizard(false)} />
+            <TemplateWizard t={t} onClose={() => setWizard(false)} onTrackTemplate={onTrackTemplate} />
           )}
         </div>
       </div>
@@ -406,10 +483,15 @@ function TemplateCard({ templateId }: { templateId: string }) {
   );
 }
 
-function TemplateWizard({ t, onClose }: { t: LegalTemplate; onClose: () => void }) {
+function TemplateWizard({ t, onClose, onTrackTemplate }: {
+  t: LegalTemplate;
+  onClose: () => void;
+  onTrackTemplate: (t: LegalTemplate, html: string) => Promise<any>;
+}) {
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [extra, setExtra] = useState("");
   const [step, setStep] = useState(0);
+  const [generating, setGenerating] = useState(false);
   const fields = t.fields;
   const done = step >= fields.length;
   const f = fields[step];
@@ -490,14 +572,23 @@ function TemplateWizard({ t, onClose }: { t: LegalTemplate; onClose: () => void 
             <Button
               size="sm"
               className="h-7 text-[11px] gap-1.5 bg-emerald-600 hover:bg-emerald-700"
-              disabled={fields.some((fld) => !fld.optional && !answers[fld.id]?.trim())}
-              onClick={() => {
-                downloadDoc(fillTemplate(t, answers, extra), t.fileName);
-                toast.success(`${t.fileName} generated — pre-approved for standard use`);
-                onClose();
+              disabled={generating || fields.some((fld) => !fld.optional && !answers[fld.id]?.trim())}
+              onClick={async () => {
+                setGenerating(true);
+                const html = fillTemplate(t, answers, extra);
+                downloadDoc(html, t.fileName);
+                try {
+                  const matter = await onTrackTemplate(t, html);
+                  toast.success(`${t.fileName} generated — tracked as ${matter.reference_number ?? "a new request"}`);
+                } catch (e: any) {
+                  toast.warning(`${t.fileName} generated, but couldn't create a tracked record: ${e?.message ?? "unknown error"}`);
+                } finally {
+                  setGenerating(false);
+                  onClose();
+                }
               }}
             >
-              <FileDown className="size-3" /> Generate contract
+              {generating ? <Loader2 className="size-3 animate-spin" /> : <FileDown className="size-3" />} Generate contract
             </Button>
           </div>
         </>

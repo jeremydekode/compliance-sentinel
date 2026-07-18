@@ -11,6 +11,7 @@ import { useEffect, useState } from "react";
 import { ShieldAlert } from "lucide-react";
 import { Toaster } from "@/components/ui/sonner";
 import { useAuth, signOut } from "@/lib/auth";
+import { applyTenantBranding } from "@/lib/tenant";
 
 import appCss from "../styles.css?url";
 
@@ -129,12 +130,32 @@ function RootComponent() {
   return (
     <QueryClientProvider client={queryClient}>
       <LoginGate />
+      <TenantBrandingEffect />
       <ApprovalGate>
         <Outlet />
       </ApprovalGate>
       <Toaster richColors position="bottom-right" />
     </QueryClientProvider>
   );
+}
+
+/**
+ * Applies the signed-in user's tenant branding (colors) to <html> once auth
+ * has resolved. Gated the same way as ApprovalGate/LoginGate (mounted +
+ * !loading) so SSR output — which never touches document — is unaffected,
+ * avoiding a hydration mismatch.
+ */
+function TenantBrandingEffect() {
+  const auth = useAuth();
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+
+  useEffect(() => {
+    if (!mounted || auth.loading) return;
+    applyTenantBranding(auth.tenant);
+  }, [mounted, auth.loading, auth.tenant]);
+
+  return null;
 }
 
 /**

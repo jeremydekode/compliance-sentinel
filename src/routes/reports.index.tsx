@@ -34,6 +34,7 @@ import {
 } from "lucide-react";
 import { FormUpdateDialog } from "@/components/form-update-dialog";
 import { SimplifyUploadDialog } from "@/components/simplify-upload-dialog";
+import { SimplifyV2UploadDialog } from "@/components/simplify-v2-upload-dialog";
 import { CreditUploadDialog } from "@/components/credit-upload-dialog";
 import { formatDate, statusMeta } from "@/lib/format";
 import {
@@ -63,8 +64,180 @@ export const Route = createFileRoute("/reports/")({
 function ReportsRoute() {
   const [workspace] = useWorkspace();
   if (workspace === "simplify") return <SimplifyReportsList />;
+  if (workspace === "simplify_v2") return <SimplifyV2ReportsList />;
   if (workspace === "credit_risk" || workspace === "credit_risk_demo") return <CreditRiskReportsList />;
   return <ReportsList />;
+}
+
+/** Simplify v2 — three-mode workspace (Simplify / Recommendation / Recommend & Edit). */
+function SimplifyV2ReportsList() {
+  const qc = useQueryClient();
+  const nav = useNavigate();
+  const remove = useServerFn(deleteReport);
+  const auth = useAuth();
+  const [showUpload, setShowUpload] = useState(false);
+
+  const reports = useQuery({
+    queryKey: ["reports", "all", "simplify_v2", auth.tenantId],
+    enabled: !auth.loading,
+    queryFn: async () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data } = await (supabase as any)
+        .from("analysis_reports")
+        .select("id, title, policy_name, status, created_at, summary_json")
+        .eq("workspace_id", "simplify_v2")
+        .eq("tenant_id", auth.tenantId)
+        .order("created_at", { ascending: false });
+      return data ?? [];
+    },
+  });
+
+  async function handleDelete(e: React.MouseEvent, id: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!confirm("Delete this analysis and all related data?")) return;
+    try {
+      await remove({ data: { id } });
+      toast.success("Analysis deleted");
+      qc.invalidateQueries({ queryKey: ["reports"] });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } catch (err: any) {
+      toast.error(err?.message ?? "Failed to delete");
+    }
+  }
+
+  const modeMeta: Record<string, { label: string; classes: string }> = {
+    simplify: { label: "Simplify", classes: "bg-violet-100 text-violet-700 border-violet-200" },
+    recommend: { label: "Recommendation", classes: "bg-sky-100 text-sky-700 border-sky-200" },
+    recommend_edit: { label: "Recommend & Edit", classes: "bg-fuchsia-100 text-fuchsia-700 border-fuchsia-200" },
+  };
+
+  return (
+    <AppShell>
+      <div className="p-8 max-w-[1400px] mx-auto space-y-8">
+        <div className="flex items-end justify-between">
+          <div>
+            <h1 className="text-3xl font-bold tracking-tight">Simplify v2</h1>
+            <p className="text-muted-foreground mt-1 text-lg">
+              Audit, restructure and simplify documents — every finding and edit verified against the source.
+            </p>
+          </div>
+          <Button
+            size="lg"
+            onClick={() => setShowUpload(true)}
+            className="gap-2 h-12 px-6 rounded-xl font-bold bg-fuchsia-600 hover:bg-fuchsia-700 text-white shadow-lg shadow-fuchsia-500/20 active:scale-95"
+          >
+            <Plus className="size-4" /> New Analysis
+          </Button>
+        </div>
+
+        <Card className="p-0 overflow-hidden border-border/50 shadow-sm glass-card">
+          <div className="px-6 py-4 border-b border-border/50 bg-muted/30 flex items-center justify-between">
+            <h2 className="font-bold text-sm uppercase tracking-[0.2em] text-muted-foreground">Documents</h2>
+            <Badge variant="secondary" className="font-black text-[10px]">{reports.data?.length ?? 0} TOTAL</Badge>
+          </div>
+
+          {reports.isLoading && (
+            <div className="p-12 text-center text-muted-foreground font-medium italic animate-pulse">Loading…</div>
+          )}
+
+          {!reports.isLoading && (reports.data?.length ?? 0) === 0 && (
+            <div className="p-20 text-center">
+              <div className="size-16 bg-muted rounded-full grid place-items-center mx-auto mb-4">
+                <FileText className="size-8 text-muted-foreground" />
+              </div>
+              <h3 className="text-xl font-bold">No documents analysed yet</h3>
+              <p className="text-muted-foreground mt-2 max-w-sm mx-auto">
+                Upload a document to simplify it, audit it for gaps and contradictions, or restructure it end to end.
+              </p>
+              <Button onClick={() => setShowUpload(true)} className="mt-6 gap-2 h-11 px-8 rounded-lg font-bold bg-fuchsia-600 hover:bg-fuchsia-700 text-white">
+                <Plus className="size-4" /> New Analysis
+              </Button>
+            </div>
+          )}
+
+          <div className="divide-y divide-border/50">
+            {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
+            {reports.data?.map((r: any) => {
+              const sj = r.summary_json ?? {};
+              const mode = modeMeta[sj.workflow_mode] ?? modeMeta.simplify;
+              const counts = sj.audit?.counts;
+              const findingsTotal = counts
+                ? Object.values(counts.bySeverity ?? {}).reduce((a: number, b) => a + Number(b ?? 0), 0)
+                : null;
+              return (
+                <Link
+                  key={r.id}
+                  to="/simplify2/$reportId"
+                  params={{ reportId: r.id }}
+                  className="flex items-center justify-between px-6 py-5 hover:bg-fuchsia-500/[0.03] transition-colors group"
+                >
+                  <div className="min-w-0 flex items-center gap-4">
+                    <div className="size-10 rounded-xl grid place-items-center shrink-0 bg-fuchsia-100 transition-transform group-hover:scale-110">
+                      <Sparkles className="size-5 text-fuchsia-700" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <div className="font-bold text-base truncate group-hover:text-fuchsia-700 transition-colors">{r.title}</div>
+                        <span className={cn("shrink-0 rounded-md border px-1.5 py-0.5 text-[10px] font-semibold", mode.classes)}>
+                          {mode.label}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2 text-xs text-muted-foreground mt-1 font-medium">
+                        {sj.pending_analysis ? (
+                          <span className="text-fuchsia-600 font-semibold">Analysing…</span>
+                        ) : sj.simplification_status === "failed" ? (
+                          <span className="text-rose-600 font-semibold">Run failed</span>
+                        ) : counts ? (
+                          <span>
+                            {findingsTotal} finding{findingsTotal === 1 ? "" : "s"}
+                            {counts.bySeverity?.critical > 0 && (
+                              <span className="text-rose-600 font-semibold"> · {counts.bySeverity.critical} critical</span>
+                            )}
+                            {sj.restructure && <span className="text-emerald-600 font-semibold"> · restructured</span>}
+                          </span>
+                        ) : sj.verification ? (
+                          <span>
+                            {sj.verification.verified} verified · {sj.verification.review} review · {sj.verification.rejected} quarantined
+                          </span>
+                        ) : (
+                          <span>Ready</span>
+                        )}
+                        <span>•</span>
+                        <span>{formatDate(r.created_at)}</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-9 rounded-lg text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
+                      onClick={(e) => handleDelete(e, r.id)}
+                    >
+                      <Trash2 className="size-4" />
+                    </Button>
+                    <div className="size-9 rounded-lg bg-muted grid place-items-center group-hover:bg-fuchsia-600 group-hover:text-white transition-all">
+                      <ArrowRight className="size-4" />
+                    </div>
+                  </div>
+                </Link>
+              );
+            })}
+          </div>
+        </Card>
+      </div>
+
+      <SimplifyV2UploadDialog
+        open={showUpload}
+        onOpenChange={setShowUpload}
+        onCreated={(reportId) => {
+          qc.invalidateQueries({ queryKey: ["reports"] });
+          nav({ to: "/simplify2/$reportId", params: { reportId } });
+        }}
+      />
+    </AppShell>
+  );
 }
 
 /** Credit Risk Alert — list of screened applications + the upload entry point. */
@@ -72,16 +245,19 @@ function CreditRiskReportsList() {
   const qc = useQueryClient();
   const nav = useNavigate();
   const remove = useServerFn(deleteReport);
+  const auth = useAuth();
   const [showUpload, setShowUpload] = useState(false);
   const [workspace] = useWorkspace();
 
   const reports = useQuery({
-    queryKey: ["reports", "all", workspace],
+    queryKey: ["reports", "all", workspace, auth.tenantId],
+    enabled: !auth.loading,
     queryFn: async () => {
       const { data } = await (supabase as any)
         .from("analysis_reports")
         .select("id, title, policy_name, status, created_at, summary_json")
         .eq("workspace_id", workspace)
+        .eq("tenant_id", auth.tenantId)
         .order("created_at", { ascending: false });
       return data ?? [];
     },
@@ -243,15 +419,18 @@ function SimplifyReportsList() {
   const qc = useQueryClient();
   const nav = useNavigate();
   const remove = useServerFn(deleteReport);
+  const auth = useAuth();
   const [showUpload, setShowUpload] = useState(false);
 
   const reports = useQuery({
-    queryKey: ["reports", "all", "simplify"],
+    queryKey: ["reports", "all", "simplify", auth.tenantId],
+    enabled: !auth.loading,
     queryFn: async () => {
       const { data } = await (supabase as any)
         .from("analysis_reports")
         .select("id, title, policy_name, status, created_at, summary_json")
         .eq("workspace_id", "simplify")
+        .eq("tenant_id", auth.tenantId)
         .order("created_at", { ascending: false });
       return data ?? [];
     },

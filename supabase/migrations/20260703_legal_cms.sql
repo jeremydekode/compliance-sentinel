@@ -60,6 +60,7 @@ create table if not exists legal_matters (
   retention_until timestamptz,
   destroy_after timestamptz,
   completed_at timestamptz,
+  awaiting_role text check (awaiting_role in ('submitter','reviewer')),
   created_at timestamptz default now(),
   updated_at timestamptz default now()
 );
@@ -73,6 +74,12 @@ alter table legal_matters add column if not exists tagged_functions  jsonb;
 alter table legal_matters add column if not exists expiry_date       timestamptz;
 alter table legal_matters add column if not exists retention_until   timestamptz;
 alter table legal_matters add column if not exists destroy_after     timestamptz;
+alter table legal_matters add column if not exists awaiting_role     text;
+
+-- Allow 'submitter'/'reviewer' awaiting_role on existing tables.
+alter table legal_matters drop constraint if exists legal_matters_awaiting_role_check;
+alter table legal_matters add constraint legal_matters_awaiting_role_check
+  check (awaiting_role in ('submitter','reviewer'));
 
 -- ---- legal_matter_events (append-only audit trail) ------------------------
 create table if not exists legal_matter_events (
@@ -96,7 +103,7 @@ create table if not exists legal_matter_comments (
   author_email text,
   content text not null,
   comment_type text default 'comment' check (
-    comment_type in ('comment','review_note','rejection_reason','ai_note')
+    comment_type in ('comment','review_note','rejection_reason','ai_note','client_approved')
   ),
   function_tag text,
   mentions jsonb,
@@ -104,6 +111,11 @@ create table if not exists legal_matter_comments (
 );
 alter table legal_matter_comments add column if not exists function_tag text;
 alter table legal_matter_comments add column if not exists mentions     jsonb;
+
+-- Allow 'client_approved' comment_type on existing tables.
+alter table legal_matter_comments drop constraint if exists legal_matter_comments_comment_type_check;
+alter table legal_matter_comments add constraint legal_matter_comments_comment_type_check
+  check (comment_type in ('comment','review_note','rejection_reason','ai_note','client_approved'));
 
 -- ---- legal_matter_documents (uploads + AI review) -------------------------
 create table if not exists legal_matter_documents (
@@ -113,7 +125,7 @@ create table if not exists legal_matter_documents (
   file_url text not null,
   mime_type text,
   size_bytes bigint,
-  doc_role text default 'submitted' check (doc_role in ('submitted','reference','executed','draft')),
+  doc_role text default 'submitted' check (doc_role in ('submitted','reference','executed','draft','counterparty_markup')),
   access_level text default 'standard' check (access_level in ('standard','restricted')),
   ai_review jsonb,
   ai_review_status text default 'none' check (ai_review_status in ('none','running','done','failed')),
@@ -130,10 +142,10 @@ alter table legal_matter_documents add column if not exists version            i
 alter table legal_matter_documents add column if not exists parent_document_id uuid;
 alter table legal_matter_documents add column if not exists version_note       text;
 
--- Allow 'draft' doc_role (amended versions from the AI Co-Pilot) on existing tables.
+-- Allow 'draft' + 'counterparty_markup' doc_role on existing tables.
 alter table legal_matter_documents drop constraint if exists legal_matter_documents_doc_role_check;
 alter table legal_matter_documents add constraint legal_matter_documents_doc_role_check
-  check (doc_role in ('submitted','reference','executed','draft'));
+  check (doc_role in ('submitted','reference','executed','draft','counterparty_markup'));
 
 -- ---- legal_kb_entries (Route D → Route C knowledge base) ------------------
 create table if not exists legal_kb_entries (

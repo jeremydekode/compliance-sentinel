@@ -16,6 +16,7 @@ import { Route as IndexRouteImport } from './routes/index'
 import { Route as ReportsIndexRouteImport } from './routes/reports.index'
 import { Route as LegalIndexRouteImport } from './routes/legal.index'
 import { Route as LayoutIndexRouteImport } from './routes/layout.index'
+import { Route as Simplify2ReportIdRouteImport } from './routes/simplify2.$reportId'
 import { Route as SimplifyReportIdRouteImport } from './routes/simplify.$reportId'
 import { Route as ReportsReportIdRouteImport } from './routes/reports.$reportId'
 import { Route as LegalRequestsRouteImport } from './routes/legal.requests'
@@ -62,6 +63,11 @@ const LegalIndexRoute = LegalIndexRouteImport.update({
 const LayoutIndexRoute = LayoutIndexRouteImport.update({
   id: '/layout/',
   path: '/layout/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const Simplify2ReportIdRoute = Simplify2ReportIdRouteImport.update({
+  id: '/simplify2/$reportId',
+  path: '/simplify2/$reportId',
   getParentRoute: () => rootRouteImport,
 } as any)
 const SimplifyReportIdRoute = SimplifyReportIdRouteImport.update({
@@ -139,6 +145,7 @@ export interface FileRoutesByFullPath {
   '/legal/requests': typeof LegalRequestsRoute
   '/reports/$reportId': typeof ReportsReportIdRouteWithChildren
   '/simplify/$reportId': typeof SimplifyReportIdRoute
+  '/simplify2/$reportId': typeof Simplify2ReportIdRoute
   '/layout/': typeof LayoutIndexRoute
   '/legal/': typeof LegalIndexRoute
   '/reports/': typeof ReportsIndexRoute
@@ -160,6 +167,7 @@ export interface FileRoutesByTo {
   '/legal/requests': typeof LegalRequestsRoute
   '/reports/$reportId': typeof ReportsReportIdRouteWithChildren
   '/simplify/$reportId': typeof SimplifyReportIdRoute
+  '/simplify2/$reportId': typeof Simplify2ReportIdRoute
   '/layout': typeof LayoutIndexRoute
   '/legal': typeof LegalIndexRoute
   '/reports': typeof ReportsIndexRoute
@@ -182,6 +190,7 @@ export interface FileRoutesById {
   '/legal/requests': typeof LegalRequestsRoute
   '/reports/$reportId': typeof ReportsReportIdRouteWithChildren
   '/simplify/$reportId': typeof SimplifyReportIdRoute
+  '/simplify2/$reportId': typeof Simplify2ReportIdRoute
   '/layout/': typeof LayoutIndexRoute
   '/legal/': typeof LegalIndexRoute
   '/reports/': typeof ReportsIndexRoute
@@ -205,6 +214,7 @@ export interface FileRouteTypes {
     | '/legal/requests'
     | '/reports/$reportId'
     | '/simplify/$reportId'
+    | '/simplify2/$reportId'
     | '/layout/'
     | '/legal/'
     | '/reports/'
@@ -226,6 +236,7 @@ export interface FileRouteTypes {
     | '/legal/requests'
     | '/reports/$reportId'
     | '/simplify/$reportId'
+    | '/simplify2/$reportId'
     | '/layout'
     | '/legal'
     | '/reports'
@@ -247,6 +258,7 @@ export interface FileRouteTypes {
     | '/legal/requests'
     | '/reports/$reportId'
     | '/simplify/$reportId'
+    | '/simplify2/$reportId'
     | '/layout/'
     | '/legal/'
     | '/reports/'
@@ -269,6 +281,7 @@ export interface RootRouteChildren {
   LegalRequestsRoute: typeof LegalRequestsRoute
   ReportsReportIdRoute: typeof ReportsReportIdRouteWithChildren
   SimplifyReportIdRoute: typeof SimplifyReportIdRoute
+  Simplify2ReportIdRoute: typeof Simplify2ReportIdRoute
   LayoutIndexRoute: typeof LayoutIndexRoute
   LegalIndexRoute: typeof LegalIndexRoute
   ReportsIndexRoute: typeof ReportsIndexRoute
@@ -325,6 +338,13 @@ declare module '@tanstack/react-router' {
       path: '/layout'
       fullPath: '/layout/'
       preLoaderRoute: typeof LayoutIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/simplify2/$reportId': {
+      id: '/simplify2/$reportId'
+      path: '/simplify2/$reportId'
+      fullPath: '/simplify2/$reportId'
+      preLoaderRoute: typeof Simplify2ReportIdRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/simplify/$reportId': {
@@ -440,6 +460,7 @@ const rootRouteChildren: RootRouteChildren = {
   LegalRequestsRoute: LegalRequestsRoute,
   ReportsReportIdRoute: ReportsReportIdRouteWithChildren,
   SimplifyReportIdRoute: SimplifyReportIdRoute,
+  Simplify2ReportIdRoute: Simplify2ReportIdRoute,
   LayoutIndexRoute: LayoutIndexRoute,
   LegalIndexRoute: LegalIndexRoute,
   ReportsIndexRoute: ReportsIndexRoute,

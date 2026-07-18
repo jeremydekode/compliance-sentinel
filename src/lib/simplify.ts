@@ -93,7 +93,7 @@ const FUZZY_REVIEW_THRESHOLD = 0.85;
 // ── Fuzzy locator ────────────────────────────────────────────────────────────
 
 /** Index of word -> positions, so fuzzy search only scans plausible starts. */
-function buildWordIndex(words: string[]): Map<string, number[]> {
+export function buildWordIndex(words: string[]): Map<string, number[]> {
   const idx = new Map<string, number[]>();
   for (let i = 0; i < words.length; i++) {
     const at = idx.get(words[i]);
@@ -114,7 +114,7 @@ function buildWordIndex(words: string[]): Map<string, number[]> {
  * whose words are simply not co-located anywhere in the document — scores far
  * lower, leaving a wide gap for the review/reject threshold to sit in.
  */
-function bestFuzzyScore(
+export function bestFuzzyScore(
   beforeWords: string[],
   docWords: string[],
   wordIndex: Map<string, number[]>,
@@ -497,3 +497,42 @@ REWRITE EXAMPLES:
   Example: source "This document can be viewed…" → after "Staff may view this document…"
   (NOT "You can view this document…")
 - Professional and instructional throughout.`;
+
+/**
+ * MAX-SIMPLIFICATION addendum — appended to the guidance when the run's
+ * profile is "max". Pushes for visible page reduction: the demo promise is
+ * "AI genuinely shrinks the document", so the model is told to be ruthless
+ * about volume while the non-negotiables (numbers, obligations, defined
+ * terms, confidence rules) stay exactly as strict as the base guidance.
+ */
+export const AGGRESSIVE_SIMPLIFY_ADDENDUM = `
+# ⚡ MAX SIMPLIFICATION MODE — this run's explicit goal is PAGE REDUCTION
+- Target: the accepted edits should cut the document's word count by 30% or more.
+- Emit an edit for EVERY unit that can shrink — in this mode, leaving a shrinkable
+  paragraph untouched is the failure, not over-editing (each edit is still
+  human-reviewed before it applies).
+- Prefer the SHORTEST faithful rewrite, not the most elegant one.
+- Collapse repetition ruthlessly: restated definitions, overview paragraphs that
+  re-describe a later section, prose that repeats an adjacent table or list —
+  delete_redundant or merge them.
+- Compress boilerplate openings/closings ("The purpose of this section is to
+  describe…" → drop or one line).
+- Convert every list-like prose passage (3+ parallel items) to bullets.
+- Sentences over 15 words: split or tighten. Paragraph openers that restate the
+  heading: delete.
+- STILL NON-NEGOTIABLE (unchanged from the base rules): every number, date,
+  threshold, monetary amount, authority limit, role title, committee name,
+  defined term, cross-reference and the SCOPE of every obligation survives
+  verbatim. Confidence calibration and the below-80 omission rule stay in force.
+`;
+
+/** Display labels for simplification action types — single source for every
+ *  surface (dashboard cards, review rail, popups). */
+export const SIMPLIFY_TYPE_LABEL: Record<string, string> = {
+  plain_english: "Plain English",
+  shorten: "Shorten",
+  to_bullets: "To bullets",
+  merge: "Merge",
+  delete_redundant: "Remove duplicate",
+  table_restructure: "Table",
+};

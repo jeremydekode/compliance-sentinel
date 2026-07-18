@@ -6,9 +6,11 @@ import { AppShell } from "@/components/app-shell";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
+import { RoleSwitcher, useLegalRole } from "@/components/legal-widgets";
 import {
   getLegalDocument,
   reviewLegalDocument,
+  reviewCounterpartyMarkup,
   acceptClauseSuggestion,
   createAmendedVersion,
   addDocumentAnnotation,
@@ -32,6 +34,7 @@ import {
   X,
   MessageSquare,
   Trash2,
+  Pencil,
 } from "lucide-react";
 
 export const Route = createFileRoute("/legal/review/$documentId")({
@@ -221,8 +224,11 @@ function CoPilotReview() {
   const { documentId } = Route.useParams();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const [role] = useLegalRole();
+  const isReviewer = role === "reviewer";
   const getDoc = useServerFn(getLegalDocument);
   const reviewFn = useServerFn(reviewLegalDocument);
+  const reviewMarkupFn = useServerFn(reviewCounterpartyMarkup);
   const acceptFn = useServerFn(acceptClauseSuggestion);
   const versionFn = useServerFn(createAmendedVersion);
 
@@ -235,6 +241,10 @@ function CoPilotReview() {
   const [reviewing, setReviewing] = useState(false);
   const [showRedline, setShowRedline] = useState(true);
   const [flashIdx, setFlashIdx] = useState<number | null>(null);
+  const [sideBySide, setSideBySide] = useState(true);
+  // Inline editing of an AI suggestion before applying it to the draft.
+  const [editIdx, setEditIdx] = useState<number | null>(null);
+  const [editText, setEditText] = useState("");
 
   // Jump from an Amendment History item to the matching insertion in the redline.
   function jumpToChange(i: number) {
@@ -255,6 +265,15 @@ function CoPilotReview() {
       acceptFn({ data: { document_id: documentId, ...p } }),
     onSuccess: (_r, p) => { toast.success(p.accepted ? "Suggestion marked for the amended draft" : "Suggestion dismissed"); refresh(); },
     onError: (e: any) => toast.error(e?.message ?? "Failed"),
+  });
+
+  // Persist a lawyer-amended suggestion so the amended draft applies THEIR
+  // wording, not the AI's first cut.
+  const editSuggestion = useMutation({
+    mutationFn: (p: { clause_index: number; suggestion: string }) =>
+      acceptFn({ data: { document_id: documentId, ...p } }),
+    onSuccess: () => { toast.success("Suggested edit updated"); setEditIdx(null); setEditText(""); refresh(); },
+    onError: (e: any) => toast.error(e?.message ?? "Failed to save"),
   });
 
   const genVersion = useMutation({
@@ -292,7 +311,9 @@ function CoPilotReview() {
   async function runReview() {
     setReviewing(true);
     try {
-      await reviewFn({ data: { document_id: documentId } });
+      const isMarkup = (data as any)?.document?.doc_role === "counterparty_markup";
+      if (isMarkup) await reviewMarkupFn({ data: { document_id: documentId } });
+      else await reviewFn({ data: { document_id: documentId } });
       toast.success("AI review complete");
       refresh();
     } catch (e: any) {
@@ -315,6 +336,11 @@ function CoPilotReview() {
   const doc: any = data.document;
   const matter: any = data.matter;
   const review: any = doc.ai_review;
+  // Only treat the document as "analyzed" once a review has actually completed —
+  // a template-generated doc pre-seeds ai_review with just documentText (no
+  // clauses, status "none") so this viewer has content to show before any AI
+  // analysis has run; that must still show the "Analyze this document" CTA.
+  const hasReview = doc.ai_review_status === "done" && !!review;
   const clauses: any[] = review?.clauses ?? [];
   const score: number = typeof review?.riskScore === "number" ? review.riskScore : (
     clauses.some((c) => c.severity === "red_flag") ? 75 : clauses.some((c) => c.severity === "caution") ? 45 : 15
@@ -327,6 +353,18 @@ function CoPilotReview() {
   const isAmended = redlineText.length > 0 || changes.length > 0;
   // The document content — extracted server-side so it shows even before any AI review.
   const docText: string = String((data as any).text ?? review?.documentText ?? "");
+  // Counterparty comparison: the review stores the original's text so the viewer
+  // can show "what we sent" and "what they returned" side by side. Older reviews
+  // (run before this was added) won't have it — re-running the comparison adds it.
+  const isCounterparty = !!review?.counterpartyReview;
+  const originalText: string = String(review?.originalDocumentText ?? "");
+  const canCompare = hasReview && isCounterparty && !isAmended && originalText.length > 0 && docText.length > 0;
+  const comparing = canCompare && sideBySide;
+  // Left pane of the comparison highlights what each change REPLACED in our
+  // original — reuse the highlighter by swapping in originalExcerpt. (Plain
+  // computation, not useMemo: this sits below the loading early-return, where
+  // hooks are off-limits.)
+  const originalClauses = clauses.map((c: any) => ({ ...c, excerpt: c.originalExcerpt ?? "" }));
 
   return (
     <AppShell>
@@ -345,27 +383,34 @@ function CoPilotReview() {
             <Bot className="size-2.5" /> Document Review
           </span>
           <div className="ml-auto flex items-center gap-1.5">
-            {review && !isAmended && (
-              <Button
-                size="sm"
-                className="h-7 text-[11px] gap-1.5 bg-indigo-600 hover:bg-indigo-700"
-                disabled={accepted === 0 || genVersion.isPending}
-                onClick={() => genVersion.mutate()}
-                title={accepted === 0 ? "Apply at least one suggestion first" : "Create an amended version from the applied suggestions"}
-              >
-                {genVersion.isPending ? <Loader2 className="size-3 animate-spin" /> : <GitBranch className="size-3" />}
-                Generate amended version{accepted > 0 ? ` (${accepted})` : ""}
-              </Button>
-            )}
-            {review ? (
-              <Button size="sm" variant="outline" className="h-7 text-[11px] gap-1.5" disabled={reviewing} onClick={runReview}>
-                {reviewing ? <Loader2 className="size-3 animate-spin" /> : <RotateCcw className="size-3" />} Re-run
-              </Button>
+            {isReviewer ? (
+              <>
+                {hasReview && !isAmended && (
+                  <Button
+                    size="sm"
+                    className="h-7 text-[11px] gap-1.5 bg-indigo-600 hover:bg-indigo-700"
+                    disabled={accepted === 0 || genVersion.isPending}
+                    onClick={() => genVersion.mutate()}
+                    title={accepted === 0 ? "Apply at least one suggestion first" : "Create an amended version from the applied suggestions"}
+                  >
+                    {genVersion.isPending ? <Loader2 className="size-3 animate-spin" /> : <GitBranch className="size-3" />}
+                    Generate amended version{accepted > 0 ? ` (${accepted})` : ""}
+                  </Button>
+                )}
+                {hasReview ? (
+                  <Button size="sm" variant="outline" className="h-7 text-[11px] gap-1.5" disabled={reviewing} onClick={runReview}>
+                    {reviewing ? <Loader2 className="size-3 animate-spin" /> : <RotateCcw className="size-3" />} Re-run
+                  </Button>
+                ) : (
+                  <Button size="sm" className="h-7 text-[11px] gap-1.5" disabled={reviewing} onClick={runReview}>
+                    {reviewing ? <Loader2 className="size-3 animate-spin" /> : <Sparkles className="size-3" />} Run AI review
+                  </Button>
+                )}
+              </>
             ) : (
-              <Button size="sm" className="h-7 text-[11px] gap-1.5" disabled={reviewing} onClick={runReview}>
-                {reviewing ? <Loader2 className="size-3 animate-spin" /> : <Sparkles className="size-3" />} Run AI review
-              </Button>
+              <span className="text-[10px] text-muted-foreground/60 italic">Analysis &amp; edits are the reviewer's — read &amp; comment only</span>
             )}
+            <RoleSwitcher />
           </div>
         </div>
 
@@ -373,9 +418,11 @@ function CoPilotReview() {
           <div className="flex-1 grid grid-cols-1 lg:grid-cols-[1fr_380px] min-h-0">
             {/* LEFT — contract editor */}
             <div className="overflow-y-auto border-r">
-              <div className="max-w-3xl mx-auto p-6">
+              <div className={cn("mx-auto p-6", comparing ? "max-w-6xl" : "max-w-3xl")}>
                 <div className="flex items-center gap-2 mb-3">
-                  <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">{isAmended ? "Amended Draft" : "Contract"}</span>
+                  <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">
+                    {isAmended ? "Amended Draft" : isCounterparty ? "Counterparty Markup" : "Contract"}
+                  </span>
                   {isAmended ? (
                     <div className="flex items-center rounded-lg border bg-muted/40 p-0.5 gap-0.5">
                       <button
@@ -391,6 +438,21 @@ function CoPilotReview() {
                         Clean
                       </button>
                     </div>
+                  ) : canCompare ? (
+                    <div className="flex items-center rounded-lg border bg-muted/40 p-0.5 gap-0.5">
+                      <button
+                        onClick={() => setSideBySide(true)}
+                        className={cn("px-2 py-0.5 rounded-md text-[10px] font-medium transition-colors", sideBySide ? "bg-background shadow-sm text-foreground" : "text-muted-foreground hover:text-foreground")}
+                      >
+                        Side-by-side
+                      </button>
+                      <button
+                        onClick={() => setSideBySide(false)}
+                        className={cn("px-2 py-0.5 rounded-md text-[10px] font-medium transition-colors", !sideBySide ? "bg-background shadow-sm text-foreground" : "text-muted-foreground hover:text-foreground")}
+                      >
+                        Their version
+                      </button>
+                    </div>
                   ) : (
                     <span className="text-[10px] text-muted-foreground/60">· click a highlight for the AI note</span>
                   )}
@@ -402,6 +464,28 @@ function CoPilotReview() {
                     <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-2 rounded-sm bg-emerald-100 dark:bg-emerald-900/40" /> <ins className="text-emerald-700 dark:text-emerald-300 no-underline font-semibold">new term</ins></span>
                   </div>
                 )}
+                {comparing ? (
+                  <div className="grid grid-cols-1 xl:grid-cols-2 gap-3 items-start">
+                    <div>
+                      <div className="flex items-center gap-1.5 mb-1.5">
+                        <span className="rounded bg-muted px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-muted-foreground">Ours — as sent</span>
+                        <span className="text-[10px] text-muted-foreground truncate">{review.compareAgainst ?? "original"}</span>
+                      </div>
+                      <div className="rounded-xl border bg-card p-4">
+                        <HighlightedContract text={originalText} clauses={originalClauses} activeIdx={activeIdx} onPick={setActiveIdx} />
+                      </div>
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-1.5 mb-1.5">
+                        <span className="rounded bg-amber-50 dark:bg-amber-900/30 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-amber-700 dark:text-amber-300">Counterparty's version</span>
+                        <span className="text-[10px] text-muted-foreground truncate">{doc.file_name}</span>
+                      </div>
+                      <div className="rounded-xl border bg-card p-4" onMouseUp={captureSelection}>
+                        <HighlightedContract text={docText} clauses={clauses} activeIdx={activeIdx} onPick={setActiveIdx} />
+                      </div>
+                    </div>
+                  </div>
+                ) : (
                 <div className="rounded-xl border bg-card p-5" onMouseUp={captureSelection}>
                   {isAmended && showRedline && redlineText ? (
                     <RedlineContract redline={redlineText} flashIdx={flashIdx} />
@@ -413,6 +497,7 @@ function CoPilotReview() {
                     </p>
                   )}
                 </div>
+                )}
 
                 {/* Selection → comment composer */}
                 {selection && (
@@ -445,7 +530,7 @@ function CoPilotReview() {
             {/* RIGHT — AI Co-Pilot sidebar */}
             <div className="overflow-y-auto bg-muted/20">
               <div className="p-4 space-y-3">
-                {!review && (
+                {!hasReview && (
                   <div className="rounded-xl border-2 border-dashed border-indigo-200 dark:border-indigo-900 bg-card p-5 text-center">
                     <div className="size-10 rounded-xl bg-indigo-50 dark:bg-indigo-900/30 grid place-items-center mx-auto mb-2.5">
                       <Bot className="size-5 text-indigo-600 dark:text-indigo-400" />
@@ -454,13 +539,17 @@ function CoPilotReview() {
                     <p className="text-[11px] text-muted-foreground mt-1 mb-3 leading-relaxed">
                       Run the AI clause-by-clause review to get a risk score, exposure breakdown, and suggested edits for this document.
                     </p>
-                    <Button size="sm" className="gap-1.5 text-xs bg-indigo-600 hover:bg-indigo-700" disabled={reviewing} onClick={runReview}>
-                      {reviewing ? <Loader2 className="size-3.5 animate-spin" /> : <Sparkles className="size-3.5" />} Run AI review
-                    </Button>
+                    {isReviewer ? (
+                      <Button size="sm" className="gap-1.5 text-xs bg-indigo-600 hover:bg-indigo-700" disabled={reviewing} onClick={runReview}>
+                        {reviewing ? <Loader2 className="size-3.5 animate-spin" /> : <Sparkles className="size-3.5" />} Run AI review
+                      </Button>
+                    ) : (
+                      <p className="text-[11px] text-muted-foreground/70 italic">Only the reviewer can run the analysis.</p>
+                    )}
                     <p className="text-[10px] text-muted-foreground/60 mt-3">You can also just read the document on the left and add comments — no analysis required.</p>
                   </div>
                 )}
-                {review && (<>
+                {hasReview && (<>
                 {/* Amendment history — old term → new term + the rationale that was accepted */}
                 {changes.length > 0 && (
                   <div className="rounded-xl border border-indigo-200/60 dark:border-indigo-900 bg-card overflow-hidden">
@@ -508,6 +597,11 @@ function CoPilotReview() {
                     <Gauge className="size-3.5 text-muted-foreground" />
                     <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">Risk Evaluation</span>
                   </div>
+                  {review.counterpartyReview && (
+                    <p className="text-[10px] text-muted-foreground -mt-1">
+                      Compared against: <span className="font-medium">{review.compareAgainst ?? "our original"}</span>
+                    </p>
+                  )}
                   <RiskGauge score={score} />
                   {review.exposure && <ExposureBars exposure={review.exposure} />}
                   {review.summary && <p className="text-[11px] leading-relaxed text-foreground/80 pt-1 border-t">{review.summary}</p>}
@@ -522,7 +616,9 @@ function CoPilotReview() {
                 {!isAmended && (
                 <div className="flex items-center gap-2 px-1">
                   <Sparkles className="size-3.5 text-indigo-600 dark:text-indigo-400" />
-                  <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">AI Suggestions</span>
+                  <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">
+                    {review.counterpartyReview ? "Counterparty Proposed Changes" : "AI Suggestions"}
+                  </span>
                   <span className="text-[10px] text-muted-foreground/60 ml-auto">{findings.length} to review</span>
                 </div>
                 )}
@@ -546,15 +642,50 @@ function CoPilotReview() {
                         <div className="rounded-lg bg-background border border-dashed p-2.5">
                           <div className="flex items-center gap-1.5 mb-1">
                             <Sparkles className="size-3 text-indigo-500" />
-                            <span className="text-[9px] font-bold uppercase tracking-wider text-indigo-600 dark:text-indigo-400">Suggested edit</span>
+                            <span className="text-[9px] font-bold uppercase tracking-wider text-indigo-600 dark:text-indigo-400">
+                              {review.counterpartyReview ? "Our counter-position" : "Suggested edit"}
+                            </span>
+                            {c.suggestionEditedBy && (
+                              <span className="text-[9px] text-muted-foreground/70" title={`Amended by ${c.suggestionEditedBy}`}>· amended</span>
+                            )}
+                            {isReviewer && editIdx !== idx && (
+                              <button
+                                onClick={() => { setEditIdx(idx); setEditText(c.suggestion); }}
+                                className="ml-auto text-muted-foreground hover:text-foreground" title="Amend this wording before applying"
+                              >
+                                <Pencil className="size-3" />
+                              </button>
+                            )}
                             <button
                               onClick={() => { navigator.clipboard?.writeText(c.suggestion); toast.success("Copied"); }}
-                              className="ml-auto text-muted-foreground hover:text-foreground" title="Copy"
+                              className={cn("text-muted-foreground hover:text-foreground", editIdx === idx && "ml-auto")} title="Copy"
                             >
                               <Copy className="size-3" />
                             </button>
                           </div>
-                          <p className="text-[11px] leading-relaxed text-foreground/90">{c.suggestion}</p>
+                          {editIdx === idx ? (
+                            <div className="space-y-1.5">
+                              <textarea
+                                autoFocus
+                                value={editText}
+                                onChange={(e) => setEditText(e.target.value)}
+                                rows={4}
+                                className="w-full rounded-lg border bg-background px-2.5 py-2 text-[11px] leading-relaxed resize-y focus:outline-none focus:ring-2 focus:ring-indigo-500/30"
+                              />
+                              <div className="flex items-center justify-end gap-2">
+                                <button onClick={() => { setEditIdx(null); setEditText(""); }} className="text-[10px] text-muted-foreground hover:text-foreground">Cancel</button>
+                                <Button
+                                  size="sm" className="h-6 text-[10px] gap-1"
+                                  disabled={!editText.trim() || editSuggestion.isPending}
+                                  onClick={() => editSuggestion.mutate({ clause_index: idx, suggestion: editText.trim() })}
+                                >
+                                  {editSuggestion.isPending ? <Loader2 className="size-3 animate-spin" /> : <Check className="size-3" />} Save wording
+                                </Button>
+                              </div>
+                            </div>
+                          ) : (
+                            <p className="text-[11px] leading-relaxed text-foreground/90">{c.suggestion}</p>
+                          )}
                         </div>
                       )}
                       <div className="flex items-center gap-2">
@@ -562,12 +693,12 @@ function CoPilotReview() {
                           <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
                             <CheckCircle2 className="size-3" /> Applied to draft
                           </span>
-                        ) : c.suggestion ? (
+                        ) : c.suggestion && isReviewer ? (
                           <Button size="sm" className="h-6 text-[10px] gap-1 bg-indigo-600 hover:bg-indigo-700" disabled={accept.isPending} onClick={() => accept.mutate({ clause_index: idx, accepted: true })}>
                             <Check className="size-3" /> Apply edit
                           </Button>
                         ) : null}
-                        {c.accepted && (
+                        {c.accepted && isReviewer && (
                           <button onClick={() => accept.mutate({ clause_index: idx, accepted: false })} className="text-[10px] text-muted-foreground hover:text-foreground">undo</button>
                         )}
                         {c.category && <span className="ml-auto text-[9px] text-muted-foreground/60 uppercase tracking-wider">{c.category}</span>}

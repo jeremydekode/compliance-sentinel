@@ -5,6 +5,7 @@ import { generateWithFallback } from "@/lib/gemini";
 import { docxToText, looksLikeDocx, applyEditsToDocx, type DocxEdit } from "@/lib/docx-editor";
 import { extractPdfPages } from "@/lib/pdf-pages";
 import { LEGAL_KB_SEED, baselinePlaybookText } from "@/lib/legal.knowledge";
+import { assertRowTenant, getCallerTenant } from "@/lib/tenant.functions";
 
 // ---------------------------------------------------------------------------
 // Legal CMS — server functions
@@ -86,10 +87,21 @@ const ALLOWED_TRANSITIONS: Record<string, string[]> = {
 };
 
 // Single source for the signed-in actor across handlers.
+// Demo hygiene: the client's real work domain must never appear on-screen
+// during a walkthrough. Masks both at the source (new events/comments/matters)
+// and is also exported for display-time masking of anything already stored
+// before this was added. Preserves the local-part so distinct testers stay
+// distinguishable ("jeremy" vs "sarah") — only the domain changes.
+export function maskDemoEmail(email: string | null | undefined): string {
+  if (!email) return "";
+  return email.replace(/@dekode\.ai$/i, "@cloud-space.co");
+}
+
 function actor(context: any): { userId: string | null; userEmail: string | null } {
+  const rawEmail = (context?.claims?.email as string | undefined) ?? null;
   return {
     userId: (context?.userId as string | undefined) ?? null,
-    userEmail: (context?.claims?.email as string | undefined) ?? null,
+    userEmail: rawEmail ? maskDemoEmail(rawEmail) : null,
   };
 }
 
@@ -108,6 +120,49 @@ async function logComment(sb: any, row: Record<string, unknown>) {
 // ---------------------------------------------------------------------------
 // AI helpers
 // ---------------------------------------------------------------------------
+
+// Close any brackets/strings left open in a truncated JSON string, tracking
+// string state so braces inside quoted text don't confuse the balance.
+function closeJson(s: string): string {
+  const stack: string[] = [];
+  let inStr = false, esc = false;
+  for (const ch of s) {
+    if (esc) { esc = false; continue; }
+    if (inStr) {
+      if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === "{") stack.push("}");
+    else if (ch === "[") stack.push("]");
+    else if (ch === "}" || ch === "]") stack.pop();
+  }
+  let out = s;
+  if (inStr) out += '"';
+  while (stack.length) out += stack.pop();
+  return out;
+}
+
+// Parse a model's JSON reply, salvaging what's parseable when the output is
+// truncated mid-array or contains a malformed tail (long clause reviews
+// sometimes cut off partway — better to keep the complete clauses than fail
+// the whole review with a raw "Expected ',' or ']'..." error).
+function parseAiJson(raw: string): any {
+  const m = raw.match(/\{[\s\S]*\}/);
+  let s = (m ? m[0] : raw).trim();
+  try { return JSON.parse(s); } catch { /* salvage below */ }
+  for (let cut = s.length; cut > 1; ) {
+    const idx = s.lastIndexOf("}", cut - 1);
+    if (idx <= 0) break;
+    try {
+      const parsed = JSON.parse(closeJson(s.slice(0, idx + 1)));
+      console.error(`[legal] AI JSON was malformed — salvaged first ${idx + 1}/${s.length} chars`);
+      return parsed;
+    } catch { cut = idx; }
+  }
+  throw new Error("The AI returned malformed output — re-run the review to try again.");
+}
 
 async function classifyMatterRoute(
   title: string,
@@ -250,10 +305,12 @@ export const listLegalMatters = createServerFn({ method: "GET" })
   )
   .handler(async ({ data, context }) => {
     const sb = context.supabase as any;
+    const { tenantId } = await getCallerTenant(context.userId);
     let q = sb
       .from("legal_matters")
       .select("*")
       .eq("workspace_id", "legal")
+      .eq("tenant_id", tenantId)
       .order("created_at", { ascending: false });
 
     if (data?.status)      q = q.eq("status", data.status);
@@ -277,6 +334,11 @@ export const getLegalMatter = createServerFn({ method: "GET" })
       sb.from("legal_matter_shares").select("*").eq("matter_id", data.id).order("created_at", { ascending: false }),
     ]);
     if (matterRes.error) throw new Error(matterRes.error.message);
+    // Tenant boundary: an id from another tenant must behave like a 404.
+    const { tenantId } = await getCallerTenant(context.userId);
+    if (matterRes.data?.tenant_id && matterRes.data.tenant_id !== tenantId) {
+      throw new Error("Matter not found");
+    }
     // Surface (don't silently swallow) secondary-query failures — an empty audit
     // trail from a query error would otherwise masquerade as "no events".
     for (const [name, res] of [["events", eventsRes], ["comments", commentsRes], ["documents", docsRes], ["shares", sharesRes]] as const) {
@@ -360,9 +422,12 @@ export const createLegalMatter = createServerFn({ method: "POST" })
       // Simple advisory: AI answers from playbooks + the published KB, and the
       // matter terminates at Step 1 — "Resolved autonomously" — unless escalated.
       initialStatus = "resolved";
+      // Tenant boundary: ground the advisory answer only in the caller's own KB.
+      const { tenantId } = await getCallerTenant(context.userId);
       const { data: kb } = await sb
         .from("legal_kb_entries")
         .select("title, takeaways")
+        .eq("tenant_id", tenantId)
         .order("created_at", { ascending: false })
         .limit(12);
       aiResponse = await generateSimpleAdvisoryResponse(data.title, data.description, kb ?? []);
@@ -430,6 +495,90 @@ export const createLegalMatter = createServerFn({ method: "POST" })
     return matter as any;
   });
 
+// Track a self-service template download (Route A) as a real matter + document,
+// instead of the file silently leaving the system with no record. Deterministically
+// Route A / resolved — the template pick already IS the routing decision, so this
+// skips the AI classification call the general intake path uses. Having a tracked
+// document here is also what lets counterparty markup be attached and reviewed
+// later (see reviewCounterpartyMarkup).
+export const createTemplateRequest = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    z.object({
+      template_id:     z.string(),
+      template_name:   z.string(),
+      matter_type:     z.string(),
+      file_name:       z.string(),
+      file_url:        z.string().url(),
+      mime_type:       z.string().optional(),
+      size_bytes:      z.number().optional(),
+      plain_text:      z.string(),
+      requestor_name:  z.string(),
+      requestor_email: z.string().email(),
+    })
+  )
+  .handler(async ({ data, context }) => {
+    const sb = context.supabase as any;
+    const { userId, userEmail } = actor(context);
+
+    const { data: matter, error } = await sb
+      .from("legal_matters")
+      .insert({
+        workspace_id:       "legal",
+        entity_code:        DEFAULT_ORG,
+        title:               `Self-service: ${data.template_name}`,
+        description:         `Generated directly from the ${data.template_name} self-service template.`,
+        matter_type:         data.matter_type,
+        route:               "A",
+        ai_route_reasoning:  "Selected directly from the self-service template library — routing is deterministic, no AI classification needed.",
+        status:              "resolved",
+        priority:            "normal",
+        is_material:         false,
+        requestor_id:        userId,
+        requestor_name:      data.requestor_name,
+        requestor_email:     data.requestor_email,
+      })
+      .select()
+      .single();
+    if (error) throw new Error(error.message);
+
+    const { data: doc, error: docErr } = await sb
+      .from("legal_matter_documents")
+      .insert({
+        matter_id:        matter.id,
+        file_name:        data.file_name,
+        file_url:         data.file_url,
+        mime_type:        data.mime_type ?? null,
+        size_bytes:       data.size_bytes ?? null,
+        doc_role:         "submitted",
+        ai_review:        { documentText: data.plain_text.slice(0, 60_000) },
+        ai_review_status: "none",
+        uploaded_by:      userId,
+        uploaded_by_name: userEmail ?? data.requestor_name,
+      })
+      .select()
+      .single();
+    if (docErr) throw new Error(docErr.message);
+
+    await logEvent(sb, {
+      matter_id:  matter.id,
+      event_type: "created",
+      actor_id:   userId,
+      actor_name: data.requestor_name,
+      to_status:  "resolved",
+      payload:    { route: "A", reasoning: "template", template_id: data.template_id },
+    });
+    await logEvent(sb, {
+      matter_id:  matter.id,
+      event_type: "document_uploaded",
+      actor_id:   userId,
+      actor_name: userEmail ?? data.requestor_name,
+      payload:    { file_name: data.file_name, doc_role: "submitted" },
+    });
+
+    return { ...matter, document_id: doc.id } as any;
+  });
+
 export const assignLegalMatter = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator(
@@ -443,6 +592,11 @@ export const assignLegalMatter = createServerFn({ method: "POST" })
   .handler(async ({ data, context }) => {
     const sb = context.supabase as any;
     const { userId, userEmail } = actor(context);
+
+    // Tenant boundary: an id from another tenant must behave like a 404.
+    const { data: matterRow } = await sb.from("legal_matters").select("tenant_id").eq("id", data.matter_id).single();
+    if (!matterRow) throw new Error("Matter not found");
+    assertRowTenant(matterRow.tenant_id, (await getCallerTenant(context.userId)).tenantId);
 
     const { error } = await sb
       .from("legal_matters")
@@ -481,6 +635,62 @@ export const assignLegalMatter = createServerFn({ method: "POST" })
     return { ok: true };
   });
 
+// Submitter ⇄ reviewer handback within the review loop — moves whose-turn
+// state without touching the coarse matter status, so a counterparty markup
+// round-trip (or a "client approved, please submit for sign-off" handback)
+// doesn't have to re-enter assignment; the reviewer already owns the matter.
+export const setAwaitingRole = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(z.object({
+    matter_id:     z.string().uuid(),
+    awaiting_role: z.enum(["submitter", "reviewer"]),
+    note:          z.string().optional(),
+    client_approved: z.boolean().optional(),
+  }))
+  .handler(async ({ data, context }) => {
+    const sb = context.supabase as any;
+    const { userId, userEmail } = actor(context);
+
+    // Tenant boundary: an id from another tenant must behave like a 404.
+    const { data: matterRow } = await sb.from("legal_matters").select("tenant_id").eq("id", data.matter_id).single();
+    if (!matterRow) throw new Error("Matter not found");
+    assertRowTenant(matterRow.tenant_id, (await getCallerTenant(context.userId)).tenantId);
+
+    const { error } = await sb
+      .from("legal_matters")
+      .update({ awaiting_role: data.awaiting_role })
+      .eq("id", data.matter_id);
+    if (error) throw new Error(error.message);
+
+    await logEvent(sb, {
+      matter_id:  data.matter_id,
+      event_type: data.awaiting_role === "submitter" ? "sent_to_submitter" : "sent_to_reviewer",
+      actor_id:   userId,
+      actor_name: userEmail ?? "User",
+      payload:    { note: data.note, client_approved: !!data.client_approved },
+    });
+
+    if (data.client_approved) {
+      await logComment(sb, {
+        matter_id:    data.matter_id,
+        author_id:    userId,
+        author_name:  userEmail ?? "User",
+        content:      data.note?.trim() || "Approved by client.",
+        comment_type: "client_approved",
+      });
+    } else if (data.note?.trim()) {
+      await logComment(sb, {
+        matter_id:    data.matter_id,
+        author_id:    userId,
+        author_name:  userEmail ?? "User",
+        content:      data.note.trim(),
+        comment_type: "review_note",
+      });
+    }
+
+    return { ok: true };
+  });
+
 export const advanceLegalMatterStatus = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator(
@@ -497,10 +707,12 @@ export const advanceLegalMatterStatus = createServerFn({ method: "POST" })
     // Fetch current status for the transition guard + event log
     const { data: current } = await sb
       .from("legal_matters")
-      .select("status, title, description, matter_type, route, ai_triage_summary, ai_executive_summary")
+      .select("tenant_id, status, title, description, matter_type, route, ai_triage_summary, ai_executive_summary")
       .eq("id", data.matter_id)
       .single();
     if (!current) throw new Error("Matter not found");
+    // Tenant boundary: an id from another tenant must behave like a 404.
+    assertRowTenant(current.tenant_id, (await getCallerTenant(context.userId)).tenantId);
 
     // Trust boundary: reject illegal transitions (the UI only shows legal ones,
     // but the server must enforce the workflow, e.g. no in_review → approved skip).
@@ -510,6 +722,13 @@ export const advanceLegalMatterStatus = createServerFn({ method: "POST" })
     }
 
     const updatePayload: any = { status: data.new_status };
+    // Submitter/reviewer handback loop: entering review starts it on the
+    // reviewer's turn; leaving the loop for formal approval (or dropping out
+    // via reject/archive) clears whose-turn state so it doesn't linger stale.
+    if (data.new_status === "in_review") updatePayload.awaiting_role = "reviewer";
+    if (["pending_approval", "approved", "rejected", "archived"].includes(data.new_status)) {
+      updatePayload.awaiting_role = null;
+    }
     if (data.new_status === "approved") {
       updatePayload.approved_by      = userId;
       updatePayload.approved_by_name = userEmail ?? "Approver";
@@ -571,13 +790,18 @@ export const addLegalComment = createServerFn({ method: "POST" })
     z.object({
       matter_id:    z.string().uuid(),
       content:      z.string().min(1),
-      comment_type: z.enum(["comment","review_note","ai_note"]).default("comment"),
+      comment_type: z.enum(["comment","review_note","ai_note","client_approved"]).default("comment"),
       function_tag: z.string().optional(),   // Tax / Compliance / Risk / Finance
     })
   )
   .handler(async ({ data, context }) => {
     const sb = context.supabase as any;
     const { userId, userEmail } = actor(context);
+
+    // Tenant boundary: an id from another tenant must behave like a 404.
+    const { data: matterRow } = await sb.from("legal_matters").select("tenant_id").eq("id", data.matter_id).single();
+    if (!matterRow) throw new Error("Matter not found");
+    assertRowTenant(matterRow.tenant_id, (await getCallerTenant(context.userId)).tenantId);
 
     // Parse @mentions so the in-matter chat can highlight / notify tagged users.
     const mentions = Array.from(new Set((data.content.match(/@([\w.\-]+)/g) ?? []).map((s) => s.slice(1))));
@@ -616,10 +840,12 @@ export const escalateLegalMatter = createServerFn({ method: "POST" })
 
     const { data: matter } = await sb
       .from("legal_matters")
-      .select("status, route, title, description, matter_type, ai_triage_summary")
+      .select("tenant_id, status, route, title, description, matter_type, ai_triage_summary")
       .eq("id", data.matter_id)
       .single();
     if (!matter) throw new Error("Matter not found");
+    // Tenant boundary: an id from another tenant must behave like a 404.
+    assertRowTenant(matter.tenant_id, (await getCallerTenant(context.userId)).tenantId);
 
     // Only an AI-resolved matter can be escalated (Route C/A terminate at intake).
     if (matter.status !== "resolved") {
@@ -670,6 +896,11 @@ export const archiveLegalMatter = createServerFn({ method: "POST" })
   .handler(async ({ data, context }) => {
     const sb = context.supabase as any;
     const { userId, userEmail } = actor(context);
+
+    // Tenant boundary: an id from another tenant must behave like a 404.
+    const { data: matterRow } = await sb.from("legal_matters").select("tenant_id").eq("id", data.matter_id).single();
+    if (!matterRow) throw new Error("Matter not found");
+    assertRowTenant(matterRow.tenant_id, (await getCallerTenant(context.userId)).tenantId);
 
     const { error } = await sb
       .from("legal_matters")
@@ -779,12 +1010,17 @@ export const attachLegalDocument = createServerFn({ method: "POST" })
       file_url:   z.string().url(),
       mime_type:  z.string().optional(),
       size_bytes: z.number().optional(),
-      doc_role:   z.enum(["submitted", "reference", "executed"]).default("submitted"),
+      doc_role:   z.enum(["submitted", "reference", "executed", "counterparty_markup"]).default("submitted"),
     })
   )
   .handler(async ({ data, context }) => {
     const sb = context.supabase as any;
     const { userId, userEmail } = actor(context);
+
+    // Tenant boundary: an id from another tenant must behave like a 404.
+    const { data: matterRow } = await sb.from("legal_matters").select("tenant_id").eq("id", data.matter_id).single();
+    if (!matterRow) throw new Error("Matter not found");
+    assertRowTenant(matterRow.tenant_id, (await getCallerTenant(context.userId)).tenantId);
 
     const { data: doc, error } = await sb
       .from("legal_matter_documents")
@@ -812,6 +1048,19 @@ export const attachLegalDocument = createServerFn({ method: "POST" })
       payload:    { file_name: data.file_name, doc_role: data.doc_role },
     });
 
+    // A counterparty markup lands squarely on the reviewer who already owns
+    // this matter — no need to loop back through assignment for it.
+    if (data.doc_role === "counterparty_markup") {
+      await sb.from("legal_matters").update({ awaiting_role: "reviewer" }).eq("id", data.matter_id);
+      await logEvent(sb, {
+        matter_id:  data.matter_id,
+        event_type: "sent_to_reviewer",
+        actor_id:   userId,
+        actor_name: userEmail ?? "User",
+        payload:    { note: `Counterparty markup received: ${data.file_name}` },
+      });
+    }
+
     return doc as any;
   });
 
@@ -831,9 +1080,11 @@ export const reviewLegalDocument = createServerFn({ method: "POST" })
     // Parent matter (separate fetch — avoids relying on PostgREST embed detection)
     const { data: matter } = await sb
       .from("legal_matters")
-      .select("id, title, matter_type, entity_code")
+      .select("id, title, matter_type, entity_code, tenant_id")
       .eq("id", doc.matter_id)
       .single();
+    // Tenant boundary: the parent matter's tenant must match the caller's.
+    assertRowTenant(matter?.tenant_id, (await getCallerTenant(context.userId)).tenantId);
 
     await sb.from("legal_matter_documents")
       .update({ ai_review_status: "running" })
@@ -901,8 +1152,7 @@ Cover the 4-10 most significant clauses. verdict = worst severity found. Make su
         { tier: "quality" }
       );
       const text = res.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-      const match = text.match(/\{[\s\S]*\}/);
-      const review = JSON.parse(match ? match[0] : text);
+      const review = parseAiJson(text);
 
       if (!review || !Array.isArray(review.clauses)) throw new Error("AI review returned an unexpected format");
       // Stash a truncated copy of the document text for the co-pilot editor view.
@@ -945,6 +1195,154 @@ Cover the 4-10 most significant clauses. verdict = worst severity found. Make su
     }
   });
 
+// Extract plain text from a stored document's file (DOCX / PDF / plain text).
+// Shared by the counterparty-markup comparison below.
+async function extractDocText(fileUrl: string, mimeType: string | null | undefined, fileName: string): Promise<string> {
+  const resp = await fetch(fileUrl);
+  if (!resp.ok) throw new Error(`Could not fetch document (${resp.status})`);
+  const buffer = Buffer.from(await resp.arrayBuffer());
+  const mime = mimeType || resp.headers.get("content-type") || "application/octet-stream";
+  if (looksLikeDocx(mime, fileName)) return await docxToText(buffer);
+  if (mime.includes("pdf") || /\.pdf($|\?)/i.test(fileName)) {
+    try {
+      const pages = await extractPdfPages(buffer);
+      return pages.map((p) => p.text).filter(Boolean).join("\n\n");
+    } catch { return ""; }
+  }
+  return buffer.toString("utf8");
+}
+
+// Review counterparty markup: compares a document the counterparty sent back
+// against the ORIGINAL document on the same matter, and produces the same
+// clauses[] shape as reviewLegalDocument (so it reuses the existing AI Co-Pilot /
+// Document Review UI) — but framed as "what did they change" rather than "what's
+// risky in our draft", with a counter-position suggestion per changed clause.
+export const reviewCounterpartyMarkup = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(z.object({ document_id: z.string().uuid() }))
+  .handler(async ({ data, context }) => {
+    const sb = context.supabase as any;
+
+    const { data: doc, error } = await sb
+      .from("legal_matter_documents")
+      .select("*")
+      .eq("id", data.document_id)
+      .single();
+    if (error || !doc) throw new Error(error?.message ?? "Document not found");
+
+    // Tenant boundary: the parent matter's tenant must match the caller's.
+    const { data: parentMatter } = await sb.from("legal_matters").select("tenant_id").eq("id", doc.matter_id).single();
+    assertRowTenant(parentMatter?.tenant_id, (await getCallerTenant(context.userId)).tenantId);
+
+    // "Original" = the most recent version of OUR draft (not the counterparty's
+    // markup) — i.e. what we most recently sent out. If we later generated an
+    // amended version (v2, v3...) after this matter's first draft, compare
+    // against THAT, not the very first document ever uploaded.
+    const { data: original } = await sb
+      .from("legal_matter_documents")
+      .select("*")
+      .eq("matter_id", doc.matter_id)
+      .neq("id", data.document_id)
+      .neq("doc_role", "counterparty_markup")
+      .order("version", { ascending: false })
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (!original) throw new Error("No original document found on this matter to compare the counterparty's markup against.");
+
+    await sb.from("legal_matter_documents")
+      .update({ ai_review_status: "running" })
+      .eq("id", data.document_id);
+
+    try {
+      const originalText = String(original.ai_review?.documentText ?? "") ||
+        await extractDocText(original.file_url, original.mime_type, original.file_name);
+      const markupText = await extractDocText(doc.file_url, doc.mime_type, doc.file_name);
+      if (!originalText.trim() || !markupText.trim()) {
+        throw new Error("Could not read text from one of the documents to compare.");
+      }
+
+      const instruction = `You are senior legal counsel AI for the Company. The Company sent the ORIGINAL document below out to a counterparty. The counterparty has returned a marked-up version with their proposed changes. Compare the two and identify every clause where the counterparty added, removed, or reworded something — skip clauses that are unchanged.
+
+ORIGINAL (as sent by the Company):
+${originalText.slice(0, 100_000)}
+
+COUNTERPARTY'S VERSION (their proposed changes):
+${markupText.slice(0, 100_000)}
+
+For each changed clause, assess it against standard company playbook positions and Malaysian law (liability caps — never unlimited, indemnities, termination rights, confidentiality, PDPA 2010, IP ownership, force majeure, governing law, payment terms).
+
+Return ONLY valid JSON:
+{
+  "verdict": "red_flag" | "caution" | "compliant",
+  "riskScore": 0-100 (0 = all changes acceptable, 100 = severe — how unfavourable their proposed changes are to the Company),
+  "summary": "3-4 sentence overall assessment of what the counterparty is asking for",
+  "exposure": {
+    "financial": "low" | "medium" | "high", "regulatory": "low" | "medium" | "high",
+    "operational": "low" | "medium" | "high", "reputational": "low" | "medium" | "high"
+  },
+  "clauses": [
+    {
+      "ref": "clause number/heading",
+      "excerpt": "an EXACT verbatim substring copied character-for-character from the COUNTERPARTY'S VERSION reflecting their proposed wording",
+      "originalExcerpt": "an EXACT verbatim substring copied character-for-character from the ORIGINAL showing what this replaced (empty string if the counterparty added something entirely new)",
+      "severity": "red_flag" | "caution" | "compliant",
+      "category": "financial" | "regulatory" | "operational" | "reputational",
+      "comment": "what the counterparty changed and why it matters — describe the shift from our original position and the risk it creates",
+      "suggestion": "the EXACT replacement clause wording we would counter-propose, written as final contract language ready to be inserted into the draft — NOT commentary, NOT instructions like 'revert to...' (empty string if their change is acceptable as-is)"
+    }
+  ]
+}
+Only include clauses that actually differ between the two versions. If nothing of substance changed, return an empty clauses array and verdict "compliant".
+IMPORTANT: "suggestion" must read as contract prose (e.g. "Each Party's aggregate liability shall not exceed the total fees paid in the twelve (12) months preceding the claim..."), never as advice about what to do.`;
+
+      const res = await generateWithFallback(
+        { contents: [{ role: "user", parts: [{ text: instruction }] }], config: { responseMimeType: "application/json", maxOutputTokens: 16384 } },
+        { tier: "quality" }
+      );
+      const text = res.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+      const review = parseAiJson(text);
+      if (!review || !Array.isArray(review.clauses)) throw new Error("AI review returned an unexpected format");
+
+      review.documentText = markupText.slice(0, 60_000);
+      review.counterpartyReview = true;
+      review.compareAgainst = original.file_name;
+      // Keep the original's text on the review so the viewer can render a
+      // side-by-side comparison without re-fetching/re-extracting the original.
+      review.originalDocumentText = originalText.slice(0, 60_000);
+      // Preserve reviewer annotations across a re-run, same as reviewLegalDocument.
+      const prior = doc.ai_review ?? {};
+      if (Array.isArray(prior.annotations) && prior.annotations.length) review.annotations = prior.annotations;
+
+      await sb.from("legal_matter_documents")
+        .update({ ai_review: review, ai_review_status: "done", ai_reviewed_at: new Date().toISOString() })
+        .eq("id", data.document_id);
+
+      const counts = { red_flag: 0, caution: 0, compliant: 0 } as Record<string, number>;
+      for (const c of review.clauses) counts[c.severity] = (counts[c.severity] ?? 0) + 1;
+
+      await logEvent(sb, {
+        matter_id:  doc.matter_id,
+        event_type: "counterparty_review_completed",
+        actor_name: "AI Counterparty Review",
+        payload:    { file_name: doc.file_name, verdict: review.verdict, ...counts },
+      });
+      await logComment(sb, {
+        matter_id:    doc.matter_id,
+        author_name:  "AI Counterparty Review",
+        content:      `Reviewed counterparty markup on "${doc.file_name}" — ${counts.red_flag} red flag${counts.red_flag !== 1 ? "s" : ""}, ${counts.caution} to negotiate, ${counts.compliant} acceptable. ${review.summary ?? ""}`,
+        comment_type: "ai_note",
+      });
+
+      return { ok: true, review };
+    } catch (e: any) {
+      await sb.from("legal_matter_documents")
+        .update({ ai_review_status: "failed" })
+        .eq("id", data.document_id);
+      throw new Error(e?.message ?? "Counterparty review failed");
+    }
+  });
+
 export const setDocumentAccess = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator(z.object({
@@ -953,6 +1351,12 @@ export const setDocumentAccess = createServerFn({ method: "POST" })
   }))
   .handler(async ({ data, context }) => {
     const sb = context.supabase as any;
+    // Tenant boundary: the parent matter's tenant must match the caller's.
+    const { data: doc } = await sb.from("legal_matter_documents").select("matter_id").eq("id", data.document_id).single();
+    if (!doc) throw new Error("Document not found");
+    const { data: parentMatter } = await sb.from("legal_matters").select("tenant_id").eq("id", doc.matter_id).single();
+    assertRowTenant(parentMatter?.tenant_id, (await getCallerTenant(context.userId)).tenantId);
+
     const { error } = await sb
       .from("legal_matter_documents")
       .update({ access_level: data.access_level })
@@ -976,9 +1380,11 @@ export const getLegalDocument = createServerFn({ method: "GET" })
 
     const { data: matter } = await sb
       .from("legal_matters")
-      .select("id, reference_number, title, route, entity_code, status")
+      .select("id, reference_number, title, route, entity_code, status, tenant_id")
       .eq("id", doc.matter_id)
       .single();
+    // Tenant boundary: the parent matter's tenant must match the caller's.
+    assertRowTenant(matter?.tenant_id, (await getCallerTenant(context.userId)).tenantId);
 
     // Extract the document text so the viewer can show content WITHOUT an AI review
     // having run first. Prefer text already stored on the review (e.g. amended
@@ -1016,7 +1422,10 @@ export const acceptClauseSuggestion = createServerFn({ method: "POST" })
   .inputValidator(z.object({
     document_id:  z.string().uuid(),
     clause_index: z.number().int().min(0),
-    accepted:     z.boolean().default(true),
+    accepted:     z.boolean().optional(),
+    // Lawyer's override of the AI's suggested wording — persisted so the edited
+    // text is what "Generate amended version" applies to the draft.
+    suggestion:   z.string().max(8000).optional(),
   }))
   .handler(async ({ data, context }) => {
     const sb = context.supabase as any;
@@ -1028,9 +1437,17 @@ export const acceptClauseSuggestion = createServerFn({ method: "POST" })
       .eq("id", data.document_id)
       .single();
     if (!doc?.ai_review?.clauses?.[data.clause_index]) throw new Error("Clause not found");
+    // Tenant boundary: the parent matter's tenant must match the caller's.
+    const { data: parentMatter } = await sb.from("legal_matters").select("tenant_id").eq("id", doc.matter_id).single();
+    assertRowTenant(parentMatter?.tenant_id, (await getCallerTenant(context.userId)).tenantId);
 
     const review = doc.ai_review;
-    review.clauses[data.clause_index].accepted = data.accepted;
+    const clause = review.clauses[data.clause_index];
+    if (data.accepted !== undefined) clause.accepted = data.accepted;
+    if (data.suggestion !== undefined) {
+      clause.suggestion = data.suggestion;
+      clause.suggestionEditedBy = userEmail ?? "Reviewer";
+    }
 
     const { error } = await sb
       .from("legal_matter_documents")
@@ -1039,10 +1456,17 @@ export const acceptClauseSuggestion = createServerFn({ method: "POST" })
     if (error) throw new Error(error.message);
 
     if (data.accepted) {
-      const clause = review.clauses[data.clause_index];
       await logEvent(sb, {
         matter_id:  doc.matter_id,
         event_type: "suggestion_accepted",
+        actor_id:   userId,
+        actor_name: userEmail ?? "User",
+        payload:    { file_name: doc.file_name, ref: clause.ref, edited: !!clause.suggestionEditedBy },
+      });
+    } else if (data.suggestion !== undefined) {
+      await logEvent(sb, {
+        matter_id:  doc.matter_id,
+        event_type: "suggestion_edited",
         actor_id:   userId,
         actor_name: userEmail ?? "User",
         payload:    { file_name: doc.file_name, ref: clause.ref },
@@ -1146,6 +1570,9 @@ export const addDocumentAnnotation = createServerFn({ method: "POST" })
     const { data: doc } = await sb
       .from("legal_matter_documents").select("ai_review, matter_id, file_name").eq("id", data.document_id).single();
     if (!doc) throw new Error("Document not found");
+    // Tenant boundary: the parent matter's tenant must match the caller's.
+    const { data: parentMatter } = await sb.from("legal_matters").select("tenant_id").eq("id", doc.matter_id).single();
+    assertRowTenant(parentMatter?.tenant_id, (await getCallerTenant(context.userId)).tenantId);
 
     const review = doc.ai_review ?? {};
     const annotations = Array.isArray(review.annotations) ? review.annotations : [];
@@ -1177,7 +1604,11 @@ export const deleteDocumentAnnotation = createServerFn({ method: "POST" })
   .inputValidator(z.object({ document_id: z.string().uuid(), index: z.number().int().min(0) }))
   .handler(async ({ data, context }) => {
     const sb = context.supabase as any;
-    const { data: doc } = await sb.from("legal_matter_documents").select("ai_review").eq("id", data.document_id).single();
+    const { data: doc } = await sb.from("legal_matter_documents").select("ai_review, matter_id").eq("id", data.document_id).single();
+    if (!doc) throw new Error("Document not found");
+    // Tenant boundary: the parent matter's tenant must match the caller's.
+    const { data: parentMatter } = await sb.from("legal_matters").select("tenant_id").eq("id", doc.matter_id).single();
+    assertRowTenant(parentMatter?.tenant_id, (await getCallerTenant(context.userId)).tenantId);
     const review = doc?.ai_review ?? {};
     if (Array.isArray(review.annotations) && review.annotations[data.index]) {
       review.annotations.splice(data.index, 1);
@@ -1202,6 +1633,9 @@ export const deleteLegalDocument = createServerFn({ method: "POST" })
       .eq("id", data.document_id)
       .single();
     if (!doc) throw new Error("Document not found");
+    // Tenant boundary: the parent matter's tenant must match the caller's.
+    const { data: parentMatter } = await sb.from("legal_matters").select("tenant_id").eq("id", doc.matter_id).single();
+    assertRowTenant(parentMatter?.tenant_id, (await getCallerTenant(context.userId)).tenantId);
 
     // Best-effort: remove the underlying storage object (public bucket key).
     try {
@@ -1241,6 +1675,9 @@ export const createAmendedVersion = createServerFn({ method: "POST" })
       .from("legal_matter_documents").select("*").eq("id", data.document_id).single();
     if (error || !doc) throw new Error(error?.message ?? "Document not found");
     if (!doc.file_url) throw new Error("This document is restricted — cannot generate a version.");
+    // Tenant boundary: the parent matter's tenant must match the caller's.
+    const { data: parentMatter } = await sb.from("legal_matters").select("tenant_id").eq("id", doc.matter_id).single();
+    assertRowTenant(parentMatter?.tenant_id, (await getCallerTenant(context.userId)).tenantId);
 
     const review = doc.ai_review;
     const accepted = (review?.clauses ?? []).filter((c: any) => c.accepted && c.suggestion);
@@ -1415,15 +1852,21 @@ export const generateProposedResponse = createServerFn({ method: "POST" })
 
     const { data: m, error } = await sb
       .from("legal_matters")
-      .select("id, title, description, matter_type")
+      .select("id, title, description, matter_type, tenant_id")
       .eq("id", data.matter_id)
       .single();
     if (error || !m) throw new Error(error?.message ?? "Matter not found");
+    // Tenant boundary: an id from another tenant must behave like a 404. The
+    // precedent/KB corpus below is scoped to the same tenant so another
+    // organisation's matters never leak into the drafted response.
+    const { tenantId } = await getCallerTenant(context.userId);
+    assertRowTenant(m.tenant_id, tenantId);
 
     // Historical precedent matching — surface similar prior matters.
     const { data: priors } = await sb
       .from("legal_matters")
       .select("reference_number, title, ai_response, ai_executive_summary")
+      .eq("tenant_id", tenantId)
       .in("status", ["resolved", "approved", "archived"])
       .neq("id", m.id)
       .limit(20);
@@ -1431,6 +1874,7 @@ export const generateProposedResponse = createServerFn({ method: "POST" })
     const { data: kb } = await sb
       .from("legal_kb_entries")
       .select("title, takeaways")
+      .eq("tenant_id", tenantId)
       .limit(12);
 
     const precedentBlock = (priors ?? []).length
@@ -1460,10 +1904,9 @@ Return ONLY valid JSON:
       { tier: "quality" }
     );
     const text = res.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-    const match = text.match(/\{[\s\S]*\}/);
     let parsed: any;
     try {
-      parsed = match ? JSON.parse(match[0]) : { proposedResponse: text };
+      parsed = parseAiJson(text);
     } catch {
       // Malformed model output — fall back to the raw text rather than 500.
       parsed = { proposedResponse: text };
@@ -1493,6 +1936,11 @@ export const referToGeneralCounsel = createServerFn({ method: "POST" })
   .handler(async ({ data, context }) => {
     const sb = context.supabase as any;
     const { userId, userEmail } = actor(context);
+
+    // Tenant boundary: an id from another tenant must behave like a 404.
+    const { data: matterRow } = await sb.from("legal_matters").select("tenant_id").eq("id", data.matter_id).single();
+    if (!matterRow) throw new Error("Matter not found");
+    assertRowTenant(matterRow.tenant_id, (await getCallerTenant(context.userId)).tenantId);
 
     const { error } = await sb
       .from("legal_matters")
@@ -1528,7 +1976,10 @@ export const tagFunctions = createServerFn({ method: "POST" })
     const sb = context.supabase as any;
     const { userId, userEmail } = actor(context);
 
-    const { data: cur } = await sb.from("legal_matters").select("tagged_functions").eq("id", data.matter_id).single();
+    const { data: cur } = await sb.from("legal_matters").select("tagged_functions, tenant_id").eq("id", data.matter_id).single();
+    if (!cur) throw new Error("Matter not found");
+    // Tenant boundary: an id from another tenant must behave like a 404.
+    assertRowTenant(cur.tenant_id, (await getCallerTenant(context.userId)).tenantId);
     const existing: string[] = Array.isArray(cur?.tagged_functions) ? cur.tagged_functions : [];
     const merged = Array.from(new Set([...existing, ...data.functions]));
 
@@ -1555,8 +2006,10 @@ export const publishToKnowledgeBase = createServerFn({ method: "POST" })
     const sb = context.supabase as any;
     const { userId, userEmail } = actor(context);
 
-    const { data: m } = await sb.from("legal_matters").select("entity_code, reference_number, status").eq("id", data.matter_id).single();
+    const { data: m } = await sb.from("legal_matters").select("entity_code, reference_number, status, tenant_id").eq("id", data.matter_id).single();
     if (!m) throw new Error("Matter not found");
+    // Tenant boundary: an id from another tenant must behave like a 404.
+    assertRowTenant(m.tenant_id, (await getCallerTenant(context.userId)).tenantId);
     // Spec: takeaways enter the KB only after the matter is signed off (approved).
     if (m.status !== "approved") {
       throw new Error("Publish to the knowledge base only after the matter is approved / signed off.");
@@ -1589,7 +2042,11 @@ export const listKnowledgeBase = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {
     const sb = context.supabase as any;
-    const { data: rows, error } = await sb.from("legal_kb_entries").select("*").order("created_at", { ascending: false });
+    const { tenantId } = await getCallerTenant(context.userId);
+    const { data: rows, error } = await sb
+      .from("legal_kb_entries").select("*")
+      .eq("tenant_id", tenantId)
+      .order("created_at", { ascending: false });
     if (error) throw new Error(error.message);
     return rows ?? [];
   });
@@ -1602,7 +2059,8 @@ export const seedKnowledgeBase = createServerFn({ method: "POST" })
     const sb = context.supabase as any;
     const { userEmail } = actor(context);
 
-    const { data: existing } = await sb.from("legal_kb_entries").select("title");
+    const { tenantId: seedTenantId } = await getCallerTenant(context.userId);
+    const { data: existing } = await sb.from("legal_kb_entries").select("title").eq("tenant_id", seedTenantId);
     const have = new Set((existing ?? []).map((e: any) => e.title));
     const toInsert = LEGAL_KB_SEED.filter((e) => !have.has(e.title)).map((e) => ({
       entity_code:       DEFAULT_ORG,
@@ -1632,6 +2090,11 @@ export const setMatterLifecycle = createServerFn({ method: "POST" })
   }))
   .handler(async ({ data, context }) => {
     const sb = context.supabase as any;
+    // Tenant boundary: an id from another tenant must behave like a 404.
+    const { data: matterRow } = await sb.from("legal_matters").select("tenant_id").eq("id", data.matter_id).single();
+    if (!matterRow) throw new Error("Matter not found");
+    assertRowTenant(matterRow.tenant_id, (await getCallerTenant(context.userId)).tenantId);
+
     const update: any = {};
     if (data.expiry_date) update.expiry_date = data.expiry_date;
     if (data.retention_years) {
@@ -1652,10 +2115,12 @@ export const listLifecycleAlerts = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {
     const sb = context.supabase as any;
+    const { tenantId } = await getCallerTenant(context.userId);
     const { data: rows, error } = await sb
       .from("legal_matters")
       .select("id, reference_number, title, entity_code, expiry_date, retention_until, destroy_after, status")
       .eq("workspace_id", "legal")
+      .eq("tenant_id", tenantId)
       .or("expiry_date.not.is.null,destroy_after.not.is.null");
     if (error) throw new Error(error.message);
     return rows ?? [];
@@ -1668,15 +2133,17 @@ export const vaultKnowledgeSearch = createServerFn({ method: "POST" })
   .inputValidator(z.object({ query: z.string().min(3) }))
   .handler(async ({ data, context }) => {
     const sb = context.supabase as any;
+    const { tenantId } = await getCallerTenant(context.userId);
 
     const mq = sb
       .from("legal_matters")
       .select("reference_number, title, description, ai_response, ai_executive_summary, matter_type")
       .eq("workspace_id", "legal")
+      .eq("tenant_id", tenantId)
       .in("status", ["resolved", "approved", "archived"])
       .limit(40);
 
-    const kq = sb.from("legal_kb_entries").select("title, takeaways, source_reference");
+    const kq = sb.from("legal_kb_entries").select("title, takeaways, source_reference").eq("tenant_id", tenantId);
 
     const [{ data: matters }, { data: kb }] = await Promise.all([mq, kq]);
 
@@ -1721,6 +2188,11 @@ export const updateExecSummary = createServerFn({ method: "POST" })
   .inputValidator(z.object({ matter_id: z.string().uuid(), summary: z.string() }))
   .handler(async ({ data, context }) => {
     const sb = context.supabase as any;
+    // Tenant boundary: an id from another tenant must behave like a 404.
+    const { data: matterRow } = await sb.from("legal_matters").select("tenant_id").eq("id", data.matter_id).single();
+    if (!matterRow) throw new Error("Matter not found");
+    assertRowTenant(matterRow.tenant_id, (await getCallerTenant(context.userId)).tenantId);
+
     const { error } = await sb
       .from("legal_matters")
       .update({ ai_executive_summary: data.summary })
@@ -1742,9 +2214,15 @@ export const shareWithCounterparty = createServerFn({ method: "POST" })
     const sb = context.supabase as any;
     const { userId, userEmail } = actor(context);
 
+    // Tenant boundary: an id from another tenant must behave like a 404.
+    const { data: matterRow } = await sb.from("legal_matters").select("tenant_id").eq("id", data.matter_id).single();
+    if (!matterRow) throw new Error("Matter not found");
+    assertRowTenant(matterRow.tenant_id, (await getCallerTenant(context.userId)).tenantId);
+
     const { data: docs } = await sb
       .from("legal_matter_documents")
       .select("file_name")
+      .eq("matter_id", data.matter_id)   // only this matter's documents can be named in the share
       .in("id", data.document_ids);
 
     const { data: share, error } = await sb
@@ -1796,4 +2274,84 @@ export const recordShareDownload = createServerFn({ method: "POST" })
       });
     }
     return { ok: true };
+  });
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// The "Living Vault" matter binder: combine every document on a matter into
+// one indexed export (Step 6 in the deck) so a finished project doesn't leave
+// its record scattered across N separate downloads. Restricted documents are
+// listed in the index but their body is withheld — the export must not be a
+// side-channel around the restricted-access control on individual docs.
+export const generateMatterBinder = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(z.object({ matter_id: z.string().uuid() }))
+  .handler(async ({ data, context }) => {
+    const sb = context.supabase as any;
+    const { data: matter, error: mErr } = await sb
+      .from("legal_matters").select("*").eq("id", data.matter_id).single();
+    if (mErr || !matter) throw new Error(mErr?.message ?? "Matter not found");
+    // Tenant boundary: an id from another tenant must behave like a 404.
+    assertRowTenant(matter.tenant_id, (await getCallerTenant(context.userId)).tenantId);
+
+    const { data: docs, error: dErr } = await sb
+      .from("legal_matter_documents")
+      .select("*")
+      .eq("matter_id", data.matter_id)
+      .order("created_at", { ascending: true });
+    if (dErr) throw new Error(dErr.message);
+    if (!docs || docs.length === 0) throw new Error("No documents on this matter to combine.");
+
+    const sections: { title: string; bodyHtml: string; restricted: boolean }[] = [];
+    for (const doc of docs) {
+      if (doc.access_level === "restricted") {
+        sections.push({
+          title: doc.file_name,
+          bodyHtml: "<p><em>This document is access-restricted — its contents are withheld from the exported binder. View it in-app with the appropriate permissions.</em></p>",
+          restricted: true,
+        });
+        continue;
+      }
+      try {
+        const text = await extractDocText(doc.file_url, doc.mime_type, doc.file_name);
+        const bodyHtml = text.split("\n").map((line) => `<p>${escapeHtml(line) || "&nbsp;"}</p>`).join("\n");
+        sections.push({ title: doc.file_name, bodyHtml, restricted: false });
+      } catch (e: any) {
+        sections.push({
+          title: doc.file_name,
+          bodyHtml: `<p><em>Could not extract text from this file: ${escapeHtml(e?.message ?? "unknown error")}.</em></p>`,
+          restricted: false,
+        });
+      }
+    }
+
+    const toc = sections
+      .map((s, i) => `<li><a href="#doc-${i + 1}">${i + 1}. ${escapeHtml(s.title)}${s.restricted ? " (restricted)" : ""}</a></li>`)
+      .join("\n");
+    const body = sections
+      .map((s, i) => `<h2 id="doc-${i + 1}" style="page-break-before:always;">${i + 1}. ${escapeHtml(s.title)}</h2>\n${s.bodyHtml}`)
+      .join("\n");
+
+    const html = `<html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word'>
+<head><meta charset="utf-8"><title>${escapeHtml(matter.title)} — Matter Binder</title></head>
+<body style="font-family:Calibri,Arial,sans-serif;">
+<h1>${escapeHtml(matter.title)}</h1>
+<p><strong>Reference:</strong> ${escapeHtml(matter.reference_number ?? "—")} &nbsp; <strong>Route:</strong> ${escapeHtml(matter.route ?? "—")} &nbsp; <strong>Status:</strong> ${escapeHtml(matter.status)}</p>
+<p><strong>Generated:</strong> ${new Date().toISOString().slice(0, 10)}</p>
+<h2>Index</h2>
+<ol>${toc}</ol>
+<hr/>
+${body}
+</body></html>`;
+
+    await logEvent(sb, {
+      matter_id: data.matter_id,
+      event_type: "binder_generated",
+      actor_name: actor(context).userEmail ?? "User",
+      payload: { documents: sections.length },
+    });
+
+    return { html, file_name: `${(matter.reference_number ?? "matter").replace(/[^\w-]/g, "_")}-binder.doc` };
   });

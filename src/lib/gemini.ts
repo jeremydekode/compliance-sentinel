@@ -27,13 +27,62 @@ const FALLBACK_CHAINS = {
 
 export type ModelTier = keyof typeof FALLBACK_CHAINS;
 
+// ── User-selectable default model (Settings → AI Model) ─────────────────────
+// The picked model always leads the QUALITY chain; the standard fallbacks
+// still apply automatically when it errors. The FAST tier is deliberately
+// untouched — mechanical high-volume batch calls stay on the cheap model.
+export const AVAILABLE_MODELS = [
+  "gemini-2.5-pro",
+  "gemini-3.5-flash",
+  "gemini-2.5-flash",
+  "gemini-3.1-flash-lite",
+] as const;
+
+let defaultModelCache: { value: string; at: number } = { value: FALLBACK_CHAINS.quality[0], at: 0 };
+
+/** Reads the app-wide default model (app_settings key "default_model"),
+ *  cached ~60s. Server-only; dynamic import keeps the service-role client out
+ *  of any client bundle that transitively imports this module. */
+export async function getDefaultModel(): Promise<string> {
+  if (Date.now() - defaultModelCache.at < 60_000) return defaultModelCache.value;
+  try {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data } = await (supabaseAdmin as any)
+      .from("app_settings").select("value").eq("key", "default_model").maybeSingle();
+    const m = data?.value?.model;
+    defaultModelCache = {
+      value: typeof m === "string" && (AVAILABLE_MODELS as readonly string[]).includes(m)
+        ? m
+        : FALLBACK_CHAINS.quality[0],
+      at: Date.now(),
+    };
+  } catch {
+    defaultModelCache = { value: FALLBACK_CHAINS.quality[0], at: Date.now() };
+  }
+  return defaultModelCache.value;
+}
+
+/** Invalidate the cache immediately after the admin changes the setting. */
+export function clearDefaultModelCache(): void {
+  defaultModelCache = { value: defaultModelCache.value, at: 0 };
+}
+
 type GenerateParams = Omit<Parameters<typeof ai.models.generateContent>[0], "model">;
 
 export async function generateWithFallback(
   params: GenerateParams,
   opts?: { tier?: ModelTier }
 ): Promise<Awaited<ReturnType<typeof ai.models.generateContent>>> {
-  const models = FALLBACK_CHAINS[opts?.tier ?? "quality"];
+  const tier = opts?.tier ?? "quality";
+  let models: readonly string[] = FALLBACK_CHAINS[tier];
+  let preferredHead: string | null = null;
+  if (tier === "quality") {
+    // The admin-picked default model leads; the standard chain backs it up.
+    const preferred = await getDefaultModel();
+    preferredHead = preferred;
+    models = [preferred, ...models.filter((m) => m !== preferred)];
+  }
   let lastError: unknown;
   for (const model of models) {
     // A transient capacity/network error ("high demand"/503/429/rate-limit/
@@ -62,6 +111,14 @@ export async function generateWithFallback(
         }
         if (capacity || notFound) {
           console.warn(`Model ${model} unavailable (${msg.slice(0, 80)}), trying next…`);
+          lastError = e;
+          break;
+        }
+        // The ADMIN-PICKED head is not guaranteed compatible with every call's
+        // config — any error on it falls through to the known-good chain
+        // instead of failing the whole run (the pre-picker guarantee).
+        if (model === preferredHead) {
+          console.warn(`Preferred model ${model} failed (${msg.slice(0, 80)}) — falling back to standard chain.`);
           lastError = e;
           break;
         }
@@ -216,7 +273,7 @@ function policyToParts(label: string, src: PolicySource): any[] {
  * It is ADDITIVE — it refines approach/emphasis and never overrides the JSON
  * output contract or the find_text / verification rules.
  */
-function guidanceBlock(guidance?: string | null): string {
+export function guidanceBlock(guidance?: string | null): string {
   const g = (guidance ?? "").trim();
   if (!g) return "";
   return `
@@ -235,7 +292,7 @@ ${g}
  * (including braces inside quoted values) are tracked so depth stays correct.
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function parseJsonArrayLoose(raw: string | null | undefined): any[] {
+export function parseJsonArrayLoose(raw: string | null | undefined): any[] {
   const text = String(raw ?? "").trim();
   if (!text) return [];
   try {
@@ -1323,7 +1380,7 @@ export interface SimplificationAction {
 /** Splits plain document text into <= maxChars chunks at paragraph (line)
  *  boundaries, so each chunk holds whole paragraphs. A single oversized line
  *  (e.g. a flattened table) is hard-split as a last resort. */
-function chunkText(text: string, maxChars: number): string[] {
+export function chunkText(text: string, maxChars: number): string[] {
   const chunks: string[] = [];
   let buf = "";
   const flush = () => { if (buf.trim()) chunks.push(buf); buf = ""; };
@@ -1341,7 +1398,7 @@ function chunkText(text: string, maxChars: number): string[] {
 }
 
 /** Runs `fn` over `items` with at most `limit` in flight at once. */
-async function mapLimit<T, R>(items: T[], limit: number, fn: (t: T) => Promise<R>): Promise<R[]> {
+export async function mapLimit<T, R>(items: T[], limit: number, fn: (t: T) => Promise<R>): Promise<R[]> {
   const out: R[] = new Array(items.length);
   let i = 0;
   const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {

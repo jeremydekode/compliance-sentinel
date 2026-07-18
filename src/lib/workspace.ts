@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-export type WorkspaceId = "rmit" | "fatf" | "forms" | "simplify" | "layout" | "policy" | "credit_risk" | "credit_risk_demo";
+export type WorkspaceId = "rmit" | "fatf" | "forms" | "simplify" | "simplify_v2" | "layout" | "policy" | "credit_risk" | "credit_risk_demo";
 
 export const WORKSPACES: Record<WorkspaceId, {
   id: WorkspaceId;
@@ -41,6 +41,14 @@ export const WORKSPACES: Record<WorkspaceId, {
     tagline: "Plain-English rewrite · Verifiable redline",
     color: "text-violet-700",
     bgColor: "bg-violet-100",
+  },
+  simplify_v2: {
+    id: "simplify_v2",
+    name: "Simplify v2",
+    short: "Simplify v2",
+    tagline: "Audit · Restructure · Simplify",
+    color: "text-fuchsia-700",
+    bgColor: "bg-fuchsia-100",
   },
   layout: {
     id: "layout",

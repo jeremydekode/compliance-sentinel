@@ -9,6 +9,8 @@ import { Briefcase } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
 import { getWorkspaceVisibility } from "@/lib/compliance.functions";
+import { RudyChat } from "@/components/rudy-chat";
+import { DEFAULT_TENANT_BRANDING } from "@/lib/tenant";
 
 type NavItem = { to: string; label: string; icon: React.ElementType; match?: (p: string) => boolean };
 
@@ -47,6 +49,7 @@ const SIDEBAR_KEY = "sidebar_collapsed";
 export function AppShell({ children }: { children: React.ReactNode }) {
   const loc = useLocation();
   const [ws] = useWorkspace();
+  const auth = useAuth();
   // Workspace lives in localStorage, which doesn't exist on the server.
   // Defer the nav switch to AFTER hydration so the server's BASE_NAV and
   // the client's first render match — otherwise React throws a hydration
@@ -54,9 +57,15 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
   const dmsNav = mounted && ws === "layout" ? DMS_LAYOUT_NAV : DMS_NAV;
+  // Tenant branding — same mounted-gate as everything else keyed off client
+  // auth state, so SSR (always the default tenant) matches first paint.
+  const tenant = mounted ? auth.tenant : DEFAULT_TENANT_BRANDING;
+  // Per-tenant capabilities: the Legal CMS product only renders for tenants
+  // with the 'legal_cms' feature (SSR default = all features, so first paint
+  // matches the unauthenticated render).
   const NAV_GROUPS = [
     { label: "DMS", items: dmsNav },
-    { label: "Legal CMS", items: LEGAL_NAV },
+    ...(tenant.features.includes("legal_cms") ? [{ label: "Legal CMS", items: LEGAL_NAV }] : []),
   ];
   const currentNav = [...dmsNav, ...LEGAL_NAV, SETTINGS_ITEM].find((n) => navActive(n, loc.pathname));
 
@@ -86,17 +95,29 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           "flex items-center border-b border-sidebar-border",
           collapsed ? "flex-col gap-2 px-2 py-3" : "gap-3 px-5 py-5"
         )}>
-          <div className="size-9 rounded-xl bg-gradient-to-br from-sidebar-primary/30 to-sidebar-primary/10 grid place-items-center ring-1 ring-sidebar-primary/20 shrink-0">
-            <ShieldCheck className="size-5 text-sidebar-primary" />
+          <div className={cn(
+            "size-9 rounded-xl grid place-items-center ring-1 ring-sidebar-primary/20 shrink-0 overflow-hidden",
+            // Third-party logos are often wide wordmarks on transparent bg —
+            // give them a white plate + contain so they never crop or vanish
+            // against the dark sidebar.
+            tenant.logoUrl ? "bg-white p-1" : "bg-gradient-to-br from-sidebar-primary/30 to-sidebar-primary/10",
+          )}>
+            {tenant.logoUrl ? (
+              <img src={tenant.logoUrl} alt={tenant.name} className="size-full object-contain" />
+            ) : (
+              <ShieldCheck className="size-5 text-sidebar-primary" />
+            )}
           </div>
           {!collapsed && (
             <div className="flex-1 min-w-0">
               <div className="font-display text-sm font-bold leading-tight text-sidebar-foreground truncate">
-                AI Document Workflow
+                {tenant.name}
               </div>
-              <div className="text-[10px] text-sidebar-foreground/50 font-medium uppercase tracking-widest">
-                Intelligence Platform
-              </div>
+              {tenant.tagline && (
+                <div className="text-[10px] text-sidebar-foreground/50 font-medium uppercase tracking-widest truncate">
+                  {tenant.tagline}
+                </div>
+              )}
             </div>
           )}
           <button
@@ -173,6 +194,10 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
         <div className="flex-1 min-w-0">{children}</div>
       </main>
+
+      {/* Rudy — tenant-aware assistant; renders nothing when the tenant lacks
+          the 'rudy' feature or the user isn't signed in. */}
+      <RudyChat />
     </div>
   );
 }
@@ -395,8 +420,13 @@ function WorkspaceSwitcher() {
     staleTime: 60_000,
   });
   const visibility = visibilityQuery.data?.visibility ?? {};
+  // Two gates compose: the global visibility toggle AND the tenant's enabled
+  // features — a workspace outside the tenant's feature list never appears
+  // (that's what keeps one bank's demo surface hidden from another's).
+  const authForFeatures = useAuth();
+  const tenantFeatures = mounted ? authForFeatures.tenant.features : DEFAULT_TENANT_BRANDING.features;
   const options = (Object.keys(WORKSPACES) as WorkspaceId[]).filter(
-    (id) => visibility[id] !== false || id === ws,
+    (id) => (visibility[id] !== false && tenantFeatures.includes(id)) || id === ws,
   );
 
   return (

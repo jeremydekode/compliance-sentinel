@@ -1,7 +1,7 @@
 import { Link } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import {
@@ -14,7 +14,69 @@ import {
 } from "@/lib/legal.functions";
 import { toast } from "sonner";
 import { differenceInCalendarDays } from "date-fns";
-import { Scale, Loader2, Send, Bot, CalendarClock, Trash2, Sparkles, BookOpen } from "lucide-react";
+import { Scale, Loader2, Send, Bot, CalendarClock, Trash2, Sparkles, BookOpen, UserCog } from "lucide-react";
+
+// ---------------------------------------------------------------------------
+// Demo role switcher — NOT real authentication or server-enforced permission.
+// It's a client-side, localStorage-backed dropdown so a single demo login can
+// walk a client through what each of the three seats sees — Submitter, General
+// Counsel (assignment + final sign-off), Reviewer / Legal team member (the
+// hands-on document work) — without needing three separate accounts. Every
+// action gate that reads this role is a UI convenience only — the actual
+// server functions don't check it.
+// ---------------------------------------------------------------------------
+export type LegalRole = "submitter" | "general_counsel" | "reviewer";
+const ROLE_KEY = "legal-cms-demo-role";
+const ROLE_VALUES: LegalRole[] = ["submitter", "general_counsel", "reviewer"];
+export const ROLE_LABEL: Record<LegalRole, string> = {
+  submitter: "Submitter",
+  general_counsel: "General Counsel",
+  reviewer: "Reviewer",
+};
+let roleListeners: Array<() => void> = [];
+
+function readRole(): LegalRole {
+  if (typeof window === "undefined") return "submitter";
+  const v = window.localStorage.getItem(ROLE_KEY);
+  return (ROLE_VALUES as string[]).includes(v ?? "") ? (v as LegalRole) : "submitter";
+}
+
+function writeRole(role: LegalRole) {
+  window.localStorage.setItem(ROLE_KEY, role);
+  roleListeners.forEach((l) => l());
+}
+
+export function useLegalRole(): [LegalRole, (r: LegalRole) => void] {
+  const [role, setRole] = useState<LegalRole>(readRole);
+  useEffect(() => {
+    const listener = () => setRole(readRole());
+    roleListeners.push(listener);
+    return () => { roleListeners = roleListeners.filter((l) => l !== listener); };
+  }, []);
+  return [role, writeRole];
+}
+
+export function RoleSwitcher() {
+  const [role, setRole] = useLegalRole();
+  return (
+    <div
+      className="flex items-center gap-1.5 rounded-lg border bg-muted/40 px-2 py-1 shrink-0"
+      title="Demo role switch — changes which actions are shown, not real permissions"
+    >
+      <UserCog className="size-3 text-muted-foreground shrink-0" />
+      <span className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground shrink-0">Viewing as</span>
+      <select
+        value={role}
+        onChange={(e) => setRole(e.target.value as LegalRole)}
+        className="text-[11px] font-semibold bg-transparent border-0 focus:outline-none cursor-pointer text-foreground pr-1"
+      >
+        {ROLE_VALUES.map((r) => (
+          <option key={r} value={r}>{ROLE_LABEL[r]}</option>
+        ))}
+      </select>
+    </div>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Shared building blocks for the Legal CMS routes (Dashboard / Requests /
@@ -124,7 +186,10 @@ export function LegalHeader({ subtitle, action }: { subtitle: string; action?: R
           <p className="text-[10px] text-muted-foreground">{subtitle}</p>
         </div>
       </div>
-      {action}
+      <div className="flex items-center gap-2 ml-auto">
+        <RoleSwitcher />
+        {action}
+      </div>
     </div>
   );
 }

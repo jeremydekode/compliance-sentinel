@@ -1,14 +1,16 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { AppShell } from "@/components/app-shell";
 import { cn } from "@/lib/utils";
-import { listLegalMatters, MATTER_TYPES } from "@/lib/legal.functions";
-import { LEGAL_TEMPLATES, downloadTemplate } from "@/lib/legal.templates";
+import { useAuth } from "@/lib/auth";
+import { supabase } from "@/integrations/supabase/client";
+import { listLegalMatters, createTemplateRequest, MATTER_TYPES, maskDemoEmail } from "@/lib/legal.functions";
+import { LEGAL_TEMPLATES, blankTemplateHtml, downloadDoc, htmlToPlainText, type LegalTemplate } from "@/lib/legal.templates";
 import { LegalHeader, VaultAgent, KnowledgeBasePanel, statusBadge, routeBadge } from "@/components/legal-widgets";
 import { toast } from "sonner";
-import { FileDown, Search, Vault, ChevronRight, Library } from "lucide-react";
+import { FileDown, Search, Vault, ChevronRight, Library, Loader2 } from "lucide-react";
 import { format } from "date-fns";
 
 export const Route = createFileRoute("/legal/repository")({
@@ -21,13 +23,72 @@ const VAULT_STATUSES = new Set(["resolved", "approved", "archived"]);
 
 function LegalRepository() {
   const listFn = useServerFn(listLegalMatters);
+  const createTemplateFn = useServerFn(createTemplateRequest);
+  const queryClient = useQueryClient();
+  const auth = useAuth();
   const [search, setSearch] = useState("");
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
+
+  // Requestor identity for tracked template downloads (mirrors legal.new.tsx).
+  const [requestorName, setRequestorName] = useState("");
+  const [requestorEmail, setRequestorEmail] = useState("");
+  useEffect(() => {
+    if (auth.email && !requestorEmail) {
+      setRequestorEmail(maskDemoEmail(auth.email));
+      if (!requestorName) {
+        const prefix = auth.email.split("@")[0];
+        setRequestorName(prefix.split(/[._-]/).map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join(" "));
+      }
+    }
+  }, [auth.email]);
 
   const { data: matters = [] } = useQuery({
     queryKey: ["legal-matters"],
     queryFn: () => listFn({ data: {} }),
     staleTime: 30_000,
   });
+
+  // Every template download is tracked as a real matter + document — otherwise
+  // the file leaves the system with no record, and there'd be nowhere to attach
+  // counterparty markup if they send changes back.
+  async function downloadAndTrack(t: LegalTemplate) {
+    setDownloadingId(t.id);
+    const html = blankTemplateHtml(t);
+    downloadDoc(html, t.fileName);
+    try {
+      // Guard the narrow race where a template is clicked before auth.email has
+      // resolved into requestorEmail — createTemplateRequest requires a valid email.
+      if (!requestorEmail.trim()) throw new Error("Still loading your profile — try again in a moment.");
+      const blob = new Blob([html], { type: "application/msword" });
+      const path = `legal/${Date.now()}-${t.fileName}`;
+      const up = await supabase.storage.from("policies").upload(path, blob, {
+        upsert: false,
+        contentType: "application/msword",
+      });
+      if (up.error) throw new Error(up.error.message);
+      const fileUrl = supabase.storage.from("policies").getPublicUrl(path).data.publicUrl;
+      const matter: any = await createTemplateFn({
+        data: {
+          template_id:     t.id,
+          template_name:   t.name,
+          matter_type:     t.matter_type,
+          file_name:       t.fileName,
+          file_url:        fileUrl,
+          mime_type:       "application/msword",
+          size_bytes:      blob.size,
+          plain_text:      htmlToPlainText(html),
+          requestor_name:  requestorName,
+          requestor_email: requestorEmail,
+        },
+      });
+      toast.success(`${t.fileName} downloaded — tracked as ${matter.reference_number ?? "a new request"}`);
+      queryClient.invalidateQueries({ queryKey: ["legal-matters"] });
+    } catch (e: any) {
+      toast.warning(`${t.fileName} downloaded, but couldn't create a tracked record: ${e?.message ?? "unknown error"}`);
+    } finally {
+      setDownloadingId(null);
+    }
+  }
 
   const q = search.trim().toLowerCase();
   const vault = matters
@@ -69,11 +130,12 @@ function LegalRepository() {
                     {LEGAL_TEMPLATES.filter((t) => t.category === cat).map((t) => (
                       <button
                         key={t.id}
-                        onClick={() => { downloadTemplate(t); toast.success(`${t.fileName} downloaded`); }}
+                        onClick={() => downloadAndTrack(t)}
+                        disabled={downloadingId === t.id}
                         title={t.description}
-                        className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-300/60 dark:border-emerald-800 bg-card px-2.5 py-1.5 text-[11px] font-medium text-emerald-800 dark:text-emerald-300 hover:bg-emerald-100/60 dark:hover:bg-emerald-900/30 transition-colors"
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-300/60 dark:border-emerald-800 bg-card px-2.5 py-1.5 text-[11px] font-medium text-emerald-800 dark:text-emerald-300 hover:bg-emerald-100/60 dark:hover:bg-emerald-900/30 transition-colors disabled:opacity-60"
                       >
-                        <FileDown className="size-3" /> {t.name}
+                        {downloadingId === t.id ? <Loader2 className="size-3 animate-spin" /> : <FileDown className="size-3" />} {t.name}
                       </button>
                     ))}
                   </div>

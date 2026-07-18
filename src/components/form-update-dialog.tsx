@@ -5,6 +5,7 @@ import { useWorkspace, WORKSPACES, type WorkspaceId } from "@/lib/workspace";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
 import { Plus, Trash2, FileEdit, Loader2, Upload, Sparkles, Wand2, Pencil } from "lucide-react";
+import { useAuth } from "@/lib/auth";
 import { supabase } from "@/integrations/supabase/client";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
@@ -57,6 +58,7 @@ export function FormUpdateDialog({
   onOpenChange: (o: boolean) => void;
   onCreated: (reportId: string) => void;
 }) {
+  const auth = useAuth();
   const createFn = useServerFn(createFormUpdateReport);
   const analyzeDocFn = useServerFn(analyzeDocForForm);
   const finalizeFn = useServerFn(finalizeFormUpdateReport);
@@ -198,6 +200,7 @@ export function FormUpdateDialog({
             .from("sop_documents")
             .select("id, title, file_url")
             .eq("workspace_id", "forms")
+            .eq("tenant_id", auth.tenantId)
             .order("created_at", { ascending: false });
           const oldDoc = (candidates ?? []).find((c: any) => {
             const flatTitle = (c.title ?? "").replace(/[^A-Za-z0-9]/g, "");

@@ -1,13 +1,21 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { useServerFn } from "@tanstack/react-start";
 import { supabase } from "@/integrations/supabase/client";
 import { ShieldCheck } from "lucide-react";
+import { getTenantBranding } from "@/lib/compliance.functions";
+import { applyTenantBranding } from "@/lib/tenant";
 
 export const Route = createFileRoute("/login")({
   component: LoginPage,
   // redirect is optional, so links to /login don't need to pass a search param.
-  validateSearch: (s: Record<string, unknown>): { redirect?: string } => ({
+  // `org` is a purely cosmetic pre-login branding preview (e.g. ?org=rhb) —
+  // NEVER a security boundary. The signed-in user's real tenant always comes
+  // from their own profiles.tenant_id, resolved after auth.
+  validateSearch: (s: Record<string, unknown>): { redirect?: string; org?: string } => ({
     redirect: typeof s.redirect === "string" ? s.redirect : undefined,
+    org: typeof s.org === "string" ? s.org : undefined,
   }),
 });
 
@@ -18,6 +26,20 @@ function LoginPage() {
   const [mounted, setMounted] = useState(false);
 
   useEffect(() => setMounted(true), []);
+
+  const getBranding = useServerFn(getTenantBranding);
+  const brandingQuery = useQuery({
+    queryKey: ["tenant_branding", search.org ?? "default"],
+    queryFn: () => getBranding({ data: { slug: search.org ?? "default" } }),
+    enabled: mounted && !!search.org,
+  });
+  const tenant = brandingQuery.data?.tenant ?? null;
+
+  // Preview the tenant's colors on this page too — self-corrects on the app
+  // shell after sign-in, which always applies the AUTHENTICATED tenant.
+  useEffect(() => {
+    if (tenant) applyTenantBranding(tenant);
+  }, [tenant]);
 
   // Already signed in? Bounce to the intended destination. Client-only — the
   // session lives in localStorage, which does not exist during SSR. A full
@@ -57,12 +79,16 @@ function LoginPage() {
   return (
     <div className="min-h-screen grid place-items-center bg-background px-4">
       <div className="w-full max-w-sm rounded-2xl border bg-card shadow-sm p-8 text-center">
-        <div className="size-12 mx-auto rounded-xl bg-gradient-to-br from-primary/30 to-primary/10 grid place-items-center ring-1 ring-primary/20">
-          <ShieldCheck className="size-6 text-primary" />
+        <div className={`size-12 mx-auto rounded-xl grid place-items-center ring-1 ring-primary/20 overflow-hidden ${tenant?.logoUrl ? "bg-white p-1.5" : "bg-gradient-to-br from-primary/30 to-primary/10"}`}>
+          {tenant?.logoUrl ? (
+            <img src={tenant.logoUrl} alt={tenant.name} className="size-full object-contain" />
+          ) : (
+            <ShieldCheck className="size-6 text-primary" />
+          )}
         </div>
-        <h1 className="font-display text-lg font-bold mt-4">AI Document Workflow</h1>
+        <h1 className="font-display text-lg font-bold mt-4">{tenant?.name ?? "AI Document Workflow"}</h1>
         <p className="text-sm text-muted-foreground mt-1">
-          Sign in to continue.
+          {tenant?.tagline ? tenant.tagline : "Sign in to continue."}
         </p>
 
         <button

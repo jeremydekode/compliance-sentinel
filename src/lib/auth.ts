@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { supabase } from "@/integrations/supabase/client";
+import { DEFAULT_TENANT_BRANDING, type TenantBranding } from "@/lib/tenant";
 
 // ----------------------------------------------------------------------------
 // LITE RBAC client store.
@@ -25,6 +26,8 @@ export interface AuthState {
   workspaceId: string | null;
   jobFunction: string | null; // non-security tag (compliance/legal); UI labels only
   approved: boolean;       // is this account on the login allowlist (or member/super)?
+  tenantId: string;        // profiles.tenant_id — server-assigned, never client-toggleable
+  tenant: TenantBranding;  // the resolved branding row (falls back to DEFAULT_TENANT_BRANDING)
 }
 
 // Server-default / pre-auth state. MUST be the value the SSR render assumes so
@@ -39,6 +42,8 @@ const DEFAULT_STATE: AuthState = {
   workspaceId: null,
   jobFunction: null,
   approved: true,
+  tenantId: "default",
+  tenant: DEFAULT_TENANT_BRANDING,
 };
 
 const listeners = new Set<(s: AuthState) => void>();
@@ -80,7 +85,7 @@ async function loadProfile(userId: string, email: string | null) {
   const [profileRes, approvedRes] = await Promise.all([
     (supabase as any)
       .from("profiles")
-      .select("role, workspace_id, job_function, email")
+      .select("role, workspace_id, job_function, email, tenant_id")
       .eq("id", userId)
       .maybeSingle(),
     (supabase as any).rpc("is_approved").then(
@@ -101,9 +106,14 @@ async function loadProfile(userId: string, email: string | null) {
       workspaceId: null,
       jobFunction: null,
       approved,
+      tenantId: "default",
+      tenant: DEFAULT_TENANT_BRANDING,
     });
     return;
   }
+
+  const tenantId: string = data.tenant_id ?? "default";
+  const tenant = await loadTenantBranding(tenantId);
 
   setState({
     loading: false,
@@ -113,7 +123,36 @@ async function loadProfile(userId: string, email: string | null) {
     workspaceId: data.workspace_id ?? null,
     jobFunction: data.job_function ?? null,
     approved,
+    tenantId,
+    tenant,
   });
+}
+
+// `tenants` carries a public SELECT policy (branding is non-sensitive), so
+// this is a plain client read — no security-definer RPC needed. Falls back to
+// the built-in default on any error/missing row so a bad tenant_id (or the
+// migration not being applied yet) never blanks the app's branding.
+async function loadTenantBranding(tenantId: string): Promise<TenantBranding> {
+  // select("*") so the read tolerates schema drift (e.g. the features column
+  // arriving in a later migration) instead of erroring the whole lookup.
+  const { data, error } = await (supabase as any)
+    .from("tenants")
+    .select("*")
+    .eq("slug", tenantId)
+    .maybeSingle();
+  if (error || !data) return DEFAULT_TENANT_BRANDING;
+  return {
+    slug: data.slug,
+    name: data.name,
+    tagline: data.tagline ?? null,
+    logoUrl: data.logo_url ?? null,
+    colorPrimary: data.color_primary ?? null,
+    colorSidebar: data.color_sidebar ?? null,
+    colorSidebarPrimary: data.color_sidebar_primary ?? null,
+    colorSidebarAccent: data.color_sidebar_accent ?? null,
+    // Pre-migration rows have no features column — treat as "everything on".
+    features: Array.isArray(data.features) ? data.features : DEFAULT_TENANT_BRANDING.features,
+  };
 }
 
 // Initialise exactly once, on the client only.
@@ -127,7 +166,7 @@ function start() {
     if (session?.user) {
       void loadProfile(session.user.id, session.user.email ?? null);
     } else {
-      setState({ loading: false, userId: null, email: null, role: "viewer", workspaceId: null, jobFunction: null, approved: true });
+      setState({ loading: false, userId: null, email: null, role: "viewer", workspaceId: null, jobFunction: null, approved: true, tenantId: "default", tenant: DEFAULT_TENANT_BRANDING });
     }
   });
 
@@ -135,7 +174,7 @@ function start() {
     if (session?.user) {
       void loadProfile(session.user.id, session.user.email ?? null);
     } else {
-      setState({ loading: false, userId: null, email: null, role: "viewer", workspaceId: null, jobFunction: null, approved: true });
+      setState({ loading: false, userId: null, email: null, role: "viewer", workspaceId: null, jobFunction: null, approved: true, tenantId: "default", tenant: DEFAULT_TENANT_BRANDING });
     }
   });
 }

@@ -7,7 +7,7 @@ import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/lib/auth";
-import { AlertTriangle, Trash2, CheckCircle2, Loader2, Plug, Unplug, Eye, EyeOff, Briefcase, RotateCcw, Users, UserPlus } from "lucide-react";
+import { AlertTriangle, Trash2, CheckCircle2, Loader2, Plug, Unplug, Eye, EyeOff, Briefcase, RotateCcw, Users, UserPlus, Palette, Pencil, CopyPlus } from "lucide-react";
 import {
   clearWorkspace,
   getGoogleAuthUrl,
@@ -23,13 +23,30 @@ import {
   setWorkspaceVisibility,
   listAppUsers,
   setUserAccess,
+  listTenants,
+  createTenant,
+  updateTenant,
+  getModelSettings,
+  setModelSettings,
+  listSeedableContent,
+  seedTenantDemo,
   type AppUserRow,
   type AccessLevel,
+  type TenantRow,
 } from "@/lib/compliance.functions";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { FolderOpen, RefreshCw } from "lucide-react";
 import { useWorkspace, WORKSPACES, type WorkspaceId } from "@/lib/workspace";
 import { DEFAULT_SIMPLIFY_GUIDANCE } from "@/lib/simplify";
+import { ALL_FEATURES } from "@/lib/tenant";
+import { DEFAULT_RECOMMEND_GUIDANCE } from "@/lib/recommend";
 import { DEFAULT_FRAME_EXTRACTION_PROMPT } from "@/lib/layout/prompt";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
@@ -41,6 +58,7 @@ export const Route = createFileRoute("/settings")({
 
 function SettingsPage() {
   const qc = useQueryClient();
+  const auth = useAuth();
   const clear = useServerFn(clearWorkspace);
   const getAuthUrl = useServerFn(getGoogleAuthUrl);
   const getStatus = useServerFn(getGoogleConnectionStatus);
@@ -105,14 +123,15 @@ function SettingsPage() {
 
   /** Persistent "what's currently indexed from Drive" tally — survives across reloads. */
   const driveIndex = useQuery({
-    queryKey: ["drive_indexed", workspace],
-    enabled: !!googleConn.data?.connected,
+    queryKey: ["drive_indexed", workspace, auth.tenantId],
+    enabled: !!googleConn.data?.connected && !auth.loading,
     queryFn: async () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const { data: rows, error } = await (supabase as any)
         .from("sop_documents")
         .select("id, title, drive_mime_type, drive_modified_time, last_sync_error, created_at")
         .eq("workspace_id", workspace)
+        .eq("tenant_id", auth.tenantId)
         .not("drive_file_id", "is", null)
         .order("created_at", { ascending: false });
       if (error) console.warn("driveIndex query failed:", error.message);
@@ -142,7 +161,7 @@ function SettingsPage() {
     // prefix and stay blank by default.
     setGuidanceText(
       saved ||
-        (workspace === "simplify"
+        (workspace === "simplify" || workspace === "simplify_v2"
           ? DEFAULT_SIMPLIFY_GUIDANCE
           : workspace === "layout"
             ? DEFAULT_FRAME_EXTRACTION_PROMPT
@@ -151,7 +170,7 @@ function SettingsPage() {
   }, [guidanceQuery.data, workspace]);
 
   function resetGuidanceToDefault() {
-    if (workspace === "simplify") setGuidanceText(DEFAULT_SIMPLIFY_GUIDANCE);
+    if (workspace === "simplify" || workspace === "simplify_v2") setGuidanceText(DEFAULT_SIMPLIFY_GUIDANCE);
     else if (workspace === "layout") setGuidanceText(DEFAULT_FRAME_EXTRACTION_PROMPT);
     else setGuidanceText("");
   }
@@ -278,12 +297,13 @@ function SettingsPage() {
   }
 
   const counts = useQuery({
-    queryKey: ["counts", workspace],
+    queryKey: ["counts", workspace, auth.tenantId],
+    enabled: !auth.loading,
     queryFn: async () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const [sops, reports] = await Promise.all([
-        (supabase as any).from("sop_documents").select("id", { count: "exact", head: true }).eq("workspace_id", workspace),
-        (supabase as any).from("analysis_reports").select("id", { count: "exact", head: true }).eq("workspace_id", workspace),
+        (supabase as any).from("sop_documents").select("id", { count: "exact", head: true }).eq("workspace_id", workspace).eq("tenant_id", auth.tenantId),
+        (supabase as any).from("analysis_reports").select("id", { count: "exact", head: true }).eq("workspace_id", workspace).eq("tenant_id", auth.tenantId),
       ]);
       return { sops: sops.count ?? 0, reports: reports.count ?? 0 };
     },
@@ -316,6 +336,9 @@ function SettingsPage() {
 
         {/* Super-admin only — renders nothing for everyone else. */}
         <TeamCard />
+        <TenantsCard />
+
+        <ModelSettingsCard />
 
         <Card className="p-6">
           <div className="flex items-start gap-3">
@@ -448,7 +471,7 @@ function SettingsPage() {
               {guidanceSaving ? <Loader2 className="size-4 animate-spin" /> : <CheckCircle2 className="size-4" />}
               {workspace === "layout" ? "Save system prompt" : "Save guidance"}
             </Button>
-            {(workspace === "layout" || workspace === "simplify") && (
+            {(workspace === "layout" || workspace === "simplify" || workspace === "simplify_v2") && (
               <Button
                 variant="outline"
                 onClick={resetGuidanceToDefault}
@@ -466,6 +489,8 @@ function SettingsPage() {
             </span>
           </div>
         </Card>
+
+        {workspace === "simplify_v2" && <RecommendGuidanceCard />}
 
         <Card className="p-6">
           <div className="flex items-start justify-between gap-4">
@@ -706,6 +731,7 @@ function TeamCard() {
   const qc = useQueryClient();
   const listUsers = useServerFn(listAppUsers);
   const setAccess = useServerFn(setUserAccess);
+  const listTenantsFn = useServerFn(listTenants);
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
   const [inviteEmail, setInviteEmail] = useState("");
@@ -718,6 +744,12 @@ function TeamCard() {
     queryFn: () => listUsers(),
     enabled: isSuper,
   });
+  const tenantsQuery = useQuery({
+    queryKey: ["tenants"],
+    queryFn: () => listTenantsFn(),
+    enabled: isSuper,
+  });
+  const tenants = tenantsQuery.data?.tenants ?? [];
 
   // Hidden for non-super-admins and until auth resolves (avoids SSR/hydration flash).
   if (!isSuper) return null;
@@ -746,6 +778,19 @@ function TeamCard() {
       qc.invalidateQueries({ queryKey: ["app_users"] });
     } catch (e: any) {
       toast.error("Could not update access", { description: e?.message });
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
+  async function changeTenant(u: AppUserRow, tenantId: string) {
+    setBusyKey(u.email);
+    try {
+      await setAccess({ data: { userId: u.id ?? undefined, email: u.email, level: u.level, tenantId } });
+      toast.success(`${u.email} branding → ${tenantId}`);
+      qc.invalidateQueries({ queryKey: ["app_users"] });
+    } catch (e: any) {
+      toast.error("Could not update branding", { description: e?.message });
     } finally {
       setBusyKey(null);
     }
@@ -836,6 +881,21 @@ function TeamCard() {
                   </div>
                   {rowBusy && <Loader2 className="size-4 animate-spin text-muted-foreground shrink-0" />}
                   <select
+                    value={u.tenantId}
+                    disabled={rowBusy}
+                    onChange={(e) => changeTenant(u, e.target.value)}
+                    title="Branding tenant"
+                    className="text-xs rounded-md border bg-card px-2 py-1.5 font-medium shrink-0 disabled:opacity-60"
+                  >
+                    {tenants.length === 0 ? (
+                      <option value={u.tenantId}>{u.tenantId}</option>
+                    ) : (
+                      tenants.map((t) => (
+                        <option key={t.slug} value={t.slug}>{t.name}</option>
+                      ))
+                    )}
+                  </select>
+                  <select
                     value={u.level}
                     disabled={rowBusy || isSelf}
                     onChange={(e) => changeLevel(u, e.target.value as AccessLevel)}
@@ -854,6 +914,456 @@ function TeamCard() {
         )}
       </div>
     </Card>
+  );
+}
+
+type TenantFormState = {
+  slug: string;
+  name: string;
+  tagline: string;
+  logoUrl: string;
+  colorPrimary: string;
+  colorSidebar: string;
+  colorSidebarPrimary: string;
+  colorSidebarAccent: string;
+  features: string[];
+};
+
+// Human labels for the per-tenant capability toggles. Workspace keys reuse the
+// WORKSPACES names; the extra capability keys are labelled here.
+const FEATURE_LABELS: Record<string, string> = {
+  legal_cms: "Legal CMS",
+  rudy: "Rudy.ai assistant",
+  create_document: "Create documents",
+};
+
+const BLANK_TENANT_FORM: TenantFormState = {
+  slug: "",
+  name: "",
+  tagline: "",
+  logoUrl: "",
+  colorPrimary: "",
+  colorSidebar: "",
+  colorSidebarPrimary: "",
+  colorSidebarAccent: "",
+  features: [...ALL_FEATURES],
+};
+
+function tenantToForm(t: TenantRow): TenantFormState {
+  const hex = (v: string | null) => (v && /^#[0-9a-f]{6}$/i.test(v) ? v : "");
+  return {
+    slug: t.slug,
+    name: t.name,
+    tagline: t.tagline ?? "",
+    logoUrl: t.logoUrl ?? "",
+    colorPrimary: hex(t.colorPrimary),
+    colorSidebar: hex(t.colorSidebar),
+    colorSidebarPrimary: hex(t.colorSidebarPrimary),
+    colorSidebarAccent: hex(t.colorSidebarAccent),
+    features: Array.isArray(t.features) ? t.features : [...ALL_FEATURES],
+  };
+}
+
+/**
+ * Tenants — super-admin-only branding admin. Lets you create a re-skinned
+ * "tenant" for an external prospect (name/tagline/logo/colors) and assign
+ * users/invites to it from the Team panel above. Purely cosmetic — every
+ * tenant's users still see every workspace, same as today.
+ */
+function TenantsCard() {
+  const auth = useAuth();
+  const qc = useQueryClient();
+  const listTenantsFn = useServerFn(listTenants);
+  const createTenantFn = useServerFn(createTenant);
+  const updateTenantFn = useServerFn(updateTenant);
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+  const [editing, setEditing] = useState<{ form: TenantFormState; isNew: boolean } | null>(null);
+  const [seeding, setSeeding] = useState<TenantRow | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  const isSuper = mounted && !auth.loading && auth.role === "super_admin";
+
+  const tenantsQuery = useQuery({
+    queryKey: ["tenants"],
+    queryFn: () => listTenantsFn(),
+    enabled: isSuper,
+  });
+
+  if (!isSuper) return null;
+
+  const tenants = tenantsQuery.data?.tenants ?? [];
+
+  async function save() {
+    if (!editing) return;
+    const f = editing.form;
+    if (!f.slug.trim() || !f.name.trim()) {
+      toast.error("Slug and name are required");
+      return;
+    }
+    setSaving(true);
+    try {
+      const payload = {
+        slug: f.slug.trim().toLowerCase(),
+        name: f.name.trim(),
+        tagline: f.tagline.trim() || undefined,
+        logoUrl: f.logoUrl.trim() || undefined,
+        colorPrimary: f.colorPrimary || undefined,
+        colorSidebar: f.colorSidebar || undefined,
+        colorSidebarPrimary: f.colorSidebarPrimary || undefined,
+        colorSidebarAccent: f.colorSidebarAccent || undefined,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        features: f.features as any,
+      };
+      if (editing.isNew) await createTenantFn({ data: payload });
+      else await updateTenantFn({ data: payload });
+      toast.success(`Saved ${payload.name}`);
+      setEditing(null);
+      qc.invalidateQueries({ queryKey: ["tenants"] });
+      qc.invalidateQueries({ queryKey: ["app_users"] });
+    } catch (e: any) {
+      toast.error("Could not save tenant", { description: e?.message });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Card className="p-6">
+      <div className="flex items-start gap-3">
+        <div className="size-10 rounded-lg bg-primary/10 grid place-items-center shrink-0">
+          <Palette className="size-5 text-primary" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <h2 className="font-display text-lg font-semibold">Tenants</h2>
+          <p className="text-sm text-muted-foreground mt-1">
+            Branded environments for external prospects: name, tagline, logo, colors,
+            plus which demos &amp; capabilities the tenant gets. Documents are always
+            tenant-scoped — one tenant can never see another's files. Assign people via
+            the tenant picker in Team &amp; Access above.
+          </p>
+        </div>
+        {!editing && (
+          <Button
+            variant="outline"
+            className="gap-1.5 shrink-0"
+            onClick={() => setEditing({ form: BLANK_TENANT_FORM, isNew: true })}
+          >
+            <UserPlus className="size-4" />
+            New tenant
+          </Button>
+        )}
+      </div>
+
+      {editing && (
+        <div className="mt-5 rounded-lg border p-4 space-y-3 max-w-lg">
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Slug</label>
+              <Input
+                value={editing.form.slug}
+                disabled={!editing.isNew}
+                placeholder="rhb"
+                onChange={(e) => setEditing({ ...editing, form: { ...editing.form, slug: e.target.value } })}
+                className="text-sm mt-1"
+              />
+            </div>
+            <div>
+              <label className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Name</label>
+              <Input
+                value={editing.form.name}
+                placeholder="RHB Bank"
+                onChange={(e) => setEditing({ ...editing, form: { ...editing.form, name: e.target.value } })}
+                className="text-sm mt-1"
+              />
+            </div>
+          </div>
+          <div>
+            <label className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Tagline</label>
+            <Input
+              value={editing.form.tagline}
+              placeholder="Compliance & Risk Intelligence"
+              onChange={(e) => setEditing({ ...editing, form: { ...editing.form, tagline: e.target.value } })}
+              className="text-sm mt-1"
+            />
+          </div>
+          <div>
+            <label className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Logo URL (optional)</label>
+            <Input
+              value={editing.form.logoUrl}
+              placeholder="https://…"
+              onChange={(e) => setEditing({ ...editing, form: { ...editing.form, logoUrl: e.target.value } })}
+              className="text-sm mt-1"
+            />
+          </div>
+          <div>
+            <label className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+              Colors (optional — blank inherits the default)
+            </label>
+            <div className="mt-1 flex gap-4">
+              {([
+                ["colorPrimary", "Primary"],
+                ["colorSidebar", "Sidebar"],
+                ["colorSidebarPrimary", "Sidebar accent"],
+                ["colorSidebarAccent", "Sidebar hover"],
+              ] as const).map(([key, label]) => (
+                <div key={key} className="flex flex-col items-center gap-1">
+                  <input
+                    type="color"
+                    value={editing.form[key] || "#ffffff"}
+                    onChange={(e) => setEditing({ ...editing, form: { ...editing.form, [key]: e.target.value } })}
+                    className="size-8 rounded border cursor-pointer"
+                  />
+                  <span className="text-[9px] text-muted-foreground">{label}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div>
+            <label className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+              Enabled demos &amp; capabilities
+            </label>
+            <p className="text-[11px] text-muted-foreground mt-0.5">
+              This tenant's users only see the workspaces and features ticked here — their
+              document lists are always limited to the tenant's own files.
+            </p>
+            <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1.5">
+              {ALL_FEATURES.map((key) => {
+                const label =
+                  FEATURE_LABELS[key] ?? WORKSPACES[key as WorkspaceId]?.name ?? key;
+                const on = editing.form.features.includes(key);
+                return (
+                  <label key={key} className="flex items-center gap-2 text-xs cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={on}
+                      onChange={(e) =>
+                        setEditing({
+                          ...editing,
+                          form: {
+                            ...editing.form,
+                            features: e.target.checked
+                              ? [...editing.form.features, key]
+                              : editing.form.features.filter((f) => f !== key),
+                          },
+                        })
+                      }
+                      className="accent-[var(--primary)]"
+                    />
+                    <span className={cn(!on && "text-muted-foreground")}>{label}</span>
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+          <div className="flex gap-2 pt-1">
+            <Button onClick={save} disabled={saving} className="gap-1.5">
+              {saving ? <Loader2 className="size-4 animate-spin" /> : <CheckCircle2 className="size-4" />}
+              Save
+            </Button>
+            <Button variant="outline" onClick={() => setEditing(null)} disabled={saving}>
+              Cancel
+            </Button>
+          </div>
+        </div>
+      )}
+
+      <div className="mt-5">
+        {tenantsQuery.isLoading ? (
+          <div className="text-xs text-muted-foreground inline-flex items-center gap-2">
+            <Loader2 className="size-3 animate-spin" /> Loading tenants…
+          </div>
+        ) : (
+          <div className="rounded-lg border divide-y">
+            {tenants.map((t) => (
+              <div key={t.slug} className="flex items-center gap-3 px-4 py-3">
+                <div className="flex gap-1 shrink-0">
+                  {[t.colorPrimary, t.colorSidebar, t.colorSidebarPrimary].map((c, i) => (
+                    <div
+                      key={i}
+                      className="size-4 rounded-full border"
+                      style={{ background: c ?? "var(--muted)" }}
+                    />
+                  ))}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="text-sm font-medium truncate">{t.name}</div>
+                  <div className="text-[11px] text-muted-foreground">
+                    {t.slug} {t.tagline ? `· ${t.tagline}` : ""}
+                  </div>
+                </div>
+                {t.slug !== "rhb" && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="gap-1.5 shrink-0 text-muted-foreground"
+                    onClick={() => setSeeding(t)}
+                  >
+                    <CopyPlus className="size-3.5" />
+                    Seed demos
+                  </Button>
+                )}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="gap-1.5 shrink-0"
+                  onClick={() => setEditing({ form: tenantToForm(t), isNew: false })}
+                >
+                  <Pencil className="size-3.5" />
+                  Edit
+                </Button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {seeding && <SeedTenantDialog tenant={seeding} onClose={() => setSeeding(null)} />}
+    </Card>
+  );
+}
+
+/**
+ * Seed demo content — pops up over the Tenants card. Lists RHB's reports and
+ * KB documents; ticked items are cloned (rows + embedding chunks, inside
+ * Postgres) into the target tenant. Files are shared by URL — nothing is
+ * re-uploaded or re-embedded, so cloning is near-instant.
+ */
+function SeedTenantDialog({ tenant, onClose }: { tenant: TenantRow; onClose: () => void }) {
+  const listFn = useServerFn(listSeedableContent);
+  const seedFn = useServerFn(seedTenantDemo);
+  const [picked, setPicked] = useState<{ reports: Set<string>; sops: Set<string> }>({
+    reports: new Set(),
+    sops: new Set(),
+  });
+  const [running, setRunning] = useState(false);
+
+  const content = useQuery({
+    queryKey: ["seedable_content", "rhb"],
+    queryFn: () => listFn({ data: { sourceTenant: "rhb" } }),
+  });
+
+  function toggle(kind: "reports" | "sops", id: string) {
+    setPicked((prev) => {
+      const next = new Set(prev[kind]);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return { ...prev, [kind]: next };
+    });
+  }
+
+  function toggleAll(kind: "reports" | "sops", ids: string[]) {
+    setPicked((prev) => {
+      const allOn = ids.every((id) => prev[kind].has(id));
+      return { ...prev, [kind]: allOn ? new Set() : new Set(ids) };
+    });
+  }
+
+  async function run() {
+    setRunning(true);
+    try {
+      const r = await seedFn({
+        data: {
+          targetTenant: tenant.slug,
+          reportIds: [...picked.reports],
+          sopIds: [...picked.sops],
+        },
+      });
+      toast.success(`Seeded ${tenant.name}`, {
+        description: `${r.reports} report(s), ${r.sops} KB doc(s) (${r.chunks} embedding chunks) cloned.`,
+      });
+      onClose();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } catch (e: any) {
+      toast.error("Seeding failed", { description: e?.message });
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  const total = picked.reports.size + picked.sops.size;
+
+  return (
+    <Dialog open onOpenChange={(o) => !o && !running && onClose()}>
+      <DialogContent className="max-w-3xl max-h-[85vh] flex flex-col p-0 gap-0 overflow-hidden">
+        <DialogHeader className="px-5 pt-5 pb-3 border-b shrink-0">
+          <DialogTitle className="flex items-center gap-2">
+            <CopyPlus className="size-4 text-primary" /> Seed "{tenant.name}" with demo content
+          </DialogTitle>
+          <DialogDescription>
+            Clones independent copies from the RHB demo library — results, findings and knowledge-base
+            embeddings included. Actions in one tenant never affect the other's copy.
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="flex-1 min-h-0 overflow-y-auto p-5">
+          {content.isLoading && (
+            <div className="text-xs text-muted-foreground inline-flex items-center gap-2 py-4">
+              <Loader2 className="size-3 animate-spin" /> Loading library…
+            </div>
+          )}
+          {content.isError && (
+            <p className="text-xs text-destructive">Could not load the demo library.</p>
+          )}
+
+          {content.data && (
+            <div className="grid md:grid-cols-2 gap-4">
+              {([
+                ["sops", "Knowledge base documents", content.data.sops, "doc_type"],
+                ["reports", "Analyses & reports", content.data.reports, "workflow_type"],
+              ] as const).map(([kind, label, rows, subKey]) => (
+                <div key={kind}>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <div className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
+                      {label} ({rows.length})
+                    </div>
+                    {rows.length > 0 && (
+                      <button
+                        className="text-[10px] text-primary hover:underline"
+                        onClick={() => toggleAll(kind, rows.map((r: { id: string }) => r.id))}
+                      >
+                        {rows.every((r: { id: string }) => picked[kind].has(r.id)) ? "Deselect all" : "Select all"}
+                      </button>
+                    )}
+                  </div>
+                  <div className="max-h-72 overflow-y-auto rounded-lg border divide-y">
+                    {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
+                    {rows.map((row: any) => (
+                      <label key={row.id} className="flex items-center gap-2 px-2.5 py-1.5 text-xs cursor-pointer hover:bg-muted/40">
+                        <input
+                          type="checkbox"
+                          checked={picked[kind].has(row.id)}
+                          onChange={() => toggle(kind, row.id)}
+                          className="accent-[var(--primary)] shrink-0"
+                        />
+                        <span className="truncate flex-1" title={row.title}>{row.title}</span>
+                        <span className="text-[10px] text-muted-foreground shrink-0">
+                          {row.workspace_id}{row[subKey] ? ` · ${row[subKey]}` : ""}
+                        </span>
+                      </label>
+                    ))}
+                    {rows.length === 0 && (
+                      <div className="p-3 text-center text-xs text-muted-foreground">Nothing available.</div>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="flex items-center gap-3 px-5 py-4 border-t shrink-0">
+          <Button onClick={run} disabled={total === 0 || running} className="gap-1.5">
+            {running ? <Loader2 className="size-4 animate-spin" /> : <CopyPlus className="size-4" />}
+            Clone {total > 0 ? `${total} item${total === 1 ? "" : "s"}` : ""} into {tenant.name}
+          </Button>
+          <span className="text-[11px] text-muted-foreground flex-1">
+            Instant — rows + embeddings copy inside the database; files are shared.
+          </span>
+          <Button variant="outline" onClick={onClose} disabled={running}>Close</Button>
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -903,4 +1413,157 @@ function timeAgo(iso: string): string {
   const d = Math.floor(h / 24);
   if (d < 30) return `${d} day${d === 1 ? "" : "s"} ago`;
   return new Date(iso).toLocaleDateString();
+}
+
+/**
+ * Simplify v2 — second guidance editor for the RECOMMENDATION (quality-audit)
+ * prompt, stored under the synthetic guidance key "simplify_v2_recommend".
+ * The main editor above owns the simplification style rules; this one owns the
+ * defect taxonomy, severity calibration and evidence rules the audit follows.
+ */
+function RecommendGuidanceCard() {
+  const qc = useQueryClient();
+  const getGuidance = useServerFn(getAnalysisGuidance);
+  const saveGuidance = useServerFn(saveAnalysisGuidance);
+  const [text, setText] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const query = useQuery({
+    queryKey: ["analysis_guidance", "simplify_v2_recommend"],
+    queryFn: async () => await getGuidance({ data: { workspace: "simplify_v2_recommend" } }),
+  });
+  useEffect(() => {
+    if (!query.data) return;
+    setText((query.data.guidance ?? "").trim() || DEFAULT_RECOMMEND_GUIDANCE);
+  }, [query.data]);
+
+  async function save() {
+    setSaving(true);
+    try {
+      await saveGuidance({ data: { workspace: "simplify_v2_recommend", guidance: text } });
+      qc.invalidateQueries({ queryKey: ["analysis_guidance", "simplify_v2_recommend"] });
+      toast.success("Audit guidance saved", { description: "It applies to the next Recommendation run." });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } catch (e: any) {
+      toast.error("Could not save guidance", { description: e?.message });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Card className="p-6">
+      <h2 className="font-display text-lg font-semibold">Audit Guidance (Recommendation modes)</h2>
+      <p className="text-sm text-muted-foreground mt-1">
+        The instruction the <span className="font-semibold text-foreground">document quality audit</span> follows
+        in Recommendation and Recommend &amp; Edit runs — defect categories, severity calibration and evidence
+        rules. The JSON output contract stays fixed.
+      </p>
+      <textarea
+        className="mt-4 w-full min-h-[280px] text-xs font-mono p-3 rounded-lg border bg-muted/30 leading-relaxed resize-y focus:outline-none focus:ring-1 focus:ring-primary"
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        disabled={query.isLoading}
+      />
+      <div className="mt-3 flex items-center gap-3 flex-wrap">
+        <Button onClick={save} disabled={saving || query.isLoading}>
+          {saving ? <Loader2 className="size-4 animate-spin" /> : <CheckCircle2 className="size-4" />}
+          Save audit guidance
+        </Button>
+        <Button
+          variant="outline"
+          onClick={() => setText(DEFAULT_RECOMMEND_GUIDANCE)}
+          disabled={saving || query.isLoading}
+          className="gap-1.5"
+        >
+          <RotateCcw className="size-3.5" />
+          Reset to default
+        </Button>
+        <span className="text-xs text-muted-foreground">Applies to the next audit run.</span>
+      </div>
+    </Card>
+  );
+}
+
+
+/**
+ * AI Model — super-admin picker for the app's DEFAULT model. The chosen model
+ * is always called FIRST for the main analysis passes; the standard fallback
+ * chain still applies automatically if it errors or is overloaded. High-volume
+ * mechanical batch calls stay on the fast/cheap model regardless.
+ */
+function ModelSettingsCard() {
+  const auth = useAuth();
+  const qc = useQueryClient();
+  const getModel = useServerFn(getModelSettings);
+  const setModel = useServerFn(setModelSettings);
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+  const [saving, setSaving] = useState(false);
+
+  const isSuper = mounted && !auth.loading && auth.role === "super_admin";
+  const query = useQuery({
+    queryKey: ["model_settings"],
+    queryFn: () => getModel(),
+    enabled: isSuper,
+  });
+
+  if (!isSuper) return null;
+
+  const MODEL_BLURB: Record<string, string> = {
+    "gemini-2.5-pro": "Strongest reasoning — best audit accuracy, slower & pricier",
+    "gemini-3.5-flash": "Balanced default — fast, strong, economical",
+    "gemini-2.5-flash": "Previous-gen balanced model",
+    "gemini-3.1-flash-lite": "Cheapest & fastest — light tasks only",
+  };
+
+  async function pick(model: string) {
+    setSaving(true);
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await setModel({ data: { model } as any });
+      await qc.invalidateQueries({ queryKey: ["model_settings"] });
+      toast.success(`Default model set to ${model}`, {
+        description: "It leads every analysis from the next run; fallbacks still apply automatically.",
+      });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } catch (e: any) {
+      toast.error("Could not save model setting", { description: e?.message });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Card className="p-6">
+      <h2 className="font-display text-lg font-semibold">AI Model</h2>
+      <p className="text-sm text-muted-foreground mt-1">
+        The default model leads every analysis call. If it fails or is overloaded, the
+        standard fallback chain takes over automatically — a run never dies because one
+        model is busy. Bulk mechanical passes always use the fast tier for cost.
+      </p>
+      <div className="mt-4 space-y-2 max-w-lg">
+        {(query.data?.available ?? []).map((m) => {
+          const active = query.data?.model === m;
+          return (
+            <button
+              key={m}
+              disabled={saving || query.isLoading}
+              onClick={() => !active && pick(m)}
+              className={cn(
+                "w-full flex items-center justify-between rounded-lg border px-4 py-2.5 text-left transition-colors",
+                active ? "border-primary bg-primary/5 ring-1 ring-primary/30" : "hover:border-primary/40",
+              )}
+            >
+              <div>
+                <div className={cn("text-sm font-semibold font-mono", active && "text-primary")}>{m}</div>
+                <div className="text-[11px] text-muted-foreground">{MODEL_BLURB[m] ?? ""}</div>
+              </div>
+              {active && <CheckCircle2 className="size-4 text-primary shrink-0" />}
+            </button>
+          );
+        })}
+      </div>
+    </Card>
+  );
 }

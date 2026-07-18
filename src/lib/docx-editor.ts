@@ -333,6 +333,72 @@ export function docxToSimplifyUnits(buffer: Buffer): { text: string; section: st
   return units;
 }
 
+/** A source unit for the RESTRUCTURE pipeline. Unlike docxToSimplifyUnits
+ *  (which flattens every table cell into its own paragraph unit, losing the
+ *  grid), a table here stays a single unit carrying its rows — so the redraft
+ *  can reproduce it as a real Word table instead of a list of loose lines.
+ *  `text` is a readable flattening of the table (used for section grouping and
+ *  the content-preservation fuzzy match, which only need plain text). */
+export interface StructuredUnit {
+  text: string;
+  section: string;
+  table?: string[][];
+}
+
+/** Extracts the rows of a single <w:tbl> as a string[][] (one string per cell,
+ *  cell text = its paragraphs joined). Non-nested tables only — a nested table
+ *  would be consumed by the outer non-greedy match, same limitation the rest of
+ *  this module already carries. Empty rows/cells are kept so column counts line
+ *  up across rows. */
+function tableRows(tblXml: string): string[][] {
+  const rows: string[][] = [];
+  for (const trMatch of tblXml.matchAll(/<w:tr\b[\s\S]*?<\/w:tr>/g)) {
+    const cells: string[] = [];
+    for (const tcMatch of trMatch[0].matchAll(/<w:tc\b[\s\S]*?<\/w:tc>/g)) {
+      const cellParas = [...tcMatch[0].matchAll(/<w:p\b[^>]*>(?:(?!<w:p\b)[\s\S])*?<\/w:p>/g)]
+        .map((p) => getParagraphText(p[0]))
+        .filter(Boolean);
+      cells.push(cellParas.join(" "));
+    }
+    if (cells.length > 0) rows.push(cells);
+  }
+  return rows;
+}
+
+/**
+ * Like docxToSimplifyUnits, but TABLE-AWARE: paragraphs become para units and
+ * each table becomes ONE unit carrying its `rows`. This is what the redraft /
+ * restructure pipeline consumes so tables survive regeneration (docxToSimplify-
+ * Units is kept for the audit, which wants per-cell granularity for claims).
+ */
+export function docxToStructuredUnits(buffer: Buffer): StructuredUnit[] {
+  const zip = new PizZip(buffer);
+  const docFile = zip.file("word/document.xml");
+  if (!docFile) return [];
+  const xml = docFile.asText();
+  const units: StructuredUnit[] = [];
+  let section = "";
+  const tokenRe = /<w:tbl\b[\s\S]*?<\/w:tbl>|<w:p\b[^>]*>(?:(?!<w:p\b)[\s\S])*?<\/w:p>/g;
+  let m: RegExpExecArray | null;
+  while ((m = tokenRe.exec(xml)) !== null) {
+    const block = m[0];
+    if (block.startsWith("<w:tbl")) {
+      const rows = tableRows(block).filter((r) => r.some((c) => c.trim()));
+      if (rows.length === 0) continue;
+      const text = rows.map((r) => r.join(" | ")).join("\n");
+      units.push({ text, section, table: rows });
+    } else {
+      const t = getParagraphText(block);
+      if (!t) continue;
+      if (t.length <= 80 && t.length >= 3 && t === t.toUpperCase() && /[A-Z]/.test(t)) {
+        section = t;
+      }
+      units.push({ text: t, section });
+    }
+  }
+  return units;
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // UC4 — FIGURES (charts / flowcharts / diagrams embedded as images)
 // Text extraction can't see image content, so figures are extracted here and
@@ -594,6 +660,45 @@ function buildRedlineParagraph(
   return `<w:p>${pPr}${textRun(prefix)}${delRun}${insRun}${textRun(suffix)}</w:p>`;
 }
 
+/**
+ * Build a paragraph with the edit applied PLAINLY — no tracked changes, no
+ * highlight. Same sub-paragraph swap and pPr/rPr inheritance as the redline
+ * builder, so the clean export is formatting-identical to the source around
+ * the change. Returns "" when the edit deletes the paragraph's entire text
+ * (pure delete_redundant of a whole paragraph) so the caller can drop it.
+ */
+function buildCleanParagraph(
+  origPXml: string,
+  paraText: string,
+  loc: { start: number; end: number },
+  after: string,
+): string {
+  const pPr = origPXml.match(/<w:pPr\b[\s\S]*?<\/w:pPr>/)?.[0] ?? "";
+  const rPr = origPXml.match(/<w:r\b[^>]*>\s*(<w:rPr\b[\s\S]*?<\/w:rPr>)/)?.[1] ?? "";
+  const prefix = paraText.slice(0, loc.start);
+  const suffix = paraText.slice(loc.end);
+  if (!(prefix + after + suffix).trim()) return ""; // paragraph fully deleted
+  const textRun = (t: string) =>
+    t ? `<w:r>${rPr}<w:t xml:space="preserve">${escapeXml(t)}</w:t></w:r>` : "";
+  return `<w:p>${pPr}${textRun(prefix)}${textRun(after)}${textRun(suffix)}</w:p>`;
+}
+
+/** Wraps an already-built paragraph in a Word comment range (rationale rider). */
+function wrapParagraphWithComment(para: string, commentId: number): string {
+  const open = para.match(/^<w:p\b[^>]*>/)?.[0] ?? "<w:p>";
+  const pPr = para.match(/<w:pPr\b[\s\S]*?<\/w:pPr>/)?.[0] ?? "";
+  const head = para.startsWith(open + pPr) ? open + pPr : open;
+  const inner = para.slice(head.length, para.length - "</w:p>".length);
+  return (
+    head +
+    `<w:commentRangeStart w:id="${commentId}"/>` +
+    inner +
+    `<w:commentRangeEnd w:id="${commentId}"/>` +
+    `<w:r><w:rPr><w:rStyle w:val="CommentReference"/></w:rPr><w:commentReference w:id="${commentId}"/></w:r>` +
+    `</w:p>`
+  );
+}
+
 /** Build a <w:p> with one highlighted run, optionally wrapped in a comment range. */
 function buildHighlightedParaWithComment(text: string, commentId: number | null): string {
   const lines = text.split(/\r?\n/);
@@ -718,7 +823,7 @@ function attachComments(zip: PizZip, commentEntries: string[], paraIds: string[]
 export function applySimplificationToDocx(
   sourceBuffer: Buffer,
   edits: SimplifyDocxEdit[],
-  opts: { author?: string; mode?: "redline" | "highlight" } = {},
+  opts: { author?: string; mode?: "redline" | "highlight" | "clean"; redlineComments?: boolean } = {},
 ): SimplifyDocxResult {
   const zip = new PizZip(sourceBuffer);
   const docFile = zip.file("word/document.xml");
@@ -726,7 +831,9 @@ export function applySimplificationToDocx(
   let documentXml = docFile.asText();
 
   // "redline" = Word tracked changes (red strikethrough deletions + insertions,
-  // Accept/Reject-able). "highlight" = yellow highlight + a Word comment.
+  // Accept/Reject-able); with opts.redlineComments each change also carries a
+  // Word comment holding the rationale. "highlight" = yellow highlight + a Word
+  // comment. "clean" = plain replacement, no markup at all (final-copy export).
   const mode = opts.mode ?? "redline";
   const author = (opts.author ?? "AI Document Workflow").slice(0, 60);
   const dateIso = new Date().toISOString();
@@ -793,12 +900,23 @@ export function applySimplificationToDocx(
       if (!paraText) continue;
 
       let newPara: string;
-      if (mode === "redline") {
+      if (mode === "clean") {
+        const loc = tolerantLocate(paraText, before);
+        if (!loc) continue;
+        newPara = buildCleanParagraph(m[0], paraText, loc, edit.after ?? "");
+      } else if (mode === "redline") {
         const loc = tolerantLocate(paraText, before);
         if (!loc) continue;
         newPara = buildRedlineParagraph(
           m[0], paraText, loc, edit.after ?? "", nextRevId++, nextRevId++, author, dateIso,
         );
+        if (opts.redlineComments && edit.rationale) {
+          const commentId = nextCommentId++;
+          const paraId = (commentId + 1).toString(16).padStart(8, "0").toUpperCase();
+          paraIds.push(paraId);
+          commentEntries.push(buildCommentEntry(commentId, edit.rationale, author, dateIso, paraId));
+          newPara = wrapParagraphWithComment(newPara, commentId);
+        }
       } else {
         const amended = tolerantReplace(paraText, before, edit.after ?? "");
         if (amended === null) continue;
@@ -827,4 +945,149 @@ export function applySimplificationToDocx(
 
   const out = zip.generate({ type: "nodebuffer", compression: "DEFLATE" }) as Buffer;
   return { buffer: out, appliedCount, skipped };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// SIMPLIFY V2 — RESTRUCTURED-BODY REBUILD
+// Replaces the BODY content of an existing DOCX with generated sections while
+// preserving everything else in the package: headers/footers (and the logo
+// images they carry), styles.xml, numbering, fonts, media, theme, settings.
+// The final <w:sectPr> (page setup + header/footer references) is retained, so
+// the output opens in Word looking like the same document family — only the
+// body text is new.
+// ════════════════════════════════════════════════════════════════════════════
+
+import type { RestructuredSection, RestructureBlock } from "./recommend";
+
+/** Discovers the original's Heading 1-3 paragraph style ids from styles.xml. */
+function discoverHeadingStyles(zip: PizZip): Record<1 | 2 | 3, string | null> {
+  const out: Record<1 | 2 | 3, string | null> = { 1: null, 2: null, 3: null };
+  const stylesFile = zip.file("word/styles.xml");
+  if (!stylesFile) return out;
+  const xml = stylesFile.asText();
+  const styleRe = /<w:style\b[^>]*w:styleId="([^"]+)"[^>]*>([\s\S]*?)<\/w:style>/g;
+  let m: RegExpExecArray | null;
+  while ((m = styleRe.exec(xml)) !== null) {
+    const nameMatch = m[2].match(/<w:name\b[^>]*w:val="([^"]+)"/);
+    const name = (nameMatch?.[1] ?? "").toLowerCase();
+    const lvl = name.match(/^heading (\d)$/)?.[1];
+    if (lvl === "1" || lvl === "2" || lvl === "3") out[Number(lvl) as 1 | 2 | 3] ??= m[1];
+  }
+  return out;
+}
+
+function headingParagraph(text: string, level: 1 | 2 | 3, styleId: string | null): string {
+  if (styleId) {
+    return `<w:p><w:pPr><w:pStyle w:val="${escapeXml(styleId)}"/></w:pPr><w:r><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`;
+  }
+  // No heading styles in the source — approximate with bold + size.
+  const sz = level === 1 ? 32 : level === 2 ? 28 : 24; // half-points
+  return `<w:p><w:r><w:rPr><w:b/><w:sz w:val="${sz}"/><w:szCs w:val="${sz}"/></w:rPr><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`;
+}
+
+function bodyParagraph(text: string): string {
+  return `<w:p><w:r><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`;
+}
+
+/** Bullets rendered as literal "• " paragraphs with a hanging indent — avoids
+ *  touching numbering.xml (whose numId space differs per document). */
+function bulletParagraph(text: string): string {
+  return (
+    `<w:p><w:pPr><w:ind w:left="360" w:hanging="360"/></w:pPr>` +
+    `<w:r><w:t xml:space="preserve">• ${escapeXml(text)}</w:t></w:r></w:p>`
+  );
+}
+
+function simpleTable(rows: string[][]): string {
+  if (rows.length === 0) return "";
+  const cols = Math.max(...rows.map((r) => r.length));
+  const borders =
+    `<w:tblBorders>` +
+    ["top", "left", "bottom", "right", "insideH", "insideV"]
+      .map((b) => `<w:${b} w:val="single" w:sz="4" w:color="auto"/>`)
+      .join("") +
+    `</w:tblBorders>`;
+  const grid = `<w:tblGrid>${Array.from({ length: cols }, () => `<w:gridCol/>`).join("")}</w:tblGrid>`;
+  const trs = rows
+    .map((row, ri) => {
+      const cells = Array.from({ length: cols }, (_, ci) => {
+        const runPr = ri === 0 ? `<w:rPr><w:b/></w:rPr>` : "";
+        return (
+          `<w:tc><w:tcPr><w:tcW w:w="0" w:type="auto"/></w:tcPr>` +
+          `<w:p><w:r>${runPr}<w:t xml:space="preserve">${escapeXml(row[ci] ?? "")}</w:t></w:r></w:p></w:tc>`
+        );
+      }).join("");
+      return `<w:tr>${cells}</w:tr>`;
+    })
+    .join("");
+  return `<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/>${borders}</w:tblPr>${grid}${trs}</w:tbl>`;
+}
+
+function blockToXml(block: RestructureBlock): string {
+  if (block.type === "para" && block.text) return bodyParagraph(block.text);
+  if (block.type === "bullets" && block.items) return block.items.map(bulletParagraph).join("");
+  if (block.type === "table" && block.rows) return simpleTable(block.rows);
+  return "";
+}
+
+/**
+ * Replaces the document body with the restructured sections. Optionally anchors
+ * a Word comment on the first paragraph of each section listing the changes
+ * made there (the "annotated" export for whole-document restructures, where
+ * tracked changes would be unreadable).
+ */
+export function rebuildDocxBody(
+  originalBuffer: Buffer,
+  sections: RestructuredSection[],
+  opts: { author?: string; sectionComments?: Record<string, string> } = {},
+): Buffer {
+  const zip = new PizZip(originalBuffer);
+  const docFile = zip.file("word/document.xml");
+  if (!docFile) throw new Error("Invalid DOCX: word/document.xml not found");
+  const documentXml = docFile.asText();
+
+  const bodyOpen = documentXml.match(/<w:body\b[^>]*>/);
+  const bodyClose = documentXml.lastIndexOf("</w:body>");
+  if (!bodyOpen || bodyClose < 0) throw new Error("Invalid DOCX: <w:body> not found");
+  const bodyStart = documentXml.indexOf(bodyOpen[0]) + bodyOpen[0].length;
+  const bodyInner = documentXml.slice(bodyStart, bodyClose);
+
+  // Retain the FINAL sectPr — page size/margins + header/footer references —
+  // which sits as the LAST direct child of <w:body>. Multi-section documents
+  // also carry sectPr elements mid-body (inside a paragraph's pPr at each
+  // section break), so anchor on the LAST occurrence, not the first: a greedy
+  // first-match would drag a chunk of the old body along with it.
+  const lastSectAt = bodyInner.lastIndexOf("<w:sectPr");
+  const sectPr = lastSectAt >= 0
+    ? bodyInner.slice(lastSectAt).match(/^<w:sectPr[\s\S]*?<\/w:sectPr>/)?.[0] ?? ""
+    : "";
+
+  const headingStyles = discoverHeadingStyles(zip);
+  const author = (opts.author ?? "AI Document Workflow").slice(0, 60);
+  const dateIso = new Date().toISOString();
+  const commentEntries: string[] = [];
+  const paraIds: string[] = [];
+  let nextCommentId = 0;
+
+  const parts: string[] = [];
+  for (const s of sections) {
+    let heading = headingParagraph(s.heading, s.level, headingStyles[s.level]);
+    const note = opts.sectionComments?.[s.heading];
+    if (note) {
+      const commentId = nextCommentId++;
+      const paraId = (commentId + 1).toString(16).padStart(8, "0").toUpperCase();
+      paraIds.push(paraId);
+      commentEntries.push(buildCommentEntry(commentId, note, author, dateIso, paraId));
+      heading = wrapParagraphWithComment(heading, commentId);
+    }
+    parts.push(heading);
+    for (const b of s.blocks) parts.push(blockToXml(b));
+  }
+
+  const newXml =
+    documentXml.slice(0, bodyStart) + parts.join("") + sectPr + documentXml.slice(bodyClose);
+  zip.file("word/document.xml", newXml);
+  if (commentEntries.length > 0) attachComments(zip, commentEntries, paraIds);
+
+  return zip.generate({ type: "nodebuffer", compression: "DEFLATE" }) as Buffer;
 }

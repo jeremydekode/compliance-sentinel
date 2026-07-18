@@ -26,6 +26,9 @@ export interface LegalTemplate {
   /** Grouping for the template library. "Banking" items are bank-specific; the
    *  rest are cross-industry and reusable by any organisation. */
   category: "Banking" | "Commercial" | "Corporate" | "Employment" | "Data & Privacy";
+  /** matter_type used when a download is tracked as a Legal CMS matter (see
+   *  createTemplateRequest) — maps onto the shared MATTER_TYPES list. */
+  matter_type: string;
   fields: TemplateField[];
   /** Body HTML with {{field_id}} tokens replaced by answers. */
   body: string;
@@ -51,6 +54,7 @@ export const LEGAL_TEMPLATES: LegalTemplate[] = [
     fileName: "Mutual-NDA.doc",
     route_hint: "A",
     category: "Commercial",
+    matter_type: "nda",
     fields: [
       { id: "company",       label: "Your company name",        placeholder: "e.g. Northwind Corporation Ltd" },
       { id: "company_addr",  label: "Your registered office",   placeholder: "Registered office address" },
@@ -81,17 +85,35 @@ export const LEGAL_TEMPLATES: LegalTemplate[] = [
 <h2>4. Compelled Disclosure</h2>
 <p>A Party may disclose Confidential Information to the extent required by law, regulation or a competent authority, provided that, where lawful, it gives the other Party prompt written notice and reasonable assistance to contest or limit the disclosure.</p>
 
-<h2>5. Term</h2>
-<p>This Agreement takes effect on the date first written above and continues for <span class="fill">{{term}}</span>. The confidentiality obligations survive for <span class="fill">{{survival}}</span> after expiry or termination.</p>
+<h2>5. Term and Termination</h2>
+<p>This Agreement takes effect on the date first written above and continues for <span class="fill">{{term}}</span>, unless earlier terminated by either Party upon thirty (30) days' prior written notice to the other Party. Termination shall not affect any rights or obligations that accrued before the effective date of termination.</p>
 
-<h2>6. Return or Destruction</h2>
-<p>On written request, each Party shall promptly return or destroy the other Party's Confidential Information, except copies required to be retained by law or bona fide document-retention policies.</p>
+<h2>6. Survival</h2>
+<p>The obligations of confidentiality under Clause 3, and the provisions of Clauses 9 to 14, survive expiry or termination of this Agreement for <span class="fill">{{survival}}</span>.</p>
 
-<h2>7. No Licence; No Obligation</h2>
-<p>Nothing in this Agreement grants any licence or IP rights, or obliges either Party to enter into any further agreement.</p>
+<h2>7. Return or Destruction</h2>
+<p>On written request, each Party shall promptly return or destroy the other Party's Confidential Information, except copies required to be retained by law or bona fide document-retention policies, and shall certify such destruction if requested.</p>
 
-<h2>8. Governing Law</h2>
-<p>This Agreement is governed by the laws of <span class="fill">{{law}}</span>, and the Parties submit to the exclusive jurisdiction of its courts.</p>
+<h2>8. No Licence; No Obligation</h2>
+<p>Nothing in this Agreement grants any licence or intellectual property rights, or obliges either Party to enter into any further agreement or to disclose any particular information.</p>
+
+<h2>9. Limitation of Liability</h2>
+<p>Neither Party shall be liable to the other for any indirect, incidental, consequential, or punitive damages arising out of or in connection with this Agreement. Nothing in this Clause 9 limits either Party's liability for breach of the confidentiality obligations under Clause 3, for which monetary damages alone may be an inadequate remedy.</p>
+
+<h2>10. Indemnification</h2>
+<p>Each Party shall indemnify and hold harmless the other Party against any losses, damages, or reasonable costs (including legal fees) arising from that Party's material breach of its obligations under this Agreement.</p>
+
+<h2>11. Remedies</h2>
+<p>Each Party acknowledges that a breach of the confidentiality obligations under this Agreement may cause irreparable harm to the other Party for which monetary damages alone would be an inadequate remedy, and accordingly the non-breaching Party shall be entitled to seek injunctive or other equitable relief, in addition to any other remedies available at law.</p>
+
+<h2>12. Data Protection</h2>
+<p>Where either Party discloses personal data under this Agreement, the receiving Party shall process such data in accordance with the Personal Data Protection Act 2010 (PDPA) of Malaysia (or the equivalent data protection law of the jurisdiction stated in Clause 13), and shall implement appropriate technical and organisational measures to protect it against unauthorised access, loss, or disclosure.</p>
+
+<h2>13. Governing Law and Dispute Resolution</h2>
+<p>This Agreement is governed by the laws of <span class="fill">{{law}}</span>. Any dispute arising out of or in connection with this Agreement, including any question regarding its existence, validity, or termination, shall be referred to and finally resolved by arbitration administered in accordance with the Asian International Arbitration Centre (AIAC) Arbitration Rules, seated in the jurisdiction stated above, conducted in the English language.</p>
+
+<h2>14. General</h2>
+<p>This Agreement constitutes the entire agreement between the Parties in relation to its subject matter and supersedes all prior discussions and agreements on that subject. No amendment or waiver of any provision is effective unless in writing and signed by both Parties. Neither Party may assign this Agreement without the other Party's prior written consent.</p>
 
 <table class="sig-table"><tr>
 <td><div class="sig-line">Signed for and on behalf of<br><b>{{company}}</b><br>Name:<br>Title:<br>Date:</div></td>
@@ -106,6 +128,7 @@ export const LEGAL_TEMPLATES: LegalTemplate[] = [
     fileName: "Services-Agreement.doc",
     route_hint: "A",
     category: "Commercial",
+    matter_type: "template",
     fields: [
       { id: "company",    label: "Your company name",  placeholder: "e.g. Northwind Corporation Ltd" },
       { id: "supplier",   label: "Supplier name",      placeholder: "e.g. Acme Services Ltd" },
@@ -154,6 +177,7 @@ export const LEGAL_TEMPLATES: LegalTemplate[] = [
     fileName: "IP-TradeMark-Application.doc",
     route_hint: "A",
     category: "Commercial",
+    matter_type: "ip_registration",
     fields: [
       { id: "company",   label: "Applicant company name", placeholder: "e.g. Northwind Corporation Sdn Bhd" },
       { id: "company_addr", label: "Applicant address",   placeholder: "Registered office address" },
@@ -194,6 +218,7 @@ export const LEGAL_TEMPLATES: LegalTemplate[] = [
     fileName: "Letter-of-Demand.doc",
     route_hint: "A",
     category: "Banking",
+    matter_type: "standard_form",
     fields: [
       { id: "company",   label: "Your company name",     placeholder: "e.g. Northwind Bank Berhad" },
       { id: "recipient", label: "Recipient name",        placeholder: "The party in default" },
@@ -227,6 +252,7 @@ export const LEGAL_TEMPLATES: LegalTemplate[] = [
     fileName: "Data-Processing-Agreement.doc",
     route_hint: "A",
     category: "Data & Privacy",
+    matter_type: "standard_form",
     fields: [
       { id: "controller", label: "Data controller (your company)", placeholder: "e.g. Northwind Bank Berhad" },
       { id: "processor",  label: "Data processor (vendor)",  placeholder: "e.g. Acme Cloud Services Sdn Bhd" },
@@ -263,6 +289,7 @@ export const LEGAL_TEMPLATES: LegalTemplate[] = [
     fileName: "Directors-Circular-Resolution.doc",
     route_hint: "A",
     category: "Corporate",
+    matter_type: "standard_form",
     fields: [
       { id: "company",  label: "Company name",       placeholder: "e.g. Northwind Corporation Sdn Bhd" },
       { id: "reg_no",   label: "Company registration no.", placeholder: "e.g. 202001000000 (1234567-A)" },
@@ -290,6 +317,7 @@ export const LEGAL_TEMPLATES: LegalTemplate[] = [
     fileName: "Employment-Offer-Letter.doc",
     route_hint: "A",
     category: "Employment",
+    matter_type: "standard_form",
     fields: [
       { id: "company",   label: "Employer (your company)", placeholder: "e.g. Northwind Corporation Sdn Bhd" },
       { id: "candidate", label: "Candidate name",       placeholder: "Full name of candidate" },
@@ -364,6 +392,28 @@ export function blankTemplateHtml(t: LegalTemplate): string {
   const blanks: Record<string, string> = {};
   for (const f of t.fields) blanks[f.id] = `[${f.label}]`;
   return fillTemplate(t, blanks);
+}
+
+/** Strip a generated template's HTML down to plain text — stored server-side as
+ *  the document's baseline text so a later AI review (or a counterparty-markup
+ *  comparison) has something to work from without re-parsing the fake .doc file
+ *  (it's HTML wearing a .doc extension, not a real Word/PDF binary). */
+export function htmlToPlainText(html: string): string {
+  return html
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<(p|div|h[1-6]|tr|br)\b[^>]*>/gi, "\n")
+    .replace(/<\/(p|div|h[1-6]|tr)>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .split("\n").map((l) => l.trim()).join("\n")
+    .trim();
 }
 
 /** Trigger a client-side download of arbitrary document HTML as a .doc file. */

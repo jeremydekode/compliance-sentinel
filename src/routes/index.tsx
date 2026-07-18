@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import { formatDate } from "@/lib/format";
 import { useWorkspace, WORKSPACES, type WorkspaceId } from "@/lib/workspace";
+import { useAuth } from "@/lib/auth";
 import { cn } from "@/lib/utils";
 import {
   mockPriority,
@@ -69,17 +70,20 @@ function Dashboard() {
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
   const workspace: WorkspaceId = mounted ? workspaceActual : "rmit";
+  const auth = useAuth();
 
   // Pull MORE than 10 here so the KPIs reflect the whole pipeline, not a tiny
   // window. Reports table per workspace tends to be < a few hundred.
   const reports = useQuery({
-    queryKey: ["reports", "dashboard", workspace],
+    queryKey: ["reports", "dashboard", workspace, auth.tenantId],
+    enabled: mounted && !auth.loading,
     queryFn: async () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const { data } = await (supabase as any)
         .from("analysis_reports")
         .select("id, title, policy_name, status, created_at")
         .eq("workspace_id", workspace)
+        .eq("tenant_id", auth.tenantId)
         .order("created_at", { ascending: false })
         .limit(200);
       return (data ?? []) as ReportRow[];

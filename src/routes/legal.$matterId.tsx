@@ -6,6 +6,7 @@ import { AppShell } from "@/components/app-shell";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
+import { RoleSwitcher, useLegalRole, ROLE_LABEL, type LegalRole } from "@/components/legal-widgets";
 import { format, formatDistanceToNow } from "date-fns";
 import {
   getLegalMatter,
@@ -16,6 +17,7 @@ import {
   escalateLegalMatter,
   attachLegalDocument,
   reviewLegalDocument,
+  reviewCounterpartyMarkup,
   setDocumentAccess,
   deleteLegalDocument,
   generateProposedResponse,
@@ -24,11 +26,17 @@ import {
   publishToKnowledgeBase,
   setMatterLifecycle,
   updateExecSummary,
+  shareWithCounterparty,
+  recordShareDownload,
+  generateMatterBinder,
+  setAwaitingRole,
   approvalTierFor,
+  maskDemoEmail,
   MATTER_TYPES,
   ROUTE_META,
   STATUS_META,
 } from "@/lib/legal.functions";
+import { downloadDoc } from "@/lib/legal.templates";
 import { supabase } from "@/integrations/supabase/client";
 import {
   ArrowLeft,
@@ -66,6 +74,7 @@ import {
   Pencil,
   Check,
   ShieldQuestion,
+  MessageSquareWarning,
 } from "lucide-react";
 
 export const Route = createFileRoute("/legal/$matterId")({
@@ -165,9 +174,38 @@ function severityMeta(sev: string) {
   return { icon: Info, cls: "text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-900/20 ring-blue-200/60 dark:ring-blue-900" };
 }
 
+// Collapsible card shell shared by the info panels on this page. The header
+// row toggles; any interactive control placed inside the header must call
+// e.stopPropagation() so it doesn't also collapse the card.
+function Collapse({ header, children, defaultOpen = true, className, headerClassName }: {
+  header: React.ReactNode;
+  children: React.ReactNode;
+  defaultOpen?: boolean;
+  className?: string;
+  headerClassName?: string;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div className={cn("rounded-xl border overflow-hidden bg-card", className)}>
+      <div
+        role="button"
+        tabIndex={0}
+        onClick={() => setOpen((o) => !o)}
+        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setOpen((o) => !o); } }}
+        className={cn("flex items-center gap-2 px-4 py-2.5 cursor-pointer select-none", open && "border-b", headerClassName)}
+      >
+        <div className="flex items-center gap-2 flex-1 min-w-0 flex-wrap">{header}</div>
+        <ChevronDown className={cn("size-3.5 text-muted-foreground shrink-0 transition-transform", open && "rotate-180")} />
+      </div>
+      {open && children}
+    </div>
+  );
+}
+
 function LegalMatterDetail() {
   const { matterId } = Route.useParams();
   const queryClient = useQueryClient();
+  const [role] = useLegalRole();
   const getFn = useServerFn(getLegalMatter);
   const assignFn = useServerFn(assignLegalMatter);
   const advanceFn = useServerFn(advanceLegalMatterStatus);
@@ -176,6 +214,7 @@ function LegalMatterDetail() {
   const escalateFn = useServerFn(escalateLegalMatter);
   const attachFn = useServerFn(attachLegalDocument);
   const reviewFn = useServerFn(reviewLegalDocument);
+  const reviewMarkupFn = useServerFn(reviewCounterpartyMarkup);
 
   const { data, isLoading } = useQuery({
     queryKey: ["legal-matter", matterId],
@@ -246,6 +285,9 @@ function LegalMatterDetail() {
   const lifecycleFn = useServerFn(setMatterLifecycle);
   const execFn = useServerFn(updateExecSummary);
   const docAccessFn = useServerFn(setDocumentAccess);
+  const shareFn = useServerFn(shareWithCounterparty);
+  const recordDownloadFn = useServerFn(recordShareDownload);
+  const binderFn = useServerFn(generateMatterBinder);
 
   const propose = useMutation({
     mutationFn: () => proposeFn({ data: { matter_id: matterId } }),
@@ -282,6 +324,34 @@ function LegalMatterDetail() {
     onSuccess: () => { toast.success("Document access updated"); refresh(); },
     onError: (e: any) => toast.error(e?.message ?? "Failed"),
   });
+  const share = useMutation({
+    mutationFn: (p: { recipient_name: string; recipient_email: string; document_ids: string[]; message?: string }) =>
+      shareFn({ data: { matter_id: matterId, ...p } }),
+    onSuccess: (_r, p) => { toast.success(`Sent to ${p.recipient_name}`); refresh(); },
+    onError: (e: any) => toast.error(e?.message ?? "Share failed"),
+  });
+  const markOpened = useMutation({
+    mutationFn: (share_id: string) => recordDownloadFn({ data: { share_id } }),
+    onSuccess: () => { toast.success("Marked as opened"); refresh(); },
+    onError: (e: any) => toast.error(e?.message ?? "Failed"),
+  });
+  const binder = useMutation({
+    mutationFn: () => binderFn({ data: { matter_id: matterId } }),
+    onSuccess: (r: any) => { downloadDoc(r.html, r.file_name); toast.success("Matter binder downloaded"); refresh(); },
+    onError: (e: any) => toast.error(e?.message ?? "Failed to generate the binder"),
+  });
+
+  const awaitingFn = useServerFn(setAwaitingRole);
+  const handback = useMutation({
+    mutationFn: (p: { awaiting_role: "submitter" | "reviewer"; note?: string; client_approved?: boolean }) =>
+      awaitingFn({ data: { matter_id: matterId, ...p } }),
+    onSuccess: (_r, p) => {
+      toast.success(p.client_approved ? "Marked approved by client" : p.awaiting_role === "submitter" ? "Sent back to submitter" : "Sent to the reviewer");
+      setActionNotes("");
+      refresh();
+    },
+    onError: (e: any) => toast.error(e?.message ?? "Failed"),
+  });
   const deleteDocFn = useServerFn(deleteLegalDocument);
   const deleteDoc = useMutation({
     mutationFn: (document_id: string) => deleteDocFn({ data: { document_id } }),
@@ -290,6 +360,7 @@ function LegalMatterDetail() {
   });
 
   const [uploadingDoc, setUploadingDoc] = useState(false);
+  const [uploadingMarkup, setUploadingMarkup] = useState(false);
   const [reviewingDocId, setReviewingDocId] = useState<string | null>(null);
 
   async function uploadDocument(file: File) {
@@ -344,6 +415,63 @@ function LegalMatterDetail() {
     }
   }
 
+  // Upload what a counterparty sent back on a document (e.g. their redlined NDA)
+  // and have the AI compare it against our original — surfacing exactly what
+  // they changed, framed as their proposed changes rather than risks in our draft.
+  async function uploadCounterpartyMarkup(file: File) {
+    setUploadingMarkup(true);
+    try {
+      const path = `legal/${Date.now()}-${file.name}`;
+      const up = await supabase.storage.from("policies").upload(path, file, {
+        upsert: false,
+        contentType: file.type || "application/octet-stream",
+      });
+      if (up.error) throw new Error(up.error.message);
+      const fileUrl = supabase.storage.from("policies").getPublicUrl(path).data.publicUrl;
+      const doc: any = await attachFn({
+        data: {
+          matter_id: matterId,
+          file_name: file.name,
+          file_url: fileUrl,
+          mime_type: file.type || undefined,
+          size_bytes: file.size,
+          doc_role: "counterparty_markup",
+        },
+      });
+      refresh();
+      setReviewingDocId(doc.id);
+      try {
+        await reviewMarkupFn({ data: { document_id: doc.id } });
+        toast.success(`AI reviewed what the counterparty changed in ${file.name}`);
+      } catch (e: any) {
+        toast.warning(`Comparison review failed — you can re-run it: ${e?.message ?? ""}`);
+      } finally {
+        setReviewingDocId(null);
+        refresh();
+      }
+    } catch (e: any) {
+      toast.error(e?.message ?? "Upload failed");
+    } finally {
+      setUploadingMarkup(false);
+    }
+  }
+
+  // "Run AI review" on an existing document — for a counterparty_markup doc this
+  // should re-run the comparison, not the standalone cold review.
+  async function rerunReviewSmart(docId: string, isMarkup: boolean) {
+    setReviewingDocId(docId);
+    try {
+      if (isMarkup) await reviewMarkupFn({ data: { document_id: docId } });
+      else await reviewFn({ data: { document_id: docId } });
+      toast.success("AI review complete");
+    } catch (e: any) {
+      toast.error(e?.message ?? "AI review failed");
+    } finally {
+      setReviewingDocId(null);
+      refresh();
+    }
+  }
+
   if (isLoading || !data) {
     return (
       <AppShell>
@@ -358,6 +486,7 @@ function LegalMatterDetail() {
   const events: any[] = data.events ?? [];
   const comments: any[] = data.comments ?? [];
   const documents: any[] = (data as any).documents ?? [];
+  const shares: any[] = (data as any).shares ?? [];
   const riskFlags: any[] = Array.isArray(m.ai_risk_flags) ? m.ai_risk_flags : [];
   const screening = m.ai_screening && m.ai_screening.status === "flags" ? m.ai_screening.flags ?? [] : [];
   const taggedFunctions: string[] = Array.isArray(m.tagged_functions) ? m.tagged_functions : [];
@@ -383,6 +512,7 @@ function LegalMatterDetail() {
             <span className="font-mono text-[10px] text-muted-foreground">{m.reference_number}</span>
             <h1 className="text-sm font-bold truncate">{m.title}</h1>
             <div className="flex items-center gap-1.5 ml-auto shrink-0">
+              <RoleSwitcher />
               {m.is_material && (
                 <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 dark:bg-amber-900/20 px-2 py-0.5 text-[10px] font-bold text-amber-700 dark:text-amber-300 ring-1 ring-amber-200/60">
                   <Landmark className="size-2.5" /> Material
@@ -425,13 +555,17 @@ function LegalMatterDetail() {
             <div className="lg:col-span-2 space-y-4">
               {/* Intake AI screening discrepancies */}
               {screening.length > 0 && (
-                <div className="rounded-xl border border-amber-300/60 dark:border-amber-900 bg-amber-50/50 dark:bg-amber-950/20 overflow-hidden">
-                  <div className="flex items-center gap-2 px-4 py-2.5 border-b border-amber-200/40 dark:border-amber-900/60">
+                <Collapse
+                  defaultOpen={false}
+                  className="border-amber-300/60 dark:border-amber-900 bg-amber-50/50 dark:bg-amber-950/20"
+                  headerClassName="border-amber-200/40 dark:border-amber-900/60"
+                  header={<>
                     <ShieldQuestion className="size-3.5 text-amber-600 dark:text-amber-400" />
                     <span className="text-[11px] font-bold uppercase tracking-wider text-amber-800 dark:text-amber-300">
                       Intake Screening — {screening.length} discrepancy{screening.length !== 1 ? " flags" : " flag"}
                     </span>
-                  </div>
+                  </>}
+                >
                   <div className="p-4 space-y-1.5">
                     {screening.map((f: any, i: number) => (
                       <div key={i} className="flex items-start gap-2 text-xs">
@@ -440,21 +574,24 @@ function LegalMatterDetail() {
                       </div>
                     ))}
                   </div>
-                </div>
+                </Collapse>
               )}
 
               {/* AI triage */}
               {(m.ai_triage_summary || riskFlags.length > 0) && (
-                <div className="rounded-xl border border-violet-200/60 dark:border-violet-900 bg-violet-50/40 dark:bg-violet-950/20 overflow-hidden">
-                  <div className="flex items-center gap-2 px-4 py-2.5 border-b border-violet-200/40 dark:border-violet-900/60">
+                <Collapse
+                  className="border-violet-200/60 dark:border-violet-900 bg-violet-50/40 dark:bg-violet-950/20"
+                  headerClassName="border-violet-200/40 dark:border-violet-900/60"
+                  header={<>
                     <Bot className="size-3.5 text-violet-600 dark:text-violet-400" />
                     <span className="text-[11px] font-bold uppercase tracking-wider text-violet-800 dark:text-violet-300">
                       AI Triage — First Cut
                     </span>
                     <span className="text-[10px] text-violet-600/60 dark:text-violet-400/60 ml-auto">
-                      generated before a lawyer opened the file
+                      {riskFlags.length > 0 ? `${riskFlags.length} risk flag${riskFlags.length !== 1 ? "s" : ""} · ` : ""}generated before a lawyer opened the file
                     </span>
-                  </div>
+                  </>}
+                >
                   <div className="p-4 space-y-3">
                     {m.ai_triage_summary && (
                       <p className="text-xs leading-relaxed text-foreground/90">{m.ai_triage_summary}</p>
@@ -479,25 +616,42 @@ function LegalMatterDetail() {
                       </div>
                     )}
                   </div>
-                </div>
+                </Collapse>
               )}
 
               {/* Documents + AI clause review */}
               <DocumentsCard
+                role={role}
+                matterStatus={m.status}
                 documents={documents}
                 uploading={uploadingDoc}
+                uploadingMarkup={uploadingMarkup}
                 reviewingDocId={reviewingDocId}
                 onUpload={uploadDocument}
-                onRerun={rerunReview}
+                onUploadMarkup={uploadCounterpartyMarkup}
+                onRerun={rerunReviewSmart}
                 onSetAccess={(document_id, access_level) => setDocAccess.mutate({ document_id, access_level })}
                 onDelete={(document_id) => deleteDoc.mutate(document_id)}
                 deletingDocId={deleteDoc.isPending ? (deleteDoc.variables as string) : null}
               />
 
+              {/* Secure external sharing — dispatch drafts to the counterparty and
+                  track when they open the package (Atmospheric Command Center, deck). */}
+              <SharePanel
+                documents={documents}
+                shares={shares}
+                onShare={(p) => share.mutate(p)}
+                onMarkOpened={(id) => markOpened.mutate(id)}
+                sharing={share.isPending}
+                markingId={markOpened.isPending ? (markOpened.variables as string) : null}
+              />
+
               {/* AI advisory response (Route C answer, or Route D proposed response) */}
               {(m.ai_response || (isRouteD && (m.status === "in_review" || m.status === "assigned"))) && (
-                <div className="rounded-xl border border-emerald-200/60 dark:border-emerald-900 bg-emerald-50/40 dark:bg-emerald-950/20 overflow-hidden">
-                  <div className="flex items-center gap-2 px-4 py-2.5 border-b border-emerald-200/40 dark:border-emerald-900/60">
+                <Collapse
+                  className="border-emerald-200/60 dark:border-emerald-900 bg-emerald-50/40 dark:bg-emerald-950/20"
+                  headerClassName="border-emerald-200/40 dark:border-emerald-900/60"
+                  header={<>
                     <Sparkles className="size-3.5 text-emerald-600 dark:text-emerald-400" />
                     <span className="text-[11px] font-bold uppercase tracking-wider text-emerald-800 dark:text-emerald-300">
                       {isRouteD ? "AI Proposed Response — for Legal Manager" : "AI Advisory Response"}
@@ -505,7 +659,8 @@ function LegalMatterDetail() {
                     <span className="text-[10px] text-emerald-600/60 dark:text-emerald-400/60 ml-auto">
                       {isRouteD ? "drawn from policies, playbooks & precedents" : "Route C · answered from playbooks"}
                     </span>
-                  </div>
+                  </>}
+                >
                   {m.ai_response ? (
                     <div className="p-4 space-y-2">
                       <div className="text-xs leading-relaxed whitespace-pre-wrap text-foreground/90">{m.ai_response}</div>
@@ -529,7 +684,7 @@ function LegalMatterDetail() {
                       </Button>
                     </div>
                   )}
-                </div>
+                </Collapse>
               )}
 
               {/* Editable executive summary for approvers */}
@@ -560,16 +715,17 @@ function LegalMatterDetail() {
               )}
 
               {/* Request description */}
-              <div className="rounded-xl border bg-card overflow-hidden">
-                <div className="flex items-center gap-2 px-4 py-2.5 border-b">
+              <Collapse
+                header={<>
                   <FileText className="size-3.5 text-muted-foreground" />
                   <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">Request</span>
                   <span className="text-[10px] text-muted-foreground/60 ml-auto">{typeLabel}</span>
-                </div>
+                </>}
+              >
                 <div className="p-4 text-xs leading-relaxed whitespace-pre-wrap text-foreground/90">
                   {m.description}
                 </div>
-              </div>
+              </Collapse>
 
               {/* In-matter chat — isolated to this matter, supports @-tagging */}
               <MatterChat
@@ -586,7 +742,8 @@ function LegalMatterDetail() {
               {/* Action panel */}
               <ActionPanel
                 m={m}
-                busy={busy}
+                role={role}
+                busy={busy || handback.isPending}
                 assignName={assignName} setAssignName={setAssignName}
                 assignEmail={assignEmail} setAssignEmail={setAssignEmail}
                 actionNotes={actionNotes} setActionNotes={setActionNotes}
@@ -594,20 +751,25 @@ function LegalMatterDetail() {
                 onAdvance={(status, notes) => advance.mutate({ status, notes })}
                 onArchive={() => archive.mutate()}
                 onEscalate={(reason) => escalate.mutate(reason)}
+                onSendToSubmitter={(note) => handback.mutate({ awaiting_role: "submitter", note })}
+                onSendToReviewer={(note) => handback.mutate({ awaiting_role: "reviewer", note })}
+                onClientApproved={(note) => handback.mutate({ awaiting_role: "reviewer", note, client_approved: true })}
               />
 
               {/* Details */}
-              <div className="rounded-xl border bg-card p-4 space-y-2.5 text-xs">
-                <div className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground mb-1">Details</div>
+              <Collapse
+                header={<span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">Details</span>}
+              >
+              <div className="p-4 space-y-2.5 text-xs">
                 <DetailRow label="Status" value={STATUS_META[m.status]?.label ?? m.status} />
                 <DetailRow label="Type" value={typeLabel} />
                 <DetailRow label="Priority" value={m.priority} cap />
-                <DetailRow label="Requestor" value={m.requestor_name ?? "—"} sub={m.requestor_email} />
-                <DetailRow label="Assigned to" value={m.assigned_to_name ?? "Unassigned"} sub={m.assigned_to_email} />
+                <DetailRow label="Requestor" value={m.requestor_name ?? "—"} sub={maskDemoEmail(m.requestor_email) || undefined} />
+                <DetailRow label="Assigned to" value={m.assigned_to_name ?? "Unassigned"} sub={maskDemoEmail(m.assigned_to_email) || undefined} />
                 {m.due_date && <DetailRow label="Needed by" value={format(new Date(m.due_date), "d MMM yyyy")} />}
                 <DetailRow label="Submitted" value={m.created_at ? format(new Date(m.created_at), "d MMM yyyy, HH:mm") : "—"} />
                 {m.contract_value != null && <DetailRow label="Contract value" value={Number(m.contract_value).toLocaleString()} />}
-                {m.approved_at && <DetailRow label="Approved" value={format(new Date(m.approved_at), "d MMM yyyy, HH:mm")} sub={m.approved_by_name} />}
+                {m.approved_at && <DetailRow label="Approved" value={format(new Date(m.approved_at), "d MMM yyyy, HH:mm")} sub={maskDemoEmail(m.approved_by_name) || undefined} />}
                 {m.referred_to_gc && <DetailRow label="Referred" value="To General Counsel" />}
                 {taggedFunctions.length > 0 && <DetailRow label="Looped in" value={taggedFunctions.join(", ")} />}
                 {m.ai_route_reasoning && (
@@ -619,19 +781,42 @@ function LegalMatterDetail() {
                   </div>
                 )}
               </div>
+              </Collapse>
 
               {/* Lifecycle — expiry / renewal / retention (Step 6) */}
               {terminal && (
                 <LifecyclePanel m={m} saving={lifecycle.isPending} onSave={(p) => lifecycle.mutate(p)} />
               )}
 
+              {/* Matter Binder — combine every document on this matter into one
+                  indexed export (the Living Vault, Step 6). */}
+              {documents.length > 0 && (
+                <Collapse
+                  defaultOpen={false}
+                  header={<>
+                    <BookOpen className="size-3.5 text-muted-foreground" />
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">Matter Binder</span>
+                  </>}
+                >
+                  <div className="p-4 space-y-2">
+                    <p className="text-[11px] text-muted-foreground leading-relaxed">
+                      Combine every document on this matter into one indexed export — restricted documents are listed but withheld.
+                    </p>
+                    <Button size="sm" variant="outline" className="w-full h-7 text-[11px] gap-1.5" disabled={binder.isPending} onClick={() => binder.mutate()}>
+                      {binder.isPending ? <Loader2 className="size-3 animate-spin" /> : <BookOpen className="size-3" />} Generate &amp; download
+                    </Button>
+                  </div>
+                </Collapse>
+              )}
+
               {/* Audit trail */}
-              <div className="rounded-xl border bg-card overflow-hidden">
-                <div className="flex items-center gap-2 px-4 py-2.5 border-b">
+              <Collapse
+                header={<>
                   <Clock className="size-3.5 text-muted-foreground" />
                   <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">Audit Trail</span>
-                  <span className="text-[10px] text-muted-foreground/50 ml-auto">unalterable</span>
-                </div>
+                  <span className="text-[10px] text-muted-foreground/50 ml-auto">unalterable · {events.length}</span>
+                </>}
+              >
                 <div className="p-4">
                   <div className="space-y-0 relative">
                     <div className="absolute left-[5px] top-1 bottom-1 w-px bg-border" />
@@ -642,7 +827,7 @@ function LegalMatterDetail() {
                           {eventLabel(ev)}
                         </div>
                         <div className="text-[10px] text-muted-foreground mt-0.5">
-                          {ev.actor_name ?? "System"} · {ev.created_at ? format(new Date(ev.created_at), "d MMM, HH:mm") : ""}
+                          {maskDemoEmail(ev.actor_name) || "System"} · {ev.created_at ? format(new Date(ev.created_at), "d MMM, HH:mm") : ""}
                         </div>
                       </div>
                     ))}
@@ -651,7 +836,7 @@ function LegalMatterDetail() {
                     )}
                   </div>
                 </div>
-              </div>
+              </Collapse>
             </div>
           </div>
         </div>
@@ -668,7 +853,9 @@ function eventLabel(ev: any): string {
     case "escalated":        return `Escalated to human review — re-routed to Route ${ev.payload?.route ?? "D"}`;
     case "document_uploaded":return `Document uploaded: ${ev.payload?.file_name ?? "file"}`;
     case "ai_review_completed": return `AI first-cut review — ${ev.payload?.verdict === "red_flag" ? "red flags found" : ev.payload?.verdict === "caution" ? "cautions raised" : "compliant"}`;
-    case "suggestion_accepted": return `AI suggested edit applied — ${ev.payload?.ref ?? "clause"}`;
+    case "counterparty_review_completed": return `AI reviewed counterparty markup — ${ev.payload?.verdict === "red_flag" ? "risky changes proposed" : ev.payload?.verdict === "caution" ? "changes need negotiation" : "acceptable changes"}`;
+    case "suggestion_accepted": return `AI suggested edit applied${ev.payload?.edited ? " (reviewer-amended)" : ""} — ${ev.payload?.ref ?? "clause"}`;
+    case "suggestion_edited":   return `Suggested edit amended by reviewer — ${ev.payload?.ref ?? "clause"}`;
     case "version_created":     return `Amended version v${ev.payload?.version ?? "?"} created — ${ev.payload?.applied ?? 0} change${ev.payload?.applied === 1 ? "" : "s"} applied`;
     case "document_deleted":    return `Document deleted${ev.payload?.file_name ? ` — ${ev.payload.file_name}` : ""}`;
     case "ai_response_generated": return "AI proposed response drafted";
@@ -677,6 +864,9 @@ function eventLabel(ev: any): string {
     case "kb_published":     return `Published to knowledge base: ${ev.payload?.title ?? ""}`;
     case "shared_external":  return `Sent to counterparty (${ev.payload?.recipient ?? ""})`;
     case "share_downloaded": return "Counterparty opened the shared package";
+    case "binder_generated": return `Matter binder exported — ${ev.payload?.documents ?? 0} document${ev.payload?.documents === 1 ? "" : "s"} combined`;
+    case "sent_to_submitter": return `Sent back to submitter${ev.payload?.note ? " — " + ev.payload.note : ""}`;
+    case "sent_to_reviewer":  return ev.payload?.client_approved ? "Submitter marked this approved by client" : `Sent to the reviewer${ev.payload?.note ? " — " + ev.payload.note : ""}`;
     case "status_changed":   return `${STATUS_META[ev.from_status]?.label ?? ev.from_status ?? ""} → ${STATUS_META[ev.to_status]?.label ?? ev.to_status}`;
     case "archived":         return "Archived to the vault";
     default:                 return ev.event_type;
@@ -695,8 +885,22 @@ function DetailRow({ label, value, sub, cap }: { label: string; value: string; s
   );
 }
 
+// Chain-of-command: General Counsel owns assignment, final sign-off, and the
+// routing decisions around it (escalate/file at intake, archive after
+// approval); the Reviewer / Legal team member owns the hands-on document work.
+const ACTION_REQUIRED_ROLE: Record<string, LegalRole> = {
+  resolved:            "general_counsel",
+  pending_assignment:  "general_counsel",
+  assigned:            "reviewer",
+  in_review:           "reviewer",
+  pending_approval:    "general_counsel",
+  rejected:            "reviewer",
+  approved:            "general_counsel",
+};
+
 function ActionPanel(props: {
   m: any;
+  role: LegalRole;
   busy: boolean;
   assignName: string; setAssignName: (v: string) => void;
   assignEmail: string; setAssignEmail: (v: string) => void;
@@ -705,8 +909,16 @@ function ActionPanel(props: {
   onAdvance: (status: string, notes?: string) => void;
   onArchive: () => void;
   onEscalate: (reason?: string) => void;
+  onSendToSubmitter: (note?: string) => void;
+  onSendToReviewer: (note?: string) => void;
+  onClientApproved: (note?: string) => void;
 }) {
-  const { m, busy, assignName, setAssignName, assignEmail, setAssignEmail, actionNotes, setActionNotes } = props;
+  const { m, role, busy, assignName, setAssignName, assignEmail, setAssignEmail, actionNotes, setActionNotes } = props;
+
+  // Handback loop state: within assigned/in_review the ball is either with the
+  // reviewer (default) or handed to the submitter for a client round.
+  const inLoop = m.status === "assigned" || m.status === "in_review";
+  const submitterTurn = inLoop && m.awaiting_role === "submitter";
 
   const notesBox = (placeholder: string) => (
     <textarea
@@ -790,9 +1002,12 @@ function ActionPanel(props: {
       body = (
         <>
           <p className="text-[11px] text-muted-foreground leading-relaxed">
-            When the review is complete, send it up for e-approval — the AI drafts an executive summary for the approver automatically.
+            Review with the AI Co-Pilot, then either hand the draft back to the submitter for the client round, or send it up for e-approval — the AI drafts an executive summary for the approver automatically.
           </p>
-          {notesBox("Review notes (optional)…")}
+          {notesBox("Remark — travels with whichever action you take…")}
+          <Button size="sm" variant="outline" className="w-full h-8 text-xs gap-1.5" disabled={busy} onClick={() => props.onSendToSubmitter(actionNotes.trim() || undefined)}>
+            {spinner || <RotateCcw className="size-3.5" />} Send back to Submitter
+          </Button>
           <Button size="sm" className="w-full h-8 text-xs gap-1.5" disabled={busy} onClick={() => props.onAdvance("pending_approval", actionNotes.trim() || undefined)}>
             {spinner || <Send className="size-3.5" />} Submit for Approval
           </Button>
@@ -883,6 +1098,78 @@ function ActionPanel(props: {
       body = <p className="text-xs text-muted-foreground italic">No action required.</p>;
   }
 
+  // Each status has one required seat: General Counsel (assign / approve /
+  // escalate-or-file routing) or Reviewer (the hands-on document work) — except
+  // when the reviewer has handed the draft to the submitter for a client round,
+  // which makes the submitter the acting seat until they hand it back.
+  const requiredRole: LegalRole | undefined = submitterTurn ? "submitter" : ACTION_REQUIRED_ROLE[m.status];
+
+  if (submitterTurn && role === "submitter") {
+    title = "Client Round — Your Turn";
+    body = (
+      <>
+        <p className="text-[11px] text-muted-foreground leading-relaxed">
+          The reviewed draft is with you. Download it from <span className="font-semibold text-foreground">Documents</span> and send it to your counterparty.
+          When they reply, upload their file via <span className="font-semibold text-foreground">Counterparty markup</span> — it goes straight back to the reviewer.
+          Or close the round below.
+        </p>
+        {notesBox("Remark — e.g. client comments, approval note…")}
+        <Button size="sm" variant="outline" className="w-full h-8 text-xs gap-1.5" disabled={busy} onClick={() => props.onSendToReviewer(actionNotes.trim() || undefined)}>
+          {spinner || <Send className="size-3.5" />} Send back to Reviewer
+        </Button>
+        <Button size="sm" className="w-full h-8 text-xs gap-1.5 bg-emerald-600 hover:bg-emerald-700" disabled={busy} onClick={() => props.onClientApproved(actionNotes.trim() || undefined)}>
+          {spinner || <CheckCircle2 className="size-3.5" />} Approved by Client
+        </Button>
+      </>
+    );
+    return (
+      <div className="rounded-xl border-2 border-indigo-200/60 dark:border-indigo-900 bg-card overflow-hidden">
+        <div className="flex items-center gap-2 px-4 py-2.5 border-b bg-indigo-50/50 dark:bg-indigo-950/30">
+          <Scale className="size-3.5 text-indigo-600 dark:text-indigo-400" />
+          <span className="text-[11px] font-bold uppercase tracking-wider text-indigo-800 dark:text-indigo-300">{title}</span>
+        </div>
+        <div className="p-4 space-y-2.5">{body}</div>
+      </div>
+    );
+  }
+
+  if (requiredRole && role !== requiredRole) {
+    const tier = approvalTierFor(m.contract_value, m.is_material);
+    return (
+      <div className="rounded-xl border-2 border-indigo-200/60 dark:border-indigo-900 bg-card overflow-hidden">
+        <div className="flex items-center gap-2 px-4 py-2.5 border-b bg-indigo-50/50 dark:bg-indigo-950/30">
+          <Scale className="size-3.5 text-indigo-600 dark:text-indigo-400" />
+          <span className="text-[11px] font-bold uppercase tracking-wider text-indigo-800 dark:text-indigo-300">{title}</span>
+          {inLoop && m.awaiting_role && (
+            <span className="ml-auto text-[9px] font-bold uppercase tracking-wider text-indigo-600/70 dark:text-indigo-400/70 shrink-0">{m.awaiting_role}'s turn</span>
+          )}
+        </div>
+        <div className="p-4 space-y-2.5 text-[11px] text-muted-foreground leading-relaxed">
+          <p>This step is performed by <span className="font-semibold text-foreground">{ROLE_LABEL[requiredRole]}</span> — switch to that role above to act on it.</p>
+          {m.status === "pending_approval" && (
+            <div className="rounded-lg bg-muted/60 px-3 py-2 flex items-center gap-2">
+              <UserCheck className="size-3.5 shrink-0 text-muted-foreground" />
+              <span>Awaiting: <span className="font-semibold text-foreground">{tier.label}</span></span>
+            </div>
+          )}
+          {m.status === "rejected" && m.rejection_reason && (
+            <div className="rounded-lg bg-red-50 dark:bg-red-900/20 ring-1 ring-red-200/60 dark:ring-red-900 px-3 py-2 text-red-800 dark:text-red-300">
+              <span className="font-bold">Rationale:</span> {m.rejection_reason}
+            </div>
+          )}
+          {/* A handback to the submitter stays theirs until THEY act — but the
+              reviewer keeps control: they can pull the matter back explicitly
+              (e.g. sent back by mistake, or new redlines to add mid-round). */}
+          {submitterTurn && role === "reviewer" && (
+            <Button size="sm" variant="outline" className="w-full h-8 text-xs gap-1.5" disabled={busy} onClick={() => props.onSendToReviewer("Reviewer took the matter back.")}>
+              <RotateCcw className="size-3.5" /> Take it back to my desk
+            </Button>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="rounded-xl border-2 border-indigo-200/60 dark:border-indigo-900 bg-card overflow-hidden">
       <div className="flex items-center gap-2 px-4 py-2.5 border-b bg-indigo-50/50 dark:bg-indigo-950/30">
@@ -934,26 +1221,43 @@ function reviewCounts(review: any): { red_flag: number; caution: number; complia
   return counts;
 }
 
+const DOC_ROLE_LABEL: Record<string, string> = {
+  submitted: "submitted",
+  reference: "reference",
+  executed: "executed",
+  draft: "draft",
+  counterparty_markup: "counterparty markup",
+};
+
 function DocumentsCard({
+  role,
+  matterStatus,
   documents,
   uploading,
+  uploadingMarkup,
   reviewingDocId,
   onUpload,
+  onUploadMarkup,
   onRerun,
   onSetAccess,
   onDelete,
   deletingDocId,
 }: {
+  role: LegalRole;
+  matterStatus: string;
   documents: any[];
   uploading: boolean;
+  uploadingMarkup: boolean;
   reviewingDocId: string | null;
   onUpload: (f: File) => void;
-  onRerun: (docId: string) => void;
+  onUploadMarkup: (f: File) => void;
+  onRerun: (docId: string, isMarkup: boolean) => void;
   onSetAccess: (documentId: string, level: "standard" | "restricted") => void;
   onDelete: (documentId: string) => void;
   deletingDocId: string | null;
 }) {
   const fileRef = useRef<HTMLInputElement>(null);
+  const markupFileRef = useRef<HTMLInputElement>(null);
   const [openDocId, setOpenDocId] = useState<string | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
@@ -981,16 +1285,53 @@ function DocumentsCard({
             e.target.value = "";
           }}
         />
-        <Button
-          size="sm"
-          variant="outline"
-          className="ml-auto h-7 text-[11px] gap-1.5 px-2"
-          disabled={uploading || !!reviewingDocId}
-          onClick={() => fileRef.current?.click()}
-        >
-          {uploading ? <Loader2 className="size-3 animate-spin" /> : <Paperclip className="size-3" />}
-          Upload
-        </Button>
+        <input
+          ref={markupFileRef}
+          type="file"
+          accept=".pdf,.doc,.docx,.txt"
+          className="hidden"
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f) onUploadMarkup(f);
+            e.target.value = "";
+          }}
+        />
+        <div className="ml-auto flex items-center gap-1.5">
+          {/* Uploading a counterparty's markup is the submitter's job — they're the
+              one relaying what came back from the other side. Only offer it once
+              there's a non-restricted, non-markup document to compare against
+              (matches the same guard SharePanel uses for "shareable"), and only
+              while the matter is actually in the review loop — otherwise it sets
+              awaiting_role="reviewer" with no handback banner able to show it. */}
+          {role === "submitter" &&
+            (matterStatus === "assigned" || matterStatus === "in_review") &&
+            documents.some((d: any) => d.doc_role !== "counterparty_markup" && d.access_level !== "restricted") && (
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 text-[11px] gap-1.5 px-2"
+              disabled={uploadingMarkup || !!reviewingDocId}
+              onClick={() => markupFileRef.current?.click()}
+              title="Upload what the counterparty sent back (e.g. their redlined NDA) — AI compares it against our original"
+            >
+              {uploadingMarkup ? <Loader2 className="size-3 animate-spin" /> : <MessageSquareWarning className="size-3" />}
+              Counterparty markup
+            </Button>
+          )}
+          {/* Attaching working/reference documents is the reviewer's job. */}
+          {role === "reviewer" && (
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 text-[11px] gap-1.5 px-2"
+              disabled={uploading || !!reviewingDocId}
+              onClick={() => fileRef.current?.click()}
+            >
+              {uploading ? <Loader2 className="size-3 animate-spin" /> : <Paperclip className="size-3" />}
+              Upload
+            </Button>
+          )}
+        </div>
       </div>
 
       {documents.length === 0 && !uploading ? (
@@ -1001,10 +1342,16 @@ function DocumentsCard({
         <div className="divide-y">
           {documents.map((d: any) => {
             const review = d.ai_review;
-            const counts = review ? reviewCounts(review) : null;
+            // Only treat the document as "reviewed" once a review has actually completed —
+            // a template-generated doc pre-seeds ai_review with just documentText (no
+            // clauses, status "none") so the viewer has content to show before any AI
+            // analysis has run; that must still show "Run AI review", not empty badges.
+            const hasReview = d.ai_review_status === "done" && !!review;
+            const counts = hasReview ? reviewCounts(review) : null;
             const reviewing = reviewingDocId === d.id;
             const open = openDocId === d.id;
             const verdict = review?.verdict && CLAUSE_SEVERITY[review.verdict];
+            const isMarkup = d.doc_role === "counterparty_markup";
             return (
               <div key={d.id}>
                 <div className="flex items-center gap-3 px-4 py-2.5">
@@ -1012,19 +1359,23 @@ function DocumentsCard({
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-1.5">
                       <span className="text-xs font-medium truncate">{d.file_name}</span>
-                      {/* Version tag: Original (v1) vs amended versions; Latest badge on the newest */}
-                      {(d.parent_document_id == null && (Number(d.version) || 1) === 1) ? (
+                      {/* Version tag: Original (v1) vs amended versions; Latest badge on the newest.
+                          Counterparty markup gets its own tag instead — it's not part of our
+                          version chain, it's what THEY sent back. */}
+                      {isMarkup ? (
+                        <span className="shrink-0 rounded bg-amber-50 dark:bg-amber-900/30 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-amber-700 dark:text-amber-300">Counterparty</span>
+                      ) : (d.parent_document_id == null && (Number(d.version) || 1) === 1) ? (
                         <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-muted-foreground">Original</span>
                       ) : (
                         <span className="shrink-0 rounded bg-indigo-50 dark:bg-indigo-900/30 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-indigo-700 dark:text-indigo-300">v{d.version}</span>
                       )}
-                      {(Number(d.version) || 1) === latestByGroup.get(d.parent_document_id ?? d.id) && latestByGroup.get(d.parent_document_id ?? d.id)! > 1 && (
+                      {!isMarkup && (Number(d.version) || 1) === latestByGroup.get(d.parent_document_id ?? d.id) && latestByGroup.get(d.parent_document_id ?? d.id)! > 1 && (
                         <span className="shrink-0 rounded bg-emerald-100 dark:bg-emerald-900/40 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-emerald-700 dark:text-emerald-300">Latest</span>
                       )}
                     </div>
                     <div className="text-[10px] text-muted-foreground">
-                      {formatBytes(d.size_bytes)}{d.size_bytes ? " · " : ""}{d.doc_role}
-                      {d.uploaded_by_name ? ` · ${d.uploaded_by_name}` : ""}
+                      {formatBytes(d.size_bytes)}{d.size_bytes ? " · " : ""}{DOC_ROLE_LABEL[d.doc_role] ?? d.doc_role}
+                      {d.uploaded_by_name ? ` · ${maskDemoEmail(d.uploaded_by_name) || d.uploaded_by_name}` : ""}
                       {d.version_note ? ` · ${d.version_note}` : ""}
                     </div>
                   </div>
@@ -1034,7 +1385,7 @@ function DocumentsCard({
                     <span className="inline-flex items-center gap-1.5 text-[10px] text-violet-600 dark:text-violet-400 font-medium shrink-0">
                       <Loader2 className="size-3 animate-spin" /> AI reviewing…
                     </span>
-                  ) : review && counts ? (
+                  ) : hasReview && counts ? (
                     <button
                       onClick={() => setOpenDocId(open ? null : d.id)}
                       className="inline-flex items-center gap-1.5 shrink-0 group"
@@ -1058,20 +1409,28 @@ function DocumentsCard({
                       <ChevronDown className={cn("size-3.5 text-muted-foreground group-hover:text-foreground transition-transform", open && "rotate-180")} />
                     </button>
                   ) : d.ai_review_status === "failed" ? (
+                    role === "reviewer" ? (
+                      <button
+                        onClick={() => onRerun(d.id, isMarkup)}
+                        className="text-[10px] text-red-600 dark:text-red-400 font-medium hover:underline shrink-0"
+                      >
+                        Review failed — retry
+                      </button>
+                    ) : (
+                      <span className="text-[10px] text-red-600/70 dark:text-red-400/70 font-medium shrink-0">Review failed</span>
+                    )
+                  ) : role === "reviewer" ? (
                     <button
-                      onClick={() => onRerun(d.id)}
-                      className="text-[10px] text-red-600 dark:text-red-400 font-medium hover:underline shrink-0"
-                    >
-                      Review failed — retry
-                    </button>
-                  ) : (
-                    <button
-                      onClick={() => onRerun(d.id)}
+                      onClick={() => onRerun(d.id, isMarkup)}
                       disabled={!!reviewingDocId}
                       className="inline-flex items-center gap-1 text-[10px] text-violet-600 dark:text-violet-400 font-medium hover:underline shrink-0"
                     >
-                      <Bot className="size-3" /> Run AI review
+                      <Bot className="size-3" /> {isMarkup ? "Compare to original" : "Run AI review"}
                     </button>
+                  ) : (
+                    <span className="inline-flex items-center gap-1 text-[10px] text-muted-foreground/60 shrink-0" title="Only the reviewer can run AI analysis">
+                      <Bot className="size-3" /> Awaiting reviewer
+                    </span>
                   )}
 
                   {/* Open the document viewer (read + comment; run AI analysis inside) */}
@@ -1135,8 +1494,14 @@ function DocumentsCard({
                 </div>
 
                 {/* Expanded AI review panel */}
-                {open && review && (
+                {open && hasReview && review && (
                   <div className="px-4 pb-4 space-y-2">
+                    {review.counterpartyReview && (
+                      <p className="text-[10px] text-muted-foreground flex items-center gap-1">
+                        <MessageSquareWarning className="size-3 text-amber-500" />
+                        Compared against: <span className="font-medium">{review.compareAgainst ?? "our original"}</span>
+                      </p>
+                    )}
                     {verdict && (
                       <div className={cn("rounded-lg border px-3 py-2 flex items-start gap-2.5", verdict.cls)}>
                         <verdict.icon className="size-3.5 shrink-0 mt-0.5" />
@@ -1162,13 +1527,13 @@ function DocumentsCard({
                             </div>
                             {c.excerpt && (
                               <p className="text-[11px] italic text-muted-foreground border-l-2 border-current/20 pl-2 my-1.5">
-                                "{c.excerpt}"
+                                {review.counterpartyReview ? "Their proposed wording: " : ""}"{c.excerpt}"
                               </p>
                             )}
                             <p className="text-[11px] leading-relaxed">{c.comment}</p>
                             {c.suggestion && (
                               <p className="text-[11px] leading-relaxed mt-1 font-medium">
-                                <span className="opacity-60">Suggested position:</span> {c.suggestion}
+                                <span className="opacity-60">{review.counterpartyReview ? "Our counter-position:" : "Suggested position:"}</span> {c.suggestion}
                               </p>
                             )}
                           </div>
@@ -1187,6 +1552,148 @@ function DocumentsCard({
 }
 
 // ---------------------------------------------------------------------------
+// Secure external sharing — send drafts to a counterparty and track the
+// interaction loop (dispatch timestamp, open/download status).
+// ---------------------------------------------------------------------------
+function SharePanel({ documents, shares, onShare, onMarkOpened, sharing, markingId }: {
+  documents: any[];
+  shares: any[];
+  onShare: (p: { recipient_name: string; recipient_email: string; document_ids: string[]; message?: string }) => void;
+  onMarkOpened: (shareId: string) => void;
+  sharing: boolean;
+  markingId: string | null;
+}) {
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [message, setMessage] = useState("");
+  const [selected, setSelected] = useState<string[]>([]);
+
+  // Restricted documents can't leave the app via this channel either — sharing
+  // must not be a side-door around the restricted-access control.
+  const shareable = documents.filter((d: any) => d.access_level !== "restricted");
+  const valid = name.trim().length > 0 && /\S+@\S+\.\S+/.test(email) && selected.length > 0;
+
+  function toggle(id: string) {
+    setSelected((cur) => (cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]));
+  }
+  function reset() {
+    setOpen(false); setName(""); setEmail(""); setMessage(""); setSelected([]);
+  }
+
+  return (
+    <Collapse
+      header={<>
+        <Share2 className="size-3.5 text-muted-foreground" />
+        <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">Secure External Sharing</span>
+        <span className="text-[10px] text-muted-foreground/60">· tracked dispatch &amp; open status · {shares.length}</span>
+      </>}
+    >
+      {!open && (
+        <div className="px-4 pt-3">
+          <Button
+            size="sm" variant="outline"
+            className="h-7 text-[11px] gap-1.5"
+            disabled={shareable.length === 0}
+            title={shareable.length === 0 ? "No shareable documents on this matter yet" : undefined}
+            onClick={() => setOpen(true)}
+          >
+            <Send className="size-3" /> Share with counterparty
+          </Button>
+        </div>
+      )}
+
+      {open && (
+        <div className="p-4 space-y-2.5 border-b bg-muted/10">
+          <div className="grid grid-cols-2 gap-2">
+            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Recipient name" className="rounded-lg border bg-background px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500/30" />
+            <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Recipient email" className="rounded-lg border bg-background px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500/30" />
+          </div>
+          <div>
+            <p className="text-[10px] text-muted-foreground mb-1">Documents to send:</p>
+            {shareable.length === 0 && (
+              <p className="text-[11px] text-amber-600 dark:text-amber-400 italic">
+                Every document on this matter is now restricted — nothing left to share. Close this and unrestrict a document first.
+              </p>
+            )}
+            <div className="flex flex-wrap gap-1.5">
+              {shareable.map((d: any) => (
+                <button
+                  key={d.id}
+                  type="button"
+                  onClick={() => toggle(d.id)}
+                  className={cn(
+                    "rounded-lg border px-2 py-1 text-[11px]",
+                    selected.includes(d.id)
+                      ? "border-indigo-300 bg-indigo-50 text-indigo-700 dark:bg-indigo-900/20 dark:text-indigo-300"
+                      : "text-muted-foreground hover:text-foreground"
+                  )}
+                >
+                  {selected.includes(d.id) ? <Check className="size-3 inline mr-1" /> : null}{d.file_name}
+                </button>
+              ))}
+            </div>
+          </div>
+          <textarea
+            value={message}
+            onChange={(e) => setMessage(e.target.value)}
+            rows={2}
+            placeholder="Note to the counterparty (optional)"
+            className="w-full rounded-lg border bg-background px-3 py-2 text-xs resize-none focus:outline-none focus:ring-2 focus:ring-indigo-500/30"
+          />
+          <div className="flex items-center justify-end gap-2">
+            <button onClick={reset} className="text-[11px] text-muted-foreground hover:text-foreground">Cancel</button>
+            <Button
+              size="sm" className="h-7 text-[11px] gap-1.5"
+              disabled={!valid || sharing}
+              onClick={() => {
+                onShare({ recipient_name: name.trim(), recipient_email: email.trim(), document_ids: selected, message: message.trim() || undefined });
+                reset();
+              }}
+            >
+              {sharing ? <Loader2 className="size-3 animate-spin" /> : <Send className="size-3" />} Send
+            </Button>
+          </div>
+        </div>
+      )}
+
+      <div className="divide-y">
+        {shares.length === 0 ? (
+          <p className="px-4 py-4 text-xs text-muted-foreground/60 italic">Nothing sent externally yet.</p>
+        ) : (
+          shares.map((s: any) => (
+            <div key={s.id} className="px-4 py-2.5 flex items-center gap-2.5 text-xs">
+              <div className="min-w-0 flex-1">
+                <div className="font-medium truncate">
+                  {s.recipient_name} <span className="text-muted-foreground font-normal">· {s.recipient_email}</span>
+                </div>
+                <div className="text-[10px] text-muted-foreground truncate">
+                  {(s.document_names ?? []).join(", ")} · sent {s.sent_at ? formatDistanceToNow(new Date(s.sent_at), { addSuffix: true }) : "—"}
+                </div>
+              </div>
+              {s.downloaded_at ? (
+                <span className="text-[10px] text-emerald-600 dark:text-emerald-400 font-medium shrink-0">
+                  opened {formatDistanceToNow(new Date(s.downloaded_at), { addSuffix: true })}
+                </span>
+              ) : (
+                <button
+                  onClick={() => onMarkOpened(s.id)}
+                  disabled={markingId === s.id}
+                  className="text-[10px] text-muted-foreground hover:text-foreground shrink-0"
+                  title="In production this fires automatically when the counterparty opens the access-controlled link — click to simulate it for the demo"
+                >
+                  {markingId === s.id ? "…" : "mark opened (demo)"}
+                </button>
+              )}
+            </div>
+          ))
+        )}
+      </div>
+    </Collapse>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Editable AI executive summary (Cluster 4)
 // ---------------------------------------------------------------------------
 function ExecSummaryPanel({ summary, editable, saving, onSave }: {
@@ -1195,18 +1702,21 @@ function ExecSummaryPanel({ summary, editable, saving, onSave }: {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(summary);
   return (
-    <div className="rounded-xl border border-blue-200/60 dark:border-blue-900 bg-blue-50/40 dark:bg-blue-950/20 overflow-hidden">
-      <div className="flex items-center gap-2 px-4 py-2.5 border-b border-blue-200/40 dark:border-blue-900/60">
+    <Collapse
+      className="border-blue-200/60 dark:border-blue-900 bg-blue-50/40 dark:bg-blue-950/20"
+      headerClassName="border-blue-200/40 dark:border-blue-900/60"
+      header={<>
         <ClipboardCheck className="size-3.5 text-blue-600 dark:text-blue-400" />
         <span className="text-[11px] font-bold uppercase tracking-wider text-blue-800 dark:text-blue-300">
           e-Approval · Executive Summary
         </span>
         {editable && !editing && (
-          <button onClick={() => { setDraft(summary); setEditing(true); }} className="ml-auto text-[11px] text-blue-700 dark:text-blue-300 inline-flex items-center gap-1 hover:underline">
+          <button onClick={(e) => { e.stopPropagation(); setDraft(summary); setEditing(true); }} className="ml-auto text-[11px] text-blue-700 dark:text-blue-300 inline-flex items-center gap-1 hover:underline">
             <Pencil className="size-3" /> Edit
           </button>
         )}
-      </div>
+      </>}
+    >
       {editing ? (
         <div className="p-4 space-y-2">
           <textarea
@@ -1225,7 +1735,7 @@ function ExecSummaryPanel({ summary, editable, saving, onSave }: {
       ) : (
         <div className="p-4 text-xs leading-relaxed whitespace-pre-wrap text-foreground/90">{summary}</div>
       )}
-    </div>
+    </Collapse>
   );
 }
 
@@ -1241,11 +1751,12 @@ function RouteDToolbar({ m, taggedFunctions, onRefer, onTag, referBusy, tagBusy 
   const [referOpen, setReferOpen] = useState(false);
   const [note, setNote] = useState("");
   return (
-    <div className="rounded-xl border bg-card overflow-hidden">
-      <div className="flex items-center gap-2 px-4 py-2.5 border-b">
+    <Collapse
+      header={<>
         <Users className="size-3.5 text-muted-foreground" />
         <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">Advisory Collaboration</span>
-      </div>
+      </>}
+    >
       <div className="p-4 space-y-3">
         {/* Cross-functional tagging */}
         <div>
@@ -1293,7 +1804,7 @@ function RouteDToolbar({ m, taggedFunctions, onRefer, onTag, referBusy, tagBusy 
           )}
         </div>
       </div>
-    </div>
+    </Collapse>
   );
 }
 
@@ -1307,11 +1818,14 @@ function PublishKbPanel({ saving, onPublish }: {
   const [title, setTitle] = useState("");
   const [takeaways, setTakeaways] = useState("");
   return (
-    <div className="rounded-xl border border-violet-200/60 dark:border-violet-900 bg-violet-50/40 dark:bg-violet-950/20 overflow-hidden">
-      <div className="flex items-center gap-2 px-4 py-2.5 border-b border-violet-200/40 dark:border-violet-900/60">
+    <Collapse
+      className="border-violet-200/60 dark:border-violet-900 bg-violet-50/40 dark:bg-violet-950/20"
+      headerClassName="border-violet-200/40 dark:border-violet-900/60"
+      header={<>
         <BookOpen className="size-3.5 text-violet-600 dark:text-violet-400" />
         <span className="text-[11px] font-bold uppercase tracking-wider text-violet-800 dark:text-violet-300">Legal Knowledge Base</span>
-      </div>
+      </>}
+    >
       <div className="p-4">
         {!open ? (
           <>
@@ -1335,7 +1849,7 @@ function PublishKbPanel({ saving, onPublish }: {
           </div>
         )}
       </div>
-    </div>
+    </Collapse>
   );
 }
 
@@ -1370,14 +1884,16 @@ function MatterChat({ comments, value, setValue, posting, onPost }: {
           return (
             <div key={c.id} className="px-4 py-3">
               <div className="flex items-center gap-2 mb-1 flex-wrap">
-                <span className={cn("text-[11px] font-semibold", isAi && "text-violet-700 dark:text-violet-300")}>{c.author_name ?? "User"}</span>
+                <span className={cn("text-[11px] font-semibold", isAi && "text-violet-700 dark:text-violet-300")}>{maskDemoEmail(c.author_name) || "User"}</span>
                 {c.function_tag && (
                   <span className="text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-600 dark:bg-emerald-900/20 dark:text-emerald-400">{c.function_tag}</span>
                 )}
                 {c.comment_type && c.comment_type !== "comment" && (
                   <span className={cn(
                     "text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded",
-                    c.comment_type === "rejection_reason" ? "bg-red-50 text-red-600 dark:bg-red-900/20 dark:text-red-400" : "bg-muted text-muted-foreground"
+                    c.comment_type === "rejection_reason" ? "bg-red-50 text-red-600 dark:bg-red-900/20 dark:text-red-400"
+                      : c.comment_type === "client_approved" ? "bg-emerald-50 text-emerald-600 dark:bg-emerald-900/20 dark:text-emerald-400"
+                      : "bg-muted text-muted-foreground"
                   )}>
                     {c.comment_type.replace("_", " ")}
                   </span>
@@ -1433,11 +1949,12 @@ function LifecyclePanel({ m, saving, onSave }: {
   const [expiry, setExpiry] = useState(m.expiry_date ? String(m.expiry_date).slice(0, 10) : "");
   const [retention, setRetention] = useState<string>(m.retention_until ? "" : "7");
   return (
-    <div className="rounded-xl border bg-card overflow-hidden">
-      <div className="flex items-center gap-2 px-4 py-2.5 border-b">
+    <Collapse
+      header={<>
         <CalendarClock className="size-3.5 text-muted-foreground" />
         <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">Lifecycle</span>
-      </div>
+      </>}
+    >
       <div className="p-4 space-y-3 text-xs">
         {m.expiry_date && (
           <DetailRow label="Expiry / renewal" value={format(new Date(m.expiry_date), "d MMM yyyy")} />
@@ -1466,6 +1983,6 @@ function LifecyclePanel({ m, saving, onSave }: {
           </Button>
         </div>
       </div>
-    </div>
+    </Collapse>
   );
 }

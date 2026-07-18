@@ -1,6 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { assertRowTenant, getCallerTenant } from "@/lib/tenant.functions";
 import { generateWithFallback } from "@/lib/gemini";
 import { placeFixtures } from "@/lib/layout/rules";
 import { DEFAULT_FRAME_EXTRACTION_PROMPT } from "@/lib/layout/prompt";
@@ -28,6 +29,25 @@ import type {
 
 const storeTypeSchema = z.enum(["standard", "small", "kiosk", "cafe"]);
 
+/**
+ * Tier-1 tenant guard for by-id layout job access. Fetches the job, then
+ * requires its tenant to match the caller's — a cross-tenant id behaves like a
+ * missing row. select("*") keeps this tolerant of the pre-migration schema
+ * (20260722_layout_tenant_scoping.sql): without a tenant_id column the job is
+ * treated as unowned and allowed through, matching assertRowTenant's NULL rule.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function requireTenantJob(supabase: any, userId: string, jobId: string): Promise<any> {
+  const { data: job, error } = await supabase
+    .from("layout_jobs")
+    .select("*")
+    .eq("id", jobId)
+    .single();
+  if (error || !job) throw new Error("Job not found");
+  assertRowTenant(job.tenant_id ?? null, (await getCallerTenant(userId)).tenantId);
+  return job;
+}
+
 // ── Create + list ─────────────────────────────────────────────────────
 
 export const createLayoutJob = createServerFn({ method: "POST" })
@@ -53,7 +73,12 @@ export const listLayoutJobs = createServerFn({ method: "GET" })
       .select("*")
       .order("created_at", { ascending: false });
     if (error) throw new Error(`Could not list layout jobs: ${error.message}`);
-    return (data ?? []) as LayoutJob[];
+    // App-side tenant filter (rather than .eq) so the pre-migration schema —
+    // no tenant_id column — still lists jobs as unowned instead of erroring.
+    const { tenantId } = await getCallerTenant(context.userId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rows = ((data ?? []) as any[]).filter((r) => !r.tenant_id || r.tenant_id === tenantId);
+    return rows as LayoutJob[];
   });
 
 export const getLayoutJob = createServerFn({ method: "GET" })
@@ -77,6 +102,7 @@ export const getLayoutJob = createServerFn({ method: "GET" })
         .order("created_at"),
     ]);
     if (job.error) throw new Error(`Job not found: ${job.error.message}`);
+    assertRowTenant(job.data?.tenant_id ?? null, (await getCallerTenant(context.userId)).tenantId);
     return {
       job: job.data as LayoutJob,
       frame: (frame.data ?? null) as LayoutFrameRow | null,
@@ -89,6 +115,7 @@ export const deleteLayoutJob = createServerFn({ method: "POST" })
   .inputValidator(z.object({ jobId: z.string().uuid() }))
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
+    await requireTenantJob(supabase, context.userId, data.jobId);
     const { error } = await (supabase as any).from("layout_jobs").delete().eq("id", data.jobId);
     if (error) throw new Error(`Could not delete job: ${error.message}`);
     return { ok: true };
@@ -107,6 +134,7 @@ export const uploadLayoutSketch = createServerFn({ method: "POST" })
   )
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
+    await requireTenantJob(supabase, context.userId, data.jobId);
     const { error } = await (supabase as any)
       .from("layout_jobs")
       .update({
@@ -130,12 +158,7 @@ export const digitizeLayoutSketch = createServerFn({ method: "POST" })
   .inputValidator(z.object({ jobId: z.string().uuid() }))
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
-    const { data: job, error: jobErr } = await (supabase as any)
-      .from("layout_jobs")
-      .select("*")
-      .eq("id", data.jobId)
-      .single();
-    if (jobErr || !job) throw new Error(`Job not found: ${jobErr?.message}`);
+    const job = await requireTenantJob(supabase, context.userId, data.jobId);
     if (!job.sketch_drive_url) throw new Error("No sketch uploaded for this job yet.");
 
     await (supabase as any)
@@ -228,6 +251,7 @@ export const approveLayoutFrame = createServerFn({ method: "POST" })
   .inputValidator(z.object({ jobId: z.string().uuid() }))
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
+    await requireTenantJob(supabase, context.userId, data.jobId);
     const now = new Date().toISOString();
     await (supabase as any)
       .from("layout_frames")
@@ -253,6 +277,7 @@ export const placeLayoutFixtures = createServerFn({ method: "POST" })
   )
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
+    await requireTenantJob(supabase, context.userId, data.jobId);
     const { data: frame, error: frameErr } = await (supabase as any)
       .from("layout_frames")
       .select("*")
@@ -318,6 +343,14 @@ export const setLayoutPlacementStatus = createServerFn({ method: "POST" })
   )
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
+    // Placements carry no tenant of their own — scope via the parent job.
+    const { data: placement, error: plErr } = await (supabase as any)
+      .from("layout_placements")
+      .select("id, job_id")
+      .eq("id", data.placementId)
+      .single();
+    if (plErr || !placement) throw new Error("Placement not found");
+    await requireTenantJob(supabase, context.userId, placement.job_id);
     const { error } = await (supabase as any)
       .from("layout_placements")
       .update({ status: data.status })
@@ -331,6 +364,7 @@ export const approveAllLayoutPlacements = createServerFn({ method: "POST" })
   .inputValidator(z.object({ jobId: z.string().uuid() }))
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
+    await requireTenantJob(supabase, context.userId, data.jobId);
     await (supabase as any)
       .from("layout_placements")
       .update({ status: "approved" })

@@ -1,20 +1,22 @@
-import { createFileRoute, Link, notFound } from "@tanstack/react-router";
+import { createFileRoute, Link, notFound, useNavigate } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect, useRef } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { AppShell } from "@/components/app-shell";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { ApprovalWorkflow } from "@/components/approval-workflow";
 import { AmendmentPanel } from "@/components/amendment-panel";
 import { LegalReviewView } from "@/components/legal-review-view";
 import { useRole } from "@/lib/role";
+import { useAuth } from "@/lib/auth";
 import { MD } from "@/components/md";
 import { exportExcel, exportHtmlPresentation } from "@/lib/exports";
 import { impactClasses, formatDate, statusMeta, changeTypeMeta } from "@/lib/format";
 import { sortChangesByPriority, autoBoldExecBullet } from "@/lib/change-utils";
-import { updateImpact, bulkApproveReady, generateAmendedDraft, startRegulatoryRerun, analyzeRegulatorySop, finalizeRegulatoryReport, rerunFormUpdateReport, analyzeDocForForm, finalizeFormUpdateReport, writeImpactToDoc } from "@/lib/compliance.functions";
+import { updateImpact, bulkApproveReady, generateAmendedDraft, startRegulatoryRerun, mapRegulatoryChange, finalizeRegulatoryReport, rerunFormUpdateReport, analyzeDocForForm, finalizeFormUpdateReport, writeImpactToDoc, createPolicyChangeReport } from "@/lib/compliance.functions";
 import { cn } from "@/lib/utils";
 import { diffOld, diffNew } from "@/lib/text-diff";
 import {
@@ -23,7 +25,8 @@ import {
   Scale, FileText, AlertCircle, Sparkles, ExternalLink,
   ArrowDownToLine, MoveDown, AlertTriangle, LayoutGrid,
   CircleDot, Circle, RefreshCw, PanelLeftClose, PanelLeftOpen, FileEdit,
-  MessageSquarePlus, FilePlus2, Replace,
+  MessageSquarePlus, FilePlus2, Replace, ShieldPlus, History,
+  ChevronDown, Download,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -40,18 +43,33 @@ export const Route = createFileRoute("/reports/$reportId")({
 function ReportPage() {
   const { reportId } = Route.useParams();
   const [role] = useRole();
-  // selectedId: null = Summary view, "<uuid>" = a specific change
+  // selectedId: null = Summary view; in byChange mode it's a change UUID,
+  // in byDocument mode it's the doc-group key (`sopId` or `__nokey_<title>`).
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Left panel grouping: by regulatory change (default) or by affected SOP doc.
+  const [viewMode, setViewMode] = useState<"byChange" | "byDocument">("byChange");
+  // How the amended-draft renders replaces: keep originals red+strike (review),
+  // or delete originals and insert the new text clean (finalised look).
+  const [draftMode, setDraftMode] = useState<"clean" | "trackChanges">("trackChanges");
   const [activeTab, setActiveTab] = useState<"analysis" | "gaps">("analysis");
   const [exporting, setExporting] = useState<null | "xlsx" | "html">(null);
   const [rerunning, setRerunning] = useState(false);
   const [approvingReady, setApprovingReady] = useState(false);
   const [generatingDraft, setGeneratingDraft] = useState(false);
   const [registerCollapsed, setRegisterCollapsed] = useState(false);
+  // Auto-analysis: a freshly created report carries summary_json.pending_analysis,
+  // so the report page itself runs the analysis (the upload screen navigates here
+  // immediately rather than blocking on a loader).
+  const [autoAnalyzing, setAutoAnalyzing] = useState(false);
+  const [autoRunFailed, setAutoRunFailed] = useState(false);
+  // Stage 4 progress — non-null while the report is revealed and changes are
+  // still being mapped to documents (the slim banner at the top of the report).
+  const [mapping, setMapping] = useState<{ done: number; total: number } | null>(null);
+  const autoRunStartedRef = useRef(false);
   const bulkApprove = useServerFn(bulkApproveReady);
   const genDraft = useServerFn(generateAmendedDraft);
   const startRegRerun = useServerFn(startRegulatoryRerun);
-  const analyzeSop = useServerFn(analyzeRegulatorySop);
+  const mapChange = useServerFn(mapRegulatoryChange);
   const finalizeReg = useServerFn(finalizeRegulatoryReport);
   const rerunForm = useServerFn(rerunFormUpdateReport);
   const analyzeDocFn = useServerFn(analyzeDocForForm);
@@ -120,6 +138,38 @@ function ReportPage() {
     return Array.from(map.values()).sort((a, b) => b.impacts.length - a.impacts.length);
   }, [allImpacts, isFormUpdate]);
 
+  // Regulatory By-Document grouping: every affected SOP doc with all impacts
+  // hitting it across every regulatory change. Same shape as UC1's docGroups
+  // so the left-panel tile rendering is shared.
+  const docGroupsRegulatory = useMemo(() => {
+    if (isFormUpdate) return [];
+    const map = new Map<string, { sopId: string | null; sopTitle: string; impacts: any[] }>();
+    for (const imp of allImpacts) {
+      const key = imp.sop_id ?? `__nokey_${imp.sop_title}`;
+      if (!map.has(key)) map.set(key, { sopId: imp.sop_id, sopTitle: imp.sop_title, impacts: [] });
+      map.get(key)!.impacts.push(imp);
+    }
+    return Array.from(map.values()).sort((a, b) => b.impacts.length - a.impacts.length);
+  }, [allImpacts, isFormUpdate]);
+
+  /** Switches the left-panel grouping and resets selection back to Summary. */
+  function switchViewMode(mode: "byChange" | "byDocument") {
+    if (mode === viewMode) return;
+    setViewMode(mode);
+    setSelectedId(null);
+  }
+
+  // Kick the analysis once when a freshly created report lands here. The ref
+  // guard makes this fire exactly once per mount even as the query refetches.
+  useEffect(() => {
+    if (autoRunStartedRef.current) return;
+    if (report.isLoading || !report.data) return;
+    const sj = ((report.data as any).summary_json ?? {}) as any;
+    if (!sj.pending_analysis || sj.uc1_form_update) return;
+    launchAutoAnalysis();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [report.isLoading, report.data]);
+
   // Conditional early returns are safe BELOW this line — no hooks after this.
   if (report.isLoading) return (
     <AppShell>
@@ -135,6 +185,22 @@ function ReportPage() {
   );
   if (!report.data) throw notFound();
 
+  // Analysis-in-progress view — shown while this report's analysis runs (either
+  // a fresh upload that auto-started, or a retry). Replaces the report body so
+  // the user sees live progress instead of an empty report.
+  if (autoAnalyzing || autoRunFailed || (summary.pending_analysis && !autoRunStartedRef.current)) {
+    return (
+      <AppShell>
+        <RegulatoryAnalyzingView
+          title={report.data.title}
+          progress={null}
+          failed={autoRunFailed}
+          onRetry={launchAutoAnalysis}
+        />
+      </AppShell>
+    );
+  }
+
   const oldPolicyName: string = summary.old_policy_name ?? "Previous version";
   const newPolicyName: string = report.data.policy_name ?? "Updated policy";
   const s = statusMeta(report.data.status);
@@ -145,6 +211,11 @@ function ReportPage() {
   const showSummary = selectedId === null;
   const selectedChange = showSummary || isFormUpdate ? null : (allChanges.find(c => c.id === selectedId) ?? null);
   const selectedDocGroup = isFormUpdate && !showSummary ? docGroups.find((d) => (d.sopId ?? `__nokey_${d.sopTitle}`) === selectedId) : null;
+  // In regulatory By-Document mode, selectedId is the doc-group key.
+  const selectedDocGroupRegulatory =
+    !isFormUpdate && viewMode === "byDocument" && !showSummary
+      ? docGroupsRegulatory.find((d) => (d.sopId ?? `__nokey_${d.sopTitle}`) === selectedId) ?? null
+      : null;
 
   const impactsForChange = (chapter_ref: string) => {
     const target = (chapter_ref ?? "").trim().toLowerCase();
@@ -187,6 +258,84 @@ function ReportPage() {
     low: allChanges.filter(c => c.impact === "low").length,
   };
 
+  // Shared regulatory orchestration — one call per SOP (full-document, no
+  // chunking), run in PARALLEL. A failed SOP is retried 3× then flagged. Used
+  // by both the auto-run on a fresh upload and the manual Re-run button.
+  // Stages 1-3 (extract → summary → route) run in startRegRerun; onExtracted
+  // fires when they finish so the report can be revealed. Stage 4 maps each
+  // change to its routed documents, in parallel, reporting progress.
+  async function runRegulatoryAnalysis(
+    onExtracted?: (total: number) => void,
+    onMapProgress?: (done: number, total: number) => void,
+  ) {
+    // Stage 1 — extract the regulatory changes. An empty result is almost
+    // always a transient AI-model overload, so retry the whole call once (a
+    // fresh server invocation) before accepting it.
+    let started = await startRegRerun({ data: { reportId } });
+    if ((started.changeCount ?? 0) === 0) {
+      console.warn("Stage 1 returned 0 changes — retrying extraction once…");
+      started = await startRegRerun({ data: { reportId } });
+    }
+    const { reportId: rid, changes } = started;
+    onExtracted?.(changes.length);
+    let regDone = 0;
+    const coverage = await Promise.all(changes.map(async (ch) => {
+      let status = "failed";
+      let impactCount = 0;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const res = await mapChange({ data: { reportId: rid, changeId: ch.id } });
+          status = res?.status ?? "mapped";
+          impactCount = res?.impactCount ?? 0;
+          if (status !== "failed") break;
+        } catch (err: any) {
+          console.warn(`Mapping attempt ${attempt} failed for ${ch.chapter_ref}:`, err?.message);
+          status = "failed";
+        }
+      }
+      regDone++;
+      onMapProgress?.(regDone, changes.length);
+      return { title: ch.chapter_ref, status, impactCount };
+    }));
+    return await finalizeReg({ data: { reportId: rid, coverage } });
+  }
+
+  function launchAutoAnalysis() {
+    autoRunStartedRef.current = true;
+    setAutoRunFailed(false);
+    setAutoAnalyzing(true);
+    setMapping(null);
+    (async () => {
+      let revealed = false;
+      try {
+        await runRegulatoryAnalysis(
+          (total) => {
+            // Stages 1-3 done — reveal the report; Stage 4 fills in the rest.
+            revealed = true;
+            setAutoAnalyzing(false);
+            setMapping({ done: 0, total });
+            qc.invalidateQueries({ queryKey: ["report", reportId] });
+            qc.invalidateQueries({ queryKey: ["changes", reportId] });
+          },
+          (done, total) => {
+            setMapping({ done, total });
+            qc.invalidateQueries({ queryKey: ["impacts", reportId] });
+          },
+        );
+        qc.invalidateQueries({ queryKey: ["report", reportId] });
+        qc.invalidateQueries({ queryKey: ["changes", reportId] });
+        qc.invalidateQueries({ queryKey: ["impacts", reportId] });
+        toast.success("Analysis complete");
+      } catch (e: any) {
+        if (!revealed) setAutoRunFailed(true);
+        toast.error("Analysis failed", { description: e?.message });
+      } finally {
+        setAutoAnalyzing(false);
+        setMapping(null);
+      }
+    })();
+  }
+
   async function runExport(kind: "xlsx" | "html", fn: () => Promise<void> | void) {
     if (exporting) return;
     setExporting(kind);
@@ -226,31 +375,12 @@ function ReportPage() {
         toast.dismiss("uc1-rerun");
         result = await finalizeFn({ data: { reportId: rid, coverage } });
       } else {
-        // Regulatory analysis — one call per SOP (full-document, no chunking),
-        // run in PARALLEL. A failed SOP is retried, then flagged.
-        const { reportId: rid, sops } = await startRegRerun({ data: { reportId } });
-        let regDone = 0;
-        toast.message(`Analysing ${sops.length} document(s)…`, { id: "reg-rerun", duration: 180000 });
-        const coverage = await Promise.all(sops.map(async (sop) => {
-          let status = "failed";
-          let impactCount = 0;
-          for (let attempt = 1; attempt <= 3; attempt++) {
-            try {
-              const res = await analyzeSop({ data: { reportId: rid, sopId: sop.id } });
-              status = res?.status ?? "analyzed";
-              impactCount = res?.impactCount ?? 0;
-              if (status !== "failed") break;
-            } catch (err: any) {
-              console.warn(`Analysis attempt ${attempt} failed for ${sop.title}:`, err?.message);
-              status = "failed";
-            }
-          }
-          regDone++;
-          toast.message(`Analysed ${regDone}/${sops.length} document(s)…`, { id: "reg-rerun", duration: 180000 });
-          return { title: sop.title, status, impactCount };
-        }));
+        toast.message("Extracting regulatory changes…", { id: "reg-rerun", duration: 240000 });
+        result = await runRegulatoryAnalysis(
+          (total) => toast.message(`Mapping ${total} change${total === 1 ? "" : "s"} to documents…`, { id: "reg-rerun", duration: 240000 }),
+          (done, total) => toast.message(`Mapped ${done}/${total} change${total === 1 ? "" : "s"}…`, { id: "reg-rerun", duration: 240000 }),
+        );
         toast.dismiss("reg-rerun");
-        result = await finalizeReg({ data: { reportId: rid, coverage } });
       }
       toast.success(`Re-analysis complete: ${result.changesCount} change${result.changesCount !== 1 ? "s" : ""}, ${result.impactCount} edit${result.impactCount !== 1 ? "s" : ""}`);
       qc.invalidateQueries({ queryKey: ["report", reportId] });
@@ -270,7 +400,7 @@ function ReportPage() {
     if (!confirm(`Generate an amended draft copy for ${approved} approved impact${approved === 1 ? "" : "s"}?\n\nThis copies each affected SOP and applies the changes to the COPY — the live documents are not touched.`)) return;
     setGeneratingDraft(true);
     try {
-      const r = await genDraft({ data: { reportId } });
+      const r = await genDraft({ data: { reportId, renderMode: draftMode } });
       const made = r.drafts.length;
       toast.success(
         made > 0
@@ -334,18 +464,17 @@ function ReportPage() {
       <div className="flex flex-col overflow-hidden" style={{ height: "calc(100vh - 3.5rem)" }}>
 
         {/* ── Top strip ─────────────────────────────────────────────── */}
-        <div className="shrink-0 px-4 sm:px-6 py-2.5 border-b bg-card flex items-center justify-between gap-4">
-          <div className="min-w-0 flex-1">
-            <Link to="/reports" className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground mb-0.5 transition-colors">
-              <ArrowLeft className="size-3" /> All Analyses
+        <div className="shrink-0 px-4 sm:px-6 py-1.5 border-b bg-card flex items-center justify-between gap-3">
+          <div className="min-w-0 flex-1 flex items-center gap-2 overflow-hidden">
+            <Link to="/reports" className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors shrink-0">
+              <ArrowLeft className="size-3" /><span className="hidden sm:inline"> All</span>
             </Link>
-            <div className="flex items-center gap-2 flex-wrap">
-              <h1 className="font-display font-bold text-base leading-tight truncate">{report.data.title}</h1>
-              <Badge variant="outline" className={cn("text-[10px]", s.classes)}>{s.label}</Badge>
-              <span className="text-xs text-muted-foreground hidden sm:inline">{formatDate(report.data.created_at)}</span>
-            </div>
+            <span className="text-muted-foreground/30 text-xs hidden sm:inline">/</span>
+            <h1 className="font-display font-bold text-sm leading-tight truncate">{report.data.title}</h1>
+            <Badge variant="outline" className={cn("text-[10px] shrink-0", s.classes)}>{s.label}</Badge>
+            <span className="text-[11px] text-muted-foreground hidden lg:inline shrink-0">{formatDate(report.data.created_at)}</span>
           </div>
-          <div className="flex items-center gap-1.5 shrink-0">
+          <div className="flex items-center gap-1 shrink-0">
             <Button variant="outline" size="sm" disabled={rerunning} className="h-7 text-xs gap-1.5"
               onClick={handleRerun}
               title={isFormUpdate ? "Re-run form propagation with the latest engine" : "Re-run AI analysis on this report (replaces current changes)"}>
@@ -362,31 +491,86 @@ function ReportPage() {
               </Button>
             )}
             {approvedCount > 0 && (
-              <Button size="sm" variant="outline" disabled={generatingDraft}
-                className="h-7 text-xs gap-1.5"
-                onClick={handleGenerateDraft}
-                title="Copy each affected SOP and apply the approved changes to the copy — the live documents are never touched">
-                {generatingDraft ? <Loader2 className="size-3 animate-spin" /> : <FileEdit className="size-3" />}
-                <span className="hidden sm:inline">Generate amended draft</span>
-              </Button>
+              <>
+                {/* Draft mode — Track Changes (review) vs Clean (finalised). */}
+                <div className="hidden md:flex items-center gap-0.5 p-0.5 rounded-md border bg-card h-7">
+                  <button
+                    type="button"
+                    onClick={() => setDraftMode("trackChanges")}
+                    disabled={generatingDraft}
+                    className={cn(
+                      "px-2 h-6 text-[10px] font-bold uppercase tracking-wider rounded transition-colors",
+                      draftMode === "trackChanges"
+                        ? "bg-foreground text-background"
+                        : "text-muted-foreground hover:bg-slate-100 dark:hover:bg-slate-800",
+                    )}
+                    title="Original kept in red strike-through, new in yellow — a track-changes review copy"
+                  >
+                    Track Changes
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDraftMode("clean")}
+                    disabled={generatingDraft}
+                    className={cn(
+                      "px-2 h-6 text-[10px] font-bold uppercase tracking-wider rounded transition-colors",
+                      draftMode === "clean"
+                        ? "bg-foreground text-background"
+                        : "text-muted-foreground hover:bg-slate-100 dark:hover:bg-slate-800",
+                    )}
+                    title="Original removed; new text replaces it highlighted yellow — a finalised draft"
+                  >
+                    Clean
+                  </button>
+                </div>
+                <Button size="sm" variant="outline" disabled={generatingDraft}
+                  className="h-7 text-xs gap-1.5"
+                  onClick={handleGenerateDraft}
+                  title={
+                    draftMode === "clean"
+                      ? "Copy each affected SOP and CLEANLY apply the approved changes to the copy (finalised look) — the live documents are never touched"
+                      : "Copy each affected SOP and apply the approved changes to the copy in TRACK-CHANGES form (original red+strike, new yellow) — the live documents are never touched"
+                  }>
+                  {generatingDraft ? <Loader2 className="size-3 animate-spin" /> : <FileEdit className="size-3" />}
+                  <span className="hidden sm:inline">Generate amended draft</span>
+                </Button>
+              </>
             )}
             <div className="h-4 w-px bg-border mx-0.5" />
-            <Button variant="outline" size="sm" disabled={!!exporting} className="h-7 text-xs gap-1.5"
+            <Button variant="outline" size="sm" disabled={!!exporting} className="h-7 px-2"
+              title="Export presentation (HTML)"
               onClick={() => runExport("html", () => exportHtmlPresentation(report.data, allChanges, allImpacts))}>
               {exporting === "html" ? <Loader2 className="size-3 animate-spin" /> : <Presentation className="size-3" />}
-              <span className="hidden sm:inline">Export</span>
             </Button>
-            <Button variant="outline" size="sm" disabled={!!exporting} className="h-7 text-xs gap-1.5"
+            <Button variant="outline" size="sm" disabled={!!exporting} className="h-7 px-2"
+              title="Export to Excel"
               onClick={() => runExport("xlsx", () => exportExcel(report.data, allChanges, allImpacts))}>
               {exporting === "xlsx" ? <Loader2 className="size-3 animate-spin" /> : <FileSpreadsheet className="size-3" />}
-              <span className="hidden sm:inline">Excel</span>
             </Button>
           </div>
         </div>
 
+        {/* ── Stage 4 mapping progress (report is live; edits filling in) ── */}
+        {mapping && (
+          <div className="shrink-0 px-4 sm:px-6 py-1.5 bg-primary/5 border-b border-primary/15 flex items-center gap-2 text-xs">
+            <Loader2 className="size-3.5 text-primary animate-spin shrink-0" />
+            <span className="font-medium text-foreground">
+              Mapping regulatory changes to your documents — {mapping.done} of {mapping.total}
+            </span>
+            <span className="text-muted-foreground hidden sm:inline">
+              · the SOP Gap Register fills in as each change is mapped
+            </span>
+          </div>
+        )}
+
         {/* ── Approval workflow ──────────────────────────────────────── */}
         <div className="shrink-0">
           <ApprovalWorkflow report={report.data} />
+        </div>
+
+        {/* ── Audit history (workflow_events) ────────────────────────── */}
+        <div className="shrink-0">
+          <WorkflowHistory reportId={reportId} />
         </div>
 
         {/* ── Amended draft copies (versioned — live docs untouched) ──── */}
@@ -467,6 +651,35 @@ function ReportPage() {
               </div>
               {/* Change list */}
               <div className="flex-1 overflow-y-auto">
+                {/* By Change / By Document toggle — regulatory workspaces only */}
+                {!isFormUpdate && (
+                  <div className="flex items-center gap-1 p-2 border-b border-slate-200 dark:border-slate-700 bg-slate-50/60 dark:bg-slate-900/30">
+                    <button
+                      type="button"
+                      onClick={() => switchViewMode("byChange")}
+                      className={cn(
+                        "flex-1 text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded transition-colors",
+                        viewMode === "byChange"
+                          ? "bg-foreground text-background shadow-sm"
+                          : "text-muted-foreground hover:bg-slate-200 dark:hover:bg-slate-800",
+                      )}
+                    >
+                      By Change
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => switchViewMode("byDocument")}
+                      className={cn(
+                        "flex-1 text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded transition-colors",
+                        viewMode === "byDocument"
+                          ? "bg-foreground text-background shadow-sm"
+                          : "text-muted-foreground hover:bg-slate-200 dark:hover:bg-slate-800",
+                      )}
+                    >
+                      By Document
+                    </button>
+                  </div>
+                )}
                 {/* Summary pseudo-item */}
                 <button
                   onClick={() => setSelectedId(null)}
@@ -527,6 +740,56 @@ function ReportPage() {
                           </div>
                           <p className="text-[10px] text-muted-foreground leading-snug">
                             {g.impacts.length} edit{g.impacts.length !== 1 ? "s" : ""} to apply
+                          </p>
+                          {!g.sopId && (
+                            <p className="mt-1 text-[9px] font-semibold text-amber-600 inline-flex items-center gap-1">
+                              <AlertTriangle className="size-2.5" /> Not in KB
+                            </p>
+                          )}
+                        </button>
+                      );
+                    })
+                  )
+                ) : viewMode === "byDocument" ? (
+                  docGroupsRegulatory.length === 0 ? (
+                    <div className="px-4 py-8 text-center text-xs text-muted-foreground italic">No affected documents.</div>
+                  ) : (
+                    docGroupsRegulatory.map((g) => {
+                      const key = g.sopId ?? `__nokey_${g.sopTitle}`;
+                      const isSelected = selectedId === key;
+                      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                      const approvedCount = g.impacts.filter((i: any) => i.status === "approved").length;
+                      const allApproved = approvedCount === g.impacts.length && g.impacts.length > 0;
+                      const cleanTitle = (g.sopTitle ?? "").replace(/\s*\(no matching internal doc(?:\s+found)?\)/gi, "").trim();
+                      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                      const changes = new Set(g.impacts.map((i: any) => i.chapter)).size;
+                      return (
+                        <button
+                          key={key}
+                          onClick={() => setSelectedId(key)}
+                          className={cn(
+                            "w-full text-left px-3 py-2.5 border-b border-slate-100 dark:border-slate-800 transition-all",
+                            "hover:bg-white dark:hover:bg-slate-800/60",
+                            isSelected
+                              ? "bg-white dark:bg-slate-800 border-l-[3px] border-l-primary shadow-sm"
+                              : "border-l-[3px] border-l-transparent",
+                            allApproved && !isSelected && "bg-emerald-50/40 dark:bg-emerald-900/10",
+                          )}
+                        >
+                          <div className="flex items-center justify-between gap-2 mb-1">
+                            <span className="font-semibold text-[11px] text-foreground truncate">{cleanTitle}</span>
+                            <span className={cn(
+                              "text-[8px] font-black px-1 py-0.5 rounded inline-flex items-center gap-0.5 shrink-0",
+                              allApproved ? "bg-emerald-100 text-emerald-700" :
+                              approvedCount > 0 ? "bg-blue-100 text-blue-700" :
+                                                  "bg-slate-100 text-slate-600"
+                            )}>
+                              {allApproved ? <CheckCircle2 className="size-2.5" /> : <Circle className="size-2.5" />}
+                              {approvedCount}/{g.impacts.length}
+                            </span>
+                          </div>
+                          <p className="text-[10px] text-muted-foreground leading-snug">
+                            {g.impacts.length} edit{g.impacts.length !== 1 ? "s" : ""} across {changes} change{changes !== 1 ? "s" : ""}
                           </p>
                           {!g.sopId && (
                             <p className="mt-1 text-[9px] font-semibold text-amber-600 inline-flex items-center gap-1">
@@ -623,6 +886,13 @@ function ReportPage() {
                   reportId={reportId}
                   formId={summary?.form_id ?? newPolicyName}
                 />
+              ) : selectedDocGroupRegulatory ? (
+                <RegulatoryDocPanel
+                  docGroup={selectedDocGroupRegulatory}
+                  sopDoc={sopById.get(selectedDocGroupRegulatory.sopId ?? "")}
+                  allChanges={allChanges}
+                  reportId={reportId}
+                />
               ) : selectedChange ? (
                 <ChangeDetailPanel
                   change={selectedChange}
@@ -630,6 +900,7 @@ function ReportPage() {
                   oldPolicyName={oldPolicyName}
                   newPolicyName={newPolicyName}
                   reportId={reportId}
+                  workspaceId={(report.data as any)?.workspace_id ?? "rmit"}
                   sopById={sopById}
                 />
               ) : (
@@ -651,9 +922,150 @@ function ReportPage() {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/** Full-screen state shown while a report's analysis runs (or after it fails). */
+function RegulatoryAnalyzingView({
+  title, progress, failed, onRetry,
+}: {
+  title: string;
+  progress: { done: number; total: number } | null;
+  failed: boolean;
+  onRetry: () => void;
+}) {
+  const total = progress?.total ?? 0;
+  const done = progress?.done ?? 0;
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+  return (
+    <div className="grid place-items-center p-8" style={{ minHeight: "calc(100vh - 3.5rem)" }}>
+      <div className="w-full max-w-md text-center space-y-6">
+        <Link to="/reports" className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors">
+          <ArrowLeft className="size-3" /> All Analyses
+        </Link>
+
+        {failed ? (
+          <>
+            <div className="size-14 mx-auto rounded-2xl bg-rose-100 text-rose-600 grid place-items-center">
+              <AlertTriangle className="size-7" />
+            </div>
+            <div className="space-y-1">
+              <h2 className="font-display font-bold text-lg">Analysis didn't finish</h2>
+              <p className="text-sm text-muted-foreground">
+                Something interrupted the run for{" "}
+                <span className="font-medium text-foreground">{title}</span>. Your document
+                is saved — you can try again.
+              </p>
+            </div>
+            <Button onClick={onRetry} className="gap-2">
+              <RefreshCw className="size-4" /> Retry analysis
+            </Button>
+          </>
+        ) : (
+          <>
+            <div className="relative mx-auto w-fit">
+              <div className="absolute inset-0 bg-primary/20 rounded-full blur-2xl animate-pulse" />
+              <div className="relative size-16 rounded-2xl border bg-card grid place-items-center shadow-sm">
+                <Loader2 className="size-8 text-primary animate-spin" strokeWidth={1.75} />
+              </div>
+            </div>
+            <div className="space-y-1">
+              <h2 className="font-display font-bold text-lg">Analysing {title}</h2>
+              <p className="text-sm text-muted-foreground">
+                {total > 0
+                  ? "Comparing each internal SOP against the regulation."
+                  : "Reading the regulation and gathering internal SOPs…"}
+              </p>
+            </div>
+            {total > 0 && (
+              <div className="space-y-2">
+                <div className="h-2 rounded-full bg-muted overflow-hidden">
+                  <div
+                    className="h-full bg-primary transition-all duration-500 ease-out"
+                    style={{ width: `${pct}%` }}
+                  />
+                </div>
+                <p className="text-xs font-semibold text-muted-foreground tabular-nums">
+                  {done} of {total} document{total === 1 ? "" : "s"} analysed
+                </p>
+              </div>
+            )}
+            <p className="text-[11px] text-muted-foreground/70">
+              This usually takes a minute or two. You can keep this tab open.
+            </p>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function cleanSopTitle(title: string | null | undefined): string {
   if (!title) return "Unknown document";
   return title.replace(/\s*\(no matching internal doc(?:\s+found)?\)/gi, "").trim();
+}
+
+/** Turns a snake_case event name into a readable phrase ("signed_off" → "Signed off"). */
+function humanizeEvent(event: string | null | undefined): string {
+  const e = (event ?? "").trim();
+  if (!e) return "Event";
+  const spaced = e.replace(/_/g, " ");
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+}
+
+/**
+ * Compact audit trail for a report, sourced from the service-role-written
+ * workflow_events table. Read with the browser supabase client (any authed user
+ * may READ under the role-only RLS). Tolerates an empty or missing table — the
+ * strip simply doesn't render when there's nothing to show.
+ */
+function WorkflowHistory({ reportId }: { reportId: string }) {
+  const events = useQuery({
+    queryKey: ["workflow_events", reportId],
+    queryFn: async () =>
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (supabase as any)
+        .from("workflow_events")
+        .select("event, from_status, to_status, actor_email, detail, created_at")
+        .eq("report_id", reportId)
+        .order("created_at", { ascending: false }),
+  });
+
+  const rows: any[] = events.data?.data ?? [];
+  if (events.isLoading || rows.length === 0) return null;
+
+  return (
+    <details className="px-4 sm:px-6 py-1 border-b bg-card/60">
+      <summary className="flex items-center gap-2 cursor-pointer select-none text-[10px] font-black uppercase tracking-widest text-muted-foreground hover:text-foreground transition-colors">
+        <History className="size-3" /> History
+        <span className="font-semibold normal-case tracking-normal text-muted-foreground/70">({rows.length})</span>
+      </summary>
+      <ul className="mt-2 space-y-1 max-h-44 overflow-y-auto">
+        {rows.map((ev, i) => {
+          const status =
+            ev.from_status && ev.to_status && ev.from_status !== ev.to_status
+              ? `${statusMeta(ev.from_status).label} → ${statusMeta(ev.to_status).label}`
+              : ev.to_status
+                ? statusMeta(ev.to_status).label
+                : null;
+          return (
+            <li key={i} className="flex items-baseline gap-2 text-[11px] leading-snug">
+              <span className="font-semibold text-foreground shrink-0">{ev.actor_email ?? "system"}</span>
+              <span className="text-muted-foreground/50">·</span>
+              <span className="text-foreground/80">{humanizeEvent(ev.event)}</span>
+              {status && (
+                <>
+                  <span className="text-muted-foreground/50">·</span>
+                  <span className="text-muted-foreground">{status}</span>
+                </>
+              )}
+              <span className="text-muted-foreground/50">·</span>
+              <span className="text-muted-foreground tabular-nums shrink-0 ml-auto">
+                {ev.created_at ? formatDate(ev.created_at) : ""}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+    </details>
+  );
 }
 
 export function ExecutiveSummary({ value }: { value: any }) {
@@ -926,14 +1338,64 @@ function StatPill({ label, count, color }: { label: string; count: number; color
   );
 }
 
+/** Bold the clause-reference tokens (S 12.1, Appendix 11, Section 17…) so the
+ *  reader's eye lands on WHERE in a long clause the obligation sits. */
+function boldClauseRefs(text: string): string {
+  return String(text ?? "")
+    .replace(/\b[SGP] ?\d+\.\d+(?:\([a-z0-9]+\))?/g, (m) => `**${m}**`)
+    .replace(/\bAppendix \d+\b/g, (m) => `**${m}**`)
+    .replace(/\bSection \d+\b/g, (m) => `**${m}**`);
+}
+
 function ChangeDetailPanel({
-  change, impacts, oldPolicyName, newPolicyName, reportId, sopById,
+  change, impacts, oldPolicyName, newPolicyName, reportId, workspaceId, sopById,
 }: {
-  change: any; impacts: any[]; oldPolicyName: string; newPolicyName: string; reportId: string; sopById: Map<string, any>;
+  change: any; impacts: any[]; oldPolicyName: string; newPolicyName: string; reportId: string; workspaceId: string; sopById: Map<string, any>;
 }) {
   const qc = useQueryClient();
   const upd = useServerFn(updateImpact);
+  const raisePolicyChange = useServerFn(createPolicyChangeReport);
+  const nav = useNavigate();
   const isNew = !change.old_requirement || (change.old_requirement as string).toLowerCase().startsWith("n/a");
+  const [showFull, setShowFull] = useState(false);
+  const [raising, setRaising] = useState(false);
+
+  // Role gate — viewers can't raise a policy change. Mounted-gated so SSR and
+  // the first client paint agree before the real role resolves.
+  const auth = useAuth();
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+  const canRaisePolicyChange = mounted && !auth.loading && (auth.role === "member" || auth.role === "super_admin");
+
+  async function handleRaisePolicyChange() {
+    if (raising) return;
+    setRaising(true);
+    try {
+      const { reportId: newId } = await raisePolicyChange({
+        data: {
+          workspace: workspaceId as any,
+          title: "Policy change — " + (change.chapter_ref ?? "manual"),
+          description: change.change_summary ?? change.summary ?? "",
+          sourceChangeId: change.id,
+        },
+      });
+      toast.success("Policy change created");
+      nav({ to: "/reports/$reportId", params: { reportId: newId } });
+    } catch (e: any) {
+      toast.error("Could not raise policy change", { description: e?.message });
+    } finally {
+      setRaising(false);
+    }
+  }
+  // Amendments with a concrete clause reference are the priority — sort them up,
+  // then by confidence. "General"/unanchored impacts fall to the bottom.
+  const sortedImpacts = [...impacts].sort((a: any, b: any) => {
+    const hasRef = (i: any) => {
+      const p = String(i.paragraph ?? "").trim();
+      return p && !/^general/i.test(p) ? 1 : 0;
+    };
+    return hasRef(b) - hasRef(a) || (Number(b.confidence) || 0) - (Number(a.confidence) || 0);
+  });
 
   async function setImpactStatus(id: string, status: "approved" | "rejected" | "routed") {
     try {
@@ -965,12 +1427,27 @@ function ChangeDetailPanel({
             <p className="text-sm text-muted-foreground leading-snug max-w-2xl">{change.change_summary}</p>
           )}
         </div>
-        {change.tone_shift && (
-          <div className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-full border bg-card text-xs font-medium text-muted-foreground">
-            <ArrowRightLeft className="size-3 opacity-60" />
-            {change.tone_shift}
-          </div>
-        )}
+        <div className="shrink-0 flex items-center gap-2">
+          {change.tone_shift && (
+            <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full border bg-card text-xs font-medium text-muted-foreground">
+              <ArrowRightLeft className="size-3 opacity-60" />
+              {change.tone_shift}
+            </div>
+          )}
+          {canRaisePolicyChange && (
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={raising}
+              onClick={handleRaisePolicyChange}
+              className="gap-1.5 h-8 text-xs border-primary/30 text-primary hover:bg-primary/5"
+              title="Open an internal policy-change workflow seeded from this regulatory change"
+            >
+              {raising ? <Loader2 className="size-3.5 animate-spin" /> : <ShieldPlus className="size-3.5" />}
+              <span className="hidden sm:inline">Raise Policy Change</span>
+            </Button>
+          )}
+        </div>
       </div>
 
       {/* ── Scrollable body ─────────────────────────────────────── */}
@@ -991,52 +1468,31 @@ function ChangeDetailPanel({
             </div>
           )}
 
-          {/* ── Before / After ──────────────────────────────────── */}
-          {isNew ? (
-            <div className="rounded-xl border border-emerald-200 dark:border-emerald-800 overflow-hidden">
-              <div className="flex items-center gap-2 px-5 py-3 bg-emerald-50 dark:bg-emerald-900/40 border-b border-emerald-200 dark:border-emerald-800">
-                <Sparkles className="size-3.5 text-emerald-700 dark:text-emerald-400" />
-                <span className="text-xs font-black uppercase tracking-widest text-emerald-800 dark:text-emerald-300">New Obligation</span>
-                <span className="text-xs text-emerald-700/60 ml-1">— introduced in {newPolicyName}</span>
+          {/* ── Regulatory text — summary inline, full clause in a popup ── */}
+          <div className={cn(
+            "rounded-xl border p-4 flex items-start justify-between gap-4",
+            isNew
+              ? "border-emerald-200 bg-emerald-50/40 dark:border-emerald-800 dark:bg-emerald-950/10"
+              : "border-blue-200 bg-blue-50/30 dark:border-blue-800 dark:bg-blue-950/10",
+          )}>
+            <div className="min-w-0 space-y-1">
+              <div className="flex items-center gap-1.5 text-[10px] font-black uppercase tracking-widest text-muted-foreground">
+                {isNew && <Sparkles className="size-3 text-emerald-600" />}
+                {isNew ? "New Obligation" : "What changed"}
               </div>
-              <div className="p-5 text-sm leading-relaxed font-medium bg-emerald-50/30 dark:bg-emerald-950/10">
-                <MD>{change.new_requirement}</MD>
-              </div>
+              <p className="text-sm leading-snug text-foreground/80">
+                {change.change_summary || change.chapter_ref}
+              </p>
             </div>
-          ) : (
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-0 rounded-xl border overflow-hidden">
-              {/* OLD */}
-              <div className="border-b lg:border-b-0 lg:border-r">
-                <div className="flex items-center gap-2 px-4 py-2.5 bg-rose-50 dark:bg-rose-900/30 border-b border-rose-100 dark:border-rose-800">
-                  <div className="size-4 rounded-full bg-rose-600 grid place-items-center shrink-0">
-                    <span className="text-[7px] font-black text-white leading-none">OLD</span>
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <span className="text-[10px] font-black uppercase tracking-widest text-rose-800 dark:text-rose-300">Before · </span>
-                    <span className="text-[10px] text-rose-600/70 dark:text-rose-400/60 truncate">{oldPolicyName}</span>
-                  </div>
-                </div>
-                <div className="p-5 text-sm leading-relaxed text-foreground/75 bg-rose-50/20 dark:bg-rose-950/10 min-h-[100px] whitespace-pre-wrap">
-                  <DiffText side="old" oldText={change.old_requirement ?? ""} newText={change.new_requirement ?? ""} />
-                </div>
-              </div>
-              {/* NEW */}
-              <div>
-                <div className="flex items-center gap-2 px-4 py-2.5 bg-blue-50 dark:bg-blue-900/30 border-b border-blue-100 dark:border-blue-800">
-                  <div className="size-4 rounded-full bg-blue-600 grid place-items-center shrink-0">
-                    <span className="text-[7px] font-black text-white leading-none">NEW</span>
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <span className="text-[10px] font-black uppercase tracking-widest text-blue-800 dark:text-blue-300">After · </span>
-                    <span className="text-[10px] text-blue-600/70 dark:text-blue-400/60 truncate">{newPolicyName}</span>
-                  </div>
-                </div>
-                <div className="p-5 text-sm leading-relaxed font-medium bg-blue-50/20 dark:bg-blue-950/10 min-h-[100px] whitespace-pre-wrap">
-                  <DiffText side="new" oldText={change.old_requirement ?? ""} newText={change.new_requirement ?? ""} />
-                </div>
-              </div>
-            </div>
-          )}
+            <Button
+              variant="outline"
+              size="sm"
+              className="shrink-0 gap-1.5 h-8 text-xs"
+              onClick={() => setShowFull(true)}
+            >
+              <FileText className="size-3.5" /> View full clause
+            </Button>
+          </div>
 
           {/* ── Impacted internal policies ───────────────────────── */}
           <div>
@@ -1057,7 +1513,7 @@ function ChangeDetailPanel({
               </div>
             ) : (
               <div className="space-y-3">
-                {impacts.map((imp: any) => (
+                {sortedImpacts.map((imp: any) => (
                   <ImpactCard key={imp.id} imp={imp} sopDoc={sopById.get(imp.sop_id)} onSetStatus={setImpactStatus} />
                 ))}
               </div>
@@ -1066,43 +1522,116 @@ function ChangeDetailPanel({
 
         </div>
       </div>
+
+      <Dialog open={showFull} onOpenChange={setShowFull}>
+        <DialogContent className="max-w-3xl max-h-[85vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle className="font-mono text-base">{change.chapter_ref}</DialogTitle>
+          </DialogHeader>
+          {isNew ? (
+            <div className="text-sm leading-relaxed">
+              <div className="text-[10px] font-black uppercase tracking-widest text-emerald-700 mb-2">
+                New obligation — introduced in {newPolicyName}
+              </div>
+              <MD>{boldClauseRefs(change.new_requirement ?? "")}</MD>
+            </div>
+          ) : (
+            <div className="space-y-3 text-sm leading-relaxed">
+              <div>
+                <div className="text-[10px] font-black uppercase tracking-widest text-rose-700 mb-1">
+                  Before · {oldPolicyName}
+                </div>
+                <div className="rounded-lg border border-rose-100 bg-rose-50/30 dark:bg-rose-950/10 p-3 whitespace-pre-wrap text-foreground/75">
+                  <DiffText side="old" oldText={change.old_requirement ?? ""} newText={change.new_requirement ?? ""} />
+                </div>
+              </div>
+              <div>
+                <div className="text-[10px] font-black uppercase tracking-widest text-blue-700 mb-1">
+                  After · {newPolicyName}
+                </div>
+                <div className="rounded-lg border border-blue-100 bg-blue-50/30 dark:bg-blue-950/10 p-3 whitespace-pre-wrap font-medium">
+                  <DiffText side="new" oldText={change.old_requirement ?? ""} newText={change.new_requirement ?? ""} />
+                </div>
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
 
-/** Versioned amended-draft copies — links to the original and the draft for side-by-side review. */
+/** Versioned amended-draft copies — collapsible, with Drive links or DOCX download. */
 function AmendedDraftPanel({ drafts }: { drafts: any[] }) {
+  const [open, setOpen] = useState(false);
   if (!drafts || drafts.length === 0) return null;
+  const isDriveUrl = (url: string) =>
+    /docs\.google\.com|drive\.google\.com/.test(url ?? "");
   return (
-    <div className="rounded-lg border border-violet-200 bg-violet-50/60 dark:bg-violet-950/20 dark:border-violet-900 px-4 py-3">
-      <div className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider text-violet-800 dark:text-violet-300">
-        <FileEdit className="size-3.5" /> Amended draft copies
-        <span className="font-normal normal-case text-violet-700/70 dark:text-violet-400/70">
-          · compare against the original, then sign off — the live SOPs are untouched
+    <div className="rounded-lg border border-violet-200 bg-violet-50/60 dark:bg-violet-950/20 dark:border-violet-900 overflow-hidden">
+      {/* ── Header / toggle ── */}
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex items-center gap-2 px-4 py-2.5 text-left hover:bg-violet-100/50 dark:hover:bg-violet-900/30 transition-colors"
+      >
+        <FileEdit className="size-3.5 text-violet-700 dark:text-violet-300 shrink-0" />
+        <span className="text-[11px] font-bold uppercase tracking-wider text-violet-800 dark:text-violet-300">
+          Amended draft copies
         </span>
-      </div>
-      <div className="mt-2 space-y-1.5">
-        {drafts.map((d: any, i: number) => (
-          <div key={i} className="flex items-center justify-between gap-3 rounded-md border bg-card px-3 py-2 text-xs">
-            <span className="font-medium truncate min-w-0">{cleanSopTitle(d.sopTitle)}</span>
-            <div className="flex items-center gap-3 shrink-0">
-              <span className="text-[10px] text-muted-foreground">
-                {d.applied}/{d.impactCount} change{d.impactCount === 1 ? "" : "s"} applied
-              </span>
-              {d.originalUrl && (
-                <a href={d.originalUrl} target="_blank" rel="noreferrer"
-                  className="inline-flex items-center gap-1 text-muted-foreground hover:text-foreground hover:underline underline-offset-2">
-                  <ExternalLink className="size-3 opacity-60" /> Original
-                </a>
-              )}
-              <a href={d.draftUrl} target="_blank" rel="noreferrer"
-                className="inline-flex items-center gap-1 font-semibold text-violet-700 dark:text-violet-300 hover:underline underline-offset-2">
-                <ExternalLink className="size-3 opacity-70" /> Amended draft
-              </a>
-            </div>
-          </div>
-        ))}
-      </div>
+        <span className="text-[11px] font-normal normal-case text-violet-700/60 dark:text-violet-400/60">
+          · {drafts.length} doc{drafts.length !== 1 ? "s" : ""}{open ? " — compare against the original, then sign off" : ""}
+        </span>
+        <ChevronDown className={cn(
+          "size-3.5 text-violet-600 dark:text-violet-400 ml-auto shrink-0 transition-transform duration-200",
+          open && "rotate-180"
+        )} />
+      </button>
+
+      {/* ── Rows ── */}
+      {open && (
+        <div className="px-3 pb-3 space-y-1.5">
+          {drafts.map((d: any, i: number) => {
+            const driveOriginal = d.originalUrl && isDriveUrl(d.originalUrl);
+            const driveDraft = d.draftUrl && isDriveUrl(d.draftUrl);
+            return (
+              <div key={i} className="flex items-center justify-between gap-3 rounded-md border bg-card px-3 py-2 text-xs">
+                <span className="font-medium truncate min-w-0">{cleanSopTitle(d.sopTitle)}</span>
+                <div className="flex items-center gap-3 shrink-0">
+                  <span className="text-[10px] text-muted-foreground">
+                    {d.applied}/{d.impactCount} change{d.impactCount === 1 ? "" : "s"} applied
+                  </span>
+                  {d.originalUrl && (
+                    driveOriginal ? (
+                      <a href={d.originalUrl} target="_blank" rel="noreferrer"
+                        className="inline-flex items-center gap-1 text-muted-foreground hover:text-foreground hover:underline underline-offset-2">
+                        <ExternalLink className="size-3 opacity-60" /> Original
+                      </a>
+                    ) : (
+                      <a href={d.originalUrl} download
+                        className="inline-flex items-center gap-1 text-muted-foreground hover:text-foreground hover:underline underline-offset-2">
+                        <Download className="size-3 opacity-60" /> Original
+                      </a>
+                    )
+                  )}
+                  {d.draftUrl && (
+                    driveDraft ? (
+                      <a href={d.draftUrl} target="_blank" rel="noreferrer"
+                        className="inline-flex items-center gap-1 font-semibold text-violet-700 dark:text-violet-300 hover:underline underline-offset-2">
+                        <ExternalLink className="size-3 opacity-70" /> Amended draft
+                      </a>
+                    ) : (
+                      <a href={d.draftUrl} download
+                        className="inline-flex items-center gap-1 font-semibold text-violet-700 dark:text-violet-300 hover:underline underline-offset-2">
+                        <Download className="size-3 opacity-70" /> Download draft
+                      </a>
+                    )
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
@@ -1124,10 +1653,12 @@ function ImpactCard({
   const alreadyInserted = !!imp.inserted_at || !!imp.drive_comment_id;
 
   async function applyToSource(mode: "comment" | "insert" | "replace") {
-    if (!isFromDrive || alreadyInserted || applying) return;
+    if (!isFromDrive || applying) return;
     setApplying(mode);
     try {
-      const r = await writeToDoc({ data: { impactId: imp.id, mode } });
+      // When the impact has already been applied, send `force` so the server
+      // bypasses the alreadyApplied short-circuit and Re-inserts cleanly.
+      const r = await writeToDoc({ data: { impactId: imp.id, mode, force: alreadyInserted } });
       const hl = "highlighted" in r && r.highlighted ? " — highlighted in yellow" : "";
       const occ = "occurrences" in r && typeof r.occurrences === "number" && r.occurrences > 1
         ? ` (${r.occurrences} locations)` : "";
@@ -1354,39 +1885,37 @@ function ImpactCard({
               className={cn("h-7 text-xs gap-1", currentStatus === "approved" && "text-emerald-700 bg-emerald-50 dark:bg-emerald-900/20")}>
               <CheckCircle2 className="size-3" /> Approve
             </Button>
-            {alreadyInserted ? (
-              <Button size="sm" variant="ghost" disabled
-                className="h-7 text-xs gap-1 text-blue-700 bg-blue-50 dark:bg-blue-900/20">
+            {alreadyInserted && (
+              <span className="inline-flex items-center gap-1 h-7 px-2 text-[10px] font-bold uppercase tracking-wider text-emerald-700 bg-emerald-50 dark:bg-emerald-900/20 rounded-md">
                 <CheckCircle2 className="size-3" /> Applied
-              </Button>
-            ) : (
-              <>
-                <Button size="sm" variant="ghost"
-                  onClick={() => applyToSource("comment")}
-                  disabled={!isFromDrive || !!applying}
-                  title={isFromDrive ? "Add this amendment as a comment in the source document" : "This SOP isn't synced from Drive"}
-                  className="h-7 text-xs gap-1">
-                  {applying === "comment" ? <Loader2 className="size-3 animate-spin" /> : <MessageSquarePlus className="size-3" />}
-                  Comment
-                </Button>
-                <Button size="sm" variant="ghost"
-                  onClick={() => applyToSource("insert")}
-                  disabled={!isFromDrive || !!applying}
-                  title={isFromDrive ? "Insert the amended text into the Google Doc, right after the found statement (highlighted)" : "This SOP isn't synced from Drive"}
-                  className="h-7 text-xs gap-1">
-                  {applying === "insert" ? <Loader2 className="size-3 animate-spin" /> : <FilePlus2 className="size-3" />}
-                  Insert
-                </Button>
-                <Button size="sm" variant="ghost"
-                  onClick={() => applyToSource("replace")}
-                  disabled={!isFromDrive || !!applying}
-                  title={isFromDrive ? "Replace the found text in the Google Doc with the amended text (highlighted)" : "This SOP isn't synced from Drive"}
-                  className="h-7 text-xs gap-1">
-                  {applying === "replace" ? <Loader2 className="size-3 animate-spin" /> : <Replace className="size-3" />}
-                  Replace
-                </Button>
-              </>
+              </span>
             )}
+            {!alreadyInserted && (
+              <Button size="sm" variant="ghost"
+                onClick={() => applyToSource("comment")}
+                disabled={!isFromDrive || !!applying}
+                title={isFromDrive ? "Add this amendment as a comment in the source document" : "This SOP isn't synced from Drive"}
+                className="h-7 text-xs gap-1">
+                {applying === "comment" ? <Loader2 className="size-3 animate-spin" /> : <MessageSquarePlus className="size-3" />}
+                Comment
+              </Button>
+            )}
+            <Button size="sm" variant="ghost"
+              onClick={() => applyToSource("insert")}
+              disabled={!isFromDrive || !!applying}
+              title={isFromDrive ? (alreadyInserted ? "Re-insert the amended text — re-applies to the Google Doc" : "Insert the amended text into the Google Doc, right after the found statement (highlighted)") : "This SOP isn't synced from Drive"}
+              className="h-7 text-xs gap-1">
+              {applying === "insert" ? <Loader2 className="size-3 animate-spin" /> : <FilePlus2 className="size-3" />}
+              {alreadyInserted ? "Re-insert" : "Insert"}
+            </Button>
+            <Button size="sm" variant="ghost"
+              onClick={() => applyToSource("replace")}
+              disabled={!isFromDrive || !!applying}
+              title={isFromDrive ? (alreadyInserted ? "Re-replace — re-runs the swap in the Google Doc" : "Replace the found text in the Google Doc with the amended text (highlighted)") : "This SOP isn't synced from Drive"}
+              className="h-7 text-xs gap-1">
+              {applying === "replace" ? <Loader2 className="size-3 animate-spin" /> : <Replace className="size-3" />}
+              {alreadyInserted ? "Re-replace" : "Replace"}
+            </Button>
             <Button size="sm" variant="ghost" onClick={() => onSetStatus(imp.id, "rejected")}
               className={cn("h-7 text-xs gap-1 text-muted-foreground", currentStatus === "rejected" && "text-slate-500 bg-slate-100 dark:bg-slate-800")}>
               <XCircle className="size-3" /> Reject
@@ -1566,7 +2095,15 @@ function GapTable({ impacts, sopById, reportId }: { impacts: any[]; sopById: Map
   }
 
   const statusOrder: Record<string, number> = { pending: 0, routed: 1, approved: 2, rejected: 3 };
+  // Amendments anchored to a concrete clause reference are the priority — sort
+  // them to the top; "General"/unanchored ones fall below.
+  const refRank = (i: any) => {
+    const p = String(i.paragraph ?? "").trim();
+    return p && !/^general/i.test(p) ? 0 : 1;
+  };
   const sorted = [...impacts].sort((a, b) => {
+    const rA = refRank(a), rB = refRank(b);
+    if (rA !== rB) return rA - rB;
     const sA = statusOrder[a.status ?? "pending"] ?? 0;
     const sB = statusOrder[b.status ?? "pending"] ?? 0;
     return sA !== sB ? sA - sB : (a.position ?? 0) - (b.position ?? 0);
@@ -1768,6 +2305,146 @@ function GapTable({ impacts, sopById, reportId }: { impacts: any[]; sopById: Map
           </tbody>
         </table>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Regulatory By-Document panel — shows every amendment hitting one SOP,
+ * grouped by their source regulatory change. Mirrors ChangeDetailPanel's
+ * status-update pattern and re-uses ImpactCard so the per-impact controls
+ * (Approve/Reject/Insert/Re-insert) work identically.
+ */
+function RegulatoryDocPanel({
+  docGroup,
+  sopDoc,
+  allChanges,
+  reportId,
+}: {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  docGroup: { sopId: string | null; sopTitle: string; impacts: any[] };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  sopDoc: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  allChanges: any[];
+  reportId: string;
+}) {
+  const qc = useQueryClient();
+  const upd = useServerFn(updateImpact);
+
+  async function setImpactStatus(id: string, status: "approved" | "rejected" | "routed") {
+    try {
+      await upd({ data: { id, status } });
+      toast.success(`Marked as ${status}`);
+      qc.invalidateQueries({ queryKey: ["impacts", reportId] });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } catch (e: any) {
+      toast.error(e?.message ?? "Failed to update");
+    }
+  }
+
+  // Group this doc's impacts by their source change (chapter_ref).
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const grouped = new Map<string, any[]>();
+  for (const imp of docGroup.impacts) {
+    const chapter = String(imp.chapter ?? "").trim() || "—";
+    if (!grouped.has(chapter)) grouped.set(chapter, []);
+    grouped.get(chapter)!.push(imp);
+  }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const changeByChapter = new Map<string, any>();
+  for (const c of allChanges) changeByChapter.set(c.chapter_ref, c);
+
+  const cleanTitle = (docGroup.sopTitle ?? "")
+    .replace(/\s*\(no matching internal doc(?:\s+found)?\)/gi, "")
+    .trim();
+  const fileUrl = sopDoc?.drive_view_url ?? sopDoc?.file_url ?? null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const approvedCount = docGroup.impacts.filter((i: any) => i.status === "approved").length;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const pendingCount = docGroup.impacts.filter((i: any) => !i.status || i.status === "pending").length;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const rejectedCount = docGroup.impacts.filter((i: any) => i.status === "rejected").length;
+
+  return (
+    <div className="p-6 max-w-[1200px] mx-auto space-y-6">
+      {/* Header */}
+      <div>
+        {fileUrl ? (
+          <a
+            href={fileUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-1.5 text-base font-bold text-primary hover:underline"
+          >
+            <FileText className="size-4 shrink-0" />
+            <span className="truncate">{cleanTitle}</span>
+            <ExternalLink className="size-3 opacity-60 shrink-0" />
+          </a>
+        ) : (
+          <h2 className="text-base font-bold flex items-center gap-1.5">
+            <FileText className="size-4" />
+            {cleanTitle}
+          </h2>
+        )}
+        <p className="text-xs text-muted-foreground mt-1">
+          {docGroup.impacts.length} amendment{docGroup.impacts.length !== 1 ? "s" : ""} from{" "}
+          {grouped.size} regulatory change{grouped.size !== 1 ? "s" : ""}
+        </p>
+        <div className="flex items-center gap-4 mt-2 text-xs text-muted-foreground">
+          <span>
+            <span className="font-black text-emerald-700 tabular-nums">{approvedCount}</span> approved
+          </span>
+          <span>
+            <span className="font-black text-amber-700 tabular-nums">{pendingCount}</span> pending
+          </span>
+          <span>
+            <span className="font-black text-rose-700 tabular-nums">{rejectedCount}</span> rejected
+          </span>
+        </div>
+        {!docGroup.sopId && (
+          <p className="mt-2 inline-flex items-center gap-1 text-xs font-semibold text-amber-700">
+            <AlertTriangle className="size-3.5" /> This SOP isn't in the KB — edits cannot be applied to the source.
+          </p>
+        )}
+      </div>
+
+      {/* Impacts grouped by source change */}
+      {[...grouped.entries()].map(([chapter, imps]) => {
+        const change = changeByChapter.get(chapter);
+        const headline = (change?.change_summary as string)?.trim() || chapter;
+        const impactLevel = change?.impact ?? "low";
+        return (
+          <section key={chapter} className="space-y-3">
+            <div className="flex items-center gap-2 pb-2 border-b border-slate-200 dark:border-slate-700">
+              <span
+                className={cn(
+                  "text-[8px] font-black uppercase tracking-widest px-1.5 py-0.5 rounded shrink-0",
+                  impactLevel === "high"
+                    ? "bg-rose-100 text-rose-700"
+                    : impactLevel === "medium"
+                      ? "bg-amber-100 text-amber-700"
+                      : "bg-emerald-100 text-emerald-700",
+                )}
+              >
+                {impactLevel}
+              </span>
+              <span className="text-sm font-semibold truncate flex-1">{headline}</span>
+              <span className="font-mono text-[10px] text-muted-foreground shrink-0">{chapter}</span>
+            </div>
+            <div className="space-y-3">
+              {imps.map((imp) => (
+                <ImpactCard
+                  key={imp.id}
+                  imp={imp}
+                  sopDoc={sopDoc}
+                  onSetStatus={setImpactStatus}
+                />
+              ))}
+            </div>
+          </section>
+        );
+      })}
     </div>
   );
 }

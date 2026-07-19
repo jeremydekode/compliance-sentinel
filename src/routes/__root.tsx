@@ -7,9 +7,17 @@ import {
   HeadContent,
   Scripts,
 } from "@tanstack/react-router";
+import { useEffect, useState } from "react";
+import { ShieldAlert } from "lucide-react";
 import { Toaster } from "@/components/ui/sonner";
+import { useAuth, signOut } from "@/lib/auth";
+import { applyTenantBranding } from "@/lib/tenant";
 
 import appCss from "../styles.css?url";
+
+// Paths that an unauthenticated user is allowed to sit on (the login screen and
+// the OAuth return URLs). Everything else triggers a redirect to /login.
+const PUBLIC_PATHS = new Set(["/login", "/auth/callback", "/auth/google/callback"]);
 
 function NotFoundComponent() {
   return (
@@ -104,7 +112,7 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
 
 function RootShell({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en">
+    <html lang="en" suppressHydrationWarning>
       <head>
         <HeadContent />
       </head>
@@ -121,8 +129,112 @@ function RootComponent() {
 
   return (
     <QueryClientProvider client={queryClient}>
-      <Outlet />
+      <LoginGate />
+      <TenantBrandingEffect />
+      <ApprovalGate>
+        <Outlet />
+      </ApprovalGate>
       <Toaster richColors position="bottom-right" />
     </QueryClientProvider>
   );
+}
+
+/**
+ * Applies the signed-in user's tenant branding (colors) to <html> once auth
+ * has resolved. Gated the same way as ApprovalGate/LoginGate (mounted +
+ * !loading) so SSR output — which never touches document — is unaffected,
+ * avoiding a hydration mismatch.
+ */
+function TenantBrandingEffect() {
+  const auth = useAuth();
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+
+  useEffect(() => {
+    if (!mounted || auth.loading) return;
+    applyTenantBranding(auth.tenant);
+  }, [mounted, auth.loading, auth.tenant]);
+
+  return null;
+}
+
+/**
+ * Approval gate. A user can authenticate with any Google account, but only
+ * approved accounts (super_admin, member, or an email in login_allowlist) may
+ * USE the app. For a signed-in-but-unapproved account we render a clear
+ * "pending access" screen instead of the app shell (which would otherwise show
+ * an empty, broken-looking UI because RLS returns zero rows).
+ *
+ * Gated on `mounted && !loading` and an EXPLICIT `approved === false`, so the
+ * SSR/first-paint (which assumes approved) never flashes this, and we never
+ * block before the check resolves. Fails open if is_approved() isn't deployed.
+ */
+function ApprovalGate({ children }: { children: React.ReactNode }) {
+  const auth = useAuth();
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+
+  if (mounted && !auth.loading && auth.userId && auth.approved === false) {
+    const path = typeof window !== "undefined" ? window.location.pathname : "";
+    if (!PUBLIC_PATHS.has(path)) return <NotApproved email={auth.email} />;
+  }
+  return <>{children}</>;
+}
+
+function NotApproved({ email }: { email: string | null }) {
+  async function handleSignOut() {
+    await signOut();
+    window.location.replace("/login");
+  }
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-background px-4">
+      <div className="w-full max-w-sm rounded-2xl border bg-card shadow-sm p-8 text-center">
+        <div className="size-12 mx-auto rounded-xl bg-amber-100 grid place-items-center ring-1 ring-amber-200">
+          <ShieldAlert className="size-6 text-amber-600" />
+        </div>
+        <h1 className="font-display text-lg font-bold mt-4">Access pending</h1>
+        <p className="text-sm text-muted-foreground mt-2 leading-relaxed">
+          You're signed in{email ? <> as <span className="font-medium text-foreground">{email}</span></> : null}, but
+          this account hasn't been granted access yet.
+        </p>
+        <p className="text-sm text-muted-foreground mt-2 leading-relaxed">
+          Ask the platform administrator to approve your email, then sign in again.
+        </p>
+        <button
+          onClick={handleSignOut}
+          className="mt-6 w-full rounded-xl border bg-card px-4 py-2.5 text-sm font-medium transition-colors hover:border-primary/40 hover:bg-muted/40"
+        >
+          Sign out
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Client-only login gate.
+ *
+ * Renders nothing — it just watches the resolved auth state and bounces an
+ * unauthenticated visitor to /login. The gating is deliberately NOT done in a
+ * server-running beforeLoad: the Supabase session lives in the browser, so on
+ * the server `auth.userId` is always null and a server-side guard would redirect
+ * every first paint. We also wait for `mounted` so SSR HTML is unchanged and the
+ * first client paint matches it (no hydration mismatch), and for `!auth.loading`
+ * so we don't redirect before the session has actually resolved.
+ */
+function LoginGate() {
+  const auth = useAuth();
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+
+  useEffect(() => {
+    if (!mounted || auth.loading || auth.userId) return;
+    const path = window.location.pathname;
+    if (PUBLIC_PATHS.has(path)) return;
+    window.location.replace(
+      "/login?redirect=" + encodeURIComponent(window.location.pathname + window.location.search),
+    );
+  }, [mounted, auth.loading, auth.userId]);
+
+  return null;
 }

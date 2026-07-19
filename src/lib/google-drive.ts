@@ -125,6 +125,11 @@ export async function createDriveComment(opts: {
   const body: Record<string, unknown> = { content: opts.content };
   if (opts.quotedText) {
     // Drive trims comment quotes to a few hundred chars; clip defensively.
+    // Note: a Drive-side `anchor` matchedString format was tried here but
+    // Google's Docs interpretation kept resolving it against an earlier
+    // revision and surfacing "Original content deleted" — until that format is
+    // pinned down, we ship file-level comments with the quoted snippet (same
+    // behaviour as the regulatory workflow).
     body.quotedFileContent = { value: opts.quotedText.slice(0, 1500) };
   }
   const postComment = async (payload: Record<string, unknown>) => {
@@ -154,6 +159,9 @@ export async function createDriveComment(opts: {
 
 // Yellow highlight applied to text written into a Doc, so reviewers can see edits.
 const DOC_HIGHLIGHT = { color: { rgbColor: { red: 1, green: 0.92, blue: 0.4 } } };
+// Pale red background for content marked as removed/replaced — paired with
+// strikethrough it gives a clear "this was deleted" track-changes signal.
+const DOC_DELETED = { color: { rgbColor: { red: 1, green: 0.8, blue: 0.8 } } };
 
 interface DocSeg { text: string; start: number }
 
@@ -220,6 +228,33 @@ function resolveInsertAnchor(fullText: string, docIndexOf: number[], anchorHint:
   return lastIdx;
 }
 
+/** Common-prefix / common-suffix diff. Splits two strings into the shared
+ *  parts at the start and end, and the differing "middles". Used to highlight
+ *  only the actually-changed portion of an amendment instead of yellow-flooding
+ *  an entire amended clause that mostly repeats the original. */
+function diffSpans(orig: string, neu: string): {
+  prefix: string;
+  midOrig: string;
+  midNew: string;
+  suffix: string;
+} {
+  const minLen = Math.min(orig.length, neu.length);
+  let p = 0;
+  while (p < minLen && orig[p] === neu[p]) p++;
+  let s = 0;
+  while (
+    s < orig.length - p &&
+    s < neu.length - p &&
+    orig[orig.length - 1 - s] === neu[neu.length - 1 - s]
+  ) s++;
+  return {
+    prefix: orig.slice(0, p),
+    midOrig: orig.slice(p, orig.length - s),
+    midNew: neu.slice(p, neu.length - s),
+    suffix: orig.slice(orig.length - s),
+  };
+}
+
 export async function writeToGoogleDoc(opts: {
   workspaceId: string;
   fileId: string;
@@ -227,6 +262,12 @@ export async function writeToGoogleDoc(opts: {
   anchor: string;
   newText: string;
   mode: "insert" | "replace";
+  /** Optional: when set on `mode: "replace"`, also inserts " (was: <originalText>)"
+   *  in strike-through italic gray immediately after the new text. This gives a
+   *  reliable in-document track-changes-style annotation showing what was
+   *  displaced, without relying on Drive's flaky anchored-comments API. Ignored
+   *  for `mode: "insert"` (nothing to strike). */
+  originalText?: string;
 }): Promise<{ highlighted: boolean; occurrences: number }> {
   const token = await refreshAccessToken(opts.workspaceId);
 
@@ -324,20 +365,43 @@ export async function writeToGoogleDoc(opts: {
   }
   for (const v of valid) {
     if (opts.mode === "replace") {
-      edits.push({
-        at: v.docStart,
-        requests: [
-          { deleteContentRange: { range: { startIndex: v.docStart, endIndex: v.docEnd } } },
-          { insertText: { location: { index: v.docStart }, text: opts.newText } },
+      // Diff-aware track-changes replace: midOrig STAYS in place, marked red
+      // + strikethrough (the "was deleted" cue); midNew is inserted right
+      // after, highlighted yellow. For preserve-and-append amendments midOrig
+      // is empty so no red styling is applied — just the yellow addition.
+      const orig = ft;
+      const { prefix, midOrig, midNew, suffix } = diffSpans(orig, opts.newText);
+      const midStart = v.docStart + prefix.length;
+      const midEnd = v.docEnd - suffix.length;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const reqs: any[] = [];
+      // Mark the original middle as deleted (in place — not removed).
+      if (midOrig.length > 0) {
+        reqs.push({
+          updateTextStyle: {
+            range: { startIndex: midStart, endIndex: midEnd },
+            textStyle: { backgroundColor: DOC_DELETED, strikethrough: true },
+            fields: "backgroundColor,strikethrough",
+          },
+        });
+      }
+      // Insert the new middle immediately after midOrig (or at midStart if there
+      // was no midOrig), highlighted yellow.
+      if (midNew.length > 0) {
+        const insertAt = midEnd; // right after midOrig (or at midStart when midOrig is empty)
+        reqs.push(
+          { insertText: { location: { index: insertAt }, text: midNew } },
           {
             updateTextStyle: {
-              range: { startIndex: v.docStart, endIndex: v.docStart + opts.newText.length },
-              textStyle: { backgroundColor: DOC_HIGHLIGHT },
-              fields: "backgroundColor",
+              range: { startIndex: insertAt, endIndex: insertAt + midNew.length },
+              textStyle: { backgroundColor: DOC_HIGHLIGHT, strikethrough: false },
+              fields: "backgroundColor,strikethrough",
             },
           },
-        ],
-      });
+        );
+      }
+      // If the diff produced no edits (orig === newText), don't emit a no-op.
+      if (reqs.length > 0) edits.push({ at: midStart, requests: reqs });
     } else {
       // End of the anchor's paragraph = the next "\n" at/after the match end.
       let paraEnd = fullText.indexOf("\n", v.fe);
@@ -372,9 +436,12 @@ export async function writeToGoogleDoc(opts: {
   return { highlighted: true, occurrences: valid.length || 1 };
 }
 
-/** Copies a Drive file (into the same folder as the original) and returns the new file's id + Doc URL. */
+/** Copies a Drive file (into the same folder as the original) and returns the new file's id + Doc URL.
+ *  Set `opts.convertToGoogleDoc` to TRUE to convert a DOCX source into a native Google Doc on copy
+ *  — required for anchored comments to work on the copy. */
 export async function copyDriveFile(
   workspaceId: string, fileId: string, newName: string,
+  opts: { convertToGoogleDoc?: boolean } = {},
 ): Promise<{ id: string; url: string }> {
   const token = await refreshAccessToken(workspaceId);
   // Place the copy alongside the original so it's easy to find.
@@ -391,6 +458,7 @@ export async function copyDriveFile(
 
   const body: Record<string, unknown> = { name: newName };
   if (parents) body.parents = parents;
+  if (opts.convertToGoogleDoc) body.mimeType = "application/vnd.google-apps.document";
   const r = await fetch(`${DRIVE_API}/files/${fileId}/copy?supportsAllDrives=true`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
@@ -412,8 +480,16 @@ export async function copyDriveFile(
 export async function applyImpactsToGoogleDoc(
   workspaceId: string,
   fileId: string,
-  impacts: { findText: string; newText: string; mode: "insert" | "replace"; anchor?: string }[],
+  impacts: { findText: string; newText: string; mode: "insert" | "replace"; anchor?: string; originalText?: string }[],
+  opts: { renderMode?: "clean" | "trackChanges" } = {},
 ): Promise<{ applied: number; total: number }> {
+  // renderMode controls how a replace lands in the doc:
+  //  - "trackChanges" (default): the original middle STAYS in place styled red +
+  //    strike-through; the new middle is inserted right after it, highlighted
+  //    yellow. Reads like a Word track-changes review copy.
+  //  - "clean": the original middle is DELETED and the new middle inserted in
+  //    its place, highlighted yellow. Reads like a finalised replacement.
+  const renderMode: "clean" | "trackChanges" = opts.renderMode ?? "trackChanges";
   const token = await refreshAccessToken(workspaceId);
   const docResp = await fetch(`${DOCS_API}/documents/${fileId}`, {
     headers: { Authorization: `Bearer ${token}` },
@@ -443,9 +519,51 @@ export async function applyImpactsToGoogleDoc(
     }
   }
 
+  // Consolidate impacts that target the SAME `findText` in replace mode. Without
+  // this, N amendments to one original clause produce N redundant "(was: …)"
+  // annotations and the batch's sequential indices cascade unpredictably — the
+  // user would see the original repeated N times in strike-through. We merge
+  // them into a single replacement that joins all the amendments and keeps a
+  // single "(was: original)" annotation.
+  const consolidated: typeof impacts = [];
+  const replaceByFind = new Map<string, typeof impacts>();
+  for (const imp of impacts) {
+    const ft = (imp.findText ?? "").trim();
+    if (imp.mode === "replace" && ft) {
+      if (!replaceByFind.has(ft)) replaceByFind.set(ft, []);
+      replaceByFind.get(ft)!.push(imp);
+    } else {
+      consolidated.push(imp);
+    }
+  }
+  for (const [ft, imps] of replaceByFind.entries()) {
+    if (imps.length === 1) {
+      consolidated.push(imps[0]);
+    } else {
+      // Merge by diff: each impact's new_text usually starts with the original
+      // wording (the AI's "preserve and append" style) — joining full new_texts
+      // would repeat that original N times. Instead, take each impact's diff
+      // against the original, keep ONE copy of the shared prefix/suffix, and
+      // concatenate just the genuinely-new middles.
+      const diffs = imps.map((i) => diffSpans(ft, (i.newText ?? "").trim()));
+      const prefix = diffs[0].prefix;
+      const suffix = diffs[0].suffix;
+      const midOrig = diffs[0].midOrig; // any impact's midOrig; usually all empty
+      const midsNew = diffs.map((d) => d.midNew.trim()).filter(Boolean).join("\n\n");
+      const mergedNew = prefix + (midOrig.length > 0 ? "" : "") + midsNew + suffix;
+      consolidated.push({
+        findText: ft,
+        newText: mergedNew,
+        mode: "replace",
+        anchor: imps[0].anchor,
+        originalText: imps[0].originalText,
+      });
+    }
+  }
+
   const edits: { at: number; requests: any[] }[] = [];
   let applied = 0;
-  for (const imp of impacts) {
+  for (const imp of consolidated) {
     const ft = (imp.findText ?? "").trim();
     const newText = (imp.newText ?? "").trim();
     if (!newText) continue;
@@ -479,13 +597,58 @@ export async function applyImpactsToGoogleDoc(
       const docStart = docIndexOf[fs];
       const docEnd = docIndexOf[fe - 1] + 1;
       if (imp.mode === "replace") {
-        edits.push({ at: docStart, requests: [
-          { deleteContentRange: { range: { startIndex: docStart, endIndex: docEnd } } },
-          { insertText: { location: { index: docStart }, text: newText } },
-          { updateTextStyle: {
-              range: { startIndex: docStart, endIndex: docStart + newText.length },
-              textStyle: { backgroundColor: DOC_HIGHLIGHT }, fields: "backgroundColor" } },
-        ]});
+        const orig = ft;
+        const { prefix, midOrig, midNew, suffix } = diffSpans(orig, newText);
+        const midStart = docStart + prefix.length;
+        const midEnd = docEnd - suffix.length;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const reqs: any[] = [];
+        if (renderMode === "clean") {
+          // Clean mode: delete the old middle, insert the new middle highlighted.
+          if (midOrig.length > 0) {
+            reqs.push({
+              deleteContentRange: { range: { startIndex: midStart, endIndex: midEnd } },
+            });
+          }
+          if (midNew.length > 0) {
+            reqs.push(
+              { insertText: { location: { index: midStart }, text: midNew } },
+              {
+                updateTextStyle: {
+                  range: { startIndex: midStart, endIndex: midStart + midNew.length },
+                  textStyle: { backgroundColor: DOC_HIGHLIGHT, strikethrough: false },
+                  fields: "backgroundColor,strikethrough",
+                },
+              },
+            );
+          }
+        } else {
+          // Track-changes mode (default): keep midOrig in place red + strikethrough,
+          // append midNew right after it, highlighted yellow.
+          if (midOrig.length > 0) {
+            reqs.push({
+              updateTextStyle: {
+                range: { startIndex: midStart, endIndex: midEnd },
+                textStyle: { backgroundColor: DOC_DELETED, strikethrough: true },
+                fields: "backgroundColor,strikethrough",
+              },
+            });
+          }
+          if (midNew.length > 0) {
+            const insertAt = midEnd;
+            reqs.push(
+              { insertText: { location: { index: insertAt }, text: midNew } },
+              {
+                updateTextStyle: {
+                  range: { startIndex: insertAt, endIndex: insertAt + midNew.length },
+                  textStyle: { backgroundColor: DOC_HIGHLIGHT, strikethrough: false },
+                  fields: "backgroundColor,strikethrough",
+                },
+              },
+            );
+          }
+        }
+        if (reqs.length > 0) edits.push({ at: midStart, requests: reqs });
       } else {
         let paraEnd = fullText.indexOf("\n", fe);
         if (paraEnd < 0) paraEnd = fullText.length - 1;
@@ -524,5 +687,7 @@ export async function applyImpactsToGoogleDoc(
     });
     if (!upd.ok) throw new Error(`Docs edit failed: ${upd.status} ${await upd.text()}`);
   }
+  // Report against the ORIGINAL impact count so the caller's stats are accurate
+  // even when several impacts were merged into one consolidated replacement.
   return { applied, total: impacts.length };
 }

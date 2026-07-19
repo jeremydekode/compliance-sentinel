@@ -10,16 +10,34 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as SettingsRouteImport } from './routes/settings'
+import { Route as LoginRouteImport } from './routes/login'
 import { Route as KnowledgeBaseRouteImport } from './routes/knowledge-base'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as ReportsIndexRouteImport } from './routes/reports.index'
+import { Route as LegalIndexRouteImport } from './routes/legal.index'
+import { Route as LayoutIndexRouteImport } from './routes/layout.index'
+import { Route as Simplify2ReportIdRouteImport } from './routes/simplify2.$reportId'
+import { Route as SimplifyReportIdRouteImport } from './routes/simplify.$reportId'
 import { Route as ReportsReportIdRouteImport } from './routes/reports.$reportId'
+import { Route as LegalRequestsRouteImport } from './routes/legal.requests'
+import { Route as LegalRepositoryRouteImport } from './routes/legal.repository'
+import { Route as LegalNewRouteImport } from './routes/legal.new'
+import { Route as LegalMatterIdRouteImport } from './routes/legal.$matterId'
+import { Route as LayoutJobIdRouteImport } from './routes/layout.$jobId'
+import { Route as CreditReportIdRouteImport } from './routes/credit.$reportId'
+import { Route as AuthCallbackRouteImport } from './routes/auth.callback'
 import { Route as ReportsReportIdPresentRouteImport } from './routes/reports.$reportId.present'
+import { Route as LegalReviewDocumentIdRouteImport } from './routes/legal.review.$documentId'
 import { Route as AuthGoogleCallbackRouteImport } from './routes/auth.google.callback'
 
 const SettingsRoute = SettingsRouteImport.update({
   id: '/settings',
   path: '/settings',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const LoginRoute = LoginRouteImport.update({
+  id: '/login',
+  path: '/login',
   getParentRoute: () => rootRouteImport,
 } as any)
 const KnowledgeBaseRoute = KnowledgeBaseRouteImport.update({
@@ -37,15 +55,75 @@ const ReportsIndexRoute = ReportsIndexRouteImport.update({
   path: '/reports/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const LegalIndexRoute = LegalIndexRouteImport.update({
+  id: '/legal/',
+  path: '/legal/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const LayoutIndexRoute = LayoutIndexRouteImport.update({
+  id: '/layout/',
+  path: '/layout/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const Simplify2ReportIdRoute = Simplify2ReportIdRouteImport.update({
+  id: '/simplify2/$reportId',
+  path: '/simplify2/$reportId',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SimplifyReportIdRoute = SimplifyReportIdRouteImport.update({
+  id: '/simplify/$reportId',
+  path: '/simplify/$reportId',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ReportsReportIdRoute = ReportsReportIdRouteImport.update({
   id: '/reports/$reportId',
   path: '/reports/$reportId',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const LegalRequestsRoute = LegalRequestsRouteImport.update({
+  id: '/legal/requests',
+  path: '/legal/requests',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const LegalRepositoryRoute = LegalRepositoryRouteImport.update({
+  id: '/legal/repository',
+  path: '/legal/repository',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const LegalNewRoute = LegalNewRouteImport.update({
+  id: '/legal/new',
+  path: '/legal/new',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const LegalMatterIdRoute = LegalMatterIdRouteImport.update({
+  id: '/legal/$matterId',
+  path: '/legal/$matterId',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const LayoutJobIdRoute = LayoutJobIdRouteImport.update({
+  id: '/layout/$jobId',
+  path: '/layout/$jobId',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const CreditReportIdRoute = CreditReportIdRouteImport.update({
+  id: '/credit/$reportId',
+  path: '/credit/$reportId',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AuthCallbackRoute = AuthCallbackRouteImport.update({
+  id: '/auth/callback',
+  path: '/auth/callback',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ReportsReportIdPresentRoute = ReportsReportIdPresentRouteImport.update({
   id: '/present',
   path: '/present',
   getParentRoute: () => ReportsReportIdRoute,
+} as any)
+const LegalReviewDocumentIdRoute = LegalReviewDocumentIdRouteImport.update({
+  id: '/legal/review/$documentId',
+  path: '/legal/review/$documentId',
+  getParentRoute: () => rootRouteImport,
 } as any)
 const AuthGoogleCallbackRoute = AuthGoogleCallbackRouteImport.update({
   id: '/auth/google/callback',
@@ -56,29 +134,68 @@ const AuthGoogleCallbackRoute = AuthGoogleCallbackRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/knowledge-base': typeof KnowledgeBaseRoute
+  '/login': typeof LoginRoute
   '/settings': typeof SettingsRoute
+  '/auth/callback': typeof AuthCallbackRoute
+  '/credit/$reportId': typeof CreditReportIdRoute
+  '/layout/$jobId': typeof LayoutJobIdRoute
+  '/legal/$matterId': typeof LegalMatterIdRoute
+  '/legal/new': typeof LegalNewRoute
+  '/legal/repository': typeof LegalRepositoryRoute
+  '/legal/requests': typeof LegalRequestsRoute
   '/reports/$reportId': typeof ReportsReportIdRouteWithChildren
+  '/simplify/$reportId': typeof SimplifyReportIdRoute
+  '/simplify2/$reportId': typeof Simplify2ReportIdRoute
+  '/layout/': typeof LayoutIndexRoute
+  '/legal/': typeof LegalIndexRoute
   '/reports/': typeof ReportsIndexRoute
   '/auth/google/callback': typeof AuthGoogleCallbackRoute
+  '/legal/review/$documentId': typeof LegalReviewDocumentIdRoute
   '/reports/$reportId/present': typeof ReportsReportIdPresentRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/knowledge-base': typeof KnowledgeBaseRoute
+  '/login': typeof LoginRoute
   '/settings': typeof SettingsRoute
+  '/auth/callback': typeof AuthCallbackRoute
+  '/credit/$reportId': typeof CreditReportIdRoute
+  '/layout/$jobId': typeof LayoutJobIdRoute
+  '/legal/$matterId': typeof LegalMatterIdRoute
+  '/legal/new': typeof LegalNewRoute
+  '/legal/repository': typeof LegalRepositoryRoute
+  '/legal/requests': typeof LegalRequestsRoute
   '/reports/$reportId': typeof ReportsReportIdRouteWithChildren
+  '/simplify/$reportId': typeof SimplifyReportIdRoute
+  '/simplify2/$reportId': typeof Simplify2ReportIdRoute
+  '/layout': typeof LayoutIndexRoute
+  '/legal': typeof LegalIndexRoute
   '/reports': typeof ReportsIndexRoute
   '/auth/google/callback': typeof AuthGoogleCallbackRoute
+  '/legal/review/$documentId': typeof LegalReviewDocumentIdRoute
   '/reports/$reportId/present': typeof ReportsReportIdPresentRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/knowledge-base': typeof KnowledgeBaseRoute
+  '/login': typeof LoginRoute
   '/settings': typeof SettingsRoute
+  '/auth/callback': typeof AuthCallbackRoute
+  '/credit/$reportId': typeof CreditReportIdRoute
+  '/layout/$jobId': typeof LayoutJobIdRoute
+  '/legal/$matterId': typeof LegalMatterIdRoute
+  '/legal/new': typeof LegalNewRoute
+  '/legal/repository': typeof LegalRepositoryRoute
+  '/legal/requests': typeof LegalRequestsRoute
   '/reports/$reportId': typeof ReportsReportIdRouteWithChildren
+  '/simplify/$reportId': typeof SimplifyReportIdRoute
+  '/simplify2/$reportId': typeof Simplify2ReportIdRoute
+  '/layout/': typeof LayoutIndexRoute
+  '/legal/': typeof LegalIndexRoute
   '/reports/': typeof ReportsIndexRoute
   '/auth/google/callback': typeof AuthGoogleCallbackRoute
+  '/legal/review/$documentId': typeof LegalReviewDocumentIdRoute
   '/reports/$reportId/present': typeof ReportsReportIdPresentRoute
 }
 export interface FileRouteTypes {
@@ -86,38 +203,90 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/knowledge-base'
+    | '/login'
     | '/settings'
+    | '/auth/callback'
+    | '/credit/$reportId'
+    | '/layout/$jobId'
+    | '/legal/$matterId'
+    | '/legal/new'
+    | '/legal/repository'
+    | '/legal/requests'
     | '/reports/$reportId'
+    | '/simplify/$reportId'
+    | '/simplify2/$reportId'
+    | '/layout/'
+    | '/legal/'
     | '/reports/'
     | '/auth/google/callback'
+    | '/legal/review/$documentId'
     | '/reports/$reportId/present'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
     | '/knowledge-base'
+    | '/login'
     | '/settings'
+    | '/auth/callback'
+    | '/credit/$reportId'
+    | '/layout/$jobId'
+    | '/legal/$matterId'
+    | '/legal/new'
+    | '/legal/repository'
+    | '/legal/requests'
     | '/reports/$reportId'
+    | '/simplify/$reportId'
+    | '/simplify2/$reportId'
+    | '/layout'
+    | '/legal'
     | '/reports'
     | '/auth/google/callback'
+    | '/legal/review/$documentId'
     | '/reports/$reportId/present'
   id:
     | '__root__'
     | '/'
     | '/knowledge-base'
+    | '/login'
     | '/settings'
+    | '/auth/callback'
+    | '/credit/$reportId'
+    | '/layout/$jobId'
+    | '/legal/$matterId'
+    | '/legal/new'
+    | '/legal/repository'
+    | '/legal/requests'
     | '/reports/$reportId'
+    | '/simplify/$reportId'
+    | '/simplify2/$reportId'
+    | '/layout/'
+    | '/legal/'
     | '/reports/'
     | '/auth/google/callback'
+    | '/legal/review/$documentId'
     | '/reports/$reportId/present'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   KnowledgeBaseRoute: typeof KnowledgeBaseRoute
+  LoginRoute: typeof LoginRoute
   SettingsRoute: typeof SettingsRoute
+  AuthCallbackRoute: typeof AuthCallbackRoute
+  CreditReportIdRoute: typeof CreditReportIdRoute
+  LayoutJobIdRoute: typeof LayoutJobIdRoute
+  LegalMatterIdRoute: typeof LegalMatterIdRoute
+  LegalNewRoute: typeof LegalNewRoute
+  LegalRepositoryRoute: typeof LegalRepositoryRoute
+  LegalRequestsRoute: typeof LegalRequestsRoute
   ReportsReportIdRoute: typeof ReportsReportIdRouteWithChildren
+  SimplifyReportIdRoute: typeof SimplifyReportIdRoute
+  Simplify2ReportIdRoute: typeof Simplify2ReportIdRoute
+  LayoutIndexRoute: typeof LayoutIndexRoute
+  LegalIndexRoute: typeof LegalIndexRoute
   ReportsIndexRoute: typeof ReportsIndexRoute
   AuthGoogleCallbackRoute: typeof AuthGoogleCallbackRoute
+  LegalReviewDocumentIdRoute: typeof LegalReviewDocumentIdRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -127,6 +296,13 @@ declare module '@tanstack/react-router' {
       path: '/settings'
       fullPath: '/settings'
       preLoaderRoute: typeof SettingsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/login': {
+      id: '/login'
+      path: '/login'
+      fullPath: '/login'
+      preLoaderRoute: typeof LoginRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/knowledge-base': {
@@ -150,11 +326,88 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ReportsIndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/legal/': {
+      id: '/legal/'
+      path: '/legal'
+      fullPath: '/legal/'
+      preLoaderRoute: typeof LegalIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/layout/': {
+      id: '/layout/'
+      path: '/layout'
+      fullPath: '/layout/'
+      preLoaderRoute: typeof LayoutIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/simplify2/$reportId': {
+      id: '/simplify2/$reportId'
+      path: '/simplify2/$reportId'
+      fullPath: '/simplify2/$reportId'
+      preLoaderRoute: typeof Simplify2ReportIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/simplify/$reportId': {
+      id: '/simplify/$reportId'
+      path: '/simplify/$reportId'
+      fullPath: '/simplify/$reportId'
+      preLoaderRoute: typeof SimplifyReportIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/reports/$reportId': {
       id: '/reports/$reportId'
       path: '/reports/$reportId'
       fullPath: '/reports/$reportId'
       preLoaderRoute: typeof ReportsReportIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/legal/requests': {
+      id: '/legal/requests'
+      path: '/legal/requests'
+      fullPath: '/legal/requests'
+      preLoaderRoute: typeof LegalRequestsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/legal/repository': {
+      id: '/legal/repository'
+      path: '/legal/repository'
+      fullPath: '/legal/repository'
+      preLoaderRoute: typeof LegalRepositoryRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/legal/new': {
+      id: '/legal/new'
+      path: '/legal/new'
+      fullPath: '/legal/new'
+      preLoaderRoute: typeof LegalNewRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/legal/$matterId': {
+      id: '/legal/$matterId'
+      path: '/legal/$matterId'
+      fullPath: '/legal/$matterId'
+      preLoaderRoute: typeof LegalMatterIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/layout/$jobId': {
+      id: '/layout/$jobId'
+      path: '/layout/$jobId'
+      fullPath: '/layout/$jobId'
+      preLoaderRoute: typeof LayoutJobIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/credit/$reportId': {
+      id: '/credit/$reportId'
+      path: '/credit/$reportId'
+      fullPath: '/credit/$reportId'
+      preLoaderRoute: typeof CreditReportIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/auth/callback': {
+      id: '/auth/callback'
+      path: '/auth/callback'
+      fullPath: '/auth/callback'
+      preLoaderRoute: typeof AuthCallbackRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/reports/$reportId/present': {
@@ -163,6 +416,13 @@ declare module '@tanstack/react-router' {
       fullPath: '/reports/$reportId/present'
       preLoaderRoute: typeof ReportsReportIdPresentRouteImport
       parentRoute: typeof ReportsReportIdRoute
+    }
+    '/legal/review/$documentId': {
+      id: '/legal/review/$documentId'
+      path: '/legal/review/$documentId'
+      fullPath: '/legal/review/$documentId'
+      preLoaderRoute: typeof LegalReviewDocumentIdRouteImport
+      parentRoute: typeof rootRouteImport
     }
     '/auth/google/callback': {
       id: '/auth/google/callback'
@@ -189,10 +449,23 @@ const ReportsReportIdRouteWithChildren = ReportsReportIdRoute._addFileChildren(
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   KnowledgeBaseRoute: KnowledgeBaseRoute,
+  LoginRoute: LoginRoute,
   SettingsRoute: SettingsRoute,
+  AuthCallbackRoute: AuthCallbackRoute,
+  CreditReportIdRoute: CreditReportIdRoute,
+  LayoutJobIdRoute: LayoutJobIdRoute,
+  LegalMatterIdRoute: LegalMatterIdRoute,
+  LegalNewRoute: LegalNewRoute,
+  LegalRepositoryRoute: LegalRepositoryRoute,
+  LegalRequestsRoute: LegalRequestsRoute,
   ReportsReportIdRoute: ReportsReportIdRouteWithChildren,
+  SimplifyReportIdRoute: SimplifyReportIdRoute,
+  Simplify2ReportIdRoute: Simplify2ReportIdRoute,
+  LayoutIndexRoute: LayoutIndexRoute,
+  LegalIndexRoute: LegalIndexRoute,
   ReportsIndexRoute: ReportsIndexRoute,
   AuthGoogleCallbackRoute: AuthGoogleCallbackRoute,
+  LegalReviewDocumentIdRoute: LegalReviewDocumentIdRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

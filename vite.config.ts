@@ -12,4 +12,10 @@ export default defineConfig({
     tsconfigPaths(),
     tailwindcss(),
   ],
+  // Pre-bundle heavy deps that are only imported inside lazily-loaded routes
+  // (the credit report). Without this, Vite discovers them on first navigation,
+  // re-optimizes, and the in-flight chunk 504s ("Outdated Optimize Dep").
+  optimizeDeps: {
+    include: ["pdfjs-dist", "react-markdown"],
+  },
 });

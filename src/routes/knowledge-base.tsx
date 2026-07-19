@@ -29,6 +29,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { ExternalLink, Eye, FileText, LayoutGrid, List, Loader2, Pencil, Plus, Trash2, Upload, RefreshCw, AlertTriangle, CheckCircle2 } from "lucide-react";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { createSop, deleteSop, updateSop, reindexSop, getChunkCounts } from "@/lib/compliance.functions";
+import { useAuth } from "@/lib/auth";
 import { useWorkspace, WORKSPACES } from "@/lib/workspace";
 import { autoDetectDocMeta, DOC_TYPE_LABEL, type DetectedDocType, type DetectedMeta } from "@/lib/auto-detect";
 import { toast } from "sonner";
@@ -48,7 +49,7 @@ function typeMeta(t: string) {
 
 export const Route = createFileRoute("/knowledge-base")({
   component: KB,
-  head: () => ({ meta: [{ title: "Knowledge Base · Compliance Sentinel" }] }),
+  head: () => ({ meta: [{ title: "Knowledge Base · AI Document Workflow" }] }),
 });
 
 function KB() {
@@ -67,13 +68,16 @@ function KB() {
 
   const [workspace] = useWorkspace();
 
+  const auth = useAuth();
   const sops = useQuery({
-    queryKey: ["sops", workspace],
+    queryKey: ["sops", workspace, auth.tenantId],
+    enabled: !auth.loading,
     queryFn: async () => {
       const { data } = await (supabase as any)
         .from("sop_documents")
         .select("*")
         .eq("workspace_id", workspace)
+        .eq("tenant_id", auth.tenantId)
         .order("is_active", { ascending: false, nullsFirst: false })
         .order("created_at", { ascending: false });
       return data ?? [];
@@ -109,7 +113,7 @@ function KB() {
   }
 
   async function handleReindexAllPdfs() {
-    const docs = (sops.data ?? []).filter((s: any) => !!s.file_url);
+    const docs = (sops.data ?? []).filter((s: any) => !!s.file_url || !!s.drive_file_id);
     if (docs.length === 0) {
       toast.info("No documents with source files to re-index in this workspace");
       return;
@@ -365,7 +369,7 @@ function KB() {
                           variant="ghost"
                           className="size-8"
                           title="Re-index (re-chunk + re-embed)"
-                          disabled={!s.file_url || reindexing === s.id}
+                          disabled={(!s.file_url && !s.drive_file_id) || reindexing === s.id}
                           onClick={() => handleReindex(s.id, s.title)}
                         >
                           {reindexing === s.id ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}

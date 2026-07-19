@@ -61,7 +61,7 @@ export function OverviewTab({ report, changes, impacts = [], view }: Props) {
               <span className="text-amber-800/80 dark:text-amber-400/80">
                 The Google Gemini API account is currently suspended ({summary.simulator_reason}). 
                 This report is served using high-fidelity 
-                regulatory simulation to demonstrate the "Compliance Sentinel" Intelligence Engine.
+                regulatory simulation to demonstrate the "AI Document Workflow" Intelligence Engine.
               </span>
             </div>
           </div>

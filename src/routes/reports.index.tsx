@@ -1,11 +1,19 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { AppShell } from "@/components/app-shell";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from "@/components/ui/dialog";
 import { supabase } from "@/integrations/supabase/client";
 import {
   ArrowRight,
@@ -21,41 +29,559 @@ import {
   HardDrive,
   FileText,
   RefreshCw,
+  ShieldPlus,
+  ShieldAlert,
 } from "lucide-react";
 import { FormUpdateDialog } from "@/components/form-update-dialog";
+import { SimplifyUploadDialog } from "@/components/simplify-upload-dialog";
+import { SimplifyV2UploadDialog } from "@/components/simplify-v2-upload-dialog";
+import { CreditUploadDialog } from "@/components/credit-upload-dialog";
 import { formatDate, statusMeta } from "@/lib/format";
 import {
   deleteReport,
   createRegulatoryReport,
-  startRegulatoryRerun,
-  analyzeRegulatorySop,
-  finalizeRegulatoryReport,
   listWorkspaceDriveFiles,
   importDriveFileForAnalysis,
   getGoogleConnectionStatus,
+  createPolicyChangeReport,
 } from "@/lib/compliance.functions";
 import { autoDetectDocMeta, DOC_TYPE_LABEL, type DetectedMeta } from "@/lib/auto-detect";
 import { useWorkspace, WORKSPACES } from "@/lib/workspace";
-import { PIPELINE_STEPS } from "@/lib/mock-pipeline";
+import { useAuth } from "@/lib/auth";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 
 export const Route = createFileRoute("/reports/")({
-  component: ReportsList,
-  head: () => ({ meta: [{ title: "Analyses · Compliance Sentinel" }] }),
+  component: ReportsRoute,
+  head: () => ({ meta: [{ title: "Analyses · AI Document Workflow" }] }),
 });
+
+/**
+ * The /reports route serves every workspace. The Document Simplification (UC4)
+ * workspace has its own self-contained landing — kept separate so the
+ * regulatory / forms list below is never disturbed.
+ */
+function ReportsRoute() {
+  const [workspace] = useWorkspace();
+  if (workspace === "simplify") return <SimplifyReportsList />;
+  if (workspace === "simplify_v2") return <SimplifyV2ReportsList />;
+  if (workspace === "credit_risk" || workspace === "credit_risk_demo") return <CreditRiskReportsList />;
+  return <ReportsList />;
+}
+
+/** Simplify v2 — three-mode workspace (Simplify / Recommendation / Recommend & Edit). */
+function SimplifyV2ReportsList() {
+  const qc = useQueryClient();
+  const nav = useNavigate();
+  const remove = useServerFn(deleteReport);
+  const auth = useAuth();
+  const [showUpload, setShowUpload] = useState(false);
+
+  const reports = useQuery({
+    queryKey: ["reports", "all", "simplify_v2", auth.tenantId],
+    enabled: !auth.loading,
+    queryFn: async () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data } = await (supabase as any)
+        .from("analysis_reports")
+        .select("id, title, policy_name, status, created_at, summary_json")
+        .eq("workspace_id", "simplify_v2")
+        .eq("tenant_id", auth.tenantId)
+        .order("created_at", { ascending: false });
+      return data ?? [];
+    },
+  });
+
+  async function handleDelete(e: React.MouseEvent, id: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!confirm("Delete this analysis and all related data?")) return;
+    try {
+      await remove({ data: { id } });
+      toast.success("Analysis deleted");
+      qc.invalidateQueries({ queryKey: ["reports"] });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } catch (err: any) {
+      toast.error(err?.message ?? "Failed to delete");
+    }
+  }
+
+  const modeMeta: Record<string, { label: string; classes: string }> = {
+    simplify: { label: "Simplify", classes: "bg-violet-100 text-violet-700 border-violet-200" },
+    recommend: { label: "Recommendation", classes: "bg-sky-100 text-sky-700 border-sky-200" },
+    recommend_edit: { label: "Recommend & Edit", classes: "bg-fuchsia-100 text-fuchsia-700 border-fuchsia-200" },
+  };
+
+  return (
+    <AppShell>
+      <div className="p-8 max-w-[1400px] mx-auto space-y-8">
+        <div className="flex items-end justify-between">
+          <div>
+            <h1 className="text-3xl font-bold tracking-tight">Simplify v2</h1>
+            <p className="text-muted-foreground mt-1 text-lg">
+              Audit, restructure and simplify documents — every finding and edit verified against the source.
+            </p>
+          </div>
+          <Button
+            size="lg"
+            onClick={() => setShowUpload(true)}
+            className="gap-2 h-12 px-6 rounded-xl font-bold bg-fuchsia-600 hover:bg-fuchsia-700 text-white shadow-lg shadow-fuchsia-500/20 active:scale-95"
+          >
+            <Plus className="size-4" /> New Analysis
+          </Button>
+        </div>
+
+        <Card className="p-0 overflow-hidden border-border/50 shadow-sm glass-card">
+          <div className="px-6 py-4 border-b border-border/50 bg-muted/30 flex items-center justify-between">
+            <h2 className="font-bold text-sm uppercase tracking-[0.2em] text-muted-foreground">Documents</h2>
+            <Badge variant="secondary" className="font-black text-[10px]">{reports.data?.length ?? 0} TOTAL</Badge>
+          </div>
+
+          {reports.isLoading && (
+            <div className="p-12 text-center text-muted-foreground font-medium italic animate-pulse">Loading…</div>
+          )}
+
+          {!reports.isLoading && (reports.data?.length ?? 0) === 0 && (
+            <div className="p-20 text-center">
+              <div className="size-16 bg-muted rounded-full grid place-items-center mx-auto mb-4">
+                <FileText className="size-8 text-muted-foreground" />
+              </div>
+              <h3 className="text-xl font-bold">No documents analysed yet</h3>
+              <p className="text-muted-foreground mt-2 max-w-sm mx-auto">
+                Upload a document to simplify it, audit it for gaps and contradictions, or restructure it end to end.
+              </p>
+              <Button onClick={() => setShowUpload(true)} className="mt-6 gap-2 h-11 px-8 rounded-lg font-bold bg-fuchsia-600 hover:bg-fuchsia-700 text-white">
+                <Plus className="size-4" /> New Analysis
+              </Button>
+            </div>
+          )}
+
+          <div className="divide-y divide-border/50">
+            {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
+            {reports.data?.map((r: any) => {
+              const sj = r.summary_json ?? {};
+              const mode = modeMeta[sj.workflow_mode] ?? modeMeta.simplify;
+              const counts = sj.audit?.counts;
+              const findingsTotal = counts
+                ? Object.values(counts.bySeverity ?? {}).reduce((a: number, b) => a + Number(b ?? 0), 0)
+                : null;
+              return (
+                <Link
+                  key={r.id}
+                  to="/simplify2/$reportId"
+                  params={{ reportId: r.id }}
+                  className="flex items-center justify-between px-6 py-5 hover:bg-fuchsia-500/[0.03] transition-colors group"
+                >
+                  <div className="min-w-0 flex items-center gap-4">
+                    <div className="size-10 rounded-xl grid place-items-center shrink-0 bg-fuchsia-100 transition-transform group-hover:scale-110">
+                      <Sparkles className="size-5 text-fuchsia-700" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <div className="font-bold text-base truncate group-hover:text-fuchsia-700 transition-colors">{r.title}</div>
+                        <span className={cn("shrink-0 rounded-md border px-1.5 py-0.5 text-[10px] font-semibold", mode.classes)}>
+                          {mode.label}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2 text-xs text-muted-foreground mt-1 font-medium">
+                        {sj.pending_analysis ? (
+                          <span className="text-fuchsia-600 font-semibold">Analysing…</span>
+                        ) : sj.simplification_status === "failed" ? (
+                          <span className="text-rose-600 font-semibold">Run failed</span>
+                        ) : counts ? (
+                          <span>
+                            {findingsTotal} finding{findingsTotal === 1 ? "" : "s"}
+                            {counts.bySeverity?.critical > 0 && (
+                              <span className="text-rose-600 font-semibold"> · {counts.bySeverity.critical} critical</span>
+                            )}
+                            {sj.restructure && <span className="text-emerald-600 font-semibold"> · restructured</span>}
+                          </span>
+                        ) : sj.verification ? (
+                          <span>
+                            {sj.verification.verified} verified · {sj.verification.review} review · {sj.verification.rejected} quarantined
+                          </span>
+                        ) : (
+                          <span>Ready</span>
+                        )}
+                        <span>•</span>
+                        <span>{formatDate(r.created_at)}</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-9 rounded-lg text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
+                      onClick={(e) => handleDelete(e, r.id)}
+                    >
+                      <Trash2 className="size-4" />
+                    </Button>
+                    <div className="size-9 rounded-lg bg-muted grid place-items-center group-hover:bg-fuchsia-600 group-hover:text-white transition-all">
+                      <ArrowRight className="size-4" />
+                    </div>
+                  </div>
+                </Link>
+              );
+            })}
+          </div>
+        </Card>
+      </div>
+
+      <SimplifyV2UploadDialog
+        open={showUpload}
+        onOpenChange={setShowUpload}
+        onCreated={(reportId) => {
+          qc.invalidateQueries({ queryKey: ["reports"] });
+          nav({ to: "/simplify2/$reportId", params: { reportId } });
+        }}
+      />
+    </AppShell>
+  );
+}
+
+/** Credit Risk Alert — list of screened applications + the upload entry point. */
+function CreditRiskReportsList() {
+  const qc = useQueryClient();
+  const nav = useNavigate();
+  const remove = useServerFn(deleteReport);
+  const auth = useAuth();
+  const [showUpload, setShowUpload] = useState(false);
+  const [workspace] = useWorkspace();
+
+  const reports = useQuery({
+    queryKey: ["reports", "all", workspace, auth.tenantId],
+    enabled: !auth.loading,
+    queryFn: async () => {
+      const { data } = await (supabase as any)
+        .from("analysis_reports")
+        .select("id, title, policy_name, status, created_at, summary_json")
+        .eq("workspace_id", workspace)
+        .eq("tenant_id", auth.tenantId)
+        .order("created_at", { ascending: false });
+      return data ?? [];
+    },
+  });
+
+  async function handleDelete(e: React.MouseEvent, id: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!confirm("Delete this credit risk analysis and all related data?")) return;
+    try {
+      await remove({ data: { id } });
+      toast.success("Analysis deleted");
+      qc.invalidateQueries({ queryKey: ["reports"] });
+    } catch (err: any) {
+      toast.error(err?.message ?? "Failed to delete");
+    }
+  }
+
+  const indicatorMeta: Record<string, { label: string; classes: string }> = {
+    high: { label: "High risk", classes: "bg-rose-100 text-rose-800 border-rose-200" },
+    probe: { label: "Probe", classes: "bg-amber-100 text-amber-800 border-amber-200" },
+    low: { label: "Low risk", classes: "bg-emerald-100 text-emerald-800 border-emerald-200" },
+  };
+
+  return (
+    <AppShell>
+      <div className="p-8 max-w-[1400px] mx-auto space-y-8">
+        <div className="flex items-end justify-between">
+          <div>
+            <h1 className="text-3xl font-bold tracking-tight">Credit Risk Alert</h1>
+            <p className="text-muted-foreground mt-1 text-lg">
+              Screen credit applications across 8 risk dimensions — every flag traced to a historical
+              case in the knowledge base.
+            </p>
+          </div>
+          <Button
+            size="lg"
+            onClick={() => setShowUpload(true)}
+            className="gap-2 h-12 px-6 rounded-xl font-bold bg-red-600 hover:bg-red-700 text-white shadow-lg shadow-red-500/20 active:scale-95"
+          >
+            <Plus className="size-4" /> New Credit Risk Analysis
+          </Button>
+        </div>
+
+        <Card className="p-0 overflow-hidden border-border/50 shadow-sm glass-card">
+          <div className="px-6 py-4 border-b border-border/50 bg-muted/30 flex items-center justify-between">
+            <h2 className="font-bold text-sm uppercase tracking-[0.2em] text-muted-foreground">
+              Screened Applications
+            </h2>
+            <Badge variant="secondary" className="font-black text-[10px]">
+              {reports.data?.length ?? 0} TOTAL
+            </Badge>
+          </div>
+
+          {reports.isLoading && (
+            <div className="p-12 text-center text-muted-foreground font-medium italic animate-pulse">
+              Loading…
+            </div>
+          )}
+
+          {!reports.isLoading && (reports.data?.length ?? 0) === 0 && (
+            <div className="p-20 text-center">
+              <div className="size-16 bg-muted rounded-full grid place-items-center mx-auto mb-4">
+                <ShieldAlert className="size-8 text-muted-foreground" />
+              </div>
+              <h3 className="text-xl font-bold">No applications screened yet</h3>
+              <p className="text-muted-foreground mt-2 max-w-sm mx-auto">
+                Upload a credit application to flag risks against the internal case knowledge base.
+              </p>
+              <Button
+                onClick={() => setShowUpload(true)}
+                className="mt-6 gap-2 h-11 px-8 rounded-lg font-bold bg-red-600 hover:bg-red-700 text-white"
+              >
+                <Plus className="size-4" /> New Credit Risk Analysis
+              </Button>
+            </div>
+          )}
+
+          <div className="divide-y divide-border/50">
+            {reports.data?.map((r: any) => {
+              const sj = r.summary_json ?? {};
+              const analysis = sj.credit_analysis;
+              const im = analysis ? indicatorMeta[analysis.overallRisk] ?? indicatorMeta.probe : null;
+              return (
+                <Link
+                  key={r.id}
+                  to="/credit/$reportId"
+                  params={{ reportId: r.id }}
+                  className="flex items-center justify-between px-6 py-5 hover:bg-red-500/[0.03] transition-colors group"
+                >
+                  <div className="min-w-0 flex items-center gap-4">
+                    <div className="size-10 rounded-xl grid place-items-center shrink-0 bg-red-100 transition-transform group-hover:scale-110">
+                      <ShieldAlert className="size-5 text-red-700" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="font-bold text-base truncate group-hover:text-red-700 transition-colors">
+                        {r.title}
+                      </div>
+                      <div className="flex items-center gap-2 text-xs text-muted-foreground mt-1 font-medium">
+                        {sj.pending_analysis ? (
+                          <span className="text-red-600 font-semibold">Analysing…</span>
+                        ) : sj.credit_status === "failed" ? (
+                          <span className="text-rose-600 font-semibold">Run failed</span>
+                        ) : analysis ? (
+                          <span>
+                            {analysis.referencesUsed?.length ?? 0} case
+                            {(analysis.referencesUsed?.length ?? 0) === 1 ? "" : "s"} referenced
+                          </span>
+                        ) : (
+                          <span>Ready</span>
+                        )}
+                        <span>•</span>
+                        <span>{formatDate(r.created_at)}</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-3 shrink-0">
+                    {im && (
+                      <Badge
+                        variant="outline"
+                        className={cn("font-black text-[10px] uppercase tracking-widest px-2", im.classes)}
+                      >
+                        {im.label}
+                      </Badge>
+                    )}
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-9 rounded-lg text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
+                      onClick={(e) => handleDelete(e, r.id)}
+                    >
+                      <Trash2 className="size-4" />
+                    </Button>
+                    <div className="size-9 rounded-lg bg-muted grid place-items-center group-hover:bg-red-600 group-hover:text-white transition-all">
+                      <ArrowRight className="size-4" />
+                    </div>
+                  </div>
+                </Link>
+              );
+            })}
+          </div>
+        </Card>
+      </div>
+
+      <CreditUploadDialog
+        open={showUpload}
+        onOpenChange={setShowUpload}
+        onCreated={(reportId) => {
+          qc.invalidateQueries({ queryKey: ["reports"] });
+          nav({ to: "/credit/$reportId", params: { reportId } });
+        }}
+      />
+    </AppShell>
+  );
+}
+
+/** UC4 — list of simplified documents + the upload entry point. */
+function SimplifyReportsList() {
+  const qc = useQueryClient();
+  const nav = useNavigate();
+  const remove = useServerFn(deleteReport);
+  const auth = useAuth();
+  const [showUpload, setShowUpload] = useState(false);
+
+  const reports = useQuery({
+    queryKey: ["reports", "all", "simplify", auth.tenantId],
+    enabled: !auth.loading,
+    queryFn: async () => {
+      const { data } = await (supabase as any)
+        .from("analysis_reports")
+        .select("id, title, policy_name, status, created_at, summary_json")
+        .eq("workspace_id", "simplify")
+        .eq("tenant_id", auth.tenantId)
+        .order("created_at", { ascending: false });
+      return data ?? [];
+    },
+  });
+
+  async function handleDelete(e: React.MouseEvent, id: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!confirm("Delete this simplification and all related data?")) return;
+    try {
+      await remove({ data: { id } });
+      toast.success("Simplification deleted");
+      qc.invalidateQueries({ queryKey: ["reports"] });
+    } catch (err: any) {
+      toast.error(err?.message ?? "Failed to delete");
+    }
+  }
+
+  return (
+    <AppShell>
+      <div className="p-8 max-w-[1400px] mx-auto space-y-8">
+        <div className="flex items-end justify-between">
+          <div>
+            <h1 className="text-3xl font-bold tracking-tight">Document Simplification</h1>
+            <p className="text-muted-foreground mt-1 text-lg">
+              Rewrite internal documents in plain English — every edit verified against the source.
+            </p>
+          </div>
+          <Button
+            size="lg"
+            onClick={() => setShowUpload(true)}
+            className="gap-2 h-12 px-6 rounded-xl font-bold bg-violet-600 hover:bg-violet-700 text-white shadow-lg shadow-violet-500/20 active:scale-95"
+          >
+            <Plus className="size-4" /> New Simplification
+          </Button>
+        </div>
+
+        <Card className="p-0 overflow-hidden border-border/50 shadow-sm glass-card">
+          <div className="px-6 py-4 border-b border-border/50 bg-muted/30 flex items-center justify-between">
+            <h2 className="font-bold text-sm uppercase tracking-[0.2em] text-muted-foreground">Simplified Documents</h2>
+            <Badge variant="secondary" className="font-black text-[10px]">{reports.data?.length ?? 0} TOTAL</Badge>
+          </div>
+
+          {reports.isLoading && (
+            <div className="p-12 text-center text-muted-foreground font-medium italic animate-pulse">Loading…</div>
+          )}
+
+          {!reports.isLoading && (reports.data?.length ?? 0) === 0 && (
+            <div className="p-20 text-center">
+              <div className="size-16 bg-muted rounded-full grid place-items-center mx-auto mb-4">
+                <FileText className="size-8 text-muted-foreground" />
+              </div>
+              <h3 className="text-xl font-bold">No documents simplified yet</h3>
+              <p className="text-muted-foreground mt-2 max-w-sm mx-auto">
+                Upload an internal document to generate a verified plain-English redline.
+              </p>
+              <Button onClick={() => setShowUpload(true)} className="mt-6 gap-2 h-11 px-8 rounded-lg font-bold bg-violet-600 hover:bg-violet-700 text-white">
+                <Plus className="size-4" /> New Simplification
+              </Button>
+            </div>
+          )}
+
+          <div className="divide-y divide-border/50">
+            {reports.data?.map((r: any) => {
+              const sj = r.summary_json ?? {};
+              const v = sj.verification;
+              return (
+                <Link
+                  key={r.id}
+                  to="/simplify/$reportId"
+                  params={{ reportId: r.id }}
+                  className="flex items-center justify-between px-6 py-5 hover:bg-violet-500/[0.03] transition-colors group"
+                >
+                  <div className="min-w-0 flex items-center gap-4">
+                    <div className="size-10 rounded-xl grid place-items-center shrink-0 bg-violet-100 transition-transform group-hover:scale-110">
+                      <Sparkles className="size-5 text-violet-700" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="font-bold text-base truncate group-hover:text-violet-700 transition-colors">{r.title}</div>
+                      <div className="flex items-center gap-2 text-xs text-muted-foreground mt-1 font-medium">
+                        {sj.pending_analysis ? (
+                          <span className="text-violet-600 font-semibold">Analysing…</span>
+                        ) : sj.simplification_status === "failed" ? (
+                          <span className="text-rose-600 font-semibold">Run failed</span>
+                        ) : v ? (
+                          <span>
+                            {v.verified} verified · {v.review} review · {v.rejected} quarantined
+                          </span>
+                        ) : (
+                          <span>Ready</span>
+                        )}
+                        <span>•</span>
+                        <span>{formatDate(r.created_at)}</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-9 rounded-lg text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
+                      onClick={(e) => handleDelete(e, r.id)}
+                    >
+                      <Trash2 className="size-4" />
+                    </Button>
+                    <div className="size-9 rounded-lg bg-muted grid place-items-center group-hover:bg-violet-600 group-hover:text-white transition-all">
+                      <ArrowRight className="size-4" />
+                    </div>
+                  </div>
+                </Link>
+              );
+            })}
+          </div>
+        </Card>
+      </div>
+
+      <SimplifyUploadDialog
+        open={showUpload}
+        onOpenChange={setShowUpload}
+        onCreated={(reportId) => {
+          qc.invalidateQueries({ queryKey: ["reports"] });
+          nav({ to: "/simplify/$reportId", params: { reportId } });
+        }}
+      />
+    </AppShell>
+  );
+}
 
 function ReportsList() {
   const qc = useQueryClient();
   const remove = useServerFn(deleteReport);
   const createReg = useServerFn(createRegulatoryReport);
-  const startReg = useServerFn(startRegulatoryRerun);
-  const analyzeReg = useServerFn(analyzeRegulatorySop);
-  const finalizeReg = useServerFn(finalizeRegulatoryReport);
   const listDrive = useServerFn(listWorkspaceDriveFiles);
   const importDrive = useServerFn(importDriveFileForAnalysis);
   const getGoogleStatus = useServerFn(getGoogleConnectionStatus);
+  const createPolicyChange = useServerFn(createPolicyChangeReport);
   const nav = useNavigate();
+
+  // Role gate for the "New Policy Change" entry point. Mounted-gated so the
+  // server render (always least-privilege "viewer") matches the first client
+  // paint, then the real role takes over — same pattern as app-shell.
+  const auth = useAuth();
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+  const canRaisePolicyChange = mounted && !auth.loading && (auth.role === "member" || auth.role === "super_admin");
+
+  // Inline "New Policy Change" dialog state.
+  const [showPolicyChange, setShowPolicyChange] = useState(false);
+  const [pcTitle, setPcTitle] = useState("");
+  const [pcDescription, setPcDescription] = useState("");
+  const [pcSubmitting, setPcSubmitting] = useState(false);
 
   const [showUpload, setShowUpload] = useState(false);
   const [showFormUpdate, setShowFormUpdate] = useState(false);
@@ -67,7 +593,6 @@ function ReportsList() {
   const [overrideDocType, setOverrideDocType] = useState<string>("");
   const [notes, setNotes] = useState("");
   const [running, setRunning] = useState(false);
-  const [stepIdx, setStepIdx] = useState(-1);
   const [workspace] = useWorkspace();
 
   // Google connection status — drives whether the "Pick from Drive" tab is usable
@@ -108,7 +633,6 @@ function ReportsList() {
   async function startAnalysis() {
     if (!file && !driveFile) return;
     setRunning(true);
-    setStepIdx(0);
 
     let fileUrl: string | null = null;
     let filename: string = "";
@@ -137,24 +661,18 @@ function ReportsList() {
       console.error("Upload/import failed:", e);
       toast.error("Could not prepare file for analysis", { description: e?.message });
       setRunning(false);
-      setStepIdx(-1);
       return;
     }
 
-    // Progress simulation for UI
-    for (let i = 0; i < PIPELINE_STEPS.length - 1; i++) {
-      setStepIdx(i);
-      await new Promise((r) => setTimeout(r, PIPELINE_STEPS[i].duration));
-    }
-
     try {
-      setStepIdx(7);
       // Merge user overrides into detected meta
       const detectedWithOverrides = detected ? {
         ...detected,
         doc_type: (overrideDocType || detected.doc_type) as DetectedMeta["doc_type"],
       } : undefined;
-      // 1. Create the report row (lightweight — no analysis yet).
+      // Create the report row only (lightweight — no analysis yet). The report
+      // page picks up the pending_analysis flag and runs the analysis there,
+      // so the user lands on the live report instead of a blocking loader.
       const { reportId } = await createReg({
         data: {
           filename,
@@ -165,56 +683,11 @@ function ReportsList() {
           notes: notes.trim() || undefined,
         },
       });
-
-      // 2. Full-document analysis — one call per internal SOP, run in PARALLEL
-      //    (each is an isolated server call), then finalise. A SOP whose call
-      //    fails is retried up to 3× and, if still failing, flagged.
-      setStepIdx(8);
-      const { sops } = await startReg({ data: { reportId } });
-      let regDone = 0;
-      toast.message(`Analysing ${sops.length} document(s)…`, { id: "reg-analyze", duration: 180000 });
-      const coverage = await Promise.all(sops.map(async (sop) => {
-        let status = "failed";
-        let impactCount = 0;
-        for (let attempt = 1; attempt <= 3; attempt++) {
-          try {
-            const res = await analyzeReg({ data: { reportId, sopId: sop.id } });
-            status = res?.status ?? "analyzed";
-            impactCount = res?.impactCount ?? 0;
-            if (status !== "failed") break;
-          } catch (err: any) {
-            console.warn(`Analysis attempt ${attempt} failed for ${sop.title}:`, err?.message);
-            status = "failed";
-          }
-        }
-        regDone++;
-        toast.message(`Analysed ${regDone}/${sops.length} document(s)…`, { id: "reg-analyze", duration: 180000 });
-        return { title: sop.title, status, impactCount };
-      }));
-      toast.dismiss("reg-analyze");
-      await finalizeReg({ data: { reportId, coverage } });
-
-      const res = { reportId };
-      toast.success("Analysis complete");
       qc.invalidateQueries({ queryKey: ["reports"] });
-
-      // Close upload and reset
-      setShowUpload(false);
-      setFile(null);
-      setDriveFile(null);
-      setSource("local");
-      setDetected(null);
-      setAnalysisName("");
-      setOverrideDocType("");
-      setNotes("");
-      setRunning(false);
-      setStepIdx(-1);
-
-      nav({ to: "/reports/$reportId", params: { reportId: res.reportId } });
+      nav({ to: "/reports/$reportId", params: { reportId } });
     } catch (e: any) {
-      toast.error("Analysis failed", { description: e?.message });
+      toast.error("Could not create analysis", { description: e?.message });
       setRunning(false);
-      setStepIdx(-1);
     }
   }
 
@@ -229,6 +702,26 @@ function ReportsList() {
       qc.invalidateQueries({ queryKey: ["reports", "all"] });
     } catch (err: any) {
       toast.error(err?.message ?? "Failed to delete");
+    }
+  }
+
+  async function submitPolicyChange() {
+    const title = pcTitle.trim();
+    if (!title || pcSubmitting) return;
+    setPcSubmitting(true);
+    try {
+      const { reportId } = await createPolicyChange({
+        data: { workspace, title, description: pcDescription.trim() || undefined },
+      });
+      setShowPolicyChange(false);
+      setPcTitle("");
+      setPcDescription("");
+      qc.invalidateQueries({ queryKey: ["reports"] });
+      nav({ to: "/reports/$reportId", params: { reportId } });
+    } catch (e: any) {
+      toast.error("Could not create policy change", { description: e?.message });
+    } finally {
+      setPcSubmitting(false);
     }
   }
 
@@ -247,6 +740,16 @@ function ReportsList() {
             </p>
           </div>
           <div className="flex items-center gap-2">
+            {canRaisePolicyChange && (
+              <Button
+                size="lg"
+                variant="outline"
+                onClick={() => setShowPolicyChange(true)}
+                className="gap-2 h-12 px-6 rounded-xl font-bold border-primary/30 text-primary hover:bg-primary/5 active:scale-95"
+              >
+                <ShieldPlus className="size-4" /> New Policy Change
+              </Button>
+            )}
             {workspace === "forms" ? (
               <Button
                 size="lg"
@@ -526,53 +1029,19 @@ function ReportsList() {
                 </div>
               </div>
             ) : (
-              <div className="py-8">
-                <div className="flex items-center justify-between mb-8">
-                  <div>
-                    <h2 className="text-2xl font-black italic tracking-tighter text-primary">Intelligence Pipeline</h2>
-                    <p className="text-sm text-muted-foreground font-medium uppercase tracking-widest mt-1">Executing multi-stage analysis...</p>
-                  </div>
-                  <Loader2 className="size-8 text-primary animate-spin" />
-                </div>
-                
-              <div className="flex flex-col items-center justify-center py-12 space-y-12">
+              <div className="py-12 flex flex-col items-center justify-center text-center gap-4">
                 <div className="relative">
-                  <div className="absolute inset-0 bg-primary/20 rounded-full blur-3xl animate-pulse" />
-                  <div className="relative size-32 rounded-full border-4 border-primary/10 grid place-items-center bg-white dark:bg-slate-950 shadow-2xl">
-                    <Loader2 className="size-16 text-primary animate-spin" strokeWidth={1.5} />
+                  <div className="absolute inset-0 bg-primary/20 rounded-full blur-2xl animate-pulse" />
+                  <div className="relative size-14 rounded-2xl border bg-card grid place-items-center shadow-sm">
+                    <Loader2 className="size-7 text-primary animate-spin" strokeWidth={1.75} />
                   </div>
                 </div>
-
-                <div className="text-center max-w-md mx-auto space-y-4">
-                  <div className="space-y-1">
-                    <h3 className="text-2xl font-black italic tracking-tighter text-primary animate-in fade-in slide-in-from-bottom-4 duration-500">
-                      {PIPELINE_STEPS[stepIdx]?.label || "Intelligence Pipeline"}
-                    </h3>
-                    <p className="text-[10px] text-muted-foreground font-black uppercase tracking-[0.3em]">
-                      Executing Autonomous Analysis Stage {stepIdx + 1} of {PIPELINE_STEPS.length}
-                    </p>
-                  </div>
-
-                  <div className="w-full bg-muted/30 h-1.5 rounded-full overflow-hidden border border-primary/5">
-                    <div 
-                      className="bg-primary h-full transition-all duration-700 ease-out shadow-[0_0_15px_rgba(var(--primary),0.5)]" 
-                      style={{ width: `${((stepIdx + 1) / PIPELINE_STEPS.length) * 100}%` }}
-                    />
-                  </div>
-                  
-                  <div className="flex items-center justify-center gap-3 pt-2">
-                    {PIPELINE_STEPS.map((_, i) => (
-                      <div 
-                        key={i}
-                        className={cn(
-                          "size-2 rounded-full transition-all duration-500",
-                          i === stepIdx ? "bg-primary w-6" : i < stepIdx ? "bg-primary/40" : "bg-muted-foreground/20"
-                        )}
-                      />
-                    ))}
-                  </div>
+                <div className="space-y-1">
+                  <div className="font-bold text-sm">Preparing your analysis…</div>
+                  <p className="text-xs text-muted-foreground max-w-xs">
+                    Uploading the document and opening the report — the analysis runs there.
+                  </p>
                 </div>
-              </div>
               </div>
             )}
           </Card>
@@ -663,6 +1132,62 @@ function ReportsList() {
           nav({ to: "/reports/$reportId", params: { reportId } });
         }}
       />
+
+      {/* New Policy Change — seeds a policy_change workflow report, then opens it. */}
+      <Dialog open={showPolicyChange} onOpenChange={(o) => !pcSubmitting && setShowPolicyChange(o)}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <ShieldPlus className="size-4 text-primary" /> New Policy Change
+            </DialogTitle>
+            <DialogDescription>
+              Start an internal policy revision. It runs through the same review and sign-off workflow as a regulatory analysis.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-1">
+            <div>
+              <label className="block text-[10px] uppercase tracking-widest text-muted-foreground font-bold mb-1.5">
+                Title <span className="text-rose-500">*</span>
+              </label>
+              <input
+                type="text"
+                autoFocus
+                value={pcTitle}
+                onChange={(e) => setPcTitle(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && pcTitle.trim()) {
+                    e.preventDefault();
+                    void submitPolicyChange();
+                  }
+                }}
+                placeholder="e.g. Updated remote-access policy — Q2 revision"
+                className="w-full text-sm font-medium px-3 py-2 rounded-lg border bg-card focus:outline-none focus:ring-1 focus:ring-primary"
+              />
+            </div>
+            <div>
+              <label className="block text-[10px] uppercase tracking-widest text-muted-foreground font-bold mb-1.5">
+                Description <span className="text-muted-foreground/60 font-normal normal-case tracking-normal">(optional)</span>
+              </label>
+              <textarea
+                value={pcDescription}
+                onChange={(e) => setPcDescription(e.target.value)}
+                placeholder="What is changing and why — context for reviewers."
+                rows={4}
+                className="w-full text-xs px-3 py-2 rounded-lg border bg-card focus:outline-none focus:ring-1 focus:ring-primary resize-none"
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" disabled={pcSubmitting} onClick={() => setShowPolicyChange(false)}>
+              Cancel
+            </Button>
+            <Button disabled={!pcTitle.trim() || pcSubmitting} onClick={submitPolicyChange} className="gap-2">
+              {pcSubmitting ? <Loader2 className="size-4 animate-spin" /> : <ShieldPlus className="size-4" />}
+              {pcSubmitting ? "Creating…" : "Create policy change"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </AppShell>
   );
 }

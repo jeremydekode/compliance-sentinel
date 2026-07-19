@@ -16,7 +16,7 @@ export const Route = createFileRoute("/auth/google/callback")({
     error: typeof search.error === "string" ? search.error : "",
   }),
   component: GoogleCallback,
-  head: () => ({ meta: [{ title: "Connecting Google · Compliance Sentinel" }] }),
+  head: () => ({ meta: [{ title: "Connecting Google · AI Document Workflow" }] }),
 });
 
 function GoogleCallback() {

@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
+import { useAuth } from "@/lib/auth";
 import { supabase } from "@/integrations/supabase/client";
 import { updateImpact } from "@/lib/compliance.functions";
 import { Card } from "@/components/ui/card";
@@ -29,10 +30,16 @@ export function ImpactsTab({ reportId }: { reportId: string }) {
       return data ?? [];
     },
   });
+  const auth = useAuth();
   const sops = useQuery({
-    queryKey: ["sop_documents_all"],
+    queryKey: ["sop_documents_all", auth.tenantId],
+    enabled: !auth.loading,
     queryFn: async () => {
-      const { data } = await supabase.from("sop_documents").select("id,title,doc_type,version,file_url");
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data } = await (supabase as any)
+        .from("sop_documents")
+        .select("id,title,doc_type,version,file_url")
+        .eq("tenant_id", auth.tenantId);
       return data ?? [];
     },
   });

@@ -371,9 +371,10 @@ export function RestructurePanel({
               : `Generate redraft from ${accepted.length} finding${accepted.length === 1 ? "" : "s"}`}
           </Button>
           <p className="text-[11px] text-muted-foreground leading-relaxed">
-            Rebuilds the document with every <b>accepted</b> fix applied — original logo,
-            headers, styles and tables preserved. Every source claim is checked against the
-            output; losses are reported, never hidden.
+            Rebuilds the document body with every <b>accepted</b> fix applied, carrying over
+            the template, headers, footers, tables and figures. The body is regenerated, so
+            expect to re-apply house numbering and fine layout before issuing it. Every source
+            claim is checked against the output; losses are reported, never hidden.
           </p>
         </>
       )}
@@ -389,6 +390,17 @@ export function RestructurePanel({
               </div>
               {preservation.repairIterations > 0 && (
                 <div className="text-[11px] mt-0.5">{preservation.repairIterations} repair pass(es) run.</div>
+              )}
+              {/* Figures are counted separately — the claim score measures TEXT
+                  only, so without this a redraft could drop every diagram and
+                  still report 100% preserved. */}
+              {typeof preservation.figuresInSource === "number" && preservation.figuresInSource > 0 && (
+                <div className={cn("text-[11px] mt-0.5",
+                  preservation.figuresCarried >= preservation.figuresInSource ? "" : "font-semibold text-amber-900")}>
+                  {preservation.figuresCarried >= preservation.figuresInSource
+                    ? `All ${preservation.figuresInSource} figure(s) carried over.`
+                    : `⚠ ${preservation.figuresInSource - preservation.figuresCarried} of ${preservation.figuresInSource} figure(s) NOT carried over — re-insert them before issuing.`}
+                </div>
               )}
               {preservation.lost.length > 0 && (
                 <details className="mt-1">

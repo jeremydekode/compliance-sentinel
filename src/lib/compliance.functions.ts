@@ -4,7 +4,8 @@ import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import { supabaseAdmin } from "@/integrations/supabase/client.server";
 import { chunkDocument, generateAmendedDocument, extractRegulatoryChanges, extractFatfRequirements, mapChangeToSops, routeChangesToSops, analyzeSopAgainstGaps, buildSopTopicMap, generateAnalysisSummary, generateWithFallback, simplifyDocument, simplifyDocumentByUnits, detectDocumentDuplication, summarizeDocument, analyzeDocFigures, type FigureReview, analyzeCreditRisk, extractCreditRiskRetrievalQueries, chatCreditRisk, generateCreditMitigations, detectFinancialAnomalies, searchAdverseNews, AVAILABLE_MODELS, getDefaultModel, clearDefaultModelCache } from "./gemini";
 import { attachEvidence } from "./credit-evidence";
-import { applyEditsToDocx, looksLikeDocx, docxToText, docxToHtml, docxToSimplifyText, docxToSimplifyUnits, docxToStructuredUnits, extractDocxFigures, applySimplificationToDocx, rebuildDocxBody, type SimplifyDocxEdit } from "./docx-editor";
+import PizZip from "pizzip";
+import { applyEditsToDocx, looksLikeDocx, docxToText, docxToHtml, docxToSimplifyText, docxToSimplifyUnits, docxToStructuredUnits, dominantBodyProps, extractDocxFigures, applySimplificationToDocx, rebuildDocxBody, type SimplifyDocxEdit } from "./docx-editor";
 import { verifyActions, analyzeStructure, crossCheckSections, DEFAULT_SIMPLIFY_GUIDANCE, AGGRESSIVE_SIMPLIFY_ADDENDUM, initialDecision } from "./simplify";
 import type { VerificationSummary, DocStructure, SectionCrossCheck } from "./simplify";
 import { runAuditPipeline, countFindings, generateRestructured, generateDocumentFromBrief, DEFAULT_RECOMMEND_GUIDANCE, type Finding, type ClaimUnit } from "./recommend";
@@ -5206,11 +5207,30 @@ export const generateRestructuredV2Document = createServerFn({ method: "POST" })
         ? `${sectionComments[c.section]}\n\n${line}` : line;
     }
 
-    const cleanBuffer = rebuildDocxBody(file.buffer, result.sections, { author: "AI Document Workflow" });
-    const annotatedBuffer = rebuildDocxBody(file.buffer, result.sections, {
+    // Rebuild carrying the source's own body formatting and pagination, so the
+    // output reads like the original document rather than bare text.
+    const rebuildOpts = {
       author: "AI Document Workflow",
+      bodyPPr: dominantBodyProps(units),
+      pageBreakBeforeSections: true,
+    };
+    const cleanBuffer = rebuildDocxBody(file.buffer, result.sections, rebuildOpts);
+    const annotatedBuffer = rebuildDocxBody(file.buffer, result.sections, {
+      ...rebuildOpts,
       sectionComments,
     });
+
+    // Figure accounting — the preservation score only ever measured TEXT
+    // claims, so a redraft could drop every diagram and still report 100%.
+    // Count the drawings the body actually references, before and after.
+    const countFigures = (buf: Buffer): number => {
+      try {
+        const xml = new PizZip(buf).file("word/document.xml")?.asText() ?? "";
+        return (xml.match(/r:embed/g) ?? []).length;
+      } catch { return 0; }
+    };
+    const figuresInSource = countFigures(file.buffer);
+    const figuresCarried = countFigures(cleanBuffer);
 
     const safeName = title.replace(/[^A-Za-z0-9_.-]+/g, "_").slice(0, 80) || "restructured";
     const stamp = Date.now();
@@ -5234,7 +5254,7 @@ export const generateRestructuredV2Document = createServerFn({ method: "POST" })
       downloadName: `${safeName}-restructured.docx`,
       generatedAt: new Date().toISOString(),
       changeReport: result.changeReport,
-      preservation: result.preservation,
+      preservation: { ...result.preservation, figuresInSource, figuresCarried },
       cost: computeCost(result.usage, await getDefaultModel()),
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

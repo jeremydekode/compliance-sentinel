@@ -343,6 +343,60 @@ export interface StructuredUnit {
   text: string;
   section: string;
   table?: string[][];
+  /** The source paragraph's <w:pPr> — its spacing, alignment, indent, style.
+   *  Carried so regenerated body text can inherit the document's real
+   *  formatting instead of being emitted as bare unstyled paragraphs. */
+  pPr?: string;
+  /** Verbatim paragraph XML for units that must be re-emitted untouched —
+   *  currently paragraphs carrying an image (logo, flowchart, diagram). The
+   *  AI never sees or rewrites these; they are passed through so figures
+   *  survive the rebuild instead of being silently dropped. */
+  figureXml?: string;
+}
+
+/** The <w:pPr> of a paragraph, or "" when it has none. */
+function paragraphProps(pXml: string): string {
+  return pXml.match(/<w:pPr\b[\s\S]*?<\/w:pPr>|<w:pPr\b[^>]*\/>/)?.[0] ?? "";
+}
+
+/** Does this paragraph carry a drawing/picture (logo, flowchart, diagram)? */
+function hasImage(pXml: string): boolean {
+  return /<w:drawing\b|<w:pict\b|<w:object\b/.test(pXml);
+}
+
+/** Styles that must never win the body-formatting vote. A long manual's table
+ *  of contents can easily outnumber its prose — picking TOC2 would style every
+ *  regenerated paragraph as a contents line. */
+const NON_BODY_STYLE_RE = /toc|contents|index|header|footer|caption|heading|title|figure|table/i;
+
+/**
+ * The paragraph formatting to apply to regenerated body text.
+ *
+ * Votes for the most common *prose* paragraph style in the source, then builds
+ * a CLEAN <w:pPr> from it rather than reusing the source XML verbatim. Two
+ * reasons: OOXML requires pPr children in a fixed schema order (splicing into
+ * arbitrary markup silently breaks it), and the winning style often carries no
+ * spacing at all — which is what made rebuilt documents read as a wall of text.
+ * Explicit spacing and justification are therefore always applied.
+ */
+export function dominantBodyProps(units: StructuredUnit[]): string {
+  const tally = new Map<string, number>();
+  for (const u of units) {
+    if (u.table || u.figureXml || !u.pPr) continue;
+    if (u.text === u.section) continue;              // heading
+    if (u.text.trim().length < 60) continue;         // labels/captions skew short
+    if (!/[.;:]/.test(u.text)) continue;             // require prose, not a TOC line
+    const style = u.pPr.match(/<w:pStyle\s+w:val="([^"]+)"/)?.[1] ?? "";
+    if (NON_BODY_STYLE_RE.test(style)) continue;
+    tally.set(style, (tally.get(style) ?? 0) + 1);
+  }
+  let best = "", bestN = 0;
+  for (const [s, n] of tally) if (n > bestN) { best = s; bestN = n; }
+
+  // Schema order matters: pStyle → spacing → jc.
+  const style = best ? `<w:pStyle w:val="${escapeXml(best)}"/>` : "";
+  const spacing = `<w:spacing w:before="0" w:after="160" w:line="276" w:lineRule="auto"/>`;
+  return `<w:pPr>${style}${spacing}<w:jc w:val="both"/></w:pPr>`;
 }
 
 /**
@@ -451,13 +505,18 @@ export function docxToStructuredUnits(buffer: Buffer): StructuredUnit[] {
       if (rows.length === 0) continue;
       const text = rows.map((r) => r.join(" | ")).join("\n");
       units.push({ text, section, table: rows });
+    } else if (hasImage(block)) {
+      // A figure (logo, flowchart, diagram). Kept verbatim — it carries no
+      // rewritable text, and dropping it loses real procedural content.
+      const caption = getParagraphText(block);
+      units.push({ text: caption || "[figure]", section, figureXml: block, pPr: paragraphProps(block) });
     } else {
       const t = getParagraphText(block);
       if (!t) continue;
       if (t.length <= 80 && t.length >= 3 && t === t.toUpperCase() && /[A-Z]/.test(t)) {
         section = t;
       }
-      units.push({ text: t, section });
+      units.push({ text: t, section, pPr: paragraphProps(block) });
     }
   }
   return units;
@@ -1049,8 +1108,17 @@ function headingParagraph(text: string, level: 1 | 2 | 3, styleId: string | null
   return `<w:p><w:r><w:rPr><w:b/><w:sz w:val="${sz}"/><w:szCs w:val="${sz}"/></w:rPr><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`;
 }
 
-function bodyParagraph(text: string): string {
-  return `<w:p><w:r><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`;
+/** A body paragraph carrying the document's own formatting. `pPr` is the
+ *  source's dominant body paragraph properties (spacing, alignment, indent);
+ *  without it the rebuilt document came out as bare unspaced text, which is
+ *  what made redrafts look nothing like the original. */
+function bodyParagraph(text: string, pPr = ""): string {
+  return `<w:p>${pPr}<w:r><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`;
+}
+
+/** An empty paragraph whose only job is to start a new page. */
+function pageBreakParagraph(): string {
+  return `<w:p><w:r><w:br w:type="page"/></w:r></w:p>`;
 }
 
 /** Bullets rendered as literal "• " paragraphs with a hanging indent — avoids
@@ -1087,10 +1155,13 @@ function simpleTable(rows: string[][]): string {
   return `<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/>${borders}</w:tblPr>${grid}${trs}</w:tbl>`;
 }
 
-function blockToXml(block: RestructureBlock): string {
-  if (block.type === "para" && block.text) return bodyParagraph(block.text);
+function blockToXml(block: RestructureBlock, bodyPPr = ""): string {
+  if (block.type === "para" && block.text) return bodyParagraph(block.text, bodyPPr);
   if (block.type === "bullets" && block.items) return block.items.map(bulletParagraph).join("");
   if (block.type === "table" && block.rows) return simpleTable(block.rows);
+  // A figure is re-emitted exactly as it appeared in the source, so the logo
+  // and process diagrams survive the rebuild.
+  if (block.type === "figure" && block.xml) return block.xml;
   return "";
 }
 
@@ -1103,7 +1174,18 @@ function blockToXml(block: RestructureBlock): string {
 export function rebuildDocxBody(
   originalBuffer: Buffer,
   sections: RestructuredSection[],
-  opts: { author?: string; sectionComments?: Record<string, string> } = {},
+  opts: {
+    author?: string;
+    sectionComments?: Record<string, string>;
+    /** The source's dominant body <w:pPr>, applied to regenerated paragraphs so
+     *  they inherit the document's real spacing/alignment (see
+     *  dominantBodyProps). Without it the rebuild emits bare paragraphs and the
+     *  output reads nothing like the original. */
+    bodyPPr?: string;
+    /** Start each top-level section on a new page, restoring the pagination
+     *  that rebuilding the body would otherwise flatten away. */
+    pageBreakBeforeSections?: boolean;
+  } = {},
 ): Buffer {
   const zip = new PizZip(originalBuffer);
   const docFile = zip.file("word/document.xml");
@@ -1134,7 +1216,12 @@ export function rebuildDocxBody(
   let nextCommentId = 0;
 
   const parts: string[] = [];
-  for (const s of sections) {
+  sections.forEach((s, i) => {
+    // Page-break between top-level sections (never before the first, which
+    // would open the document on a blank page).
+    if (opts.pageBreakBeforeSections && i > 0 && s.level === 1) {
+      parts.push(pageBreakParagraph());
+    }
     let heading = headingParagraph(s.heading, s.level, headingStyles[s.level]);
     const note = opts.sectionComments?.[s.heading];
     if (note) {
@@ -1145,8 +1232,8 @@ export function rebuildDocxBody(
       heading = wrapParagraphWithComment(heading, commentId);
     }
     parts.push(heading);
-    for (const b of s.blocks) parts.push(blockToXml(b));
-  }
+    for (const b of s.blocks) parts.push(blockToXml(b, opts.bodyPPr ?? ""));
+  });
 
   const newXml =
     documentXml.slice(0, bodyStart) + parts.join("") + sectPr + documentXml.slice(bodyClose);

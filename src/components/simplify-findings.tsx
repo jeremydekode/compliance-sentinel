@@ -261,8 +261,10 @@ export function FindingsRail({
         )}
       </div>
 
-      {/* cards */}
-      <div className="flex-1 overflow-y-auto p-3 space-y-2.5">
+      {/* cards — pb-20 keeps the last card clear of the floating Ask Rudy
+          button, which is fixed to the bottom-right and would otherwise sit
+          on top of it. */}
+      <div className="flex-1 overflow-y-auto p-3 pb-20 space-y-2.5">
         {visible.length === 0 && (
           <p className="text-xs text-muted-foreground text-center py-8">
             {live.length === 0 ? "No verified findings — the document audit came back clean." : "No findings at this severity."}
@@ -352,7 +354,7 @@ export function RestructurePanel({
     : null;
 
   return (
-    <div className="border-t bg-card/60 p-3 space-y-2.5">
+    <div className="border-b bg-card/60 p-3 space-y-2.5 shrink-0">
       <div className="flex items-center gap-2">
         <Sparkles className="size-4 text-primary" />
         <span className="text-sm font-semibold">Restructured document</span>
@@ -360,16 +362,19 @@ export function RestructurePanel({
 
       {!restructure && (
         <>
-          <p className="text-[11px] text-muted-foreground leading-relaxed">
-            Regenerates the document fixing every <b>accepted</b> finding and applying
-            plain-English simplification — original logo, headers and styles preserved.
-            Every source claim is checked against the output; losses are reported, never hidden.
-          </p>
-          <Button size="sm" className="w-full h-8 text-xs" disabled={accepted.length === 0 || running} onClick={run}>
-            {running ? (<><Loader2 className="size-3.5 mr-1.5 animate-spin" /> Generating — takes a few minutes…</>)
+          {/* The action leads; the explanation follows. This is the primary
+              thing to do in Recommend & Edit, so it must be the first thing
+              the eye lands on — not a button under a paragraph. */}
+          <Button className="w-full h-9 text-sm font-semibold" disabled={accepted.length === 0 || running} onClick={run}>
+            {running ? (<><Loader2 className="size-4 mr-2 animate-spin" /> Generating — takes a few minutes…</>)
               : accepted.length === 0 ? "Accept at least one finding first"
-              : `Generate from ${accepted.length} accepted finding${accepted.length === 1 ? "" : "s"}`}
+              : `Generate redraft from ${accepted.length} finding${accepted.length === 1 ? "" : "s"}`}
           </Button>
+          <p className="text-[11px] text-muted-foreground leading-relaxed">
+            Rebuilds the document with every <b>accepted</b> fix applied — original logo,
+            headers, styles and tables preserved. Every source claim is checked against the
+            output; losses are reported, never hidden.
+          </p>
         </>
       )}
 

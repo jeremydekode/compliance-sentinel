@@ -415,6 +415,21 @@ function SimplifyV2ReportPage() {
                 />
               ) : (
                 <>
+                  {/* Generating the redraft is the PRIMARY action of this mode,
+                      so it sits at the top of the rail where it is visible
+                      without scrolling. Below the findings list it was pushed
+                      off-screen by a long list and overlapped by the Rudy
+                      button — reviewers could not find it. */}
+                  {workflowMode === "recommend_edit" && (
+                    <RestructurePanel
+                      reportId={reportId}
+                      findings={findings}
+                      restructure={restructure}
+                      comparing={view === "compare"}
+                      onCompareToggle={(on) => setView(on ? "compare" : "document")}
+                      onGenerated={() => qc.invalidateQueries({ queryKey: ["report", reportId] })}
+                    />
+                  )}
                   <div className="flex-1 min-h-0">
                     <FindingsRail
                       reportId={reportId}
@@ -426,16 +441,6 @@ function SimplifyV2ReportPage() {
                       onSeverityFilterChange={setSeverityFilter}
                     />
                   </div>
-                  {workflowMode === "recommend_edit" && (
-                    <RestructurePanel
-                      reportId={reportId}
-                      findings={findings}
-                      restructure={restructure}
-                      comparing={view === "compare"}
-                      onCompareToggle={(on) => setView(on ? "compare" : "document")}
-                      onGenerated={() => qc.invalidateQueries({ queryKey: ["report", reportId] })}
-                    />
-                  )}
                 </>
               )}
             </div>

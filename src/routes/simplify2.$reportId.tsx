@@ -93,6 +93,26 @@ function SimplifyV2ReportPage() {
   const findings: Finding[] = Array.isArray(sj.findings) ? sj.findings : [];
   const actions: VerifiedAction[] = Array.isArray(sj.actions) ? sj.actions : [];
 
+  /** Did the run actually land, regardless of what the HTTP call reported?
+   *  A long audit can outlive the request (gateway/proxy timeout, dropped
+   *  connection) while the server-side run completes and writes its results.
+   *  Treating that as a failure told the user "the analysis failed" on a
+   *  SUCCESSFUL run — and an obliging re-run billed them for a second audit
+   *  they already had. So the report row, not the response, is the source of
+   *  truth. */
+  async function runLanded(): Promise<boolean> {
+    try {
+      const { data, error } = await supabase
+        .from("analysis_reports").select("summary_json").eq("id", reportId).single();
+      if (error || !data) return false;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const s = ((data.summary_json as any) ?? {}) as any;
+      return !s.pending_analysis && s.simplification_status === "ok";
+    } catch {
+      return false;
+    }
+  }
+
   async function runAnalysis() {
     setFailed(false);
     setAnalyzing(true);
@@ -100,10 +120,11 @@ function SimplifyV2ReportPage() {
     try {
       const r = await runFn({ data: { reportId } });
       await qc.invalidateQueries({ queryKey: ["report", reportId] });
-      if (r.status !== "ok") setFailed(true);
+      if (r.status !== "ok" && !(await runLanded())) setFailed(true);
     } catch {
-      setFailed(true);
+      if (!(await runLanded())) setFailed(true);
     } finally {
+      await qc.invalidateQueries({ queryKey: ["report", reportId] });
       setAnalyzing(false);
     }
   }

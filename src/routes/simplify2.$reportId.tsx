@@ -363,14 +363,34 @@ function SimplifyV2ReportPage() {
                 onDrill={() => setView("document")}
               />
             ) : (
-              <AuditHealthDashboard
-                reportId={reportId}
-                findings={findings}
-                structure={sj.structure ?? null}
-                sourceUrl={sourceUrl}
-                onView={(id) => { setSeverityFilter("all"); setActiveId(id); setView("document"); }}
-                onDrill={(sev) => { setSeverityFilter(sev); setView("document"); }}
-              />
+              <>
+                {/* Dashboard is the landing view, so the redraft action has to
+                    live here too — otherwise the header says "Generate redraft"
+                    while the only button sits one view away under the document
+                    rail, which is where reviewers lost it. */}
+                {workflowMode === "recommend_edit" && (
+                  <div className="px-5 pt-5">
+                    <div className="max-w-xl rounded-xl border overflow-hidden shadow-sm">
+                      <RestructurePanel
+                        reportId={reportId}
+                        findings={findings}
+                        restructure={restructure}
+                        comparing={false}
+                        onCompareToggle={(on) => setView(on ? "compare" : "document")}
+                        onGenerated={() => qc.invalidateQueries({ queryKey: ["report", reportId] })}
+                      />
+                    </div>
+                  </div>
+                )}
+                <AuditHealthDashboard
+                  reportId={reportId}
+                  findings={findings}
+                  structure={sj.structure ?? null}
+                  sourceUrl={sourceUrl}
+                  onView={(id) => { setSeverityFilter("all"); setActiveId(id); setView("document"); }}
+                  onDrill={(sev) => { setSeverityFilter(sev); setView("document"); }}
+                />
+              </>
             )}
           </div>
         ) : view === "compare" && restructure?.downloadUrl ? (

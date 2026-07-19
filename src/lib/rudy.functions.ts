@@ -65,7 +65,7 @@ const CATALOG: { kind: Exclude<RudyActionKind, "none">; feature: string; text: s
   {
     kind: "redraft",
     feature: "simplify_v2",
-    text: `redraft — Fully automatic end-to-end redraft of ONE document: audit, auto-apply the verified fixes, regenerate a clean restructured copy (original logo/headers preserved). Needs a short "brief" describing the direction (e.g. "align with the 2026 outsourcing policy"). Choose when the user says "redraft/rewrite/restructure it for me" and doesn't want to review individual findings first.`,
+    text: `redraft — Fast-track redraft of ONE document: audits it, then PRE-SELECTS the verified fixes and stops at the findings for the user to review. The user clicks "Generate redraft" themselves to produce the restructured copy (original logo/headers preserved) — nothing is rewritten or downloaded without that click. Needs a short "brief" describing the direction (e.g. "align with the 2026 outsourcing policy"). Choose when the user says "redraft/rewrite/restructure it for me" and wants the fixes chosen for them rather than triaging each finding by hand. Describe it as preparing the redraft for their review — never promise a finished document up front.`,
   },
   {
     kind: "regulatory",

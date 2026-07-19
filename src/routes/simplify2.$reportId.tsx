@@ -35,9 +35,26 @@ import {
 } from "lucide-react";
 
 export const Route = createFileRoute("/simplify2/$reportId")({
-  component: SimplifyV2ReportPage,
+  component: SimplifyV2Route,
   head: () => ({ meta: [{ title: "Simplify v2 · AI Document Workflow" }] }),
 });
+
+/**
+ * Remounts the page whenever the report id changes.
+ *
+ * TanStack Router REUSES the component across param-only navigations (e.g. Rudy
+ * routing you straight from one report to another). Without this key the page
+ * carries the previous report's refs and state: `startedRef` stays true so a
+ * freshly-created report's analysis never kicks off, the AnalyzingView guard
+ * (`pending_analysis && !startedRef.current`) is skipped, and the dashboard
+ * renders "no verified findings — the audit came back clean" for a document
+ * that was never analysed. The Rudy auto-chain's `autoRef` leaks the same way.
+ * Keying by id resets all of it in one place.
+ */
+function SimplifyV2Route() {
+  const { reportId } = Route.useParams();
+  return <SimplifyV2ReportPage key={reportId} />;
+}
 
 const MODE_META: Record<string, { label: string; icon: React.ElementType; chip: string }> = {
   simplify: { label: "Simplify", icon: Sparkles, chip: "bg-violet-100 text-violet-700 ring-violet-200" },

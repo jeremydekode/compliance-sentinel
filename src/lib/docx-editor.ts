@@ -345,17 +345,69 @@ export interface StructuredUnit {
   table?: string[][];
 }
 
-/** Extracts the rows of a single <w:tbl> as a string[][] (one string per cell,
- *  cell text = its paragraphs joined). Non-nested tables only — a nested table
- *  would be consumed by the outer non-greedy match, same limitation the rest of
- *  this module already carries. Empty rows/cells are kept so column counts line
- *  up across rows. */
+/**
+ * Index just PAST the close tag matching the element that opens at `start`,
+ * counting nesting depth. `start` must be the "<" of an opening `<tag …>`.
+ * Self-closing (`<tag/>`) elements return the index just past that tag.
+ * Returns -1 when the markup is unbalanced.
+ *
+ * A non-greedy /<w:tbl>[\s\S]*?<\/w:tbl>/ stops at the FIRST close tag, which
+ * for a table containing a table ends the match inside the parent — silently
+ * truncating the outer table's remaining rows. This walks depth instead.
+ */
+function endOfElement(xml: string, start: number, tag: string): number {
+  const re = new RegExp(`<${tag}\\b[^>]*>|</${tag}>`, "g");
+  re.lastIndex = start;
+  let depth = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(xml)) !== null) {
+    const s = m[0];
+    if (s.startsWith("</")) {
+      depth--;
+      if (depth === 0) return re.lastIndex;
+    } else if (s.endsWith("/>")) {
+      if (depth === 0) return re.lastIndex; // self-closing element, no body
+    } else {
+      depth++;
+    }
+  }
+  return -1;
+}
+
+/** Outer XML of each DIRECT child `tag` inside `xml`. Consuming each match whole
+ *  (depth-aware) means a nested table's rows/cells are skipped rather than
+ *  mistaken for the parent's. */
+function directChildren(xml: string, tag: string): string[] {
+  const out: string[] = [];
+  const openRe = new RegExp(`<${tag}\\b[^>]*>`, "g");
+  let m: RegExpExecArray | null;
+  while ((m = openRe.exec(xml)) !== null) {
+    const end = m[0].endsWith("/>")
+      ? m.index + m[0].length
+      : endOfElement(xml, m.index, tag);
+    if (end < 0) break;
+    out.push(xml.slice(m.index, end));
+    openRe.lastIndex = end;
+  }
+  return out;
+}
+
+/**
+ * Rows of a single <w:tbl> as string[][] (one string per cell, cell text = its
+ * paragraphs joined). Depth-aware: only the table's OWN rows and cells are read.
+ *
+ * A table nested inside a cell cannot be represented in this flat row model, so
+ * its text is folded into the containing cell — the outer grid stays intact and
+ * no content is dropped, which beats truncating the parent table.
+ */
 function tableRows(tblXml: string): string[][] {
   const rows: string[][] = [];
-  for (const trMatch of tblXml.matchAll(/<w:tr\b[\s\S]*?<\/w:tr>/g)) {
+  for (const rowXml of directChildren(tblXml, "w:tr")) {
     const cells: string[] = [];
-    for (const tcMatch of trMatch[0].matchAll(/<w:tc\b[\s\S]*?<\/w:tc>/g)) {
-      const cellParas = [...tcMatch[0].matchAll(/<w:p\b[^>]*>(?:(?!<w:p\b)[\s\S])*?<\/w:p>/g)]
+    for (const cellXml of directChildren(rowXml, "w:tc")) {
+      // Every paragraph in the cell, including any inside a nested table, so
+      // nested content survives as text rather than vanishing.
+      const cellParas = [...cellXml.matchAll(/<w:p\b[^>]*>(?:(?!<w:p\b)[\s\S])*?<\/w:p>/g)]
         .map((p) => getParagraphText(p[0]))
         .filter(Boolean);
       cells.push(cellParas.join(" "));
@@ -378,11 +430,23 @@ export function docxToStructuredUnits(buffer: Buffer): StructuredUnit[] {
   const xml = docFile.asText();
   const units: StructuredUnit[] = [];
   let section = "";
-  const tokenRe = /<w:tbl\b[\s\S]*?<\/w:tbl>|<w:p\b[^>]*>(?:(?!<w:p\b)[\s\S])*?<\/w:p>/g;
+  // Walk TOP-LEVEL tables and paragraphs in document order. Each table is
+  // consumed whole (depth-aware), so its own paragraphs — and any nested
+  // table — are handled as part of that table, never re-emitted as loose body
+  // paragraphs.
+  const tokenRe = /<w:tbl\b[^>]*>|<w:p\b[^>]*>/g;
   let m: RegExpExecArray | null;
   while ((m = tokenRe.exec(xml)) !== null) {
-    const block = m[0];
-    if (block.startsWith("<w:tbl")) {
+    const isTable = m[0].startsWith("<w:tbl");
+    const tag = isTable ? "w:tbl" : "w:p";
+    const end = m[0].endsWith("/>")
+      ? m.index + m[0].length
+      : endOfElement(xml, m.index, tag);
+    if (end < 0) break; // unbalanced markup — stop rather than mis-slice
+    const block = xml.slice(m.index, end);
+    tokenRe.lastIndex = end;
+
+    if (isTable) {
       const rows = tableRows(block).filter((r) => r.some((c) => c.trim()));
       if (rows.length === 0) continue;
       const text = rows.map((r) => r.join(" | ")).join("\n");

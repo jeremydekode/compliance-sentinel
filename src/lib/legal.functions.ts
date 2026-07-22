@@ -1516,37 +1516,54 @@ function buildNormMap(s: string): { norm: string; map: number[] } {
 // Locate an AI clause quote (`ne` = already-normalized excerpt) inside a normalized
 // document (`normMut`), returning the ORIGINAL-text span [origStart, origEnd) plus the
 // NORM span [normStart, normEnd) for blanking. Tries an exact normalized match first,
-// then falls back to anchoring on the clause's opening + closing phrases (so a quote
-// that differs only in the middle — the common cause of a clause being "appended" —
-// is still placed in line).
+// then the same match with a leading clause enumerator stripped, then falls back to
+// anchoring on the clause's opening + closing phrases (so a quote that differs only in
+// the middle — a common cause of a clause being "appended" — is still placed in line).
+//
+// Why the enumerator strip matters: the AI is asked to prefix the clause number/heading
+// (e.g. "7.2", "(a)", "Clause 12.3 —"), but Word list-numbering and PDF layout render or
+// drop that number differently in the extracted text. A spurious/absent leading number
+// is the single most common reason an otherwise-verbatim quote fails to match — and a
+// failed match means the edit is appended with NO strikethrough shown in the document.
 function locateClauseSpan(
   normMut: string,
   map: number[],
   ne: string,
 ): { origStart: number; origEnd: number; normStart: number; normEnd: number } | null {
   if (ne.length < 6) return null;
+  const span = (normStart: number, normEnd: number) => ({
+    origStart: map[normStart], origEnd: map[normEnd - 1] + 1, normStart, normEnd,
+  });
 
+  // 1 — exact normalized match.
   const exact = normMut.indexOf(ne);
-  if (exact >= 0) {
-    const normEnd = exact + ne.length;
-    return { origStart: map[exact], origEnd: map[normEnd - 1] + 1, normStart: exact, normEnd };
+  if (exact >= 0) return span(exact, exact + ne.length);
+
+  // 2 — exact match with a leading clause enumerator stripped.
+  const enumRe = /^\s*(?:clause\s+|section\s+|article\s+)?(?:\d+(?:\.\d+)*|\([a-z0-9]+\)|[a-z]\))[\s.):\-–—]+/i;
+  const stripped = ne.replace(enumRe, "").trim();
+  const hasEnum = stripped.length >= 6 && stripped !== ne;
+  if (hasEnum) {
+    const p = normMut.indexOf(stripped);
+    if (p >= 0) return span(p, p + stripped.length);
   }
 
-  // Anchor fallback: first 4 + last 4 words must appear verbatim, in order.
-  const words = ne.split(" ").filter(Boolean);
+  // 3 — anchor fallback: a head phrase and a tail phrase must appear verbatim, in
+  // order, close enough together. Anchor on the enumerator-stripped words so a
+  // spurious/missing clause number can't break the head; tolerate a reworded or
+  // appended final token by also trying the tail shifted one word left.
+  const words = (hasEnum ? stripped : ne).split(" ").filter(Boolean);
   if (words.length >= 8) {
     const head = words.slice(0, 4).join(" ");
-    const tail = words.slice(-4).join(" ");
     const p1 = normMut.indexOf(head);
     if (p1 >= 0) {
-      const p2 = normMut.indexOf(tail, p1 + head.length);
-      if (p2 >= 0) {
+      for (const tail of [words.slice(-4).join(" "), words.slice(-5, -1).join(" ")]) {
+        if (tail.length < 4) continue;
+        const p2 = normMut.indexOf(tail, p1 + head.length);
+        if (p2 < 0) continue;
         const normEnd = p2 + tail.length;
-        const spanLen = normEnd - p1;
         // reject an implausibly large span (grabbed across clauses)
-        if (spanLen <= ne.length * 2 + 120) {
-          return { origStart: map[p1], origEnd: map[normEnd - 1] + 1, normStart: p1, normEnd };
-        }
+        if (normEnd - p1 <= ne.length * 2 + 120) return span(p1, normEnd);
       }
     }
   }
@@ -1758,8 +1775,19 @@ export const createAmendedVersion = createServerFn({ method: "POST" })
       suggestion: "", accepted: true,
     }));
     if (unmatchedCount) {
+      // Couldn't place these in line — append them, but still render each as a real
+      // redline (old term struck through, new term highlighted) so the edit is
+      // visible instead of a bare insertion with nothing shown as removed.
       redline += "\n\n--- ADDITIONAL ACCEPTED AMENDMENTS ---\n" +
-        unmatched.map((c) => INS_O + `${c.ref}: ${String(c.suggestion ?? "").trim()}` + INS_C).join("\n");
+        unmatched.map((c) => {
+          const ref = String(c.ref ?? "").trim();
+          const before = String(c.excerpt ?? "").trim();
+          const after = String(c.suggestion ?? "").trim();
+          const body = before
+            ? DEL_O + before + DEL_C + " " + INS_O + after + INS_C
+            : INS_O + after + INS_C;
+          return (ref ? ref + ": " : "") + body;
+        }).join("\n");
     }
 
     // Clean amended text (deletions removed, insertions kept) — used for the clean

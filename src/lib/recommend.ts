@@ -182,6 +182,16 @@ underlying policy choices.
   simplification findings.
 - info — structural/format decay.
 
+# PATTERN COMPLETENESS — half-done passes are worse than none
+When you flag a defect PATTERN (a vague trigger like "where necessary", a bare
+imperative with no actor, a step missing a deadline), you MUST report EVERY
+occurrence of that pattern in the document under ONE finding, listing each
+location in the evidence (up to 10 quotes). A document where 5 of 40 steps got
+role attribution is INTERNALLY INCONSISTENT — readers infer the unattributed
+steps are deliberately role-agnostic. Sweep systematically: process tables
+section by section, every step. If there are too many occurrences to fix,
+still enumerate them — the reviewer decides scope, not you.
+
 # EVIDENCE RULES — non-negotiable
 - Every finding MUST quote the document VERBATIM (no paraphrase) with section.
 - contradiction and redundancy MUST quote BOTH locations.
@@ -194,10 +204,17 @@ underlying policy choices.
 - Phrase every fix as a SINGLE-PASSAGE replacement of the quoted text where
   possible, and include the concrete replacement wording in quotes:
   … such as: 'the Reviewer shall forward the legal documents to Group Legal'.
-- undefined_term fixes: expand at first use in the standard form — such as:
-  'Group Legal ("GL")' — and state that later uses keep the bare acronym; if
-  the document has a glossary, add "and add a Glossary row" as a secondary
-  instruction.
+- undefined_term fixes: if the document HAS a glossary/definitions table, the
+  fix is to ADD a row there — that is the PRIMARY and usually the ONLY edit
+  (no inline expansion too; the glossary exists so the body doesn't repeat
+  definitions). Expand at first use in the standard form — such as:
+  'Group Legal ("GL")' — ONLY when the document has no glossary, or for a
+  polysemous acronym where each site must name its own meaning.
+- NEVER write a fix that references a section, appendix, table or form that
+  does not exist in this document ("as listed in Appendix A" when there is no
+  Appendix A). A dangling reference is WORSE than the vagueness it replaces.
+  Reference only structures you can quote; if the fix truly needs a new
+  appendix, say so in the fix text as an instruction to the reviewer instead.
 - ambiguous_actor fixes: name a PLACEHOLDER role in the example and keep it
   obviously replaceable — the reviewer supplies the real owner.
 - redundancy fixes: state which copy is canonical (the detail section unless
@@ -913,6 +930,7 @@ export async function deriveConcreteEdits(
   text: string,
   findings: Finding[],
   inputs: Record<string, string>,
+  opts?: { today?: string },
 ): Promise<{ edits: ConcreteEdit[]; unresolved: { findingId: string; title: string; reason: string }[]; usage: TokenUsage }> {
   const unresolved: { findingId: string; title: string; reason: string }[] = [];
   const workable = findings.filter((f) => {
@@ -945,7 +963,10 @@ export async function deriveConcreteEdits(
 4. ADDITIONS (a missing step, exception path, escalation rule): use the insertion form instead — "insert_after" is the EXACT verbatim text of the existing paragraph the new content should follow (one paragraph, copied character-for-character), and "replace_text" is ONLY the new content — never restate the anchor text. The anchor must be UNIQUE in the document (pick a longer span if a short one repeats elsewhere). Do NOT anchor additions inside tables (e.g. glossary rows) — put those in "unresolved" ("needs a table row"). Match the document's voice; never renumber existing steps — interpolate ("Step 5a") instead. Use a blank line inside replace_text to make multiple paragraphs.
 5. A finding MAY need SEVERAL edits — fix BOTH copies of a contradiction, BOTH meanings of a polysemous acronym, EVERY affected row or reference. Emit one edit object PER passage and repeat the findingId. If a change spans a paragraph boundary, SPLIT it into one edit per paragraph instead of quoting across the boundary.
 6. TABLE ROW ADDITIONS (e.g. a new glossary entry): use the row form — "insert_row_after" is verbatim cell text identifying the row the new one follows. It MUST be UNIQUE in the whole document: documents often repeat a definition's text outside its table (e.g. in a requirements list), so pick a cell whose text appears NOWHERE else — a short code/acronym cell is often safer than a long definition. "cells" has EXACTLY one string per column of that table, in column order ("" leaves a cell empty, e.g. an auto-number column). Never use insert_after for content that belongs in a table.
-7. Only if a finding truly cannot be expressed as replacements, insertions, or table rows, put it in "unresolved" with a one-sentence reason. Never force a bad edit.
+7. Acronym/term definitions belong in the GLOSSARY table when the document has one — emit ONE row edit and NO inline expansion (the glossary exists so the body doesn't repeat definitions). Inline first-use expansion only when there is no glossary, or for polysemy where each site must name its meaning.
+8. NEVER introduce a cross-reference to a section, appendix, table or form that does not exist in the document. Every reference you write must be quotable from the document itself.${opts?.today ? `
+9. CHANGE HISTORY: if the document contains a version/change-history table, ALSO emit one table-row edit adding the next revision row — next version number, date ${opts.today}, a one-line summary ("Amendments per document quality audit — see tracked changes"), and "[to assign]" for reference/attestation cells. Anchor it after the last existing version row and use "CHANGE-LOG" as its findingId. A content change without a change-history row is a governance failure.` : ""}
+10. Only if a finding truly cannot be expressed as replacements, insertions, or table rows, put it in "unresolved" with a one-sentence reason. Never force a bad edit.
 
 # FINDINGS
 ${findingBlocks}
@@ -992,15 +1013,45 @@ ${text.slice(0, 400_000)}
     unresolved.push({ findingId: id, title, reason });
   };
 
+  // An edit that INTRODUCES a reference to a structure the document doesn't
+  // have ("as listed in Appendix A" with no Appendix A) is worse than the
+  // vagueness it replaces — verify every written reference deterministically.
+  const textNorm = norm(text);
+  const danglingRef = (replaceT: string, findT: string): string | null => {
+    const refRe = /\b(Appendix|Annex|Schedule|Section|Table|Form)\s+([A-Z0-9][\w./-]{0,15})/g;
+    let rm: RegExpExecArray | null;
+    while ((rm = refRe.exec(replaceT)) !== null) {
+      const phrase = norm(rm[0]);
+      if (norm(findT).includes(phrase)) continue;  // pre-existing, not introduced
+      if (textNorm.includes(phrase)) continue;     // full phrase exists in the doc
+      const ident = rm[2].toLowerCase().replace(/[.,;:]$/, "");
+      if (ident.length >= 2 && (textNorm.includes(` ${ident} `) || paraNorms.some((p) => p.startsWith(ident)))) continue;
+      return rm[0];
+    }
+    return null;
+  };
+
   for (const e of rawEdits) {
     const id = String(e?.findingId ?? "");
-    const f = byId.get(id);
-    if (!f) continue;
     const find = String(e?.find_text ?? "").trim();
     const insertAfter = String(e?.insert_after ?? "").trim();
     const insertRowAfter = String(e?.insert_row_after ?? "").trim();
     const cells = Array.isArray(e?.cells) ? e.cells.map((c: unknown) => String(c ?? "")) : null;
     const replace = String(e?.replace_text ?? "").trim();
+
+    // Synthetic governance edit: the change-history row (no backing finding).
+    if (id === "CHANGE-LOG") {
+      if (insertRowAfter && cells?.some((c: string) => c.trim())) {
+        const aNorm = norm(insertRowAfter);
+        if (aNorm.length >= 6 && paraNorms.filter((p) => p.includes(aNorm)).length === 1) {
+          edits.push({ findingId: id, find_text: "", replace_text: "", insert_row_after: insertRowAfter, cells, rationale: String(e?.rationale ?? "Change-history row for this revision") });
+        }
+      }
+      continue;
+    }
+
+    const f = byId.get(id);
+    if (!f) continue;
     const rationale = String(e?.rationale ?? f.title);
 
     // ── Table-row form: anchor cell text must locate — UNIQUELY. Documents
@@ -1048,6 +1099,11 @@ ${text.slice(0, 400_000)}
         markUnresolved(id, f.title, "Insertion content was only a restatement of the anchor");
         continue;
       }
+      const dref = danglingRef(content, "");
+      if (dref) {
+        markUnresolved(id, f.title, `Fix introduces a reference to "${dref}" which does not exist in the document`);
+        continue;
+      }
       edits.push({ findingId: id, find_text: "", insert_after: insertAfter, replace_text: content, rationale });
       editedIds.add(id);
       continue;
@@ -1063,6 +1119,11 @@ ${text.slice(0, 400_000)}
           ? "Passage spans a paragraph boundary — needs a manual edit"
           : "Proposed passage not found verbatim in the document",
       );
+      continue;
+    }
+    const dref = danglingRef(replace, find);
+    if (dref) {
+      markUnresolved(id, f.title, `Fix introduces a reference to "${dref}" which does not exist in the document`);
       continue;
     }
     edits.push({ findingId: id, find_text: find, replace_text: replace, rationale });

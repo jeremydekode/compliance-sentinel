@@ -20,6 +20,7 @@ import type { FindingSeverity } from "@/lib/recommend";
 import { findingNeedsInput, findingInputSuggestion } from "@/lib/recommend";
 import { Button } from "@/components/ui/button";
 import { supabase } from "@/integrations/supabase/client";
+import { useAuth } from "@/lib/auth";
 import {
   runSimplifyV2Report,
   setSimplificationDecision,
@@ -97,6 +98,7 @@ const MODE_META: Record<string, { label: string; icon: React.ElementType; chip: 
 function SimplifyV2ReportPage() {
   const { reportId } = Route.useParams();
   const qc = useQueryClient();
+  const auth = useAuth();
   const runFn = useServerFn(runSimplifyV2Report);
   const [analyzing, setAnalyzing] = useState(false);
   const [failed, setFailed] = useState(false);
@@ -446,7 +448,7 @@ function SimplifyV2ReportPage() {
     if (simplifyFinalCurrent) { openEditor("apply"); return; }
     setSimplifyFinalBusy(true);
     try {
-      await applySimplifyFn({ data: { reportId, exportMode: "annotated" } });
+      await applySimplifyFn({ data: { reportId, exportMode: "annotated", ...(auth.email ? { author: auth.email } : {}) } });
       await qc.invalidateQueries({ queryKey: ["report", reportId] });
       openEditor("apply");
     } catch (e) {
@@ -465,7 +467,7 @@ function SimplifyV2ReportPage() {
     try {
       const typed: Record<string, string> = {};
       for (const [k, v] of Object.entries(decisions)) if (v.trim()) typed[k] = v.trim();
-      const r = await buildFinal({ data: { reportId, ...(Object.keys(typed).length ? { userInputs: typed } : {}) } });
+      const r = await buildFinal({ data: { reportId, ...(Object.keys(typed).length ? { userInputs: typed } : {}), ...(auth.email ? { author: auth.email } : {}) } });
       await qc.invalidateQueries({ queryKey: ["report", reportId] });
       const failed = (r.unresolved?.length ?? 0) + (r.skipped?.length ?? 0);
       if (failed > 0) {

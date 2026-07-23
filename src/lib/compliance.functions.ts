@@ -5260,6 +5260,8 @@ export const applySimplifyV2Report = createServerFn({ method: "POST" })
   .inputValidator(z.object({
     reportId: z.string(),
     exportMode: z.enum(["clean", "annotated"]),
+    /** Reviewer identity stamped as tracked-change/comment author. */
+    author: z.string().max(80).optional(),
   }))
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
@@ -5303,7 +5305,7 @@ export const applySimplifyV2Report = createServerFn({ method: "POST" })
     }
 
     const result = applySimplificationToDocx(file.buffer, edits, {
-      author: "AI Document Workflow",
+      author: data.author?.trim() || "Reviewer",
       mode: data.exportMode === "clean" ? "clean" : "redline",
       redlineComments: data.exportMode === "annotated",
     });
@@ -5362,6 +5364,8 @@ export const applyFindingsInPlaceV2Report = createServerFn({ method: "POST" })
   .inputValidator(z.object({
     reportId: z.string(),
     exportMode: z.enum(["clean", "annotated"]),
+    /** Reviewer identity stamped as tracked-change/comment author. */
+    author: z.string().max(80).optional(),
   }))
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
@@ -5413,7 +5417,7 @@ export const applyFindingsInPlaceV2Report = createServerFn({ method: "POST" })
     }));
 
     const result = applySimplificationToDocx(file.buffer, edits, {
-      author: "AI Document Workflow",
+      author: data.author?.trim() || "Reviewer",
       mode: data.exportMode === "clean" ? "clean" : "redline",
       redlineComments: data.exportMode === "annotated",
     });
@@ -5514,6 +5518,8 @@ export const buildFinalDocument = createServerFn({ method: "POST" })
   .inputValidator(z.object({
     reportId: z.string(),
     userInputs: z.record(z.string(), z.string().max(600)).optional(),
+    /** Reviewer identity stamped as tracked-change/comment author (audit trail). */
+    author: z.string().max(80).optional(),
   }))
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
@@ -5547,10 +5553,10 @@ export const buildFinalDocument = createServerFn({ method: "POST" })
     }
 
     const { createHash } = await import("node:crypto");
-    // "v4" engine salt: bumping it invalidates finals built by an older engine
-    // (v4: exact short anchors — "CA 2010"-style glossary cells — now locate).
+    // "v5" engine salt: reviewer authorship, value traceability, dangling-ref
+    // guard, glossary-primary definitions, change-history row.
     const sig = createHash("sha1")
-      .update(JSON.stringify({ v: "v4", ids: accepted.map((f) => f.id).sort(), inputs }))
+      .update(JSON.stringify({ v: "v5", ids: accepted.map((f) => f.id).sort(), inputs }))
       .digest("hex").slice(0, 16);
     if (sj.finalDoc?.url && sj.finalDoc.sig === sig) return sj.finalDoc;
 
@@ -5563,18 +5569,30 @@ export const buildFinalDocument = createServerFn({ method: "POST" })
     try { srcText = docxToSimplifyText(file.buffer); } catch { /* validated below */ }
     if (!srcText.trim()) throw new Error("Could not extract text from the source document.");
 
-    const { edits, unresolved, usage: deriveUsage } = await deriveConcreteEdits(title, srcText, accepted, inputs);
+    const today = new Date().toISOString().slice(0, 10);
+    const { edits, unresolved, usage: deriveUsage } = await deriveConcreteEdits(title, srcText, accepted, inputs, { today });
     if (!edits.length) throw new Error("No applicable edits could be derived — see unresolved findings.");
 
-    const simplifyEdits: SimplifyDocxEdit[] = edits.map((e) =>
-      e.insert_row_after
-        ? { before: "", after: "", insertRowAfter: e.insert_row_after, cells: e.cells ?? [], rationale: e.rationale }
+    // Traceability: when a reviewer-supplied value backed an edit, the comment
+    // cites who supplied it and when — "reviewer-provided" alone doesn't
+    // survive an audit.
+    const reviewer = data.author?.trim() || "Reviewer";
+    const simplifyEdits: SimplifyDocxEdit[] = edits.map((e) => {
+      let rationale = e.rationale;
+      if (inputs[e.findingId]) {
+        rationale = `${rationale} — value supplied by ${reviewer} on ${today}: "${inputs[e.findingId].slice(0, 120)}"`;
+      }
+      return e.insert_row_after
+        ? { before: "", after: "", insertRowAfter: e.insert_row_after, cells: e.cells ?? [], rationale }
         : e.insert_after
-          ? { before: "", after: e.replace_text, insertAfter: e.insert_after, rationale: e.rationale }
-          : { before: e.find_text, after: e.replace_text, rationale: e.rationale },
-    );
+          ? { before: "", after: e.replace_text, insertAfter: e.insert_after, rationale }
+          : { before: e.find_text, after: e.replace_text, rationale };
+    });
     const result = applySimplificationToDocx(file.buffer, simplifyEdits, {
-      author: "AI Document Workflow",
+      // Tracked changes + comments carry the REVIEWER's name — an "AI Document
+      // Workflow" authorship string surfacing in a governed repository reads as
+      // an unauthorised author in audit.
+      author: reviewer,
       mode: "redline",          // Word tracked changes: deletions struck through, insertions marked
       redlineComments: true,    // rationale as a margin comment per change
     });

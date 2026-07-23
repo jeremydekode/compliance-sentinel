@@ -125,7 +125,7 @@ function Editor({ apiUrl, config, comments, className }: { apiUrl: string; confi
 export function ExactEditor({
   reportId, target = "redraft", className, onKey, onDocUrl, comments,
 }: {
-  reportId: string; target?: "redraft" | "source" | "final"; className?: string;
+  reportId: string; target?: "redraft" | "source" | "final" | "apply"; className?: string;
   onKey?: (key: string) => void;
   /** Reports the URL of the document actually being edited (for Download). */
   onDocUrl?: (url: string) => void;

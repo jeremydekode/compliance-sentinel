@@ -136,7 +136,7 @@ function SimplifyV2ReportPage() {
   const [srcPdfBusy, setSrcPdfBusy] = useState(false);
   const [docExact, setDocExact] = useState(false);
   // "editor": the exact in-app OnlyOffice editor. Which docx it edits:
-  const [editorTarget, setEditorTarget] = useState<"redraft" | "source" | "final">("final");
+  const [editorTarget, setEditorTarget] = useState<"redraft" | "source" | "final" | "apply">("final");
   const buildFinal = useServerFn(buildFinalDocument);
   const [finalBusy, setFinalBusy] = useState(false);
   // Executive summary — fetched once per mount when the dashboard shows; the
@@ -316,9 +316,15 @@ function SimplifyV2ReportPage() {
   }, [workflowMode, actions, findings]);
 
   // Review-workspace highlights on the EXACT PDF: violet = needs your input,
-  // severity colors = AI amendments. Same ids as the finding cards so click
-  // syncs both ways.
+  // severity colors = AI amendments (R&E); emerald = proposed simplifications
+  // (Simplify). Same ids as the cards so click syncs both ways.
   const pdfHighlights = useMemo(() => {
+    if (workflowMode === "simplify") {
+      return actions
+        .map((a, i) => ({ a, i }))
+        .filter(({ a }) => a.verification?.status !== "rejected" && (a.before ?? "").trim())
+        .map(({ a, i }) => ({ id: `a-${i}`, text: a.before, kind: "edit" as const }));
+    }
     if (workflowMode !== "recommend_edit") return [];
     return findings
       .filter((f) => f.verification?.status !== "rejected")
@@ -332,7 +338,7 @@ function SimplifyV2ReportPage() {
         return { id: f.id, text: quote, kind };
       })
       .filter((h): h is { id: string; text: string; kind: "input" | "critical" | "high" | "medium" | "info" } => !!h);
-  }, [workflowMode, findings]);
+  }, [workflowMode, findings, actions]);
 
   // Is the cached final document still current? Mirrors the server's basis
   // (accepted ids + effective inputs) so the button can honestly say "opens
@@ -422,11 +428,32 @@ function SimplifyV2ReportPage() {
   }
 
   // Open the exact in-app editor (OnlyOffice) for a document.
-  function openEditor(target: "redraft" | "source" | "final") {
+  function openEditor(target: "redraft" | "source" | "final" | "apply") {
     setEditKey(null);
     setEditorDocUrl(null);
     setEditorTarget(target);
     setView("editor");
+  }
+
+  // SIMPLIFY final document: accepted simplifications applied to the ORIGINAL
+  // as tracked changes. Fully deterministic (no LLM) — building/refreshing it
+  // costs nothing; we re-apply whenever the accepted set changed.
+  const applySimplifyFn = useServerFn(applySimplifyV2Report);
+  const [simplifyFinalBusy, setSimplifyFinalBusy] = useState(false);
+  const simplifyApplySig = actions.map((a, i) => (a?.decision === "accepted" ? i : -1)).filter((i) => i >= 0).join(",");
+  const simplifyFinalCurrent = !!(sj.apply?.annotatedUrl && sj.apply?.sig === simplifyApplySig);
+  async function openSimplifyFinal() {
+    if (simplifyFinalCurrent) { openEditor("apply"); return; }
+    setSimplifyFinalBusy(true);
+    try {
+      await applySimplifyFn({ data: { reportId, exportMode: "annotated" } });
+      await qc.invalidateQueries({ queryKey: ["report", reportId] });
+      openEditor("apply");
+    } catch (e) {
+      toast.error("Couldn't build the final document", { description: (e as Error)?.message });
+    } finally {
+      setSimplifyFinalBusy(false);
+    }
   }
 
   // THE FINAL DOCUMENT: derive one verifiable edit per accepted finding
@@ -572,9 +599,9 @@ function SimplifyV2ReportPage() {
                 Review amendments, then open the Final document
               </span>
             )}
-            {/* view toggle: dashboard ↔ review workspace (R&E) / document (simplify) */}
+            {/* view toggle: dashboard ↔ review workspace (R&E + Simplify) */}
             <div className="flex rounded-lg border overflow-hidden text-[11px] font-medium">
-              {(workflowMode === "recommend_edit" ? (["dashboard", "review"] as const) : (["dashboard", "document"] as const)).map((v) => (
+              {(workflowMode === "recommend_edit" || workflowMode === "simplify" ? (["dashboard", "review"] as const) : (["dashboard", "document"] as const)).map((v) => (
                 <button
                   key={v}
                   onClick={() => (v === "review" ? openReview() : setView(v))}
@@ -639,8 +666,13 @@ function SimplifyV2ReportPage() {
           <div className="flex-1 min-h-0 overflow-y-auto">
             {/* Primary entry point — review & edit the exact document with the AI
                 findings as comments. Front-and-centre above the summary. */}
-            {workflowMode === "recommend_edit" && (
-              <div className={cn("px-6 pt-6 grid gap-3", findings.some((f) => f.decision === "accepted") && "lg:grid-cols-2")}>
+            {(workflowMode === "recommend_edit" || workflowMode === "simplify") && (
+              <div className={cn(
+                "px-6 pt-6 grid gap-3",
+                (workflowMode === "recommend_edit"
+                  ? findings.some((f) => f.decision === "accepted")
+                  : actions.some((a) => a.decision === "accepted")) && "lg:grid-cols-2",
+              )}>
                 <button
                   onClick={openReview}
                   className="w-full rounded-2xl border-2 border-indigo-300 dark:border-indigo-800 bg-gradient-to-r from-indigo-50 to-fuchsia-50 dark:from-indigo-950/30 dark:to-fuchsia-950/20 p-5 flex items-center gap-4 hover:shadow-md transition-shadow text-left group"
@@ -649,13 +681,39 @@ function SimplifyV2ReportPage() {
                     <SearchCheck className="size-6 text-white" />
                   </div>
                   <div className="flex-1 min-w-0">
-                    <div className="text-base font-bold text-indigo-900 dark:text-indigo-200">Review amendments &amp; inputs</div>
+                    <div className="text-base font-bold text-indigo-900 dark:text-indigo-200">
+                      {workflowMode === "simplify" ? "Review simplifications" : "Review amendments & inputs"}
+                    </div>
                     <div className="text-sm text-indigo-700/80 dark:text-indigo-300/70">
-                      The exact document with all {findings.length} proposed amendment{findings.length === 1 ? "" : "s"} highlighted — areas needing your input in purple. Decide, fill in, then generate.
+                      {workflowMode === "simplify"
+                        ? `The exact document with all ${actions.filter((a) => a.verification?.status !== "rejected").length} proposed simplifications highlighted — accept or dismiss, then open the final document.`
+                        : `The exact document with all ${findings.length} proposed amendment${findings.length === 1 ? "" : "s"} highlighted — areas needing your input in purple. Decide, fill in, then generate.`}
                     </div>
                   </div>
                   <ArrowRight className="size-5 text-indigo-500 group-hover:translate-x-1 transition-transform shrink-0" />
                 </button>
+                {workflowMode === "simplify" && actions.some((a) => a.decision === "accepted") && (
+                  <button
+                    onClick={openSimplifyFinal}
+                    disabled={simplifyFinalBusy}
+                    className="w-full rounded-2xl border-2 border-emerald-300 dark:border-emerald-800 bg-gradient-to-r from-emerald-50 to-teal-50 dark:from-emerald-950/30 dark:to-teal-950/20 p-5 flex items-center gap-4 hover:shadow-md transition-shadow text-left group disabled:opacity-70"
+                  >
+                    <div className="size-12 rounded-xl bg-emerald-600 grid place-items-center shrink-0">
+                      {simplifyFinalBusy ? <Loader2 className="size-6 text-white animate-spin" /> : <PenLine className="size-6 text-white" />}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-base font-bold text-emerald-900 dark:text-emerald-200">
+                        {simplifyFinalBusy ? "Applying simplifications…" : "Open final document"}
+                      </div>
+                      <div className="text-sm text-emerald-700/80 dark:text-emerald-300/70">
+                        {simplifyFinalCurrent
+                          ? "Up to date — opens instantly. Accepted simplifications as tracked changes on the original."
+                          : "Accepted simplifications applied to the ORIGINAL as tracked changes — deterministic, no AI cost."}
+                      </div>
+                    </div>
+                    <ArrowRight className="size-5 text-emerald-500 group-hover:translate-x-1 transition-transform shrink-0" />
+                  </button>
+                )}
                 {findings.some((f) => f.decision === "accepted") && (
                   <button
                     onClick={openFinal}
@@ -789,7 +847,7 @@ function SimplifyV2ReportPage() {
           <div className="flex-1 min-h-0 flex flex-col overflow-hidden relative">
             <div className="flex items-center justify-between px-3 py-1.5 border-b bg-indigo-50/60 dark:bg-indigo-950/20 shrink-0 gap-2">
               <span className="text-[11px] font-semibold text-indigo-700 dark:text-indigo-300 truncate">
-                {editorTarget === "final"
+                {editorTarget === "final" || editorTarget === "apply"
                   ? "Final document — tracked changes on the original · removals struck through · rationale in comments · saves automatically"
                   : editorTarget === "redraft"
                     ? "Restructured draft — rebuilt document · change comments in margin · saves automatically"
@@ -832,11 +890,17 @@ function SimplifyV2ReportPage() {
                   </span>
                   {/* legend */}
                   <div className="hidden md:flex items-center gap-2.5 text-[10px] text-muted-foreground">
-                    <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-purple-500/60" /> Needs your input</span>
-                    <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-red-500/60" /> Critical</span>
-                    <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-orange-500/60" /> High</span>
-                    <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-amber-500/60" /> Medium</span>
-                    <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-sky-400/60" /> Info</span>
+                    {workflowMode === "simplify" ? (
+                      <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-emerald-500/60" /> Proposed simplification</span>
+                    ) : (
+                      <>
+                        <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-purple-500/60" /> Needs your input</span>
+                        <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-red-500/60" /> Critical</span>
+                        <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-orange-500/60" /> High</span>
+                        <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-amber-500/60" /> Medium</span>
+                        <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-sky-400/60" /> Info</span>
+                      </>
+                    )}
                   </div>
                 </div>
                 <button onClick={() => setView("dashboard")} className="text-[11px] text-muted-foreground hover:text-foreground shrink-0">
@@ -864,7 +928,34 @@ function SimplifyV2ReportPage() {
 
             {/* decision rail: generate at top, finding cards below */}
             <div className="min-h-0 min-w-0 flex flex-col bg-card/30">
-              {workflowMode === "recommend_edit" && (
+              {workflowMode === "simplify" ? (
+                <>
+                  <div className="p-2 border-b">
+                    <Button
+                      size="sm"
+                      className="w-full h-8 text-xs gap-1.5 bg-indigo-600 hover:bg-indigo-700 text-white"
+                      disabled={simplifyFinalBusy || !actions.some((a) => a.decision === "accepted")}
+                      onClick={openSimplifyFinal}
+                    >
+                      {simplifyFinalBusy ? <Loader2 className="size-3.5 animate-spin" /> : <PenLine className="size-3.5" />}
+                      {simplifyFinalBusy ? "Applying…" : simplifyFinalCurrent ? "Open final document (up to date)" : "Open final document"}
+                    </Button>
+                    <p className="text-[9px] text-muted-foreground mt-1 text-center">
+                      Accepted simplifications applied to the original as tracked changes — no AI cost.
+                    </p>
+                  </div>
+                  <div className="flex-1 min-h-0">
+                    <SimplifyRail
+                      reportId={reportId}
+                      actions={actions}
+                      activeId={activeId}
+                      anchorStatus={anchorStatus}
+                      onSelect={setActiveId}
+                      apply={sj.apply ?? null}
+                    />
+                  </div>
+                </>
+              ) : workflowMode === "recommend_edit" && (
                 <RestructurePanel
                   reportId={reportId}
                   findings={findings}
@@ -881,19 +972,21 @@ function SimplifyV2ReportPage() {
                   decisions={decisions}
                 />
               )}
-              <div className="flex-1 min-h-0">
-                <FindingsRail
-                  reportId={reportId}
-                  findings={findings}
-                  activeId={activeId}
-                  anchorStatus={anchorStatus}
-                  onSelect={setActiveId}
-                  severityFilter={severityFilter}
-                  onSeverityFilterChange={setSeverityFilter}
-                  decisions={decisions}
-                  onDecisionChange={updateDecision}
-                />
-              </div>
+              {workflowMode !== "simplify" && (
+                <div className="flex-1 min-h-0">
+                  <FindingsRail
+                    reportId={reportId}
+                    findings={findings}
+                    activeId={activeId}
+                    anchorStatus={anchorStatus}
+                    onSelect={setActiveId}
+                    severityFilter={severityFilter}
+                    onSeverityFilterChange={setSeverityFilter}
+                    decisions={decisions}
+                    onDecisionChange={updateDecision}
+                  />
+                </div>
+              )}
             </div>
           </div>
         ) : (

@@ -5916,7 +5916,7 @@ export const getEditorConfig = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator(z.object({
     reportId: z.string(),
-    target: z.enum(["redraft", "source", "final"]).default("redraft"),
+    target: z.enum(["redraft", "source", "final", "apply"]).default("redraft"),
     origin: z.string().url(),
   }))
   .handler(async ({ data, context }) => {
@@ -5937,12 +5937,17 @@ export const getEditorConfig = createServerFn({ method: "POST" })
       ? (sj.restructure?.downloadUrl as string | undefined)
       : data.target === "final"
         ? (sj.finalDoc?.url as string | undefined)
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        : ((report as any).source_file_url as string | undefined);
+        : data.target === "apply"
+          // Simplify-mode final: accepted actions applied to the ORIGINAL as
+          // tracked changes (annotated copy; falls back to the clean one).
+          ? ((sj.apply?.annotatedUrl ?? sj.apply?.cleanUrl) as string | undefined)
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          : ((report as any).source_file_url as string | undefined);
     if (!docUrl) {
       throw new Error(
         data.target === "redraft" ? "No redraft to edit yet."
         : data.target === "final" ? "No final document built yet."
+        : data.target === "apply" ? "No applied copy yet — run Apply first."
         : "No source document to edit.",
       );
     }

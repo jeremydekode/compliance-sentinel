@@ -858,6 +858,10 @@ function paragraphContainsLoose(paraText: string, before: string): boolean {
     (s ?? "").replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/\s+/g, " ").trim().toLowerCase();
   const p = norm(paraText);
   const b = norm(before);
+  // EXACT equality is safe at any reasonable length — the length gate below
+  // guards FUZZY containment, but it was also rejecting exact short anchors
+  // like a glossary cell "CA 2010" (7 chars normalized).
+  if (p === b && p.length >= 4) return true;
   if (p.length < 8 || b.length < 8) return false;
   if (p.includes(b)) return true;              // paragraph holds the excerpt
   if (p.length >= 40 && b.includes(p)) return true; // excerpt spans ≥ this paragraph

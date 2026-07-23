@@ -1284,11 +1284,19 @@ export function applySimplificationToDocx(
           placedRow = true;
           break;
         }
+        // A row must match its table's shape. More values than columns means
+        // the anchor matched the WRONG table (duplicated text elsewhere) — a
+        // malformed row that sticks out sideways. Refuse, don't improvise.
+        if (edit.cells.length > tcs.length) {
+          skipped.push({ reason: `anchor row has ${tcs.length} column(s) but ${edit.cells.length} values were provided — likely the wrong table`, before: anchorText });
+          placedRow = true;
+          break;
+        }
         const a = escapeXml(author);
-        // Clone per-column formatting from the anchor row's cells; missing
-        // template cells (more values than columns) reuse the last one.
-        const newCells = edit.cells.slice(0, Math.max(tcs.length, edit.cells.length)).map((val, i) => {
-          const tpl = rowXml.slice(tcs[Math.min(i, tcs.length - 1)].start, tcs[Math.min(i, tcs.length - 1)].end);
+        // Clone per-column formatting from the anchor row's cells, one new cell
+        // per EXISTING column (pad missing values with empty cells).
+        const newCells = Array.from({ length: tcs.length }, (_, i) => edit.cells![i] ?? "").map((val, i) => {
+          const tpl = rowXml.slice(tcs[i].start, tcs[i].end);
           const tcPr = tpl.match(/<w:tcPr\b[\s\S]*?<\/w:tcPr>/)?.[0] ?? "";
           const pPr = (tpl.match(/<w:pPr\b[\s\S]*?<\/w:pPr>/)?.[0] ?? "").replace(/<w:numPr\b[\s\S]*?<\/w:numPr>/, "");
           const rPr = tpl.match(/<w:r\b[^>]*>\s*(<w:rPr\b[\s\S]*?<\/w:rPr>)/)?.[1] ?? "";

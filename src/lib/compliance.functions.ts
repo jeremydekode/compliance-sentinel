@@ -5547,10 +5547,11 @@ export const buildFinalDocument = createServerFn({ method: "POST" })
     }
 
     const { createHash } = await import("node:crypto");
-    // "v2" engine salt: bumping it invalidates finals built by an older engine
-    // (e.g. the pre-hardening build that misplaced glossary insertions).
+    // "v3" engine salt: bumping it invalidates finals built by an older engine
+    // (v3: unique row anchors + column-count guard after a glossary row landed
+    // in the wrong table via duplicated anchor text).
     const sig = createHash("sha1")
-      .update(JSON.stringify({ v: "v2", ids: accepted.map((f) => f.id).sort(), inputs }))
+      .update(JSON.stringify({ v: "v3", ids: accepted.map((f) => f.id).sort(), inputs }))
       .digest("hex").slice(0, 16);
     if (sj.finalDoc?.url && sj.finalDoc.sig === sig) return sj.finalDoc;
 

@@ -944,7 +944,7 @@ export async function deriveConcreteEdits(
 3. Where a REVIEWER-PROVIDED VALUE is given, use it verbatim in replace_text.
 4. ADDITIONS (a missing step, exception path, escalation rule): use the insertion form instead — "insert_after" is the EXACT verbatim text of the existing paragraph the new content should follow (one paragraph, copied character-for-character), and "replace_text" is ONLY the new content — never restate the anchor text. The anchor must be UNIQUE in the document (pick a longer span if a short one repeats elsewhere). Do NOT anchor additions inside tables (e.g. glossary rows) — put those in "unresolved" ("needs a table row"). Match the document's voice; never renumber existing steps — interpolate ("Step 5a") instead. Use a blank line inside replace_text to make multiple paragraphs.
 5. A finding MAY need SEVERAL edits — fix BOTH copies of a contradiction, BOTH meanings of a polysemous acronym, EVERY affected row or reference. Emit one edit object PER passage and repeat the findingId. If a change spans a paragraph boundary, SPLIT it into one edit per paragraph instead of quoting across the boundary.
-6. TABLE ROW ADDITIONS (e.g. a new glossary entry): use the row form — "insert_row_after" is verbatim text that uniquely identifies an existing row (quote one cell's full text, e.g. the definition text of the row it should follow), and "cells" is an array with one string per column of that table, in column order (use "" for cells to leave empty, e.g. an auto-number column). Never use insert_after for content that belongs in a table.
+6. TABLE ROW ADDITIONS (e.g. a new glossary entry): use the row form — "insert_row_after" is verbatim cell text identifying the row the new one follows. It MUST be UNIQUE in the whole document: documents often repeat a definition's text outside its table (e.g. in a requirements list), so pick a cell whose text appears NOWHERE else — a short code/acronym cell is often safer than a long definition. "cells" has EXACTLY one string per column of that table, in column order ("" leaves a cell empty, e.g. an auto-number column). Never use insert_after for content that belongs in a table.
 7. Only if a finding truly cannot be expressed as replacements, insertions, or table rows, put it in "unresolved" with a one-sentence reason. Never force a bad edit.
 
 # FINDINGS
@@ -1003,11 +1003,19 @@ ${text.slice(0, 400_000)}
     const replace = String(e?.replace_text ?? "").trim();
     const rationale = String(e?.rationale ?? f.title);
 
-    // ── Table-row form: anchor cell text must locate. ──
+    // ── Table-row form: anchor cell text must locate — UNIQUELY. Documents
+    // duplicate text across tables (a glossary definition repeated in a
+    // requirements list), and a first-match row insert lands in the WRONG
+    // table. Ambiguous anchors are rejected, not guessed. ──
     if (insertRowAfter && cells?.some((c: string) => c.trim())) {
       const aNorm = norm(insertRowAfter);
-      if (aNorm.length < 6 || !paraNorms.some((p) => p.includes(aNorm))) {
+      const hits = aNorm.length >= 6 ? paraNorms.filter((p) => p.includes(aNorm)).length : 0;
+      if (hits === 0) {
         markUnresolved(id, f.title, "Table-row anchor not found verbatim in the document");
+        continue;
+      }
+      if (hits > 1) {
+        markUnresolved(id, f.title, `Table-row anchor appears in ${hits} places — pick text unique to the target table, or apply manually`);
         continue;
       }
       edits.push({ findingId: id, find_text: "", replace_text: "", insert_row_after: insertRowAfter, cells, rationale });

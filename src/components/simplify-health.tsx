@@ -12,7 +12,11 @@ import { useEffect, useMemo, useState } from "react";
 import { useServerFn } from "@tanstack/react-start";
 import { useQueryClient } from "@tanstack/react-query";
 import type { Finding, FindingSeverity } from "@/lib/recommend";
-import { FINDING_CATEGORY_META } from "@/lib/recommend";
+import { FINDING_CATEGORY_META, findingNeedsInput } from "@/lib/recommend";
+import {
+  ResponsiveContainer, PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis,
+  Tooltip as ChartTooltip,
+} from "recharts";
 import { SIMPLIFY_TYPE_LABEL, type VerifiedAction } from "@/lib/simplify";
 import {
   setV2FindingDecision,
@@ -874,7 +878,7 @@ export function RedraftDashboard({
                 </a>
               )}
               <Button size="sm" variant="ghost" className="h-8 text-xs text-muted-foreground" onClick={onDrill}>
-                Findings detail
+                Review amendments
               </Button>
             </div>
           </div>
@@ -1015,6 +1019,127 @@ export function RedraftDashboard({
           </>
         )}
       />
+    </div>
+  );
+}
+
+// ── Findings analytics dashboard (Recommend & Edit landing) ──────────────────
+// A management-level read of the audit: severity mix, issue categories, the
+// core problems, and where the workflow stands. The findings themselves are
+// reviewed in the review workspace — this view is for orientation, not triage.
+
+const SEV_COLORS: Record<string, string> = {
+  critical: "#ef4444",
+  high: "#f97316",
+  medium: "#f59e0b",
+  info: "#38bdf8",
+};
+
+export function FindingsAnalyticsDashboard({
+  findings, restructure,
+}: {
+  findings: Finding[];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  restructure: any | null;
+}) {
+  const active = useMemo(() => findings.filter((f) => f.verification?.status !== "rejected"), [findings]);
+
+  const sevData = useMemo(() =>
+    SEV_ORDER
+      .map((s) => ({ name: s, label: s[0].toUpperCase() + s.slice(1), value: active.filter((f) => f.severity === s).length }))
+      .filter((d) => d.value > 0),
+  [active]);
+
+  const catData = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const f of active) counts.set(f.category, (counts.get(f.category) ?? 0) + 1);
+    return [...counts.entries()]
+      .map(([cat, count]) => ({
+        cat,
+        label: FINDING_CATEGORY_META[cat as keyof typeof FINDING_CATEGORY_META]?.label ?? cat,
+        hint: FINDING_CATEGORY_META[cat as keyof typeof FINDING_CATEGORY_META]?.hint ?? "",
+        count,
+      }))
+      .sort((a, b) => b.count - a.count);
+  }, [active]);
+
+  const accepted = active.filter((f) => f.decision === "accepted").length;
+  const needsInput = active.filter((f) => findingNeedsInput(f)).length;
+  const total = active.length;
+
+  return (
+    <div className="px-6 py-5 space-y-5">
+      {/* status band */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-2">
+        <StatTile icon={ListChecks} value={total} label="Findings raised" className="border-fuchsia-200 bg-fuchsia-50 text-fuchsia-700" />
+        <StatTile icon={CheckCircle2} value={`${accepted}/${total}`} label="Accepted for fixing" className="border-emerald-200 bg-emerald-50 text-emerald-700" />
+        <StatTile icon={Quote} value={needsInput} label="Need your input (purple in review)" className="border-purple-200 bg-purple-50 text-purple-700" />
+        <StatTile
+          icon={Layers}
+          value={restructure?.downloadUrl ? "Generated" : "Not yet"}
+          label={restructure?.downloadUrl ? `Redraft ready — ${restructure?.changeReport?.length ?? 0} changes` : "Redraft — generate from the review"}
+          className={cn(restructure?.downloadUrl ? "border-indigo-200 bg-indigo-50 text-indigo-700" : "border-border bg-muted/40 text-muted-foreground")}
+        />
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-3">
+        {/* severity donut */}
+        <div className="rounded-2xl border bg-card p-4">
+          <div className="text-xs font-bold mb-1">Severity mix</div>
+          <div className="h-44">
+            <ResponsiveContainer width="100%" height="100%">
+              <PieChart>
+                <Pie data={sevData} dataKey="value" nameKey="label" innerRadius={42} outerRadius={64} paddingAngle={2} strokeWidth={0}>
+                  {sevData.map((d) => <Cell key={d.name} fill={SEV_COLORS[d.name]} />)}
+                </Pie>
+                <ChartTooltip formatter={(v: number, n: string) => [`${v} finding${v === 1 ? "" : "s"}`, n]} />
+              </PieChart>
+            </ResponsiveContainer>
+          </div>
+          <div className="flex flex-wrap gap-x-3 gap-y-1 justify-center">
+            {sevData.map((d) => (
+              <span key={d.name} className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                <span className="size-2 rounded-sm" style={{ background: SEV_COLORS[d.name] }} />
+                {d.label} · <b className="text-foreground">{d.value}</b>
+              </span>
+            ))}
+          </div>
+        </div>
+
+        {/* category bars */}
+        <div className="rounded-2xl border bg-card p-4">
+          <div className="text-xs font-bold mb-1">Issue categories</div>
+          <div style={{ height: Math.max(176, catData.length * 34) }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={catData} layout="vertical" margin={{ left: 4, right: 16, top: 4, bottom: 4 }}>
+                <XAxis type="number" hide domain={[0, "dataMax"]} />
+                <YAxis type="category" dataKey="label" width={104} tick={{ fontSize: 11 }} axisLine={false} tickLine={false} />
+                <ChartTooltip formatter={(v: number) => [`${v} finding${v === 1 ? "" : "s"}`, ""]} />
+                <Bar dataKey="count" fill="#6366f1" radius={[0, 4, 4, 0]} barSize={16} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+
+        {/* core issues */}
+        <div className="rounded-2xl border bg-card p-4">
+          <div className="text-xs font-bold mb-2">Core issues in this document</div>
+          <div className="space-y-2.5">
+            {catData.slice(0, 4).map((c) => (
+              <div key={c.cat} className="rounded-lg border bg-muted/30 px-3 py-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-semibold">{c.label}</span>
+                  <span className="text-[10px] font-bold rounded-full bg-indigo-100 text-indigo-700 px-1.5 py-0.5">{c.count}</span>
+                </div>
+                <p className="text-[10px] text-muted-foreground mt-0.5 leading-relaxed">{c.hint}</p>
+              </div>
+            ))}
+            {catData.length === 0 && (
+              <p className="text-xs text-muted-foreground">No findings — the document came back clean.</p>
+            )}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

@@ -22,6 +22,10 @@ export interface DocHighlight {
   id: string;
   /** Verbatim-ish text to anchor on (an edit's `before`, a finding's evidence quote). */
   text: string;
+  /** Fallback anchor tried when `text` can't be found — e.g. a change's original
+   *  ("was") passage, so an edit whose new wording drifted still grounds at the
+   *  place it applies. */
+  altText?: string;
   /** Highlight style bucket — maps to a ::highlight() rule. */
   kind: "edit" | "critical" | "high" | "medium" | "info";
 }
@@ -126,14 +130,34 @@ function buildTextIndex(root: HTMLElement): TextIndex {
   return { nodes, full, starts, locate };
 }
 
-/** Finds `needle` in the index and returns a DOM Range, or null. */
+/** Finds `needle` in the index and returns a DOM Range, or null. Exact first;
+ *  on a miss, falls back to the LONGEST consecutive word-run of `needle` that
+ *  actually appears in the document. This grounds a highlight even when the text
+ *  drifted slightly from its source (e.g. a redraft's "what changed" note is
+ *  paraphrased from the body) — a partial highlight still shows WHERE the edit
+ *  is, instead of reporting "not located". */
 function findRange(index: TextIndex, needle: string): Range | null {
   const q = normalize(needle).trim();
   if (q.length < 8) return null; // too short to anchor reliably
-  const at = index.full.indexOf(q);
-  if (at < 0) return null;
+  let at = index.full.indexOf(q);
+  let len = q.length;
+  if (at < 0) {
+    const words = q.split(" ");
+    const maxN = Math.min(words.length, 40);
+    let found = false;
+    // n descending → the first hit is the longest matching phrase.
+    for (let n = maxN; n >= 4 && !found; n--) {
+      for (let i = 0; i + n <= words.length; i++) {
+        const phrase = words.slice(i, i + n).join(" ");
+        if (phrase.length < 15) continue; // ignore short, non-distinctive runs
+        const p = index.full.indexOf(phrase);
+        if (p >= 0) { at = p; len = phrase.length; found = true; break; }
+      }
+    }
+    if (!found) return null;
+  }
   const start = index.locate(at);
-  const end = index.locate(at + q.length - 1);
+  const end = index.locate(at + len - 1);
   if (!start || !end) return null;
   const range = document.createRange();
   range.setStart(start.node, start.offset);
@@ -162,6 +186,39 @@ function ensureHighlightStyles() {
 
 const supportsHighlightApi = () =>
   typeof CSS !== "undefined" && "highlights" in CSS && typeof (window as any).Highlight === "function"; // eslint-disable-line @typescript-eslint/no-explicit-any
+
+// docx-preview renders every embedded image as an <img>, but browsers can't
+// decode EMF/WMF vector metafiles — Word's usual format for logos, flowcharts
+// and diagrams — so those show a broken-image icon. Swap any image the browser
+// failed to decode for a clean labeled placeholder; the real figure is intact in
+// the file, so the note points the reader to the download. (In-browser EMF→PNG
+// rasterisation was tried but the vector→raster output was too rough for complex
+// bank swimlane flowcharts — text/box misalignment — so we keep the clean
+// placeholder and let Word render the figures faithfully in the download.)
+function patchUnsupportedImages(root: HTMLElement) {
+  for (const img of Array.from(root.querySelectorAll("img"))) {
+    if (img.dataset.dvSeen) continue;
+    img.dataset.dvSeen = "1";
+    const replace = () => {
+      if (img.naturalWidth > 0 || !img.isConnected) return; // decoded fine, or already swapped
+      const w = img.width || parseInt(img.style.width || "0", 10) || 0;
+      const h = img.height || parseInt(img.style.height || "0", 10) || 0;
+      const ph = document.createElement("div");
+      ph.style.cssText =
+        "display:flex;align-items:center;justify-content:center;text-align:center;" +
+        "padding:12px;margin:4px auto;border:1px dashed #cbd5e1;border-radius:8px;" +
+        "background:#f8fafc;color:#64748b;font-size:11px;font-style:italic;line-height:1.4;" +
+        (w ? `width:${w}px;` : "max-width:100%;") + `min-height:${Math.max(48, h || 64)}px;`;
+      ph.textContent = "Figure — available in the downloaded document";
+      img.replaceWith(ph);
+    };
+    if (img.complete) replace();
+    else {
+      img.addEventListener("load", replace, { once: true });
+      img.addEventListener("error", replace, { once: true });
+    }
+  }
+}
 
 // ── component ────────────────────────────────────────────────────────────────
 
@@ -253,6 +310,16 @@ export function DocViewer({
     return () => { cancelled = true; };
   }, [fileUrl, fallbackText, renderChanges]);
 
+  // 1b — swap browser-undecodable figures (EMF/WMF) for a labeled placeholder,
+  // once at render and again shortly after (images can error post-paint).
+  useEffect(() => {
+    if (phase !== "docx" || !containerRef.current) return;
+    const root = containerRef.current;
+    patchUnsupportedImages(root);
+    const t = setTimeout(() => patchUnsupportedImages(root), 400);
+    return () => clearTimeout(t);
+  }, [phase, rendered]);
+
   // 2 — anchor highlights over the rendered content (Custom Highlight API).
   useEffect(() => {
     if (phase !== "docx" || !containerRef.current) return;
@@ -266,7 +333,7 @@ export function DocViewer({
     const ranges = new Map<string, Range>();
     const status: AnchorStatus = {};
     for (const h of highlights) {
-      const range = findRange(index, h.text);
+      const range = findRange(index, h.text) || (h.altText ? findRange(index, h.altText) : null);
       status[h.id] = !!range;
       if (!range) continue;
       ranges.set(h.id, range);

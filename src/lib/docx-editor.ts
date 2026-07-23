@@ -343,15 +343,65 @@ export interface StructuredUnit {
   text: string;
   section: string;
   table?: string[][];
+  /** Verbatim <w:tbl> XML of a table unit — so a table the redraft reproduces
+   *  UNCHANGED can be re-emitted byte-for-byte (keeping its shading, borders,
+   *  column widths and merged cells) instead of rebuilt as a generic grid. */
+  tableXml?: string;
   /** The source paragraph's <w:pPr> — its spacing, alignment, indent, style.
    *  Carried so regenerated body text can inherit the document's real
    *  formatting instead of being emitted as bare unstyled paragraphs. */
   pPr?: string;
+  /** This paragraph is an item in a real bullet/numbered list (its <w:numPr>
+   *  resolves to that format in numbering.xml) — so the redraft can rebuild it
+   *  as a native list instead of flattening the items into prose paragraphs. */
+  list?: "bullet" | "number";
   /** Verbatim paragraph XML for units that must be re-emitted untouched —
    *  currently paragraphs carrying an image (logo, flowchart, diagram). The
    *  AI never sees or rewrites these; they are passed through so figures
    *  survive the rebuild instead of being silently dropped. */
   figureXml?: string;
+}
+
+/**
+ * Maps each list paragraph's <w:numPr> (numId + ilvl) to its format by reading
+ * numbering.xml — so we can tell a genuine BULLET list from a decimal/lettered
+ * NUMBERED list, and from a numbered-clause paragraph that merely looks numbered.
+ * Returns (numId → ilvl → "bullet" | "number"); missing entries => not a list.
+ */
+function readNumberingFormats(zip: PizZip): Map<string, Map<string, "bullet" | "number">> {
+  const out = new Map<string, Map<string, "bullet" | "number">>();
+  const numXml = zip.file("word/numbering.xml")?.asText();
+  if (!numXml) return out;
+  // abstractNumId → (ilvl → format)
+  const abstractFmt = new Map<string, Map<string, "bullet" | "number">>();
+  for (const am of numXml.matchAll(/<w:abstractNum\b[^>]*w:abstractNumId="([^"]+)"[\s\S]*?<\/w:abstractNum>/g)) {
+    const aid = am[1];
+    const levels = new Map<string, "bullet" | "number">();
+    for (const lv of am[0].matchAll(/<w:lvl\b[^>]*w:ilvl="([^"]+)"[\s\S]*?<\/w:lvl>/g)) {
+      const fmt = lv[0].match(/<w:numFmt\b[^>]*w:val="([^"]+)"/)?.[1] ?? "";
+      levels.set(lv[1], fmt === "bullet" ? "bullet" : "number");
+    }
+    abstractFmt.set(aid, levels);
+  }
+  // num (numId) → abstractNumId
+  for (const nm of numXml.matchAll(/<w:num\b[^>]*w:numId="([^"]+)"[\s\S]*?<\/w:num>/g)) {
+    const aid = nm[0].match(/<w:abstractNumId\b[^>]*w:val="([^"]+)"/)?.[1];
+    if (aid && abstractFmt.has(aid)) out.set(nm[1], abstractFmt.get(aid)!);
+  }
+  return out;
+}
+
+/** The list format of a paragraph, from its <w:numPr>, or null when not a list. */
+function paragraphListFormat(
+  pXml: string,
+  numFormats: Map<string, Map<string, "bullet" | "number">>,
+): "bullet" | "number" | null {
+  const numPr = pXml.match(/<w:numPr\b[\s\S]*?<\/w:numPr>/)?.[0];
+  if (!numPr) return null;
+  const numId = numPr.match(/<w:numId\b[^>]*w:val="([^"]+)"/)?.[1];
+  const ilvl = numPr.match(/<w:ilvl\b[^>]*w:val="([^"]+)"/)?.[1] ?? "0";
+  if (!numId) return null;
+  return numFormats.get(numId)?.get(ilvl) ?? numFormats.get(numId)?.get("0") ?? null;
 }
 
 /** The <w:pPr> of a paragraph, or "" when it has none. */
@@ -380,7 +430,10 @@ const NON_BODY_STYLE_RE = /toc|contents|index|header|footer|caption|heading|titl
  * Explicit spacing and justification are therefore always applied.
  */
 export function dominantBodyProps(units: StructuredUnit[]): string {
-  const tally = new Map<string, number>();
+  const styleTally = new Map<string, number>();
+  const spacingTally = new Map<string, number>();
+  const jcTally = new Map<string, number>();
+  const vote = (map: Map<string, number>, k: string) => map.set(k, (map.get(k) ?? 0) + 1);
   for (const u of units) {
     if (u.table || u.figureXml || !u.pPr) continue;
     if (u.text === u.section) continue;              // heading
@@ -388,16 +441,68 @@ export function dominantBodyProps(units: StructuredUnit[]): string {
     if (!/[.;:]/.test(u.text)) continue;             // require prose, not a TOC line
     const style = u.pPr.match(/<w:pStyle\s+w:val="([^"]+)"/)?.[1] ?? "";
     if (NON_BODY_STYLE_RE.test(style)) continue;
-    tally.set(style, (tally.get(style) ?? 0) + 1);
+    vote(styleTally, style);
+    // Sample the paragraphs' REAL spacing and justification so the rebuild keeps
+    // the document's actual layout instead of a one-size-fits-all guess.
+    const sp = u.pPr.match(/<w:spacing\b[^>]*\/>/)?.[0];
+    if (sp) vote(spacingTally, sp);
+    const jc = u.pPr.match(/<w:jc\b[^>]*\/>/)?.[0];
+    if (jc) vote(jcTally, jc);
   }
-  let best = "", bestN = 0;
-  for (const [s, n] of tally) if (n > bestN) { best = s; bestN = n; }
+  const winner = (map: Map<string, number>) => {
+    let best = "", bestN = 0;
+    for (const [k, n] of map) if (n > bestN) { best = k; bestN = n; }
+    return best;
+  };
+  const bestStyle = winner(styleTally);
 
   // Schema order matters: pStyle → spacing → jc.
-  const style = best ? `<w:pStyle w:val="${escapeXml(best)}"/>` : "";
-  const spacing = `<w:spacing w:before="0" w:after="160" w:line="276" w:lineRule="auto"/>`;
-  return `<w:pPr>${style}${spacing}<w:jc w:val="both"/></w:pPr>`;
+  const style = bestStyle ? `<w:pStyle w:val="${escapeXml(bestStyle)}"/>` : "";
+  const spacing = winner(spacingTally) || `<w:spacing w:before="0" w:after="160" w:line="276" w:lineRule="auto"/>`;
+  const jc = winner(jcTally); // inherit (no jc) when the source doesn't set one
+  return `<w:pPr>${style}${spacing}${jc}</w:pPr>`;
 }
+
+/**
+ * The dominant RUN font + size of the source's body PROSE — sampled from the
+ * actual text runs (not styles, which would need inheritance resolution). Applied
+ * to every regenerated run so the redraft keeps the document's real typeface and
+ * size instead of falling back to the Word default (Calibri). Returns a ready
+ * <w:rPr> (or "" when the source carries no explicit run font anywhere).
+ */
+export function dominantBodyRunProps(buffer: Buffer): string {
+  const zip = new PizZip(buffer);
+  const xml = zip.file("word/document.xml")?.asText() ?? "";
+  const tally = new Map<string, number>(); // "font|size" → count
+  const pRe = /<w:p\b[^>]*>(?:(?!<w:p\b)[\s\S])*?<\/w:p>/g;
+  let m: RegExpExecArray | null;
+  while ((m = pRe.exec(xml)) !== null) {
+    const pXml = m[0];
+    if (!/<w:t[ >]/.test(pXml)) continue;               // no visible text
+    if (getParagraphText(pXml).trim().length < 40) continue; // prose, not labels
+    // The first real text run's rPr represents the paragraph's body font.
+    const rPr = pXml.match(/<w:r\b[^>]*>\s*(<w:rPr\b[\s\S]*?<\/w:rPr>)/)?.[1] ?? "";
+    const font = rPr.match(/<w:rFonts\b[^>]*\bw:ascii="([^"]+)"/)?.[1] ?? "";
+    const sz = rPr.match(/<w:sz\b[^>]*w:val="([^"]+)"/)?.[1] ?? "";
+    if (!font && !sz) continue;
+    vote2(tally, `${font}|${sz}`);
+  }
+  let font = "", sz = "", best = 0;
+  for (const [k, n] of tally) if (n > best) { best = n; [font, sz] = k.split("|"); }
+  // Fall back to docDefaults when body runs carry no explicit font.
+  if (!font && !sz) {
+    const styles = zip.file("word/styles.xml")?.asText() ?? "";
+    const dd = styles.match(/<w:docDefaults>[\s\S]*?<\/w:docDefaults>/)?.[0] ?? "";
+    font = dd.match(/<w:rFonts\b[^>]*\bw:ascii="([^"]+)"/)?.[1] ?? "";
+    sz = dd.match(/<w:sz\b[^>]*w:val="([^"]+)"/)?.[1] ?? "";
+  }
+  if (!font && !sz) return "";
+  const rFonts = font ? `<w:rFonts w:ascii="${escapeXml(font)}" w:hAnsi="${escapeXml(font)}" w:cs="${escapeXml(font)}"/>` : "";
+  const size = sz ? `<w:sz w:val="${escapeXml(sz)}"/><w:szCs w:val="${escapeXml(sz)}"/>` : "";
+  return `<w:rPr>${rFonts}${size}</w:rPr>`;
+}
+
+function vote2(map: Map<string, number>, k: string) { map.set(k, (map.get(k) ?? 0) + 1); }
 
 /**
  * Index just PAST the close tag matching the element that opens at `start`,
@@ -482,6 +587,7 @@ export function docxToStructuredUnits(buffer: Buffer): StructuredUnit[] {
   const docFile = zip.file("word/document.xml");
   if (!docFile) return [];
   const xml = docFile.asText();
+  const numFormats = readNumberingFormats(zip);
   const units: StructuredUnit[] = [];
   let section = "";
   // Walk TOP-LEVEL tables and paragraphs in document order. Each table is
@@ -504,7 +610,19 @@ export function docxToStructuredUnits(buffer: Buffer): StructuredUnit[] {
       const rows = tableRows(block).filter((r) => r.some((c) => c.trim()));
       if (rows.length === 0) continue;
       const text = rows.map((r) => r.join(" | ")).join("\n");
-      units.push({ text, section, table: rows });
+      // Carry the verbatim table XML so an unchanged table can be re-emitted
+      // with its exact styling instead of rebuilt as a generic grid.
+      units.push({ text, section, table: rows, tableXml: block });
+    } else if (/<w:txbxContent>/.test(block)) {
+      // A floating TEXT BOX (e.g. a "Note:" callout). Word floats it, so after a
+      // redraft reflows the body it lands ON TOP of the table it used to sit
+      // beside. De-float it: pull the text box's paragraphs INLINE so the note
+      // flows with the document instead of overlapping other content.
+      const inner = block.match(/<w:txbxContent>([\s\S]*?)<\/w:txbxContent>/)?.[1] ?? "";
+      for (const pm of inner.matchAll(/<w:p\b[^>]*>(?:(?!<w:p\b)[\s\S])*?<\/w:p>/g)) {
+        const t = getParagraphText(pm[0]);
+        if (t) units.push({ text: t, section });
+      }
     } else if (hasImage(block)) {
       // A figure (logo, flowchart, diagram). Kept verbatim — it carries no
       // rewritable text, and dropping it loses real procedural content.
@@ -513,10 +631,19 @@ export function docxToStructuredUnits(buffer: Buffer): StructuredUnit[] {
     } else {
       const t = getParagraphText(block);
       if (!t) continue;
+      // Skip Table-of-Contents entries. The rebuild can't regenerate a Word TOC
+      // field, so reproducing it flattens the tab leaders — titles and page
+      // numbers run together ("D.1Business Rules…D-1") and the page numbers are
+      // stale once the body is regenerated. Detected by the TOC paragraph styles
+      // Word applies to TOC lines (TOC1–TOC9, TOCHeading, Contents…). The reader
+      // can regenerate a clean TOC in Word in one click.
+      const pStyle = paragraphProps(block).match(/<w:pStyle\s+w:val="([^"]+)"/)?.[1] ?? "";
+      if (/^toc/i.test(pStyle) || /contents/i.test(pStyle)) continue;
       if (t.length <= 80 && t.length >= 3 && t === t.toUpperCase() && /[A-Z]/.test(t)) {
         section = t;
       }
-      units.push({ text: t, section, pPr: paragraphProps(block) });
+      const list = paragraphListFormat(block, numFormats) ?? undefined;
+      units.push({ text: t, section, pPr: paragraphProps(block), list });
     }
   }
   return units;
@@ -1191,21 +1318,31 @@ function discoverHeadingStyles(zip: PizZip): Record<1 | 2 | 3, string | null> {
   return out;
 }
 
-function headingParagraph(text: string, level: 1 | 2 | 3, styleId: string | null): string {
+/** Insert `inner` inside an existing `<w:rPr>…</w:rPr>` (before its close), or
+ *  wrap it in a fresh rPr when there is none. Keeps run props schema-valid. */
+function mergeRPr(rPr: string, inner: string): string {
+  if (!rPr) return `<w:rPr>${inner}</w:rPr>`;
+  return rPr.replace(/<\/w:rPr>\s*$/, `${inner}</w:rPr>`);
+}
+
+function headingParagraph(text: string, level: 1 | 2 | 3, styleId: string | null, rPr = ""): string {
+  // Left-align headings (the source often centres section titles, which reads
+  // awkwardly in the regenerated flow); jc overrides the style's alignment.
   if (styleId) {
-    return `<w:p><w:pPr><w:pStyle w:val="${escapeXml(styleId)}"/></w:pPr><w:r><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`;
+    return `<w:p><w:pPr><w:pStyle w:val="${escapeXml(styleId)}"/><w:jc w:val="left"/></w:pPr><w:r><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`;
   }
-  // No heading styles in the source — approximate with bold + size.
+  // No heading styles in the source — approximate with the body font, bold + size.
   const sz = level === 1 ? 32 : level === 2 ? 28 : 24; // half-points
-  return `<w:p><w:r><w:rPr><w:b/><w:sz w:val="${sz}"/><w:szCs w:val="${sz}"/></w:rPr><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`;
+  const font = rPr.match(/<w:rFonts\b[^>]*\/>/)?.[0] ?? "";
+  return `<w:p><w:pPr><w:jc w:val="left"/></w:pPr><w:r><w:rPr>${font}<w:b/><w:sz w:val="${sz}"/><w:szCs w:val="${sz}"/></w:rPr><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`;
 }
 
 /** A body paragraph carrying the document's own formatting. `pPr` is the
- *  source's dominant body paragraph properties (spacing, alignment, indent);
- *  without it the rebuilt document came out as bare unspaced text, which is
- *  what made redrafts look nothing like the original. */
-function bodyParagraph(text: string, pPr = ""): string {
-  return `<w:p>${pPr}<w:r><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`;
+ *  source's dominant body paragraph properties (spacing, alignment, indent) and
+ *  `rPr` its dominant run font — without them the rebuilt document came out as
+ *  bare, wrong-font text that read nothing like the original. */
+function bodyParagraph(text: string, pPr = "", rPr = ""): string {
+  return `<w:p>${pPr}<w:r>${rPr}<w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`;
 }
 
 /** An empty paragraph whose only job is to start a new page. */
@@ -1213,48 +1350,145 @@ function pageBreakParagraph(): string {
   return `<w:p><w:r><w:br w:type="page"/></w:r></w:p>`;
 }
 
-/** Bullets rendered as literal "• " paragraphs with a hanging indent — avoids
- *  touching numbering.xml (whose numId space differs per document). */
-function bulletParagraph(text: string): string {
+/** A NATIVE Word list item — real bullet/number via a numbering.xml numId, so
+ *  the redraft's lists render, indent and (for numbered) auto-count like Word's
+ *  own, instead of a literal "• " glyph baked into the text. */
+function listParagraph(text: string, numId: number, rPr = ""): string {
   return (
-    `<w:p><w:pPr><w:ind w:left="360" w:hanging="360"/></w:pPr>` +
-    `<w:r><w:t xml:space="preserve">• ${escapeXml(text)}</w:t></w:r></w:p>`
+    `<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="${numId}"/></w:numPr></w:pPr>` +
+    `<w:r>${rPr}<w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`
   );
 }
 
-function simpleTable(rows: string[][]): string {
+// Twips of usable text width on A4 with 1" margins (11906 − 2×1440).
+const PAGE_TEXT_WIDTH = 9026;
+
+function simpleTable(rows: string[][], rPr = ""): string {
   if (rows.length === 0) return "";
   const cols = Math.max(...rows.map((r) => r.length));
+  // Distribute the page width by each column's longest content, so a wide
+  // "Process Details" column gets the room and a "Seq." column stays slim —
+  // fills the page without one-word-per-line wrapping. Every width is explicit
+  // (with fixed layout) so nothing ever collapses to one char per line.
+  const maxLen = Array.from({ length: cols }, (_, c) =>
+    Math.max(3, ...rows.map((r) => (r[c] ?? "").length)));
+  const totalLen = maxLen.reduce((a, b) => a + b, 0) || cols;
+  const MIN = 700;
+  const colW = maxLen.map((l) => Math.max(MIN, Math.round((l / totalLen) * PAGE_TEXT_WIDTH)));
+  // The MIN floor can push the total past the page width — pull the excess back
+  // out of the columns that have room above the floor, so the table fits the
+  // page exactly instead of overflowing off the right edge.
+  let over = colW.reduce((a, b) => a + b, 0) - PAGE_TEXT_WIDTH;
+  if (over > 0) {
+    const flex = colW.map((w) => Math.max(0, w - MIN));
+    const flexTotal = flex.reduce((a, b) => a + b, 0) || 1;
+    for (let i = 0; i < cols; i++) colW[i] = Math.max(MIN, colW[i] - Math.round((over * flex[i]) / flexTotal));
+  }
+  const totalW = colW.reduce((a, b) => a + b, 0);
   const borders =
     `<w:tblBorders>` +
     ["top", "left", "bottom", "right", "insideH", "insideV"]
       .map((b) => `<w:${b} w:val="single" w:sz="4" w:color="auto"/>`)
       .join("") +
     `</w:tblBorders>`;
-  const grid = `<w:tblGrid>${Array.from({ length: cols }, () => `<w:gridCol/>`).join("")}</w:tblGrid>`;
+  const grid = `<w:tblGrid>${colW.map((w) => `<w:gridCol w:w="${w}"/>`).join("")}</w:tblGrid>`;
+  const headerRPr = mergeRPr(rPr, "<w:b/>");
   const trs = rows
     .map((row, ri) => {
       const cells = Array.from({ length: cols }, (_, ci) => {
-        const runPr = ri === 0 ? `<w:rPr><w:b/></w:rPr>` : "";
+        const runPr = ri === 0 ? headerRPr : rPr;
         return (
-          `<w:tc><w:tcPr><w:tcW w:w="0" w:type="auto"/></w:tcPr>` +
+          `<w:tc><w:tcPr><w:tcW w:w="${colW[ci]}" w:type="dxa"/></w:tcPr>` +
           `<w:p><w:r>${runPr}<w:t xml:space="preserve">${escapeXml(row[ci] ?? "")}</w:t></w:r></w:p></w:tc>`
         );
       }).join("");
       return `<w:tr>${cells}</w:tr>`;
     })
     .join("");
-  return `<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/>${borders}</w:tblPr>${grid}${trs}</w:tbl>`;
+  // Schema order: tblW → tblBorders → tblLayout. Fixed layout honours the
+  // explicit gridCol widths so the columns never collapse to one char per line.
+  return `<w:tbl><w:tblPr><w:tblW w:w="${totalW}" w:type="dxa"/>${borders}<w:tblLayout w:type="fixed"/></w:tblPr>${grid}${trs}</w:tbl>`;
 }
 
-function blockToXml(block: RestructureBlock, bodyPPr = ""): string {
-  if (block.type === "para" && block.text) return bodyParagraph(block.text, bodyPPr);
-  if (block.type === "bullets" && block.items) return block.items.map(bulletParagraph).join("");
-  if (block.type === "table" && block.rows) return simpleTable(block.rows);
+interface RebuildCtx {
+  bodyPPr: string;
+  bodyRPr: string;
+  bulletNumId: number;
+  numberNumId: number;
+}
+
+function blockToXml(block: RestructureBlock, ctx: RebuildCtx): string {
+  if (block.type === "para" && block.text) return bodyParagraph(block.text, ctx.bodyPPr, ctx.bodyRPr);
+  if (block.type === "bullets" && block.items) {
+    const numId = block.ordered ? ctx.numberNumId : ctx.bulletNumId;
+    return block.items.map((it) => listParagraph(it, numId, ctx.bodyRPr)).join("");
+  }
+  // A reproduced-unchanged table re-emits its ORIGINAL xml UNTOUCHED — Word
+  // authored its column widths correctly, so leave them alone (over-writing them
+  // collapsed some tables to one character per line). An edited/new table uses
+  // the rebuilt grid, which carries its own explicit full-width columns.
+  if (block.type === "table" && block.xml) return block.xml;
+  if (block.type === "table" && block.rows) return simpleTable(block.rows, ctx.bodyRPr);
   // A figure is re-emitted exactly as it appeared in the source, so the logo
   // and process diagrams survive the rebuild.
   if (block.type === "figure" && block.xml) return block.xml;
   return "";
+}
+
+/**
+ * Ensures the package has a bullet list and a decimal (numbered) list definition
+ * in numbering.xml, returning their numIds. Creates numbering.xml (and registers
+ * it in the rels + content types) when the source has none. Ids are chosen past
+ * the highest existing ones so they never clash with the document's own lists.
+ * OOXML requires every <w:abstractNum> to precede every <w:num>, so the new
+ * abstractNums are spliced right after the opening tag and the nums before the
+ * close.
+ */
+function ensureListNumbering(zip: PizZip): { bulletNumId: number; numberNumId: number } {
+  let numXml = zip.file("word/numbering.xml")?.asText();
+  const created = !numXml;
+  if (!numXml) {
+    numXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"></w:numbering>`;
+  }
+  const absIds = [...numXml.matchAll(/w:abstractNumId="(\d+)"/g)].map((mm) => Number(mm[1]));
+  const numIds = [...numXml.matchAll(/<w:num\b[^>]*w:numId="(\d+)"/g)].map((mm) => Number(mm[1]));
+  let nextAbs = (absIds.length ? Math.max(...absIds) : 0) + 1;
+  let nextNum = (numIds.length ? Math.max(...numIds) : 0) + 1;
+  const bulletAbs = nextAbs++, numberAbs = nextAbs++;
+  const bulletNumId = nextNum++, numberNumId = nextNum++;
+  const lvlPPr = `<w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr>`;
+  const abstracts =
+    `<w:abstractNum w:abstractNumId="${bulletAbs}"><w:multiLevelType w:val="hybridMultilevel"/>` +
+    `<w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="•"/><w:lvlJc w:val="left"/>${lvlPPr}</w:lvl></w:abstractNum>` +
+    `<w:abstractNum w:abstractNumId="${numberAbs}"><w:multiLevelType w:val="hybridMultilevel"/>` +
+    `<w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/><w:lvlJc w:val="left"/>${lvlPPr}</w:lvl></w:abstractNum>`;
+  const nums =
+    `<w:num w:numId="${bulletNumId}"><w:abstractNumId w:val="${bulletAbs}"/></w:num>` +
+    `<w:num w:numId="${numberNumId}"><w:abstractNumId w:val="${numberAbs}"/></w:num>`;
+  numXml = numXml.replace(/(<w:numbering\b[^>]*>)/, `$1${abstracts}`).replace("</w:numbering>", `${nums}</w:numbering>`);
+  zip.file("word/numbering.xml", numXml);
+
+  if (created) {
+    const relsFile = zip.file("word/_rels/document.xml.rels");
+    if (relsFile) {
+      let rels = relsFile.asText();
+      if (!/Target="numbering\.xml"/.test(rels)) {
+        const ids = [...rels.matchAll(/Id="rId(\d+)"/g)].map((mm) => Number(mm[1]));
+        const nid = (ids.length ? Math.max(...ids) : 0) + 1;
+        const rel = `<Relationship Id="rId${nid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>`;
+        zip.file("word/_rels/document.xml.rels", rels.replace("</Relationships>", `${rel}</Relationships>`));
+      }
+    }
+    const ctFile = zip.file("[Content_Types].xml");
+    if (ctFile) {
+      const ct = ctFile.asText();
+      if (!/word\/numbering\.xml/.test(ct)) {
+        const ovr = `<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>`;
+        zip.file("[Content_Types].xml", ct.replace("</Types>", `${ovr}</Types>`));
+      }
+    }
+  }
+  return { bulletNumId, numberNumId };
 }
 
 /**
@@ -1274,6 +1508,10 @@ export function rebuildDocxBody(
      *  dominantBodyProps). Without it the rebuild emits bare paragraphs and the
      *  output reads nothing like the original. */
     bodyPPr?: string;
+    /** The source's dominant body run <w:rPr> (font + size). Defaults to
+     *  dominantBodyRunProps(originalBuffer) so regenerated text keeps the
+     *  document's real typeface instead of the Word default. */
+    bodyRPr?: string;
     /** Start each top-level section on a new page, restoring the pagination
      *  that rebuilding the body would otherwise flatten away. */
     pageBreakBeforeSections?: boolean;
@@ -1307,14 +1545,27 @@ export function rebuildDocxBody(
   const paraIds: string[] = [];
   let nextCommentId = 0;
 
+  // Body run font (keeps the document's real typeface) + native list numbering
+  // (only wired when the redraft actually has lists, so an all-prose document
+  // isn't given a numbering part it never uses).
+  const bodyRPr = opts.bodyRPr ?? dominantBodyRunProps(originalBuffer);
+  const hasList = sections.some((s) => s.blocks.some((b) => b.type === "bullets" && b.items?.length));
+  const { bulletNumId, numberNumId } = hasList ? ensureListNumbering(zip) : { bulletNumId: 0, numberNumId: 0 };
+  const ctx: RebuildCtx = { bodyPPr: opts.bodyPPr ?? "", bodyRPr, bulletNumId, numberNumId };
+
   const parts: string[] = [];
-  sections.forEach((s, i) => {
-    // Page-break between top-level sections (never before the first, which
-    // would open the document on a blank page).
-    if (opts.pageBreakBeforeSections && i > 0 && s.level === 1) {
+  let emitted = 0;
+  sections.forEach((s) => {
+    // Skip sections with no content — e.g. a "TABLE OF CONTENTS" whose entries
+    // were dropped — so the redraft doesn't carry an empty heading on a blank page.
+    if (!s.blocks || s.blocks.length === 0) return;
+    // Page-break between top-level sections (never before the first EMITTED one,
+    // which would open the document on a blank page).
+    if (opts.pageBreakBeforeSections && emitted > 0 && s.level === 1) {
       parts.push(pageBreakParagraph());
     }
-    let heading = headingParagraph(s.heading, s.level, headingStyles[s.level]);
+    emitted++;
+    let heading = headingParagraph(s.heading, s.level, headingStyles[s.level], bodyRPr);
     const note = opts.sectionComments?.[s.heading];
     if (note) {
       const commentId = nextCommentId++;
@@ -1324,7 +1575,7 @@ export function rebuildDocxBody(
       heading = wrapParagraphWithComment(heading, commentId);
     }
     parts.push(heading);
-    for (const b of s.blocks) parts.push(blockToXml(b, opts.bodyPPr ?? ""));
+    for (const b of s.blocks) parts.push(blockToXml(b, ctx));
   });
 
   const newXml =

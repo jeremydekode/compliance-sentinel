@@ -8,7 +8,7 @@ import PizZip from "pizzip";
 import { applyEditsToDocx, looksLikeDocx, docxToText, docxToHtml, docxToSimplifyText, docxToSimplifyUnits, docxToStructuredUnits, dominantBodyProps, extractDocxFigures, applySimplificationToDocx, rebuildDocxBody, type SimplifyDocxEdit } from "./docx-editor";
 import { verifyActions, analyzeStructure, crossCheckSections, DEFAULT_SIMPLIFY_GUIDANCE, AGGRESSIVE_SIMPLIFY_ADDENDUM, initialDecision } from "./simplify";
 import type { VerificationSummary, DocStructure, SectionCrossCheck, VerifiedAction } from "./simplify";
-import { runAuditPipeline, countFindings, generateRestructured, generateDocumentFromBrief, DEFAULT_RECOMMEND_GUIDANCE, proposeTargetedEdits, verifyFindings, type Finding, type ClaimUnit, type FindingCategory, type FindingSeverity } from "./recommend";
+import { runAuditPipeline, countFindings, generateRestructured, generateDocumentFromBrief, DEFAULT_RECOMMEND_GUIDANCE, proposeTargetedEdits, verifyFindings, deriveConcreteEdits, findingNeedsInput, findingInputSuggestion, type Finding, type ClaimUnit, type FindingCategory, type FindingSeverity } from "./recommend";
 import type { SimplificationAction } from "./gemini";
 import { getCallerTenant, assertRowTenant, ALL_TENANT_FEATURES } from "./tenant.functions";
 import { computeCost, addUsage, type RunCost } from "./pricing";
@@ -4893,6 +4893,30 @@ export const runSimplifyV2Report = createServerFn({ method: "POST" })
       console.warn(`[simplify_v2] run failed for "${title}":`, errorMsg);
     }
 
+    // Carry the reviewer's typed decision inputs ACROSS the re-run: findings
+    // are fresh objects with new ids, so remap each saved input onto the new
+    // finding flagging the same passage (normalised evidence quote). Without
+    // this a re-run silently discards work the reviewer already did.
+    const prevInputs = (prevJson.decisionInputs ?? {}) as Record<string, string>;
+    const carried: Record<string, string> = {};
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const newFindings: any[] = Array.isArray((patch as any)?.findings) ? (patch as any).findings : [];
+    if (Object.keys(prevInputs).length && newFindings.length) {
+      const qNorm = (s: unknown) => String(s ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+      const oldByQuote = new Map<string, string>();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const oldFindings: any[] = Array.isArray(prevJson.findings) ? prevJson.findings : [];
+      for (const f of oldFindings) {
+        const v = prevInputs[f?.id];
+        const q = qNorm(f?.evidence?.[0]?.quote);
+        if (v?.trim() && q) oldByQuote.set(q, v);
+      }
+      for (const f of newFindings) {
+        const v = oldByQuote.get(qNorm(f?.evidence?.[0]?.quote));
+        if (v) carried[f.id] = v;
+      }
+    }
+
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (supabase as any).from("analysis_reports").update({
       summary_json: {
@@ -4902,7 +4926,9 @@ export const runSimplifyV2Report = createServerFn({ method: "POST" })
         // results (and a lingering restructure{} would block redraft_auto).
         apply: null,
         restructure: null,
+        finalDoc: null,
         ...patch,
+        decisionInputs: carried,
         kind: "simplification_v2",
         workflow_mode: workflowMode,
         pending_analysis: false,
@@ -4913,6 +4939,42 @@ export const runSimplifyV2Report = createServerFn({ method: "POST" })
     }).eq("id", report.id);
 
     return { reportId: report.id as string, status, error: errorMsg };
+  });
+
+/**
+ * Persists the reviewer's typed decision-input values (findingId → value) on
+ * the report, so they survive reloads and sessions — and re-runs, via the
+ * quote-based carry-over in runSimplifyV2Report. Values are merged; an empty
+ * string deletes the entry.
+ */
+export const saveDecisionInputs = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(z.object({
+    reportId: z.string(),
+    inputs: z.record(z.string(), z.string().max(600)),
+  }))
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report, error } = await (supabase as any)
+      .from("analysis_reports").select("summary_json, tenant_id").eq("id", data.reportId).single();
+    if (error || !report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, (await getCallerTenant(context.userId)).tenantId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sj = ((report.summary_json as any) ?? {}) as Record<string, any>;
+    const merged: Record<string, string> = { ...(sj.decisionInputs ?? {}) };
+    for (const [id, v] of Object.entries(data.inputs)) {
+      if (v.trim()) merged[id] = v;
+      else delete merged[id];
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { error: upErr } = await (supabase as any)
+      .from("analysis_reports")
+      .update({ summary_json: { ...sj, decisionInputs: merged } })
+      .eq("id", data.reportId);
+    if (upErr) throw new Error(`Failed to save inputs: ${upErr.message}`);
+    return { saved: Object.keys(merged).length };
   });
 
 /** Records a reviewer's Accept/Dismiss decision on one audit finding (by id). */
@@ -5374,6 +5436,106 @@ export const applyFindingsInPlaceV2Report = createServerFn({ method: "POST" })
   });
 
 /**
+ * THE FINAL DOCUMENT — the reliable path. One LLM call derives a verbatim
+ * find→replace pair per accepted finding (reviewer decisions baked in), each
+ * pair is verified to anchor in the source, then the deterministic redline
+ * engine applies them to the ORIGINAL docx as Word tracked changes + rationale
+ * comments. Fidelity is preserved by construction (cover, headers, sections,
+ * TOC untouched); anything that can't be applied is reported, never faked.
+ * Cached on the report keyed to (accepted ids + effective inputs).
+ */
+export const buildFinalDocument = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(z.object({
+    reportId: z.string(),
+    userInputs: z.record(z.string(), z.string().max(600)).optional(),
+  }))
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    const { data: report, error: repErr } = await supabase
+      .from("analysis_reports").select("*").eq("id", data.reportId).single();
+    if (repErr || !report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, (await getCallerTenant(context.userId)).tenantId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sj = ((report.summary_json as any) ?? {}) as Record<string, any>;
+    const allFindings: Finding[] = Array.isArray(sj.findings) ? sj.findings : [];
+    const accepted = allFindings.filter((f) => f.decision === "accepted" && f.verification.status !== "rejected");
+    if (accepted.length === 0) throw new Error("No accepted findings to apply.");
+    if (!report.source_file_url) throw new Error("Report has no source file URL");
+
+    // Effective inputs, in priority order: what this session typed → the value
+    // persisted on the report (survives reloads and re-runs) → the suggestion
+    // the decision box displayed (never visually blank ⇒ shown value applies).
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const savedInputs = (sj.decisionInputs ?? {}) as Record<string, string>;
+    const inputs: Record<string, string> = {};
+    for (const f of accepted) {
+      const typed = data.userInputs?.[f.id]?.trim();
+      const saved = savedInputs[f.id]?.trim();
+      if (typed) inputs[f.id] = typed;
+      else if (saved) inputs[f.id] = saved;
+      else if (findingNeedsInput(f)) {
+        const sugg = findingInputSuggestion(f)?.trim();
+        if (sugg) inputs[f.id] = sugg;
+      }
+    }
+
+    const { createHash } = await import("node:crypto");
+    const sig = createHash("sha1")
+      .update(JSON.stringify({ ids: accepted.map((f) => f.id).sort(), inputs }))
+      .digest("hex").slice(0, 16);
+    if (sj.finalDoc?.url && sj.finalDoc.sig === sig) return sj.finalDoc;
+
+    const file = await fetchFile(report.source_file_url);
+    if (!looksLikeDocx(file.mimeType, report.source_file_url)) {
+      throw new Error("The final document needs a DOCX source. For PDFs, re-upload as DOCX.");
+    }
+    const title = (report.policy_name as string) ?? "Document";
+    let srcText = "";
+    try { srcText = docxToSimplifyText(file.buffer); } catch { /* validated below */ }
+    if (!srcText.trim()) throw new Error("Could not extract text from the source document.");
+
+    const { edits, unresolved } = await deriveConcreteEdits(title, srcText, accepted, inputs);
+    if (!edits.length) throw new Error("No applicable edits could be derived — see unresolved findings.");
+
+    const simplifyEdits: SimplifyDocxEdit[] = edits.map((e) => ({
+      before: e.find_text,
+      after: e.replace_text,
+      rationale: e.rationale,
+    }));
+    const result = applySimplificationToDocx(file.buffer, simplifyEdits, {
+      author: "AI Document Workflow",
+      mode: "redline",          // Word tracked changes: deletions struck through, insertions marked
+      redlineComments: true,    // rationale as a margin comment per change
+    });
+
+    const safeName = title.replace(/[^A-Za-z0-9_.-]+/g, "_").slice(0, 80) || "final";
+    const path = `simplify-v2/finaldoc-${Date.now()}-${safeName}.docx`;
+    const up = await supabase.storage.from("policies").upload(path, result.buffer, {
+      upsert: false,
+      contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    });
+    if (up.error) throw new Error(`Storage upload failed: ${up.error.message}`);
+    const url = supabase.storage.from("policies").getPublicUrl(path).data.publicUrl;
+
+    const finalDoc = {
+      url,
+      sig,
+      builtAt: new Date().toISOString(),
+      derived: edits.length,
+      appliedCount: result.appliedCount,
+      skipped: result.skipped,
+      unresolved,
+      totalAccepted: accepted.length,
+    };
+    await supabase.from("analysis_reports")
+      .update({ summary_json: { ...sj, finalDoc } })
+      .eq("id", report.id);
+    return finalDoc;
+  });
+
+/**
  * Recommend & Edit stage 2 — regenerates the document from accepted findings.
  * Produces a CLEAN restructured docx (original package preserved: logo/headers/
  * styles; body rebuilt) plus an ANNOTATED companion whose section headings
@@ -5383,7 +5545,12 @@ export const applyFindingsInPlaceV2Report = createServerFn({ method: "POST" })
  */
 export const generateRestructuredV2Document = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator(z.object({ reportId: z.string() }))
+  .inputValidator(z.object({
+    reportId: z.string(),
+    // Reviewer-provided decisions (findingId → value) collected before generating,
+    // so the redraft applies them directly instead of leaving [CONFIRM] markers.
+    userInputs: z.record(z.string(), z.string().max(600)).optional(),
+  }))
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
     const { data: report, error: repErr } = await supabase
@@ -5415,7 +5582,7 @@ export const generateRestructuredV2Document = createServerFn({ method: "POST" })
       || (await fetchAnalysisGuidance(supabase, "simplify"))
       || DEFAULT_SIMPLIFY_GUIDANCE;
 
-    const result = await generateRestructured(title, units, claims, accepted, simplifyGuidance);
+    const result = await generateRestructured(title, units, claims, accepted, simplifyGuidance, data.userInputs);
 
     // Per-section change notes → Word comments on the annotated copy.
     const sectionComments: Record<string, string> = {};
@@ -5466,6 +5633,28 @@ export const generateRestructuredV2Document = createServerFn({ method: "POST" })
       urls[u.key] = supabase.storage.from("policies").getPublicUrl(u.path).data.publicUrl;
     }
 
+    // Collect the [CONFIRM: …] placeholders the redraft inserted for values a
+    // human must decide (an owner role, an acronym's full name…), so the UI can
+    // offer to fill each one and write it back into the document. Unique by token.
+    const phMap = new Map<string, { token: string; suggested: string; context: string; section: string }>();
+    const scan = (text: string, section: string) => {
+      for (const m of String(text ?? "").matchAll(/\[CONFIRM:\s*([^\]]+?)\s*\]/g)) {
+        const token = m[0];
+        if (phMap.has(token)) continue;
+        const at = String(text).indexOf(token);
+        const context = String(text).slice(Math.max(0, at - 70), at + token.length + 70).replace(/\s+/g, " ").trim();
+        phMap.set(token, { token, suggested: m[1].trim(), context, section });
+      }
+    };
+    for (const s of result.sections) {
+      for (const b of s.blocks) {
+        if (b.type === "para" && b.text) scan(b.text, s.heading);
+        else if (b.type === "bullets" && b.items) b.items.forEach((it) => scan(it, s.heading));
+        else if (b.type === "table" && b.rows) b.rows.forEach((row) => row.forEach((c) => scan(c, s.heading)));
+      }
+    }
+    const placeholders = [...phMap.values()];
+
     const restructure = {
       downloadUrl: urls.downloadUrl,
       annotatedUrl: urls.annotatedUrl,
@@ -5473,6 +5662,7 @@ export const generateRestructuredV2Document = createServerFn({ method: "POST" })
       generatedAt: new Date().toISOString(),
       changeReport: result.changeReport,
       preservation: { ...result.preservation, figuresInSource, figuresCarried },
+      placeholders,
       cost: computeCost(result.usage, await getDefaultModel()),
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -5481,6 +5671,341 @@ export const generateRestructuredV2Document = createServerFn({ method: "POST" })
       .update({ summary_json: { ...sj, restructure } })
       .eq("id", report.id);
     return restructure;
+  });
+
+/**
+ * Fills the redraft's [CONFIRM: …] placeholders with values the reviewer entered
+ * (e.g. OM → "Operations Manual"), writing them back into the restructured
+ * document(s). Each token is a literal string inside a single text run, so a
+ * plain XML-escaped find/replace is exact. Re-uploads the patched files, updates
+ * the download URLs, and records which placeholders are now resolved.
+ */
+export const resolveRedraftPlaceholders = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(z.object({
+    reportId: z.string(),
+    values: z.record(z.string(), z.string().max(600)),
+  }))
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    const { data: report, error } = await supabase
+      .from("analysis_reports").select("*").eq("id", data.reportId).single();
+    if (error || !report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, (await getCallerTenant(context.userId)).tenantId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sj = ((report.summary_json as any) ?? {}) as Record<string, any>;
+    const restructure = sj.restructure;
+    if (!restructure?.downloadUrl) throw new Error("No redraft to update");
+
+    const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+    // Only apply non-empty values.
+    const pairs = Object.entries(data.values).filter(([, v]) => v.trim().length > 0);
+    if (pairs.length === 0) throw new Error("Enter at least one value.");
+
+    const patch = async (fileUrl: string): Promise<string> => {
+      const res = await fetch(fileUrl);
+      if (!res.ok) throw new Error(`Could not fetch redraft (${res.status})`);
+      const zip = new PizZip(Buffer.from(await res.arrayBuffer()));
+      const docFile = zip.file("word/document.xml");
+      if (!docFile) throw new Error("Invalid redraft DOCX");
+      let xml = docFile.asText();
+      for (const [token, value] of pairs) {
+        // Replace the escaped form (as stored in the doc) and, defensively, the raw.
+        xml = xml.split(esc(token)).join(esc(value)).split(token).join(esc(value));
+      }
+      zip.file("word/document.xml", xml);
+      const out = zip.generate({ type: "nodebuffer", compression: "DEFLATE" }) as Buffer;
+      const path = `simplify-v2/restructured-${Date.now()}-filled.docx`;
+      const up = await supabase.storage.from("policies").upload(path, out, {
+        upsert: false, contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      });
+      if (up.error) throw new Error(`Upload failed: ${up.error.message}`);
+      return supabase.storage.from("policies").getPublicUrl(path).data.publicUrl;
+    };
+
+    const downloadUrl = await patch(restructure.downloadUrl);
+    const annotatedUrl = restructure.annotatedUrl ? await patch(restructure.annotatedUrl) : restructure.annotatedUrl;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const placeholders = (restructure.placeholders ?? []).map((p: any) => {
+      const v = data.values[p.token];
+      return v && v.trim() ? { ...p, value: v.trim(), resolved: true } : p;
+    });
+    const newRestructure = { ...restructure, downloadUrl, annotatedUrl, placeholders };
+    await supabase.from("analysis_reports")
+      .update({ summary_json: { ...sj, restructure: newRestructure } })
+      .eq("id", data.reportId);
+    return newRestructure;
+  });
+
+/**
+ * Returns a PDF rendering of the redraft for the EXACT (pdf.js) viewer,
+ * converting the docx once with CloudConvert and caching the result on the
+ * report (keyed to the current downloadUrl, so a regenerate re-converts).
+ */
+export const getRedraftPdf = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(z.object({ reportId: z.string() }))
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    const { data: report, error } = await supabase
+      .from("analysis_reports").select("*").eq("id", data.reportId).single();
+    if (error || !report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, (await getCallerTenant(context.userId)).tenantId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sj = ((report.summary_json as any) ?? {}) as Record<string, any>;
+    const rs = sj.restructure;
+    if (!rs?.downloadUrl) throw new Error("No redraft to convert yet.");
+    // Cached and still current (same source docx)?
+    if (rs.pdfUrl && rs.pdfFromUrl === rs.downloadUrl) return { pdfUrl: rs.pdfUrl as string };
+
+    const { convertDocxToPdf } = await import("./pdf-convert");
+    const pdf = await convertDocxToPdf(rs.downloadUrl);
+    const path = `simplify-v2/redraft-${Date.now()}.pdf`;
+    const up = await supabase.storage.from("policies").upload(path, pdf, { upsert: false, contentType: "application/pdf" });
+    if (up.error) throw new Error(`Upload failed: ${up.error.message}`);
+    const pdfUrl = supabase.storage.from("policies").getPublicUrl(path).data.publicUrl;
+    await supabase.from("analysis_reports")
+      .update({ summary_json: { ...sj, restructure: { ...rs, pdfUrl, pdfFromUrl: rs.downloadUrl } } })
+      .eq("id", data.reportId);
+    return { pdfUrl };
+  });
+
+/**
+ * Exact PDF of the ORIGINAL source document (as Word draws it — EMF logos,
+ * tables, fonts). Powers the "Exact" view during review, available immediately
+ * (no redraft needed). Cached on the report keyed to source_file_url.
+ */
+export const getSourcePdf = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(z.object({ reportId: z.string() }))
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    const { data: report, error } = await supabase
+      .from("analysis_reports").select("*").eq("id", data.reportId).single();
+    if (error || !report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, (await getCallerTenant(context.userId)).tenantId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sj = ((report.summary_json as any) ?? {}) as Record<string, any>;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sourceUrl = (report as any).source_file_url as string | null;
+    if (!sourceUrl) throw new Error("No source document to convert.");
+    // Cached and still current (same source docx)?
+    if (sj.sourcePdfUrl && sj.sourcePdfFromUrl === sourceUrl) return { pdfUrl: sj.sourcePdfUrl as string };
+
+    const { convertDocxToPdf } = await import("./pdf-convert");
+    const pdf = await convertDocxToPdf(sourceUrl);
+    const path = `simplify-v2/source-${Date.now()}.pdf`;
+    const up = await supabase.storage.from("policies").upload(path, pdf, { upsert: false, contentType: "application/pdf" });
+    if (up.error) throw new Error(`Upload failed: ${up.error.message}`);
+    const pdfUrl = supabase.storage.from("policies").getPublicUrl(path).data.publicUrl;
+    await supabase.from("analysis_reports")
+      .update({ summary_json: { ...sj, sourcePdfUrl: pdfUrl, sourcePdfFromUrl: sourceUrl } })
+      .eq("id", data.reportId);
+    return { pdfUrl };
+  });
+
+/** Storage path (inside the `policies` bucket) from a Supabase public URL. */
+function policiesPathFromUrl(url: string): string | null {
+  const m = url.match(/\/object\/public\/policies\/(.+)$/);
+  return m ? decodeURIComponent(m[1].split("?")[0]) : null;
+}
+
+/**
+ * Build the OnlyOffice editor config for the exact in-app editor. Resolves the
+ * target docx (redraft or source), pins the save-back path in a signed token,
+ * and returns { apiUrl, config } for the client to mount. Editing/saving needs
+ * the OnlyOffice server (ONLYOFFICE_URL) reachable over HTTPS.
+ */
+export const getEditorConfig = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(z.object({
+    reportId: z.string(),
+    target: z.enum(["redraft", "source", "final"]).default("redraft"),
+    origin: z.string().url(),
+  }))
+  .handler(async ({ data, context }) => {
+    const apiUrl = process.env.ONLYOFFICE_URL;
+    if (!apiUrl) throw new Error("Exact editor isn't configured yet (ONLYOFFICE_URL not set).");
+    const supabase = context.supabase;
+    const { data: report, error } = await supabase
+      .from("analysis_reports").select("*").eq("id", data.reportId).single();
+    if (error || !report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, (await getCallerTenant(context.userId)).tenantId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sj = ((report.summary_json as any) ?? {}) as Record<string, any>;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const title = ((report as any).title as string) ?? "Document";
+
+    let docUrl = data.target === "redraft"
+      ? (sj.restructure?.downloadUrl as string | undefined)
+      : data.target === "final"
+        ? (sj.finalDoc?.url as string | undefined)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        : ((report as any).source_file_url as string | undefined);
+    if (!docUrl) {
+      throw new Error(
+        data.target === "redraft" ? "No redraft to edit yet."
+        : data.target === "final" ? "No final document built yet."
+        : "No source document to edit.",
+      );
+    }
+
+    const { createHash } = await import("node:crypto");
+
+    // For the REDRAFT (the final output), serve a WORKING COPY with the change
+    // report baked in: edited/added paragraphs get margin comments (+highlight),
+    // removals appear as red strikethrough paragraphs under their section. The
+    // reviewer's edits save to this working copy; regeneration re-annotates.
+    if (data.target === "redraft") {
+      const rs = sj.restructure ?? {};
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const changes: any[] = Array.isArray(rs.changeReport) ? rs.changeReport : [];
+      const cHash = createHash("sha1").update(JSON.stringify(changes) + String(rs.downloadUrl)).digest("hex").slice(0, 16);
+      if (rs.editorDocUrl && rs.editorDocHash === cHash) {
+        docUrl = rs.editorDocUrl as string; // reuse (carries prior edits)
+      } else if (changes.length) {
+        try {
+          const res = await fetch(docUrl);
+          const srcBuf = Buffer.from(await res.arrayBuffer());
+          const { annotateRedraftDocx } = await import("./docx-comments");
+          const { buffer, annotated } = annotateRedraftDocx(srcBuf, changes);
+          if (annotated > 0) {
+            const cpath = `simplify-v2/final-${data.reportId}-${Date.now()}.docx`;
+            const up = await supabase.storage.from("policies").upload(cpath, buffer, {
+              upsert: false,
+              contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            });
+            if (!up.error) {
+              docUrl = supabase.storage.from("policies").getPublicUrl(cpath).data.publicUrl;
+              await supabase.from("analysis_reports")
+                .update({ summary_json: { ...sj, restructure: { ...rs, editorDocUrl: docUrl, editorDocHash: cHash } } })
+                .eq("id", data.reportId);
+            }
+          }
+        } catch { /* fall back to the clean redraft */ }
+      }
+    }
+
+    // For the SOURCE, serve a copy with the AI findings baked in as native Word
+    // comments + highlights. Generated once (cached, keyed to the findings), then
+    // reused so the reviewer's edits + comments persist across opens.
+    if (data.target === "source") {
+      const { buildFindingComments } = await import("./docx-comments");
+      const comments = buildFindingComments(sj.findings);
+      const cHash = createHash("sha1").update(JSON.stringify(comments)).digest("hex").slice(0, 16);
+      if (sj.commentedSourceUrl && sj.commentedHash === cHash) {
+        docUrl = sj.commentedSourceUrl as string;   // reuse (has comments + prior edits)
+      } else if (comments.length) {
+        try {
+          const res = await fetch(docUrl);
+          const srcBuf = Buffer.from(await res.arrayBuffer());
+          const { injectCommentsIntoDocx } = await import("./docx-comments");
+          const { buffer, injected } = injectCommentsIntoDocx(srcBuf, comments);
+          if (injected > 0) {
+            const cpath = `simplify-v2/commented-${data.reportId}-${Date.now()}.docx`;
+            const up = await supabase.storage.from("policies").upload(cpath, buffer, {
+              upsert: false,
+              contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            });
+            if (!up.error) {
+              docUrl = supabase.storage.from("policies").getPublicUrl(cpath).data.publicUrl;
+              await supabase.from("analysis_reports")
+                .update({ summary_json: { ...sj, commentedSourceUrl: docUrl, commentedHash: cHash } })
+                .eq("id", data.reportId);
+            }
+          }
+        } catch { /* fall back to the raw source */ }
+      }
+    }
+
+    const path = policiesPathFromUrl(docUrl);
+    if (!path) throw new Error("Editable copy must live in the policies bucket.");
+
+    const { buildEditorConfig, signJwt } = await import("./onlyoffice");
+    // Fresh key + cache-busted URL on EVERY open. OnlyOffice identifies a doc by
+    // its `key` and caches it; a stable key made it serve a locked, read-only
+    // copy of the just-closed session on reopen (and could serve stale content).
+    // A per-open key forces a clean editing session that re-fetches the LATEST
+    // saved docx. The `?v=` also busts any CDN cache on the Supabase URL.
+    const freshUrl = `${docUrl}${docUrl.includes("?") ? "&" : "?"}v=${Date.now()}`;
+    const key = createHash("sha1").update(freshUrl).digest("hex").slice(0, 20);
+    // Path-pinned token: the callback will only save to exactly this object.
+    const pathToken = signJwt({ path, reportId: data.reportId, target: data.target });
+    const callbackUrl = `${data.origin}/api/onlyoffice-callback?t=${encodeURIComponent(pathToken)}`;
+
+    const { config } = buildEditorConfig({
+      key,
+      title: `${title}.docx`,
+      docUrl: freshUrl,
+      callbackUrl,
+      user: { id: context.userId, name: "Reviewer" },
+      mode: "edit",
+    });
+    // config is a plain JSON object (with a signed `token`); typed loosely so
+    // the RPC serializer doesn't choke on its `unknown`-valued fields.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return { apiUrl, config: config as any, key, docUrl };
+  });
+
+/**
+ * Fire-and-forget force-save — triggered whenever the editor unmounts (any exit
+ * path: nav click, view switch, etc.), so an immediate save always happens even
+ * when the reviewer doesn't use the explicit "Back to dashboard" button.
+ */
+export const forceSaveEditor = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(z.object({ reportId: z.string(), key: z.string() }))
+  .handler(async ({ data, context }) => {
+    const { data: report } = await context.supabase
+      .from("analysis_reports").select("tenant_id").eq("id", data.reportId).single();
+    if (!report) return { ok: false };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, (await getCallerTenant(context.userId)).tenantId);
+    const { forceSave } = await import("./onlyoffice");
+    const r = await forceSave(data.key);
+    return { ok: r.ok };
+  });
+
+/**
+ * Called when the reviewer leaves the exact editor. Force-saves the open
+ * document and WAITS until the save-back callback has actually written it to
+ * storage (the callback bumps `editSavedAt`). This removes the "one version
+ * behind" race where reopening fetched the doc before OnlyOffice's lazy save.
+ */
+export const finalizeEdit = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(z.object({ reportId: z.string(), key: z.string() }))
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    const { data: report, error } = await supabase
+      .from("analysis_reports").select("*").eq("id", data.reportId).single();
+    if (error || !report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, (await getCallerTenant(context.userId)).tenantId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sj = ((report.summary_json as any) ?? {}) as Record<string, any>;
+    const before = (sj.editSavedAt as number) ?? 0;
+
+    const { forceSave } = await import("./onlyoffice");
+    const r = await forceSave(data.key);
+    if (r.code === 4) return { saved: true };   // nothing changed — already current
+    if (!r.ok) return { saved: false };
+
+    // Poll for the callback to land the file (bumps editSavedAt), up to ~12s.
+    for (let i = 0; i < 12; i++) {
+      await new Promise((res) => setTimeout(res, 1000));
+      const { data: r2 } = await supabase
+        .from("analysis_reports").select("summary_json").eq("id", data.reportId).single();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const now = ((r2?.summary_json as any)?.editSavedAt as number) ?? 0;
+      if (now > before) return { saved: true };
+    }
+    return { saved: false };
   });
 
 // ── Demo seeding — clone generic demo content into a tenant (super-admin) ────

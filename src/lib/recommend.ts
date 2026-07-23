@@ -778,6 +778,117 @@ If nothing in the document is actually relevant to the request, return an empty 
   return { candidates, usage };
 }
 
+// ── Concrete edit derivation (final document) ────────────────────────────────
+
+export interface ConcreteEdit {
+  findingId: string;
+  find_text: string;
+  replace_text: string;
+  rationale: string;
+}
+
+/**
+ * Turns accepted findings (+ the reviewer's decision values) into VERBATIM
+ * find→replace pairs against the source document. Unlike the whole-document
+ * rewrite, each pair is independently verifiable: find_text either anchors in
+ * the source or the edit is reported as unresolved — nothing silently skipped.
+ */
+export async function deriveConcreteEdits(
+  title: string,
+  text: string,
+  findings: Finding[],
+  inputs: Record<string, string>,
+): Promise<{ edits: ConcreteEdit[]; unresolved: { findingId: string; title: string; reason: string }[]; usage: TokenUsage }> {
+  const unresolved: { findingId: string; title: string; reason: string }[] = [];
+  const workable = findings.filter((f) => {
+    if (!f.evidence?.[0]?.quote?.trim()) {
+      unresolved.push({ findingId: f.id, title: f.title, reason: "No quoted passage to anchor the edit" });
+      return false;
+    }
+    return true;
+  });
+  if (!workable.length) return { edits: [], unresolved, usage: EMPTY_USAGE };
+
+  const findingBlocks = workable.map((f) => {
+    const ui = inputs[f.id]?.trim();
+    return [
+      `## ${f.id} — ${f.title}`,
+      `Passage (verbatim from document): "${f.evidence[0].quote}"`,
+      `Problem: ${f.description}`,
+      `Fix instruction: ${f.suggestedFix}`,
+      ui ? `REVIEWER-PROVIDED VALUE: "${ui}" — incorporate this EXACT value/wording; do not invent a different one.` : "",
+    ].filter(Boolean).join("\n");
+  }).join("\n\n");
+
+  const prompt = `# ROLE: PRECISION DOCUMENT EDITOR
+"${title}" has been audited. For EACH finding below, produce ONE concrete edit that fixes it — as an exact find→replace pair against the document.
+
+# HARD RULES
+1. "find_text" MUST be copied CHARACTER-FOR-CHARACTER from the document (the flagged passage, or the smallest span that must change). Never paraphrase it.
+2. "replace_text" is the corrected passage: the SAME text with ONLY the fix applied. Keep everything else identical — same terminology, same tone, no gratuitous rewriting.
+3. Where a REVIEWER-PROVIDED VALUE is given, use it verbatim in replace_text.
+4. Single passage only — no new paragraphs, headings or lists. If the fix genuinely needs new standalone content, append the new sentence(s) to the end of the flagged passage inside replace_text.
+5. If a finding cannot be fixed by replacing one passage, put it in "unresolved" with a one-sentence reason. Never force a bad edit.
+
+# FINDINGS
+${findingBlocks}
+
+# DOCUMENT
+${text.slice(0, 400_000)}
+
+# OUTPUT — ONLY JSON:
+{"edits": [{"findingId": "F-001", "find_text": "…", "replace_text": "…", "rationale": "one sentence"}],
+ "unresolved": [{"findingId": "F-00X", "reason": "…"}]}`;
+
+  const { items, usage } = await askJson(prompt, "quality", 32768);
+  // askJson returns an array OR the parsed object wrapped — normalise both.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const root: any = Array.isArray(items) ? (items[0] ?? {}) : items;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const rawEdits: any[] = Array.isArray(root?.edits) ? root.edits : (Array.isArray(items) && items.length && items[0]?.find_text ? items : []);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const rawUnresolved: any[] = Array.isArray(root?.unresolved) ? root.unresolved : [];
+
+  const norm = (s: string) => s.replace(/\s+/g, " ").replace(/[‘’]/g, "'").replace(/[“”]/g, '"').trim().toLowerCase();
+  // Validate at PARAGRAPH granularity — the apply engine anchors per paragraph,
+  // so a find_text spanning paragraphs would pass a flat-text check here and
+  // then silently fail downstream.
+  const paraNorms = text.split(/\n+/).map(norm).filter(Boolean);
+  const byId = new Map(workable.map((f) => [f.id, f]));
+  const edits: ConcreteEdit[] = [];
+
+  for (const e of rawEdits) {
+    const id = String(e?.findingId ?? "");
+    const f = byId.get(id);
+    const find = String(e?.find_text ?? "").trim();
+    const replace = String(e?.replace_text ?? "").trim();
+    if (!f || !find || !replace) continue;
+    // Deterministic anchor check — a claimed edit must actually locate.
+    const fNorm = norm(find);
+    if (!paraNorms.some((p) => p.includes(fNorm))) {
+      unresolved.push({
+        findingId: id,
+        title: f.title,
+        reason: paraNorms.length && norm(text).includes(fNorm)
+          ? "Passage spans a paragraph boundary — needs a manual edit"
+          : "Proposed passage not found verbatim in the document",
+      });
+      continue;
+    }
+    edits.push({ findingId: id, find_text: find, replace_text: replace, rationale: String(e?.rationale ?? f.title) });
+    byId.delete(id);
+  }
+  for (const u of rawUnresolved) {
+    const id = String(u?.findingId ?? "");
+    const f = byId.get(id);
+    if (f) { unresolved.push({ findingId: id, title: f.title, reason: String(u?.reason ?? "Model could not derive a single-passage edit") }); byId.delete(id); }
+  }
+  for (const f of byId.values()) {
+    unresolved.push({ findingId: f.id, title: f.title, reason: "No edit returned for this finding" });
+  }
+  return { edits, unresolved, usage };
+}
+
 // ── Orchestrator ─────────────────────────────────────────────────────────────
 
 export function countFindings(findings: Finding[]): AuditCounts {
@@ -856,10 +967,13 @@ export interface RestructureBlock {
   type: "para" | "bullets" | "table" | "figure";
   text?: string;       // para
   items?: string[];    // bullets
+  /** bullets — render as a NUMBERED list rather than bulleted. */
+  ordered?: boolean;
   rows?: string[][];   // table (first row = header)
-  /** figure — verbatim source paragraph XML (logo, flowchart, diagram).
-   *  Never generated by the model; passed straight through the pipeline so
-   *  images survive the rebuild. */
+  /** Verbatim XML passed straight through to the rebuild (never model-generated):
+   *  for a "figure" block the source paragraph (logo/flowchart/diagram); for a
+   *  "table" block the source <w:tbl> when the redraft reproduced it UNCHANGED,
+   *  so its exact shading/widths/borders survive instead of a generic rebuild. */
   xml?: string;
 }
 
@@ -954,6 +1068,62 @@ function tableSignature(rows: string[][]): string {
   return (rows[0] ?? []).map((c) => c.toLowerCase().replace(/\s+/g, " ").trim()).join("|");
 }
 
+/** Keep a source table's ORIGINAL xml (its exact shading/widths) only when it
+ *  already fills the page AND carries no floating text box. Otherwise it is
+ *  rebuilt full-width: a narrow table stretches to the page column, and a
+ *  floating "Note" callout is pulled inline instead of overlapping the cells. */
+function keepVerbatim(xml?: string): boolean {
+  if (!xml) return false;
+  if (/<w:txbxContent>/.test(xml)) return false; // floating note → rebuild inline
+  const total = [...xml.matchAll(/<w:gridCol\b[^>]*w:w="(\d+)"/g)]
+    .map((m) => Number(m[1])).reduce((a, b) => a + b, 0);
+  return total >= 7600; // ~84% of the 9026-twip text column → already full-width
+}
+
+/** Whole-table content equality (whitespace/case-insensitive) — tells whether a
+ *  model-reproduced table is byte-for-byte the source's, so it can be re-emitted
+ *  with its original styling rather than a rebuilt grid. */
+function tablesEqual(a: string[][], b: string[][]): boolean {
+  const norm = (s: string) => (s ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if ((a[i]?.length ?? 0) !== (b[i]?.length ?? 0)) return false;
+    for (let j = 0; j < a[i].length; j++) if (norm(a[i][j]) !== norm(b[i][j])) return false;
+  }
+  return true;
+}
+
+/** Does resolving this finding require a VALUE only the organisation can supply
+ *  (an acronym's full form, a responsible owner/role, a timeline)? Such findings
+ *  are surfaced for a decision BEFORE the redraft is generated. */
+export function findingNeedsInput(f: Finding): boolean {
+  const t = `${f.title} ${f.suggestedFix ?? ""}`.toLowerCase();
+  return /never defined|not defined|undefined|acronym|abbreviation|unspecified|ambiguous|unclear (owner|actor|role|party)|missing (an?|the)?\s*(owner|actor|role|timeline|deadline|value|threshold|date)|no (defined |clear )?(owner|actor|role|timeline|deadline)|assign (a |an )?(clear )?(owner|actor|role|party)|specify (a |an |the )?(owner|actor|role|timeline|deadline|value)|expand at first use|define the (acronym|term)/i.test(t);
+}
+
+/** A short label for the input this finding needs (e.g. `Full form of "OM"`). */
+export function findingInputLabel(f: Finding): string {
+  const acr = f.title.match(/\b([A-Z]{2,6})\b/) || (f.suggestedFix ?? "").match(/\(([A-Z]{2,6})\)/);
+  if (/acronym|abbreviation|never defined|not defined|undefined|define the/i.test(f.title) && acr) return `Full form of "${acr[1]}"`;
+  if (/actor|owner|responsib|party|role/i.test(f.title)) return "Responsible role / owner";
+  if (/timeline|deadline|date|frequency/i.test(f.title)) return "Timeline / deadline";
+  return "Your value";
+}
+
+/** The AI's own suggested value, if it put one in the fix (e.g. an "e.g. 'X'"). */
+export function findingInputSuggestion(f: Finding): string {
+  const fix = f.suggestedFix ?? "";
+  // Explicit example phrasings first ("such as: '…'", "e.g. '…'"), then any
+  // quoted span. Fix suggestions often quote a full replacement sentence, so
+  // allow long spans — the decision box wraps.
+  const m = fix.match(/(?:such as|e\.g\.|for example|for instance)[:,]?\s*['"“‘]([^'"”’]{2,400})['"”’]/i)
+    || fix.match(/\b(?:to|as)\s+['"“‘]([^'"”’]{2,400})['"”’]/i)
+    || fix.match(/['"“‘]([^'"”’]{2,400})['"”’]/);
+  const v = (m?.[1] ?? "").trim();
+  // Skip placeholder-ish suggestions like "Full Name (OM)".
+  return /full name|full form|<|>/i.test(v) ? "" : v;
+}
+
 async function generateSection(
   title: string,
   plan: OutlinePlanSection,
@@ -961,6 +1131,7 @@ async function generateSection(
   findings: Finding[],
   simplifyGuidance: string,
   mustPreserve?: string[],
+  userInputs?: Record<string, string>,
 ): Promise<{ section: RestructuredSection; changes: ChangeReportEntry[]; usage: TokenUsage }> {
   // Figures are never sent to the model — they carry no rewritable text and
   // must come through byte-identical — so they are held aside and re-attached
@@ -968,56 +1139,110 @@ async function generateSection(
   const figures = sourceUnits.filter((u) => u.figureXml).map((u) => u.figureXml!);
   const textUnits = sourceUnits.filter((u) => !u.figureXml);
 
-  // Render the source so the model SEES tables as tables: a table unit becomes a
-  // fenced pipe-table it must reproduce structurally, not flatten into prose.
+  // Render the source so the model SEES structure: tables as fenced pipe-tables
+  // it must reproduce, and list items with their marker ("• " bullet, "N. "
+  // numbered) so it re-emits them as a list instead of flattening to prose.
+  let numCounter = 0;
   const source = textUnits
-    .map((u) => (u.table ? `[TABLE]\n${u.table.map((r) => `| ${r.join(" | ")} |`).join("\n")}\n[/TABLE]` : u.text))
+    .map((u) => {
+      if (u.table) { numCounter = 0; return `[TABLE]\n${u.table.map((r) => `| ${r.join(" | ")} |`).join("\n")}\n[/TABLE]`; }
+      if (u.list === "bullet") { numCounter = 0; return `• ${u.text}`; }
+      if (u.list === "number") { numCounter++; return `${numCounter}. ${u.text}`; }
+      numCounter = 0; return u.text;
+    })
     .join("\n\n");
-  const sourceTables = textUnits.filter((u) => u.table && u.table.length > 0).map((u) => u.table!);
+  // Source tables with their verbatim XML — so a table reproduced UNCHANGED can
+  // be re-emitted with exact styling (matched later by header signature).
+  const sourceTables = textUnits
+    .filter((u) => u.table && u.table.length > 0)
+    .map((u) => ({ rows: u.table!, xml: u.tableXml, sig: tableSignature(u.table!) }));
   const findingBlock = findings
-    .map((f) => `${f.id} [${f.category}] ${f.title}\n  Problem: ${f.description}\n  Required fix: ${f.suggestedFix}\n${f.evidence.map((e) => `  Evidence [${e.section}]: "${e.quote}"`).join("\n")}`)
+    .map((f) => {
+      const ui = userInputs?.[f.id]?.trim();
+      const uiLine = ui
+        ? `\n  USER-PROVIDED VALUE — use this EXACT value in the rewritten sentence and do NOT wrap it in [CONFIRM]: "${ui}"`
+        : "";
+      return `${f.id} [${f.category}] ${f.title}\n  Problem: ${f.description}\n  Required fix: ${f.suggestedFix}${uiLine}\n${f.evidence.map((e) => `  Evidence [${e.section}]: "${e.quote}"`).join("\n")}`;
+    })
     .join("\n\n");
-  const prompt = `# ROLE: SECTION REGENERATION for the restructured bank document "${title}"
-Rewrite the target section "${plan.heading}" from the VERBATIM source content below.
+  const prompt = `# ROLE: SECTION REGENERATION for the corrected bank document "${title}"
+You are producing the CORRECTED version of the target section "${plan.heading}". Two jobs, in order: (1) APPLY every assigned finding's fix by REWRITING the flagged text; (2) preserve everything else faithfully.
 
-# NON-NEGOTIABLE CONTENT RULES
-- PRESERVE every unique obligation, control, number, threshold, date, %, monetary amount, authority limit, role title, committee name, defined term and cross-reference from the source. Restructure and rephrase — never drop, never invent.
-- TABLES: content between [TABLE] … [/TABLE] is a real table. Reproduce EACH one as a {"type":"table","rows":[...]} block, keeping every row and column and the header row. You may fix wording inside a cell when a finding requires it, but NEVER flatten a table into paragraphs or bullets, and never drop rows/columns.
-- Resolve ONLY the assigned findings below (apply each "Required fix"). Log each resolution in "changes".
-- If two source passages conflict and NO finding covers it, keep both verbatim — do not silently pick one.
+# JOB 1 — APPLY THE FIXES (your primary job — the whole point of this task)
+For EACH assigned finding: find its evidence quote in the source and REWRITE that exact passage so the fix is implemented IN THE TEXT. The corrected sentence REPLACES the original — the flagged wording must come out CHANGED.
+- A finding is resolved ONLY when its flagged sentence is now DIFFERENT and contains the fix. Leaving the sentence unchanged and merely noting the fix in "changes" is a FAILURE — a redraft produces a corrected document, not a to-do list.
+- "Required fix" below is ADVICE describing what to do. IMPLEMENT it in concrete wording — do NOT copy the advice into the document:
+  • "assign/specify an owner or actor" → name the role the surrounding process implies and rewrite the sentence around it. e.g. "Invoices shall be prepared and forwarded…" → "The [CONFIRM: Trust Operations Officer] shall prepare and forward the invoices…"
+  • "define/expand an acronym" → write the full form inline. e.g. "OM" → "Operations Manual (OM)" (infer it — this document IS the "…Operations Manual").
+  • "consolidate redundant/divergent rules" → MERGE them into ONE clause and delete the duplicate.
+  • "specify a timeline/threshold" → state a concrete one, e.g. "within [CONFIRM: 2 business days]".
+- Applying a fix is NOT "inventing" — it resolves a flagged DEFECT and is REQUIRED. Wrap ONLY a value you genuinely had to assume (a human should verify) in [CONFIRM: …]; everything around it must read as finished, committed text.
+- WORKED EXAMPLE — finding "Unspecified actor for invoice preparation":
+   ✗ WRONG (leaves it): block text "Invoices shall be prepared and forwarded…"; change.after "Assign a clear owner."
+   ✓ RIGHT (applies it): block text "The [CONFIRM: Trust Operations Officer] shall prepare and forward the invoices…"; change.after copies that exact new sentence.
+
+# JOB 2 — PRESERVE everything the findings do NOT touch
+- Keep every unique obligation, control, number, threshold, date, %, monetary amount, authority limit, role title, committee name, defined term and cross-reference. Restructure/rephrase freely — never DROP a fact. (Applying an assigned fix is required and never counts as a violation here.)
+- TABLES: content between [TABLE] … [/TABLE] is a real table. Reproduce EACH as a {"type":"table","rows":[...]} block, every row/column and the header. Edit a cell only when a finding requires it; NEVER flatten a table to paragraphs/bullets or drop rows/columns. An unchanged table is re-emitted with its exact original styling.
+- LISTS: a line beginning "• " is a BULLET item — group consecutive items into ONE {"type":"bullets","items":[…]} block. Lines "1. ", "2. " … are a NUMBERED list — {"type":"bullets","ordered":true,"items":[…]} (omit the numbers). Keep every item; never merge a list into a paragraph.
+- Log each applied change in "changes" with the LITERAL new wording in "after" (a copyable phrase from your rewritten text, NOT an instruction).
+- If two source passages conflict and NO finding covers it, keep both verbatim.
 ${mustPreserve && mustPreserve.length > 0 ? `\n# MUST PRESERVE — these spans were LOST in a previous draft; each one MUST be represented in your output:\n${mustPreserve.map((q) => `- "${q}"`).join("\n")}\n` : ""}
 # STYLE (apply while rewriting)
 ${guidanceBlock(simplifyGuidance) || "- Plain, active, formal bank-policy register."}
-# ASSIGNED FINDINGS TO RESOLVE:
+# ASSIGNED FINDINGS TO IMPLEMENT (rewrite each one's evidence into a corrected sentence):
 ${findingBlock || "(none — restructure/simplify only)"}
 
 # SOURCE CONTENT (verbatim units):
 ${source}
 
 # OUTPUT — ONLY one JSON object:
-{ "blocks": [ {"type":"para","text":"..."} | {"type":"bullets","items":["..."]} | {"type":"table","rows":[["h1","h2"],["a","b"]]} ], "changes": [ {"findingId":"F-001","summary":"<what changed>","before":"<short source quote>","after":"<short new text>"} ] }
+{ "blocks": [ {"type":"para","text":"..."} | {"type":"bullets","items":["..."]} | {"type":"bullets","ordered":true,"items":["..."]} | {"type":"table","rows":[["h1","h2"],["a","b"]]} ], "changes": [ {"findingId":"F-001","summary":"<WHY this was changed>","before":"<short verbatim source quote you replaced>","after":"<the LITERAL new wording as it now appears in a block above — a copyable phrase from your output, NOT an instruction like 'expand at first use'>"} ] }
 `;
   const { items, usage } = await askJson(prompt, "quality");
   // askJson returns an array; a single object comes back as [obj].
   const obj = (items[0] ?? {}) as any; // eslint-disable-line @typescript-eslint/no-explicit-any
+  // When the model reproduces a source table UNCHANGED, re-emit its original XML
+  // (exact shading/widths/borders) instead of a generic rebuild; an edited table
+  // falls back to the row grid.
+  const tableXmlFor = (rows: string[][]): string | undefined => {
+    const src = sourceTables.find((t) => t.sig === tableSignature(rows));
+    if (!src || !src.xml || !tablesEqual(src.rows, rows)) return undefined;
+    // Reproduce verbatim only when the table already fills the page and has no
+    // floating note; otherwise rebuild it full-width (see keepVerbatim).
+    return keepVerbatim(src.xml) ? src.xml : undefined;
+  };
   const blocks: RestructureBlock[] = [];
   for (const b of Array.isArray(obj.blocks) ? obj.blocks : []) {
     if (b?.type === "para" && typeof b.text === "string" && b.text.trim()) blocks.push({ type: "para", text: b.text.trim() });
-    else if (b?.type === "bullets" && Array.isArray(b.items)) blocks.push({ type: "bullets", items: b.items.map(String).filter(Boolean) });
-    else if (b?.type === "table" && Array.isArray(b.rows)) blocks.push({ type: "table", rows: b.rows.map((row: unknown[]) => (Array.isArray(row) ? row.map(String) : [])) });
+    else if (b?.type === "bullets" && Array.isArray(b.items)) blocks.push({ type: "bullets", ordered: !!b.ordered, items: b.items.map(String).filter(Boolean) });
+    else if (b?.type === "table" && Array.isArray(b.rows)) {
+      const rows = b.rows.map((row: unknown[]) => (Array.isArray(row) ? row.map(String) : []));
+      const xml = tableXmlFor(rows);
+      blocks.push(xml ? { type: "table", rows, xml } : { type: "table", rows });
+    }
   }
   // A generation that produced nothing keeps the source verbatim — content
-  // survival beats aesthetics (tables stay tables).
+  // survival beats aesthetics (tables stay tables, lists stay lists).
   if (blocks.length === 0) {
-    for (const u of textUnits) blocks.push(u.table ? { type: "table", rows: u.table } : { type: "para", text: u.text });
+    for (const u of textUnits) {
+      blocks.push(
+        u.table ? { type: "table", rows: u.table, ...(keepVerbatim(u.tableXml) ? { xml: u.tableXml } : {}) }
+          : u.list ? { type: "bullets", ordered: u.list === "number", items: [u.text] }
+          : { type: "para", text: u.text },
+      );
+    }
   }
   // Table safety-net: if the model dropped a source table (flattened it into
-  // prose or omitted it), re-append it verbatim so no table is ever lost. Match
-  // by header signature so a table the model DID reproduce isn't duplicated.
+  // prose or omitted it), re-append it VERBATIM so no table — nor its styling —
+  // is ever lost. Match by header signature so a reproduced table isn't dupli-
+  // cated.
   if (sourceTables.length > 0) {
     const emitted = new Set(blocks.filter((b) => b.type === "table" && b.rows).map((b) => tableSignature(b.rows!)));
     for (const t of sourceTables) {
-      if (!emitted.has(tableSignature(t))) blocks.push({ type: "table", rows: t });
+      if (emitted.has(t.sig)) continue;
+      const xml = keepVerbatim(t.xml) ? t.xml : undefined; // rebuild narrow / floating-note tables full-width
+      blocks.push(xml ? { type: "table", rows: t.rows, xml } : { type: "table", rows: t.rows });
     }
   }
   // Re-attach this section's figures verbatim. They sit at the end of the
@@ -1069,6 +1294,7 @@ export async function generateRestructured(
   sourceClaims: ClaimUnit[],
   acceptedFindings: Finding[],
   simplifyGuidance: string,
+  userInputs?: Record<string, string>,
 ): Promise<RestructureResult> {
   let usage = EMPTY_USAGE;
 
@@ -1095,7 +1321,7 @@ export async function generateRestructured(
   const generated = await mapLimit(outline, 3, async (plan) => {
     const units = plan.sourceSections.flatMap((s) => unitsBySection.get(s) ?? []);
     const findings = plan.findingIds.map((id) => findingById.get(id)).filter(Boolean) as Finding[];
-    return generateSection(title, plan, units, findings, simplifyGuidance).catch((e) => {
+    return generateSection(title, plan, units, findings, simplifyGuidance, undefined, userInputs).catch((e) => {
       console.warn(`generateSection "${plan.heading}" failed:`, (e as Error)?.message?.slice(0, 100));
       // Verbatim passthrough on failure — never drop content (tables stay tables).
       return {
@@ -1104,7 +1330,8 @@ export async function generateRestructured(
           level: plan.level,
           blocks: units.map((u): RestructureBlock =>
             u.figureXml ? { type: "figure", xml: u.figureXml }
-              : u.table ? { type: "table", rows: u.table }
+              : u.table ? { type: "table", rows: u.table, ...(keepVerbatim(u.tableXml) ? { xml: u.tableXml } : {}) }
+              : u.list ? { type: "bullets", ordered: u.list === "number", items: [u.text] }
               : { type: "para", text: u.text }),
         },
         changes: [] as ChangeReportEntry[],
@@ -1152,7 +1379,7 @@ export async function generateRestructured(
       const plan = outline[ownerIdx];
       const units = plan.sourceSections.flatMap((s) => unitsBySection.get(s) ?? []);
       const findings = plan.findingIds.map((id) => findingById.get(id)).filter(Boolean) as Finding[];
-      const res = await generateSection(title, plan, units, findings, simplifyGuidance, quotes).catch(() => null);
+      const res = await generateSection(title, plan, units, findings, simplifyGuidance, quotes, userInputs).catch(() => null);
       return { ownerIdx, res };
     });
     for (const { ownerIdx, res } of repairs) {

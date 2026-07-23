@@ -3,9 +3,10 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist/client",
   "rewrites": [
-    { "source": "/(.*)", "destination": "/api/server" }
+    { "source": "/((?!api/onlyoffice-callback).*)", "destination": "/api/server" }
   ],
   "functions": {
-    "api/server.js": { "maxDuration": 300 }
+    "api/server.js": { "maxDuration": 300 },
+    "api/onlyoffice-callback.js": { "maxDuration": 60 }
   }
 }

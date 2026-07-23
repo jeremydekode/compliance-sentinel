@@ -1,0 +1,24 @@
+# OnlyOffice Document Server — the exact, editable docx engine embedded in the app.
+# Runs as one always-on container (NOT on Vercel; see README for hosts).
+#
+# The JWT secret here MUST equal ONLYOFFICE_JWT_SECRET in the app's env, so the
+# app and the server can trust each other's signed requests.
+services:
+  onlyoffice:
+    image: onlyoffice/documentserver:latest
+    restart: unless-stopped
+    ports:
+      - "80:80"      # front a TLS proxy in front of this (Railway/Fly do it for you)
+    environment:
+      - JWT_ENABLED=true
+      - JWT_SECRET=${ONLYOFFICE_JWT_SECRET}   # must match the app's ONLYOFFICE_JWT_SECRET
+      - JWT_HEADER=Authorization
+    volumes:
+      - onlyoffice_data:/var/www/onlyoffice/Data
+      - onlyoffice_logs:/var/log/onlyoffice
+      - onlyoffice_cache:/var/lib/onlyoffice
+
+volumes:
+  onlyoffice_data:
+  onlyoffice_logs:
+  onlyoffice_cache:

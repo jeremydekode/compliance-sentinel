@@ -12,9 +12,12 @@ import { useServerFn } from "@tanstack/react-start";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AppShell } from "@/components/app-shell";
 import { DocViewer, type DocHighlight } from "@/components/doc-viewer";
-import { FindingsRail, RestructurePanel } from "@/components/simplify-findings";
-import { AuditHealthDashboard, SimplifyChangesDashboard, RedraftDashboard } from "@/components/simplify-health";
+import { PdfViewer } from "@/components/pdf-viewer";
+import { ExactEditor } from "@/components/onlyoffice-editor";
+import { FindingsRail, RestructurePanel, ChangesRail } from "@/components/simplify-findings";
+import { AuditHealthDashboard, SimplifyChangesDashboard, RedraftDashboard, FindingsAnalyticsDashboard } from "@/components/simplify-health";
 import type { FindingSeverity } from "@/lib/recommend";
+import { findingNeedsInput } from "@/lib/recommend";
 import { Button } from "@/components/ui/button";
 import { supabase } from "@/integrations/supabase/client";
 import {
@@ -24,6 +27,11 @@ import {
   applySimplifyV2Report,
   bulkSetV2FindingDecision,
   requestTargetedEdit,
+  getRedraftPdf,
+  getSourcePdf,
+  finalizeEdit,
+  buildFinalDocument,
+  saveDecisionInputs,
 } from "@/lib/compliance.functions";
 import type { Finding } from "@/lib/recommend";
 import { SIMPLIFY_TYPE_LABEL } from "@/lib/simplify";
@@ -35,8 +43,8 @@ import {
 } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
 import {
-  ArrowLeft, Loader2, RotateCcw, Check, X, Sparkles, SearchCheck, FileEdit,
-  FileDown, AlertTriangle, Link2Off, Quote, Info, Wand2,
+  ArrowLeft, ArrowRight, Loader2, RotateCcw, Check, X, Sparkles, SearchCheck, FileEdit,
+  FileDown, AlertTriangle, Link2Off, Quote, Info, Wand2, PenLine,
 } from "lucide-react";
 
 export const Route = createFileRoute("/simplify2/$reportId")({
@@ -61,6 +69,23 @@ function SimplifyV2Route() {
   return <SimplifyV2ReportPage key={reportId} />;
 }
 
+/**
+ * The text to HIGHLIGHT for a change. The change report's "after" is often a
+ * description that wraps the real new wording in quotes — e.g.
+ *   Consolidate both statements into a single clause: "Trustees shall bill…"
+ * Only the quoted clause actually appears in the document, so anchor on that:
+ * prefer the longest quoted span; else the text after the last instruction colon;
+ * else the whole string.
+ */
+function editAnchorText(after: unknown): string {
+  const s = String(after ?? "").trim();
+  if (!s) return "";
+  const quoted = [...s.matchAll(/[‘“"']([^’”"']{12,})[’”"']/g)].map((m) => m[1].trim()).filter(Boolean);
+  if (quoted.length) return quoted.sort((a, b) => b.length - a.length)[0];
+  const afterColon = s.includes(":") ? s.slice(s.lastIndexOf(":") + 1).trim() : s;
+  return afterColon.length >= 12 ? afterColon : s;
+}
+
 const MODE_META: Record<string, { label: string; icon: React.ElementType; chip: string }> = {
   simplify: { label: "Simplify", icon: Sparkles, chip: "bg-violet-100 text-violet-700 ring-violet-200" },
   recommend: { label: "Recommendation", icon: SearchCheck, chip: "bg-sky-100 text-sky-700 ring-sky-200" },
@@ -76,9 +101,53 @@ function SimplifyV2ReportPage() {
   const [failed, setFailed] = useState(false);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [anchorStatus, setAnchorStatus] = useState<Record<string, boolean>>({});
-  // Each mode LANDS on its dashboard (the management-level view); "document"
-  // is the drill-down; "compare" is the R&E side-by-side.
-  const [view, setView] = useState<"dashboard" | "document" | "compare">("dashboard");
+  // "edits" view: which change is selected, and which of the change highlights
+  // DocViewer could anchor in the restructured document.
+  const [editActiveId, setEditActiveId] = useState<string | null>(null);
+  const [editAnchor, setEditAnchor] = useState<Record<string, boolean>>({});
+  // Reviewer decisions (findingId → value) for fixes needing a value only the
+  // org can supply — entered inline on the finding cards, fed into generation.
+  // Persisted to the report as the reviewer types (debounced) so the work
+  // survives reloads, sessions, and — via quote matching — re-runs.
+  const [decisions, setDecisions] = useState<Record<string, string>>({});
+  const saveInputsFn = useServerFn(saveDecisionInputs);
+  const decisionsHydrated = useRef(false);
+  const saveTimer = useRef<number | null>(null);
+  function updateDecision(id: string, v: string) {
+    setDecisions((d) => {
+      const next = { ...d, [id]: v };
+      if (saveTimer.current) window.clearTimeout(saveTimer.current);
+      saveTimer.current = window.setTimeout(() => {
+        saveInputsFn({ data: { reportId, inputs: next } }).catch(() => { /* retried on next keystroke */ });
+      }, 800);
+      return next;
+    });
+  }
+  // "exact" view: the redraft rendered as a real PDF (pdf.js) — faithful to Word.
+  const getPdf = useServerFn(getRedraftPdf);
+  const [pdfUrl, setPdfUrl] = useState<string | null>(null);
+  const [pdfBusy, setPdfBusy] = useState(false);
+  // Exact PDF of the ORIGINAL source doc — available during review, before any
+  // redraft. `docExact` toggles the Document view between the interactive
+  // (docx-preview, with clickable finding highlights) and exact (PDF) renders.
+  const getSrcPdf = useServerFn(getSourcePdf);
+  const [srcPdfUrl, setSrcPdfUrl] = useState<string | null>(null);
+  const [srcPdfBusy, setSrcPdfBusy] = useState(false);
+  const [docExact, setDocExact] = useState(false);
+  // "editor": the exact in-app OnlyOffice editor. Which docx it edits:
+  const [editorTarget, setEditorTarget] = useState<"redraft" | "source" | "final">("final");
+  const buildFinal = useServerFn(buildFinalDocument);
+  const [finalBusy, setFinalBusy] = useState(false);
+  const [editKey, setEditKey] = useState<string | null>(null);
+  const [editorDocUrl, setEditorDocUrl] = useState<string | null>(null);
+  const [savingEdit, setSavingEdit] = useState(false);
+  const finalizeEditFn = useServerFn(finalizeEdit);
+  // Each mode LANDS on its dashboard (the management-level view); "review" is
+  // the R&E review workspace (exact PDF w/ highlighted amendments + finding
+  // cards); "document" is the legacy drill-down; "compare" is the side-by-side;
+  // "edits" reviews every change made; "exact" is the faithful PDF render;
+  // "editor" is exact editing.
+  const [view, setView] = useState<"dashboard" | "review" | "document" | "compare" | "edits" | "exact" | "editor">("dashboard");
   const [severityFilter, setSeverityFilter] = useState<FindingSeverity | "all">("all");
   const startedRef = useRef(false);
 
@@ -91,6 +160,16 @@ function SimplifyV2ReportPage() {
       return data;
     },
   });
+
+  // Hydrate saved decision inputs ONCE per mount (locally-typed values win).
+  useEffect(() => {
+    if (decisionsHydrated.current || !report.data) return;
+    decisionsHydrated.current = true;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const saved = ((report.data as any)?.summary_json?.decisionInputs ?? {}) as Record<string, string>;
+    if (Object.keys(saved).length) setDecisions((d) => ({ ...saved, ...d }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [report.data]);
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const sj = ((report.data as any)?.summary_json ?? {}) as any;
@@ -208,6 +287,25 @@ function SimplifyV2ReportPage() {
       .filter((h) => h.text);
   }, [workflowMode, actions, findings]);
 
+  // Review-workspace highlights on the EXACT PDF: violet = needs your input,
+  // severity colors = AI amendments. Same ids as the finding cards so click
+  // syncs both ways.
+  const pdfHighlights = useMemo(() => {
+    if (workflowMode !== "recommend_edit") return [];
+    return findings
+      .filter((f) => f.verification?.status !== "rejected")
+      .map((f) => {
+        const quote = (f.evidence?.[0]?.quote ?? "").trim();
+        if (!quote) return null;
+        const kind = findingNeedsInput(f)
+          ? ("input" as const)
+          : ((["critical", "high", "medium", "info"].includes(f.severity) ? f.severity : "medium") as
+              "critical" | "high" | "medium" | "info");
+        return { id: f.id, text: quote, kind };
+      })
+      .filter((h): h is { id: string; text: string; kind: "input" | "critical" | "high" | "medium" | "info" } => !!h);
+  }, [workflowMode, findings]);
+
   if (report.isLoading) {
     return (
       <AppShell>
@@ -250,6 +348,129 @@ function SimplifyV2ReportPage() {
   }
 
   const restructure = sj.restructure ?? null;
+
+  // Open the EXACT (PDF) view — convert the redraft once (cached), then render
+  // it with pdf.js.
+  async function openExact() {
+    setView("exact");
+    if (pdfUrl || (restructure?.pdfUrl && restructure.pdfFromUrl === restructure.downloadUrl)) {
+      if (!pdfUrl && restructure?.pdfUrl) setPdfUrl(restructure.pdfUrl);
+      return;
+    }
+    setPdfBusy(true);
+    try {
+      const r = await getPdf({ data: { reportId } });
+      setPdfUrl(r.pdfUrl);
+    } catch (e) {
+      toast.error("Couldn't build the exact view", { description: (e as Error)?.message });
+    } finally {
+      setPdfBusy(false);
+    }
+  }
+
+  // Open the exact in-app editor (OnlyOffice) for a document.
+  function openEditor(target: "redraft" | "source" | "final") {
+    setEditKey(null);
+    setEditorDocUrl(null);
+    setEditorTarget(target);
+    setView("editor");
+  }
+
+  // THE FINAL DOCUMENT: derive one verifiable edit per accepted finding
+  // (reviewer decisions baked in), apply them to the ORIGINAL docx as tracked
+  // changes + comments, then open the result in the exact editor. Cached
+  // server-side; rebuilds only when the accepted set or inputs change.
+  async function openFinal() {
+    setFinalBusy(true);
+    try {
+      const typed: Record<string, string> = {};
+      for (const [k, v] of Object.entries(decisions)) if (v.trim()) typed[k] = v.trim();
+      const r = await buildFinal({ data: { reportId, ...(Object.keys(typed).length ? { userInputs: typed } : {}) } });
+      await qc.invalidateQueries({ queryKey: ["report", reportId] });
+      const failed = (r.unresolved?.length ?? 0) + (r.skipped?.length ?? 0);
+      if (failed > 0) {
+        toast.info(`${r.appliedCount} of ${r.totalAccepted} accepted fixes applied as tracked changes`, {
+          description: `${failed} need manual attention — the applied ones carry rationale comments in the margin.`,
+        });
+      }
+      openEditor("final");
+    } catch (e) {
+      toast.error("Couldn't build the final document", { description: (e as Error)?.message });
+    } finally {
+      setFinalBusy(false);
+    }
+  }
+
+  // Leave the editor: force-save and WAIT until the file has actually landed in
+  // storage, so reopening (or the exact/PDF views) shows the newest version —
+  // not the one-behind copy OnlyOffice would otherwise leave mid-save.
+  async function closeEditor() {
+    if (editKey) {
+      setSavingEdit(true);
+      try { await finalizeEditFn({ data: { reportId, key: editKey } }); }
+      catch { /* proceed regardless */ }
+      setSavingEdit(false);
+    }
+    // Invalidate caches so the exact/PDF/interactive views refetch the new file.
+    setSrcPdfUrl(null);
+    setPdfUrl(null);
+    await qc.invalidateQueries({ queryKey: ["report", reportId] });
+    setView("dashboard");
+  }
+
+  // Ensure the exact source PDF exists (convert once, cached), then land in the
+  // review workspace: exact PDF w/ highlighted amendments + the finding cards.
+  async function openReview() {
+    setView("review");
+    if (srcPdfUrl) return;
+    if (sj.sourcePdfUrl && sj.sourcePdfFromUrl === sourceUrl) {
+      setSrcPdfUrl(sj.sourcePdfUrl);
+      return;
+    }
+    setSrcPdfBusy(true);
+    try {
+      const r = await getSrcPdf({ data: { reportId } });
+      setSrcPdfUrl(r.pdfUrl);
+    } catch (e) {
+      // Stay in the review workspace: the PdfViewer shows its error state and
+      // the finding cards remain fully usable.
+      toast.error("Couldn't build the exact document view", {
+        description: (e as Error)?.message,
+      });
+    } finally {
+      setSrcPdfBusy(false);
+    }
+  }
+
+  // Toggle the Document view between interactive (highlights) and exact (PDF).
+  // Converting the source docx once, on first switch to Exact; cached after.
+  async function toggleDocExact(exact: boolean) {
+    setDocExact(exact);
+    if (!exact) return;
+    if (srcPdfUrl || (sj.sourcePdfUrl && sj.sourcePdfFromUrl === sourceUrl)) {
+      if (!srcPdfUrl && sj.sourcePdfUrl) setSrcPdfUrl(sj.sourcePdfUrl);
+      return;
+    }
+    setSrcPdfBusy(true);
+    try {
+      const r = await getSrcPdf({ data: { reportId } });
+      setSrcPdfUrl(r.pdfUrl);
+    } catch (e) {
+      toast.error("Couldn't build the exact view", { description: (e as Error)?.message });
+      setDocExact(false);
+    } finally {
+      setSrcPdfBusy(false);
+    }
+  }
+
+  // Every edit the redraft made — section, before → after, and why. Powers the
+  // "Review edits" view: a per-section list plus (best-effort) highlights of the
+  // new wording in the restructured document.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const changeReport: any[] = Array.isArray(restructure?.changeReport) ? restructure.changeReport : [];
+  const editHighlights: DocHighlight[] = changeReport
+    .map((c, i) => ({ id: String(i), text: editAnchorText(c.after), altText: String(c.before ?? ""), kind: "edit" as const }))
+    .filter((h) => h.text.trim().length >= 8 || h.altText.trim().length >= 8);
 
   return (
     <AppShell>
@@ -349,6 +570,49 @@ function SimplifyV2ReportPage() {
           </div>
         ) : view === "dashboard" ? (
           <div className="flex-1 min-h-0 overflow-y-auto">
+            {/* Primary entry point — review & edit the exact document with the AI
+                findings as comments. Front-and-centre above the summary. */}
+            {workflowMode === "recommend_edit" && (
+              <div className={cn("px-6 pt-6 grid gap-3", findings.some((f) => f.decision === "accepted") && "lg:grid-cols-2")}>
+                <button
+                  onClick={openReview}
+                  className="w-full rounded-2xl border-2 border-indigo-300 dark:border-indigo-800 bg-gradient-to-r from-indigo-50 to-fuchsia-50 dark:from-indigo-950/30 dark:to-fuchsia-950/20 p-5 flex items-center gap-4 hover:shadow-md transition-shadow text-left group"
+                >
+                  <div className="size-12 rounded-xl bg-indigo-600 grid place-items-center shrink-0">
+                    <SearchCheck className="size-6 text-white" />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-base font-bold text-indigo-900 dark:text-indigo-200">Review amendments &amp; inputs</div>
+                    <div className="text-sm text-indigo-700/80 dark:text-indigo-300/70">
+                      The exact document with all {findings.length} proposed amendment{findings.length === 1 ? "" : "s"} highlighted — areas needing your input in purple. Decide, fill in, then generate.
+                    </div>
+                  </div>
+                  <ArrowRight className="size-5 text-indigo-500 group-hover:translate-x-1 transition-transform shrink-0" />
+                </button>
+                {findings.some((f) => f.decision === "accepted") && (
+                  <button
+                    onClick={openFinal}
+                    disabled={finalBusy}
+                    className="w-full rounded-2xl border-2 border-emerald-300 dark:border-emerald-800 bg-gradient-to-r from-emerald-50 to-teal-50 dark:from-emerald-950/30 dark:to-teal-950/20 p-5 flex items-center gap-4 hover:shadow-md transition-shadow text-left group disabled:opacity-70"
+                  >
+                    <div className="size-12 rounded-xl bg-emerald-600 grid place-items-center shrink-0">
+                      {finalBusy ? <Loader2 className="size-6 text-white animate-spin" /> : <PenLine className="size-6 text-white" />}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-base font-bold text-emerald-900 dark:text-emerald-200">
+                        {finalBusy ? "Building final document…" : "Open final document"}
+                      </div>
+                      <div className="text-sm text-emerald-700/80 dark:text-emerald-300/70">
+                        {finalBusy
+                          ? "Deriving each accepted fix and applying it to the original as tracked changes — takes 1–2 minutes."
+                          : "Every accepted fix applied to the ORIGINAL document as Word tracked changes — removals struck through, rationale in comments. Edit and download."}
+                      </div>
+                    </div>
+                    <ArrowRight className="size-5 text-emerald-500 group-hover:translate-x-1 transition-transform shrink-0" />
+                  </button>
+                )}
+              </div>
+            )}
             {workflowMode === "simplify" ? (
               <SimplifyChangesDashboard
                 reportId={reportId}
@@ -358,46 +622,32 @@ function SimplifyV2ReportPage() {
                 onView={(id) => { setActiveId(id); setView("document"); }}
                 onDrill={() => setView("document")}
               />
-            ) : workflowMode === "recommend_edit" && restructure ? (
-              <RedraftDashboard
-                restructure={restructure}
+            ) : workflowMode === "recommend_edit" ? (
+              /* Proper landing dashboard: charts + core issues. Triage lives in
+                 the review workspace; generation lives in its rail — no
+                 duplicated panels or findings lists here. */
+              <>
+                <FindingsAnalyticsDashboard findings={findings} restructure={restructure} />
+                {restructure && (
+                  <RedraftDashboard
+                    restructure={restructure}
+                    findings={findings}
+                    structure={sj.structure ?? null}
+                    sourceUrl={sourceUrl}
+                    onCompare={() => setView("compare")}
+                    onDrill={openReview}
+                  />
+                )}
+              </>
+            ) : (
+              <AuditHealthDashboard
+                reportId={reportId}
                 findings={findings}
                 structure={sj.structure ?? null}
                 sourceUrl={sourceUrl}
-                onCompare={() => setView("compare")}
-                onDrill={() => setView("document")}
+                onView={(id) => { setSeverityFilter("all"); setActiveId(id); setView("document"); }}
+                onDrill={(sev) => { setSeverityFilter(sev); setView("document"); }}
               />
-            ) : (
-              <>
-                {/* Dashboard is the landing view, so the redraft action has to
-                    live here too — otherwise the header says "Generate redraft"
-                    while the only button sits one view away under the document
-                    rail, which is where reviewers lost it. */}
-                {workflowMode === "recommend_edit" && (
-                  <div className="px-5 pt-5">
-                    <div className="max-w-xl rounded-xl border overflow-hidden shadow-sm">
-                      <RestructurePanel
-                        reportId={reportId}
-                        findings={findings}
-                        restructure={restructure}
-                        apply={sj.apply ?? null}
-                        comparing={false}
-                        onCompareToggle={(on) => setView(on ? "compare" : "document")}
-                        onGenerated={() => qc.invalidateQueries({ queryKey: ["report", reportId] })}
-                        onApplied={() => qc.invalidateQueries({ queryKey: ["report", reportId] })}
-                      />
-                    </div>
-                  </div>
-                )}
-                <AuditHealthDashboard
-                  reportId={reportId}
-                  findings={findings}
-                  structure={sj.structure ?? null}
-                  sourceUrl={sourceUrl}
-                  onView={(id) => { setSeverityFilter("all"); setActiveId(id); setView("document"); }}
-                  onDrill={(sev) => { setSeverityFilter(sev); setView("document"); }}
-                />
-              </>
             )}
           </div>
         ) : view === "compare" && restructure?.downloadUrl ? (
@@ -415,26 +665,226 @@ function SimplifyV2ReportPage() {
               <DocViewer fileUrl={restructure.downloadUrl} className="flex-1" />
             </div>
           </div>
+        ) : view === "edits" && restructure?.downloadUrl ? (
+          <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_400px]">
+            {/* restructured document with each edit highlighted */}
+            <div className="min-h-0 min-w-0 border-r flex flex-col overflow-hidden">
+              <div className="flex items-center justify-between px-3 py-1.5 border-b bg-emerald-50/60 dark:bg-emerald-950/20 shrink-0">
+                <span className="text-[11px] font-semibold text-emerald-700 dark:text-emerald-300">Restructured — edits highlighted</span>
+                <button onClick={() => setView("dashboard")} className="text-[11px] text-muted-foreground hover:text-foreground">← Back to dashboard</button>
+              </div>
+              <DocViewer
+                fileUrl={restructure.downloadUrl}
+                highlights={editHighlights}
+                activeId={editActiveId}
+                onSelect={setEditActiveId}
+                onAnchorStatus={setEditAnchor}
+                className="flex-1"
+              />
+            </div>
+            <ChangesRail
+              changes={changeReport}
+              activeId={editActiveId}
+              anchorStatus={editAnchor}
+              onSelect={setEditActiveId}
+            />
+          </div>
+        ) : view === "exact" ? (
+          <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
+            <div className="flex items-center justify-between px-3 py-1.5 border-b bg-emerald-50/60 dark:bg-emerald-950/20 shrink-0">
+              <span className="text-[11px] font-semibold text-emerald-700 dark:text-emerald-300">
+                Exact document — faithful PDF render (as Word sees it)
+              </span>
+              <button onClick={() => setView("dashboard")} className="text-[11px] text-muted-foreground hover:text-foreground">← Back to dashboard</button>
+            </div>
+            {pdfBusy ? (
+              <div className="flex-1 grid place-items-center">
+                <div className="flex flex-col items-center gap-2 text-sm text-muted-foreground">
+                  <Loader2 className="size-5 animate-spin" />
+                  Building the exact PDF… (a few seconds)
+                </div>
+              </div>
+            ) : (
+              <PdfViewer fileUrl={pdfUrl} className="flex-1" />
+            )}
+          </div>
+        ) : view === "editor" ? (
+          <div className="flex-1 min-h-0 flex flex-col overflow-hidden relative">
+            <div className="flex items-center justify-between px-3 py-1.5 border-b bg-indigo-50/60 dark:bg-indigo-950/20 shrink-0 gap-2">
+              <span className="text-[11px] font-semibold text-indigo-700 dark:text-indigo-300 truncate">
+                {editorTarget === "final"
+                  ? "Final document — tracked changes on the original · removals struck through · rationale in comments · saves automatically"
+                  : editorTarget === "redraft"
+                    ? "Restructured draft — rebuilt document · change comments in margin · saves automatically"
+                    : "Exact editor — original document · findings as comments · edits save automatically"}
+              </span>
+              <div className="flex items-center gap-2 shrink-0">
+                {editorDocUrl && (
+                  <a href={editorDocUrl} target="_blank" rel="noreferrer">
+                    <Button size="sm" variant="outline" className="h-6 px-2 text-[10px] gap-1">
+                      <FileDown className="size-3" /> Download
+                    </Button>
+                  </a>
+                )}
+                <button
+                  onClick={closeEditor}
+                  disabled={savingEdit}
+                  className="text-[11px] text-muted-foreground hover:text-foreground disabled:opacity-60"
+                >
+                  {savingEdit ? "Saving…" : "← Back to dashboard"}
+                </button>
+              </div>
+            </div>
+            <ExactEditor reportId={reportId} target={editorTarget} onKey={setEditKey} onDocUrl={setEditorDocUrl} className="flex-1" />
+            {savingEdit && (
+              <div className="absolute inset-0 z-20 grid place-items-center bg-background/70 backdrop-blur-sm">
+                <div className="flex items-center gap-2 text-sm font-medium">
+                  <Loader2 className="size-4 animate-spin" /> Saving your edits…
+                </div>
+              </div>
+            )}
+          </div>
+        ) : view === "review" ? (
+          /* ── Review workspace: exact PDF w/ highlighted amendments + cards ── */
+          <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_400px]">
+            <div className="min-h-0 min-w-0 border-r flex flex-col overflow-hidden">
+              <div className="flex items-center justify-between px-3 py-1.5 border-b bg-muted/40 shrink-0 gap-2">
+                <div className="flex items-center gap-3 min-w-0">
+                  <span className="text-[11px] font-semibold text-muted-foreground shrink-0">
+                    Exact document — amendments highlighted
+                  </span>
+                  {/* legend */}
+                  <div className="hidden md:flex items-center gap-2.5 text-[10px] text-muted-foreground">
+                    <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-purple-500/60" /> Needs your input</span>
+                    <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-red-500/60" /> Critical</span>
+                    <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-orange-500/60" /> High</span>
+                    <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-amber-500/60" /> Medium</span>
+                    <span className="flex items-center gap-1"><span className="size-2 rounded-sm bg-sky-400/60" /> Info</span>
+                  </div>
+                </div>
+                <button onClick={() => setView("dashboard")} className="text-[11px] text-muted-foreground hover:text-foreground shrink-0">
+                  ← Dashboard
+                </button>
+              </div>
+              {srcPdfBusy ? (
+                <div className="flex-1 grid place-items-center">
+                  <div className="flex flex-col items-center gap-2 text-sm text-muted-foreground">
+                    <Loader2 className="size-5 animate-spin" />
+                    Building the exact document… (a few seconds, first time only)
+                  </div>
+                </div>
+              ) : (
+                <PdfViewer
+                  fileUrl={srcPdfUrl}
+                  highlights={pdfHighlights}
+                  activeId={activeId}
+                  onSelect={setActiveId}
+                  onAnchorStatus={setAnchorStatus}
+                  className="flex-1"
+                />
+              )}
+            </div>
+
+            {/* decision rail: generate at top, finding cards below */}
+            <div className="min-h-0 min-w-0 flex flex-col bg-card/30">
+              {workflowMode === "recommend_edit" && (
+                <RestructurePanel
+                  reportId={reportId}
+                  findings={findings}
+                  restructure={restructure}
+                  apply={sj.apply ?? null}
+                  comparing={false}
+                  onCompareToggle={(on) => setView(on ? "compare" : "review")}
+                  onGenerated={() => qc.invalidateQueries({ queryKey: ["report", reportId] })}
+                  onApplied={() => qc.invalidateQueries({ queryKey: ["report", reportId] })}
+                  onReviewEdits={() => setView("edits")}
+                  onExactView={openExact}
+                  onEditExact={openFinal}
+                  decisions={decisions}
+                />
+              )}
+              <div className="flex-1 min-h-0">
+                <FindingsRail
+                  reportId={reportId}
+                  findings={findings}
+                  activeId={activeId}
+                  anchorStatus={anchorStatus}
+                  onSelect={setActiveId}
+                  severityFilter={severityFilter}
+                  onSeverityFilterChange={setSeverityFilter}
+                  decisions={decisions}
+                  onDecisionChange={updateDecision}
+                />
+              </div>
+            </div>
+          </div>
         ) : (
           <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_380px]">
             {/* document viewer */}
             <div className="min-h-0 min-w-0 border-r flex flex-col overflow-hidden">
-              <div className="flex items-center justify-between px-3 py-1.5 border-b bg-muted/40 shrink-0">
-                <span className="text-[11px] font-semibold text-muted-foreground">Document</span>
-                <EditWithAiButton
-                  reportId={reportId}
-                  workflowMode={workflowMode}
-                  onApplied={(id) => setActiveId(id)}
-                />
+              <div className="flex items-center justify-between px-3 py-1.5 border-b bg-muted/40 shrink-0 gap-2">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="text-[11px] font-semibold text-muted-foreground shrink-0">Document</span>
+                  {/* Interactive (highlights) ⇄ Exact (faithful PDF) toggle */}
+                  <div className="inline-flex rounded-md border overflow-hidden shrink-0">
+                    <button
+                      onClick={() => toggleDocExact(false)}
+                      className={cn("px-2 py-0.5 text-[10px] font-semibold transition-colors",
+                        !docExact ? "bg-fuchsia-600 text-white" : "text-muted-foreground hover:bg-muted")}
+                    >
+                      Interactive
+                    </button>
+                    <button
+                      onClick={() => toggleDocExact(true)}
+                      className={cn("px-2 py-0.5 text-[10px] font-semibold transition-colors border-l",
+                        docExact ? "bg-emerald-600 text-white" : "text-muted-foreground hover:bg-muted")}
+                    >
+                      Exact
+                    </button>
+                  </div>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    onClick={() => openEditor("source")}
+                    className="inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[10px] font-semibold text-indigo-700 dark:text-indigo-300 hover:bg-indigo-50 dark:hover:bg-indigo-950/30 transition-colors"
+                  >
+                    <PenLine className="size-3" /> Edit exact
+                  </button>
+                  <EditWithAiButton
+                    reportId={reportId}
+                    workflowMode={workflowMode}
+                    onApplied={(id) => setActiveId(id)}
+                  />
+                </div>
               </div>
-              <DocViewer
-                fileUrl={sourceUrl}
-                highlights={highlights}
-                activeId={activeId}
-                onSelect={setActiveId}
-                onAnchorStatus={setAnchorStatus}
-                className="flex-1"
-              />
+              {docExact ? (
+                srcPdfBusy ? (
+                  <div className="flex-1 grid place-items-center">
+                    <div className="flex flex-col items-center gap-2 text-sm text-muted-foreground">
+                      <Loader2 className="size-5 animate-spin" />
+                      Building the exact document… (a few seconds)
+                    </div>
+                  </div>
+                ) : (
+                  <PdfViewer
+                    fileUrl={srcPdfUrl}
+                    highlights={pdfHighlights}
+                    activeId={activeId}
+                    onSelect={setActiveId}
+                    onAnchorStatus={setAnchorStatus}
+                    className="flex-1"
+                  />
+                )
+              ) : (
+                <DocViewer
+                  fileUrl={sourceUrl}
+                  highlights={highlights}
+                  activeId={activeId}
+                  onSelect={setActiveId}
+                  onAnchorStatus={setAnchorStatus}
+                  className="flex-1"
+                />
+              )}
             </div>
 
             {/* review rail */}
@@ -465,6 +915,10 @@ function SimplifyV2ReportPage() {
                       onCompareToggle={(on) => setView(on ? "compare" : "document")}
                       onGenerated={() => qc.invalidateQueries({ queryKey: ["report", reportId] })}
                       onApplied={() => qc.invalidateQueries({ queryKey: ["report", reportId] })}
+                        onReviewEdits={() => setView("edits")}
+                        onExactView={openExact}
+                        onEditExact={openFinal}
+                        decisions={decisions}
                     />
                   )}
                   <div className="flex-1 min-h-0">
@@ -476,6 +930,8 @@ function SimplifyV2ReportPage() {
                       onSelect={setActiveId}
                       severityFilter={severityFilter}
                       onSeverityFilterChange={setSeverityFilter}
+                      decisions={decisions}
+                      onDecisionChange={updateDecision}
                     />
                   </div>
                 </>

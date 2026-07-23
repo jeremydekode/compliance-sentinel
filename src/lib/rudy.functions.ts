@@ -129,6 +129,87 @@ function buildUploadedBlock(filename: string | undefined, text: string, ragBlock
   return `\n# UPLOADED DOCUMENT: "${filename ?? "document"}" (the user just attached this — docRef "uploaded")\n${text}\n${ragBlock}\n`;
 }
 
+/**
+ * Assembles the "you are looking at this right now" context for a Legal CMS
+ * review document — its text plus the AI review (flagged clauses / applied
+ * amendments) — so Rudy answers questions about it directly. Tenant-scoped:
+ * the parent matter's tenant must match the caller; anything else returns ""
+ * (Rudy just behaves as if there were no page context). Best-effort — any read
+ * failure degrades to "" rather than erroring the chat.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function loadLegalDocContext(supabase: any, tenantId: string, documentId: string): Promise<string> {
+  try {
+    const { data: doc } = await supabase
+      .from("legal_matter_documents")
+      .select("id, file_name, ai_review, ai_review_status, matter_id, access_level, file_url")
+      .eq("id", documentId)
+      .single();
+    if (!doc) return "";
+    const { data: matter } = await supabase
+      .from("legal_matters")
+      .select("tenant_id, title, reference_number")
+      .eq("id", doc.matter_id)
+      .single();
+    if (!matter || matter.tenant_id !== tenantId) return ""; // cross-tenant → invisible
+
+    const review = doc.ai_review ?? {};
+    let text = String(review.documentText ?? "");
+    // No stored text yet (review never run) — extract from the source file once.
+    if (!text.trim() && doc.access_level !== "restricted" && doc.file_url) {
+      try {
+        const res = await fetch(doc.file_url);
+        if (res.ok) {
+          const buf = Buffer.from(await res.arrayBuffer());
+          if (looksLikeDocx(null, doc.file_url)) {
+            text = await docxToText(buf).catch(() => "");
+          } else if (/\.pdf($|\?)/i.test(doc.file_url)) {
+            const { extractPdfPages } = await import("./pdf-pages");
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            text = (await extractPdfPages(buf)).map((p: any) => p.text).join("\n\n");
+          } else {
+            text = buf.toString("utf-8");
+          }
+        }
+      } catch { /* best-effort */ }
+    }
+
+    const lines: string[] = [];
+    lines.push(`# CURRENT DOCUMENT — the user is viewing this right now on a review screen. Answer their questions about THIS document by default; do NOT ask which document they mean or tell them to upload/pick one.`);
+    lines.push(`Title: "${doc.file_name}"${matter.reference_number ? ` (matter ${matter.reference_number}${matter.title ? ` — ${matter.title}` : ""})` : ""}`);
+    const clauses: any[] = Array.isArray(review.clauses) ? review.clauses : []; // eslint-disable-line @typescript-eslint/no-explicit-any
+    const changes: any[] = Array.isArray(review.changes) ? review.changes : []; // eslint-disable-line @typescript-eslint/no-explicit-any
+    if (doc.ai_review_status === "done" && (review.verdict || clauses.length)) {
+      if (review.verdict) {
+        lines.push(`AI review: verdict ${review.verdict}${typeof review.riskScore === "number" ? ` · risk ${review.riskScore}/100` : ""}.${review.summary ? ` ${String(review.summary).slice(0, 500)}` : ""}`);
+      }
+      if (changes.length) {
+        lines.push(`Applied amendments (this is an amended draft):`);
+        for (const ch of changes.slice(0, 20)) {
+          lines.push(`- ${ch.ref ?? "clause"}: was "${String(ch.before ?? "").slice(0, 160)}" → now "${String(ch.after ?? "").slice(0, 160)}"`);
+        }
+      } else if (clauses.length) {
+        lines.push(`Flagged clauses:`);
+        for (const c of clauses.slice(0, 20)) {
+          const head = [c.ref, c.severity ? `[${c.severity}]` : "", c.comment ? `— ${String(c.comment).slice(0, 240)}` : ""].filter(Boolean).join(" ");
+          const sug = c.suggestion ? ` → suggested: "${String(c.suggestion).slice(0, 240)}"` : "";
+          lines.push(`- ${head}${sug}`);
+        }
+      }
+    } else {
+      lines.push(`(No AI review has been run on this document yet — answer from the document text below.)`);
+    }
+    if (text.trim()) {
+      lines.push(`--- DOCUMENT TEXT (verbatim, may be truncated) ---`);
+      lines.push(text.slice(0, 45_000));
+    }
+    return "\n" + lines.join("\n") + "\n";
+  } catch (e) {
+    console.warn("[rudy] legal doc context failed:", (e as Error)?.message?.slice(0, 100));
+    return "";
+  }
+}
+
 // ── serverFn ─────────────────────────────────────────────────────────────────
 
 export const rudyChat = createServerFn({ method: "POST" })
@@ -139,6 +220,11 @@ export const rudyChat = createServerFn({ method: "POST" })
       history: z.array(z.object({ role: z.enum(["user", "assistant"]), content: z.string() })).max(20).default([]),
       fileUrl: z.string().url().optional(),
       filename: z.string().optional(),
+      // The document the user is CURRENTLY viewing (page-sensitive context) —
+      // e.g. a Legal CMS review screen. Rudy answers about it without the user
+      // having to name or upload it. Tenant-checked server-side; a doc from
+      // another tenant is silently ignored.
+      context: z.object({ kind: z.literal("legal_document"), id: z.string().uuid() }).optional(),
     }),
   )
   .handler(async ({ data, context }): Promise<RudyReply> => {
@@ -178,6 +264,11 @@ export const rudyChat = createServerFn({ method: "POST" })
 
     // 2 — enabled workflow catalog.
     const catalog = CATALOG.filter((c) => features.includes(c.feature)).map((c) => c.text);
+
+    // 2b — page context: the document the user is currently viewing (if any).
+    const currentDocBlock = data.context?.kind === "legal_document"
+      ? await loadLegalDocContext(supabase, tenantId, data.context.id)
+      : "";
 
     // 3 — uploaded document: extract text + RAG over the tenant's KB.
     // Cached per (tenant, fileUrl) so a pinned attachment is processed once
@@ -247,16 +338,24 @@ export const rudyChat = createServerFn({ method: "POST" })
 You help bank staff figure out what they need, then set up the right workflow for them. You are talking to a non-technical user.
 
 # HOW TO BEHAVE
-- INTERVIEW FIRST. Until you know (a) WHICH document (from the DOCUMENT INDEX, or the uploaded one) and (b) WHAT OUTCOME they want, ask short, concrete questions — set action kind "none".
+- If a CURRENT DOCUMENT block is present, the user is looking at that document RIGHT NOW. Treat their questions as being about it by default — its risks, a specific clause, what was changed, or how it compares to the policy excerpts — and answer directly in markdown. Do NOT ask which document they mean, and do NOT tell them to upload or pick one. (Legal review documents can't be sent to a workflow from here, so focus on answering; if they ask to audit/redraft it, point them to the buttons on the review screen.)
+- INTERVIEW FIRST (when there is NO current document). Until you know (a) WHICH document (from the DOCUMENT INDEX, or the uploaded one) and (b) WHAT OUTCOME they want, ask short, concrete questions — set action kind "none".
 - When you have enough, PROPOSE exactly one workflow action. The user sees it as a confirmation card and must click Confirm — so make "label" a short imperative ("Audit S16 Operations Manual") and "description" one honest sentence about what will happen.
 - If the user asks a question you can answer from the uploaded document or the policy excerpts, ANSWER IT well (markdown, cite the policy titles) — an action is optional, not mandatory.
 - Never invent documents: docRef must be an id from the DOCUMENT INDEX or the literal "uploaded".
 - Only offer workflows from the catalog below. If the request maps to nothing, say what you CAN do instead.
 - Keep replies under 150 words.
 
+# FORMATTING — replies must be easy to scan, never a wall of text
+- Open with ONE short sentence of context, then a blank line.
+- Break specifics into a markdown bullet list: one "- " item per point, each on its own line, with a blank line before the list.
+- Bold the label at the start of each bullet, e.g. "- **Governing Law (Clause 14):** shift to Singapore law." Keep each bullet to one or two lines.
+- Leave a blank line between the intro, the list, and any closing sentence. Use at most ~6 bullets.
+- Only use a numbered list when the order matters (steps). Do not cram multiple points into one paragraph.
+
 # AVAILABLE WORKFLOWS
 ${catalog.join("\n\n")}
-
+${currentDocBlock}
 # DOCUMENT INDEX (this organisation's documents — the ONLY valid docRef values besides "uploaded")
 ${docIndexLines.length > 0 ? docIndexLines.join("\n") : "(no documents yet — the user can upload one here in the chat or in a workflow)"}
 ${uploadedBlock}

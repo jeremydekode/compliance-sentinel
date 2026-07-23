@@ -68,6 +68,12 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     ...(tenant.features.includes("legal_cms") ? [{ label: "Legal CMS", items: LEGAL_NAV }] : []),
   ];
   const currentNav = [...dmsNav, ...LEGAL_NAV, SETTINGS_ITEM].find((n) => navActive(n, loc.pathname));
+  // The DMS workspace switcher and the compliance/legal "viewing as" persona
+  // only affect DMS-side flows (simplify/reports/layout/etc) — Legal CMS's
+  // nav and routes are workspace-independent and carry their own Submitter /
+  // General Counsel / Reviewer switcher in LegalHeader, so both would be dead
+  // controls (and a confusing second "viewing as") inside Legal CMS.
+  const isLegalCms = loc.pathname.startsWith("/legal");
 
   const [collapsed, setCollapsed] = useState(false);
   useEffect(() => {
@@ -184,10 +190,14 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             <span className="text-foreground font-semibold">{currentNav?.label ?? "AI Document Workflow"}</span>
           </div>
           <div className="flex items-center gap-2">
-            <WorkspaceSwitcher />
-            <div className="h-6 w-px bg-border" />
-            <RoleSwitcher />
-            <div className="h-6 w-px bg-border" />
+            {!isLegalCms && (
+              <>
+                <WorkspaceSwitcher />
+                <div className="h-6 w-px bg-border" />
+                <RoleSwitcher />
+                <div className="h-6 w-px bg-border" />
+              </>
+            )}
             <UserMenu />
           </div>
         </header>

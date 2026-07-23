@@ -3,10 +3,14 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
 import { useMemo, useState } from "react";
 import { AppShell } from "@/components/app-shell";
+import { DocViewer, type DocHighlight } from "@/components/doc-viewer";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { RoleSwitcher, useLegalRole } from "@/components/legal-widgets";
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter,
+} from "@/components/ui/dialog";
 import {
   getLegalDocument,
   reviewLegalDocument,
@@ -15,6 +19,7 @@ import {
   createAmendedVersion,
   addDocumentAnnotation,
   deleteDocumentAnnotation,
+  refineClauseSuggestion,
 } from "@/lib/legal.functions";
 import {
   ArrowLeft,
@@ -34,7 +39,11 @@ import {
   X,
   MessageSquare,
   Trash2,
+  ChevronDown,
+  Quote,
   Pencil,
+  Wand2,
+  Link2Off,
 } from "lucide-react";
 
 export const Route = createFileRoute("/legal/review/$documentId")({
@@ -49,6 +58,11 @@ const SEV = {
 } as const;
 
 type Sev = keyof typeof SEV;
+
+// Map a clause severity to a DocViewer highlight bucket (its ::highlight() rule).
+function sevKind(sev: string): DocHighlight["kind"] {
+  return sev === "red_flag" ? "critical" : sev === "caution" ? "medium" : "info";
+}
 
 function riskBand(score: number) {
   if (score >= 67) return { label: "High risk", color: "text-red-600 dark:text-red-400", stroke: "stroke-red-500" };
@@ -116,12 +130,39 @@ function HighlightedContract({ text, clauses, activeIdx, onPick }: {
 }) {
   const segments = useMemo(() => {
     if (!text) return null;
+    // A verbatim clause quote from the AI rarely matches the rendered text with a
+    // raw indexOf: PDF/DOCX extraction collapses or re-wraps whitespace, so a
+    // single missing newline or double-space defeats an exact match and the
+    // clause silently doesn't highlight. Match in a WHITESPACE-NORMALISED copy of
+    // the text (every run of whitespace → one space), keeping an index map back
+    // to the original so the highlight lands on the real characters.
+    const norm: string[] = [];
+    const map: number[] = []; // norm char index -> original index
+    let prevSpace = false;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (/\s/.test(ch)) {
+        if (prevSpace) continue;
+        norm.push(" "); map.push(i); prevSpace = true;
+      } else {
+        norm.push(ch); map.push(i); prevSpace = false;
+      }
+    }
+    const normText = norm.join("");
+    const normTextLower = normText.toLowerCase();
+    const normQuote = (s: string) => s.replace(/\s+/g, " ").trim();
     const marks: Array<{ start: number; end: number; idx: number }> = [];
     clauses.forEach((c, i) => {
-      const ex = (c.excerpt ?? "").trim();
+      const ex = normQuote(c.excerpt ?? "");
       if (ex.length < 6) return;
-      const at = text.indexOf(ex);
-      if (at >= 0) marks.push({ start: at, end: at + ex.length, idx: i });
+      let at = normText.indexOf(ex);
+      if (at < 0) at = normTextLower.indexOf(ex.toLowerCase());
+      if (at < 0) return;
+      const endNorm = at + ex.length - 1;
+      // Map the normalised span back to original character offsets.
+      const start = map[at];
+      const end = map[endNorm] + 1;
+      marks.push({ start, end, idx: i });
     });
     marks.sort((a, b) => a.start - b.start);
     // drop overlaps
@@ -160,6 +201,7 @@ function HighlightedContract({ text, clauses, activeIdx, onPick }: {
         ) : (
           <mark
             key={i}
+            id={`clause-hl-${s.idx}`}
             onClick={() => onPick(s.idx!)}
             title={clauses[s.idx!]?.ref}
             className={cn(
@@ -231,6 +273,7 @@ function CoPilotReview() {
   const reviewMarkupFn = useServerFn(reviewCounterpartyMarkup);
   const acceptFn = useServerFn(acceptClauseSuggestion);
   const versionFn = useServerFn(createAmendedVersion);
+  const refineFn = useServerFn(refineClauseSuggestion);
 
   const { data, isLoading } = useQuery({
     queryKey: ["legal-doc", documentId],
@@ -240,20 +283,43 @@ function CoPilotReview() {
   const [activeIdx, setActiveIdx] = useState<number | null>(null);
   const [reviewing, setReviewing] = useState(false);
   const [showRedline, setShowRedline] = useState(true);
-  const [flashIdx, setFlashIdx] = useState<number | null>(null);
   const [sideBySide, setSideBySide] = useState(true);
+  // Which highlights DocViewer could actually anchor in the rendered document —
+  // keyed by the same string ids we hand it. Lets the rail badge a clause whose
+  // quote couldn't be located and focusClause warn instead of scrolling nowhere.
+  const [anchorStatus, setAnchorStatus] = useState<Record<string, boolean>>({});
   // Inline editing of an AI suggestion before applying it to the draft.
   const [editIdx, setEditIdx] = useState<number | null>(null);
   const [editText, setEditText] = useState("");
+  const [detailsIdx, setDetailsIdx] = useState<number | null>(null);
+  // AI-assisted refine of a clause's proposed redline (free-text instruction).
+  const [aiIdx, setAiIdx] = useState<number | null>(null);
+  const [aiText, setAiText] = useState("");
 
-  // Jump from an Amendment History item to the matching insertion in the redline.
+  // Click a clause card → select it AND scroll the document to its highlight, so
+  // an off-screen clause is actually brought into view. The exact-document
+  // renderer (DocViewer) scrolls to its active highlight itself; the plain-text
+  // fallback (PDF) exposes a `clause-hl-{idx}` <mark> we scroll to here.
+  function focusClause(idx: number) {
+    setActiveIdx(idx);
+    if (typeof document === "undefined") return;
+    requestAnimationFrame(() => {
+      const el = document.getElementById(`clause-hl-${idx}`);
+      if (el) { el.scrollIntoView({ behavior: "smooth", block: "center" }); return; }
+      // No text-fallback mark → DocViewer will scroll via its activeId effect.
+      // Only warn when we KNOW the quote couldn't be anchored in the render.
+      if (anchorStatus[String(idx)] === false) {
+        toast.info("Couldn't pinpoint this clause in the rendered document — open “Show clause text” to see the exact wording.");
+      }
+    });
+  }
+
+  // Jump from an Amendment History item to its change in the amended draft. The
+  // amended DocViewer highlights are keyed by change index, so selecting the id
+  // scrolls the redline to that insertion.
   function jumpToChange(i: number) {
     setShowRedline(true);
-    setFlashIdx(i);
-    setTimeout(() => {
-      document.getElementById(`redline-ins-${i}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
-    }, 60);
-    setTimeout(() => setFlashIdx((cur) => (cur === i ? null : cur)), 2000);
+    setActiveIdx(i);
   }
 
   function refresh() {
@@ -276,10 +342,25 @@ function CoPilotReview() {
     onError: (e: any) => toast.error(e?.message ?? "Failed to save"),
   });
 
+  // AI rewrites the proposed redline for one clause from a free-text instruction.
+  const refineAi = useMutation({
+    mutationFn: (p: { clause_index: number; instruction: string }) =>
+      refineFn({ data: { document_id: documentId, ...p } }),
+    onSuccess: (r: any) => {
+      toast.success("AI updated the proposed edit", { description: r?.note || undefined });
+      setAiIdx(null); setAiText(""); refresh();
+    },
+    onError: (e: any) => toast.error(e?.message ?? "AI couldn't refine that"),
+  });
+
   const genVersion = useMutation({
     mutationFn: () => versionFn({ data: { document_id: documentId } }),
     onSuccess: (newDoc: any) => {
       toast.success(`Amended draft created — ${newDoc.file_name}`);
+      // The new draft is a document on the matter — refresh the matter page's
+      // document list (and the list view) so it appears without a manual reload.
+      if (newDoc.matter_id) queryClient.invalidateQueries({ queryKey: ["legal-matter", newDoc.matter_id] });
+      queryClient.invalidateQueries({ queryKey: ["legal-matters"] });
       // Open the new draft in the viewer so the applied changes are immediately visible.
       navigate({ to: "/legal/review/$documentId", params: { documentId: newDoc.id } });
     },
@@ -366,6 +447,24 @@ function CoPilotReview() {
   // hooks are off-limits.)
   const originalClauses = clauses.map((c: any) => ({ ...c, excerpt: c.originalExcerpt ?? "" }));
 
+  // Render the EXACT document (docx-preview page chrome, headers, logo, fonts)
+  // when the source is a real .docx; PDFs/plain text fall back to the extracted-
+  // text renderer, which keeps its own clause <mark> highlights.
+  const isDocxFile = /\.docx($|\?)/i.test(String(doc.file_url ?? ""));
+  // Clause highlights for the exact-document renderer, keyed by clause index so a
+  // rail click (setActiveIdx) selects and scrolls to the right one. Anchored on
+  // the verbatim excerpt; DocViewer reports back which ones it could locate.
+  const clauseHighlights: DocHighlight[] = clauses
+    .map((c: any, i: number) => ({ id: String(i), text: String(c.excerpt ?? ""), kind: sevKind(c.severity) }))
+    .filter((h) => h.text.trim().length >= 8);
+  // Amended draft: highlight each applied change on its NEW wording (`after`),
+  // keyed by change index so the Amendment History can jump to it. `after` is
+  // present in both the redline (inside <w:ins>) and the clean render.
+  const changeHighlights: DocHighlight[] = changes
+    .map((ch: any, i: number) => ({ id: String(i), text: String(ch.after ?? ""), kind: "edit" as const, ok: ch.located !== false }))
+    .filter((h) => h.ok && h.text.trim().length >= 8)
+    .map(({ id, text, kind }) => ({ id, text, kind }));
+
   return (
     <AppShell>
       <div className="flex flex-col h-screen">
@@ -416,10 +515,13 @@ function CoPilotReview() {
 
         {(
           <div className="flex-1 grid grid-cols-1 lg:grid-cols-[1fr_380px] min-h-0">
-            {/* LEFT — contract editor */}
-            <div className="overflow-y-auto border-r">
-              <div className={cn("mx-auto p-6", comparing ? "max-w-6xl" : "max-w-3xl")}>
-                <div className="flex items-center gap-2 mb-3">
+            {/* LEFT — contract editor. A fixed toolbar over a bounded content
+                region: the exact-document renderer (DocViewer) manages its own
+                scroll + fit-to-width zoom, so it needs a flex-sized parent, not
+                a page that scrolls the toolbar away with it. */}
+            <div className="flex flex-col min-h-0 border-r overflow-hidden">
+              <div className="shrink-0 px-6 pt-4 pb-2 space-y-2">
+                <div className="flex items-center gap-2">
                   <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground">
                     {isAmended ? "Amended Draft" : isCounterparty ? "Counterparty Markup" : "Contract"}
                   </span>
@@ -429,7 +531,7 @@ function CoPilotReview() {
                         onClick={() => setShowRedline(true)}
                         className={cn("px-2 py-0.5 rounded-md text-[10px] font-medium transition-colors", showRedline ? "bg-background shadow-sm text-foreground" : "text-muted-foreground hover:text-foreground")}
                       >
-                        Historical edits
+                        Redline
                       </button>
                       <button
                         onClick={() => setShowRedline(false)}
@@ -454,18 +556,21 @@ function CoPilotReview() {
                       </button>
                     </div>
                   ) : (
-                    <span className="text-[10px] text-muted-foreground/60">· click a highlight for the AI note</span>
+                    <span className="text-[10px] text-muted-foreground/60">· click a highlighted clause to see the AI note</span>
                   )}
                   <span className="text-[10px] text-muted-foreground/60 ml-auto"><span className="text-indigo-600 dark:text-indigo-400">select text to comment</span></span>
                 </div>
                 {isAmended && showRedline && (
-                  <div className="mb-2 flex items-center gap-3 text-[10px]">
+                  <div className="flex items-center gap-3 text-[10px]">
                     <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-2 rounded-sm bg-red-100 dark:bg-red-900/40 line-through" /> <del className="text-red-600 dark:text-red-400">removed</del></span>
                     <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-2 rounded-sm bg-emerald-100 dark:bg-emerald-900/40" /> <ins className="text-emerald-700 dark:text-emerald-300 no-underline font-semibold">new term</ins></span>
                   </div>
                 )}
-                {comparing ? (
-                  <div className="grid grid-cols-1 xl:grid-cols-2 gap-3 items-start">
+              </div>
+
+              {comparing ? (
+                <div className="flex-1 min-h-0 overflow-y-auto px-6 pb-6">
+                  <div className="mx-auto max-w-6xl grid grid-cols-1 xl:grid-cols-2 gap-3 items-start">
                     <div>
                       <div className="flex items-center gap-1.5 mb-1.5">
                         <span className="rounded bg-muted px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-muted-foreground">Ours — as sent</span>
@@ -485,46 +590,70 @@ function CoPilotReview() {
                       </div>
                     </div>
                   </div>
-                ) : (
-                <div className="rounded-xl border bg-card p-5" onMouseUp={captureSelection}>
-                  {isAmended && showRedline && redlineText ? (
-                    <RedlineContract redline={redlineText} flashIdx={flashIdx} />
-                  ) : docText ? (
-                    <HighlightedContract text={docText} clauses={clauses} activeIdx={activeIdx} onPick={setActiveIdx} />
-                  ) : (
-                    <p className="text-xs text-muted-foreground italic py-8 text-center">
-                      Document content isn't extractable in the browser (e.g. a scanned image PDF). Download to view, or run AI review for a clause summary.
-                    </p>
-                  )}
                 </div>
-                )}
+              ) : isDocxFile && doc.file_url ? (
+                // Exact document — real page chrome, headers, logo, fonts. Clauses
+                // highlight via the Custom Highlight API (no DOM surgery); an
+                // amended draft renders its Word tracked changes inline as a
+                // redline. Wrapped so a text selection still opens the composer.
+                <div className="flex-1 min-h-0" onMouseUp={captureSelection}>
+                  <DocViewer
+                    fileUrl={doc.file_url}
+                    fallbackText={docText || null}
+                    highlights={isAmended ? changeHighlights : clauseHighlights}
+                    activeId={activeIdx != null ? String(activeIdx) : null}
+                    onSelect={(id) => setActiveIdx(Number(id))}
+                    onAnchorStatus={setAnchorStatus}
+                    renderChanges={isAmended && showRedline}
+                    className="h-full"
+                  />
+                </div>
+              ) : (
+                <div className="flex-1 min-h-0 overflow-y-auto px-6 pb-6">
+                  <div className="mx-auto max-w-3xl rounded-xl border bg-card p-5 mt-1" onMouseUp={captureSelection}>
+                    {isAmended && showRedline && redlineText ? (
+                      <RedlineContract redline={redlineText} flashIdx={null} />
+                    ) : docText ? (
+                      <HighlightedContract text={docText} clauses={isAmended ? [] : clauses} activeIdx={activeIdx} onPick={setActiveIdx} />
+                    ) : (
+                      <p className="text-xs text-muted-foreground italic py-8 text-center">
+                        Document content isn't extractable in the browser (e.g. a scanned image PDF). Download to view, or run AI review for a clause summary.
+                      </p>
+                    )}
+                  </div>
+                </div>
+              )}
 
-                {/* Selection → comment composer */}
-                {selection && (
-                  <div className="mt-3 rounded-xl border-2 border-indigo-300 dark:border-indigo-800 bg-card p-3 space-y-2 sticky bottom-3 shadow-lg">
-                    <div className="flex items-center gap-2">
-                      <MessageSquarePlus className="size-3.5 text-indigo-600 dark:text-indigo-400" />
-                      <span className="text-[11px] font-bold uppercase tracking-wider text-indigo-700 dark:text-indigo-300">Comment on selection</span>
-                      <button onClick={() => { setSelection(""); setAnnNote(""); }} className="ml-auto text-muted-foreground hover:text-foreground"><X className="size-3.5" /></button>
-                    </div>
-                    <p className="text-[11px] italic text-muted-foreground border-l-2 border-indigo-300 pl-2 line-clamp-2">"{selection}"</p>
+              {/* Selection → comment composer. A centered dialog (not an inline
+                  sticky card, whose action buttons could fall below the viewport
+                  on a long document and become unclickable). */}
+              <Dialog open={!!selection} onOpenChange={(o) => { if (!o) { setSelection(""); setAnnNote(""); } }}>
+                  <DialogContent>
+                    <DialogHeader>
+                      <DialogTitle className="flex items-center gap-2 text-base">
+                        <MessageSquarePlus className="size-4 text-indigo-600 dark:text-indigo-400" /> Comment on selection
+                      </DialogTitle>
+                      <DialogDescription className="italic border-l-2 border-indigo-300 pl-2 line-clamp-3 not-italic">
+                        "{selection}"
+                      </DialogDescription>
+                    </DialogHeader>
                     <textarea
                       autoFocus
                       value={annNote}
                       onChange={(e) => setAnnNote(e.target.value)}
-                      rows={2}
+                      rows={3}
                       placeholder="Your comment on this passage…"
-                      className="w-full rounded-lg border bg-background px-3 py-2 text-xs resize-none focus:outline-none focus:ring-2 focus:ring-indigo-500/30"
+                      onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && annNote.trim()) annotate.mutate(); }}
+                      className="w-full rounded-lg border bg-background px-3 py-2 text-sm resize-none focus:outline-none focus:ring-2 focus:ring-indigo-500/30"
                     />
-                    <div className="flex items-center justify-end gap-2">
-                      <button onClick={() => { setSelection(""); setAnnNote(""); }} className="text-[11px] text-muted-foreground hover:text-foreground">Cancel</button>
-                      <Button size="sm" className="h-7 text-[11px] gap-1.5" disabled={!annNote.trim() || annotate.isPending} onClick={() => annotate.mutate()}>
-                        {annotate.isPending ? <Loader2 className="size-3 animate-spin" /> : <Check className="size-3" />} Add comment
+                    <DialogFooter>
+                      <Button variant="outline" size="sm" onClick={() => { setSelection(""); setAnnNote(""); }}>Cancel</Button>
+                      <Button size="sm" className="gap-1.5" disabled={!annNote.trim() || annotate.isPending} onClick={() => annotate.mutate()}>
+                        {annotate.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <Check className="size-3.5" />} Add comment
                       </Button>
-                    </div>
-                  </div>
-                )}
-              </div>
+                    </DialogFooter>
+                  </DialogContent>
+                </Dialog>
             </div>
 
             {/* RIGHT — AI Co-Pilot sidebar */}
@@ -564,13 +693,13 @@ function CoPilotReview() {
                           key={i}
                           onClick={() => jumpToChange(i)}
                           className="w-full text-left p-3 space-y-1.5 hover:bg-indigo-50/50 dark:hover:bg-indigo-950/20 transition-colors block"
-                          title="Jump to this change in the document"
+                          title={ch.located === false ? "This change couldn't be matched to the document text — apply it manually" : "Jump to this change in the document"}
                         >
                           <div className="flex items-center gap-1.5">
                             <span className="text-[11px] font-bold">{ch.ref}</span>
                             {ch.category && <span className="text-[9px] uppercase tracking-wider text-muted-foreground/60">{ch.category}</span>}
                             {ch.located === false
-                              ? <span className="ml-auto text-[9px] font-bold uppercase tracking-wider text-amber-600 dark:text-amber-400">appended</span>
+                              ? <span title="Couldn't be matched to the document text — apply this change manually." className="ml-auto text-[9px] font-bold uppercase tracking-wider text-amber-600 dark:text-amber-400">not located</span>
                               : <span className="ml-auto text-[9px] text-indigo-500">jump →</span>}
                           </div>
                           <p className="text-[11px] leading-relaxed">
@@ -622,6 +751,17 @@ function CoPilotReview() {
                   <span className="text-[10px] text-muted-foreground/60 ml-auto">{findings.length} to review</span>
                 </div>
                 )}
+                {/* Auto-applied notice — explains the pre-checked high-confidence
+                    changes once, and points at the ready "Generate amended version". */}
+                {!isAmended && Number(review?.autoAppliedCount) > 0 && (
+                  <div className="rounded-xl border border-indigo-200/70 dark:border-indigo-900 bg-indigo-50/60 dark:bg-indigo-950/20 px-3 py-2 flex items-start gap-2">
+                    <Sparkles className="size-3.5 text-indigo-600 dark:text-indigo-400 mt-0.5 shrink-0" />
+                    <p className="text-[10px] leading-relaxed text-indigo-900/80 dark:text-indigo-200/80">
+                      <span className="font-bold">{review.autoAppliedCount} high-confidence change{review.autoAppliedCount !== 1 ? "s" : ""} auto-applied.</span>{" "}
+                      These are pre-selected for the amended draft — review and <span className="font-semibold">undo</span> any you disagree with, then Generate amended version.
+                    </p>
+                  </div>
+                )}
 
                 {!isAmended && findings.map((c) => {
                   const idx = clauses.indexOf(c);
@@ -629,15 +769,70 @@ function CoPilotReview() {
                   return (
                     <div
                       key={idx}
-                      onMouseEnter={() => setActiveIdx(idx)}
+                      // Hover rings the card in the text/compare renderer. Not for
+                      // the exact-document renderer: there activeIdx also drives a
+                      // scroll-into-view, so hover-select would jank the page —
+                      // clicking the card (focusClause) is what scrolls to it.
+                      onMouseEnter={() => { if (!isDocxFile) setActiveIdx(idx); }}
                       className={cn("rounded-xl border p-3 space-y-2 transition-all", sev.ring, activeIdx === idx && "ring-2 ring-indigo-400")}
                     >
-                      <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => focusClause(idx)}
+                        className="flex items-center gap-2 w-full text-left cursor-pointer group"
+                        title="Jump to this clause in the document"
+                      >
                         <sev.icon className={cn("size-3.5 shrink-0", sev.text)} />
-                        <span className="text-[11px] font-bold">{c.ref}</span>
+                        <span className="text-[11px] font-bold group-hover:underline">{c.ref}</span>
                         <span className={cn("ml-auto rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider", sev.chip)}>{sev.label}</span>
+                      </button>
+
+                      {/* Anchor status: warn when this clause's quote couldn't be
+                          located in the rendered document, so a "jump to clause"
+                          that goes nowhere isn't a mystery (only tracked for the
+                          exact-document renderer). */}
+                      {isDocxFile && anchorStatus[String(idx)] === false && (c.excerpt ?? "").trim().length >= 8 && (
+                        <div className="flex items-center gap-1 text-[9px] font-medium text-amber-600 dark:text-amber-400">
+                          <Link2Off className="size-3 shrink-0" /> Couldn't pinpoint this in the document — see the clause text below.
+                        </div>
+                      )}
+
+                      <div className={cn("rounded-lg px-2.5 py-2 space-y-0.5", sev.chip)}>
+                        <div className="text-[9px] font-bold uppercase tracking-wider opacity-70">Why this is flagged</div>
+                        <p className="text-[12px] font-medium leading-relaxed">{c.comment}</p>
                       </div>
-                      <p className="text-[11px] leading-relaxed text-foreground/85">{c.comment}</p>
+
+                      {(c.excerpt || c.originalExcerpt) && (
+                        <div>
+                          <button
+                            onClick={() => setDetailsIdx(detailsIdx === idx ? null : idx)}
+                            className="inline-flex items-center gap-1 text-[10px] font-medium text-muted-foreground hover:text-foreground"
+                          >
+                            <Quote className="size-3" />
+                            {detailsIdx === idx ? "Hide clause text" : "Show clause text"}
+                            <ChevronDown className={cn("size-3 transition-transform", detailsIdx === idx && "rotate-180")} />
+                          </button>
+                          {detailsIdx === idx && (
+                            <div className="mt-1.5 space-y-1.5">
+                              {review.counterpartyReview && c.originalExcerpt && (
+                                <div className="rounded-lg bg-background border px-2.5 py-2">
+                                  <div className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground/70 mb-1">Ours — as sent</div>
+                                  <p className="text-[11px] italic leading-relaxed text-foreground/80">"{c.originalExcerpt}"</p>
+                                </div>
+                              )}
+                              {c.excerpt && (
+                                <div className="rounded-lg bg-background border px-2.5 py-2">
+                                  <div className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground/70 mb-1">
+                                    {review.counterpartyReview ? "Their wording" : "Clause text"}
+                                  </div>
+                                  <p className="text-[11px] italic leading-relaxed text-foreground/80">"{c.excerpt}"</p>
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )}
+
                       {c.suggestion && (
                         <div className="rounded-lg bg-background border border-dashed p-2.5">
                           <div className="flex items-center gap-1.5 mb-1">
@@ -648,17 +843,25 @@ function CoPilotReview() {
                             {c.suggestionEditedBy && (
                               <span className="text-[9px] text-muted-foreground/70" title={`Amended by ${c.suggestionEditedBy}`}>· amended</span>
                             )}
-                            {isReviewer && editIdx !== idx && (
-                              <button
-                                onClick={() => { setEditIdx(idx); setEditText(c.suggestion); }}
-                                className="ml-auto text-muted-foreground hover:text-foreground" title="Amend this wording before applying"
-                              >
-                                <Pencil className="size-3" />
-                              </button>
+                            {isReviewer && editIdx !== idx && aiIdx !== idx && (
+                              <>
+                                <button
+                                  onClick={() => { setAiIdx(idx); setAiText(""); }}
+                                  className="ml-auto inline-flex items-center gap-0.5 text-indigo-600 dark:text-indigo-400 hover:text-indigo-800" title="Ask AI to revise this wording"
+                                >
+                                  <Wand2 className="size-3" />
+                                </button>
+                                <button
+                                  onClick={() => { setEditIdx(idx); setEditText(c.suggestion); }}
+                                  className="text-muted-foreground hover:text-foreground" title="Amend this wording before applying"
+                                >
+                                  <Pencil className="size-3" />
+                                </button>
+                              </>
                             )}
                             <button
                               onClick={() => { navigator.clipboard?.writeText(c.suggestion); toast.success("Copied"); }}
-                              className={cn("text-muted-foreground hover:text-foreground", editIdx === idx && "ml-auto")} title="Copy"
+                              className={cn("text-muted-foreground hover:text-foreground", (editIdx === idx || aiIdx === idx) && "ml-auto")} title="Copy"
                             >
                               <Copy className="size-3" />
                             </button>
@@ -686,13 +889,46 @@ function CoPilotReview() {
                           ) : (
                             <p className="text-[11px] leading-relaxed text-foreground/90">{c.suggestion}</p>
                           )}
+                          {aiIdx === idx && (
+                            <div className="mt-2 space-y-1.5 rounded-lg border border-indigo-200 dark:border-indigo-900 bg-indigo-50/50 dark:bg-indigo-950/20 p-2">
+                              <div className="flex items-center gap-1 text-[9px] font-bold uppercase tracking-wider text-indigo-600 dark:text-indigo-400">
+                                <Wand2 className="size-3" /> Ask AI to revise
+                              </div>
+                              <textarea
+                                autoFocus
+                                value={aiText}
+                                onChange={(e) => setAiText(e.target.value)}
+                                rows={2}
+                                placeholder='e.g. "make it mutual", "cap liability at 12 months’ fees", "soften this"'
+                                disabled={refineAi.isPending}
+                                onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && aiText.trim()) refineAi.mutate({ clause_index: idx, instruction: aiText.trim() }); }}
+                                className="w-full rounded-lg border bg-background px-2.5 py-2 text-[11px] leading-relaxed resize-y focus:outline-none focus:ring-2 focus:ring-indigo-500/30"
+                              />
+                              <div className="flex items-center justify-end gap-2">
+                                <button onClick={() => { setAiIdx(null); setAiText(""); }} className="text-[10px] text-muted-foreground hover:text-foreground" disabled={refineAi.isPending}>Cancel</button>
+                                <Button
+                                  size="sm" className="h-6 text-[10px] gap-1"
+                                  disabled={aiText.trim().length < 2 || refineAi.isPending}
+                                  onClick={() => refineAi.mutate({ clause_index: idx, instruction: aiText.trim() })}
+                                >
+                                  {refineAi.isPending ? <Loader2 className="size-3 animate-spin" /> : <Wand2 className="size-3" />} {refineAi.isPending ? "Revising…" : "Revise with AI"}
+                                </Button>
+                              </div>
+                            </div>
+                          )}
                         </div>
                       )}
                       <div className="flex items-center gap-2">
                         {c.accepted ? (
-                          <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
-                            <CheckCircle2 className="size-3" /> Applied to draft
-                          </span>
+                          c.autoApplied ? (
+                            <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-indigo-600 dark:text-indigo-400" title="The AI was highly confident this change is required, so it was applied automatically. Undo if you disagree.">
+                              <Sparkles className="size-3" /> Auto-applied · high confidence
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
+                              <CheckCircle2 className="size-3" /> Applied to draft
+                            </span>
+                          )
                         ) : c.suggestion && isReviewer ? (
                           <Button size="sm" className="h-6 text-[10px] gap-1 bg-indigo-600 hover:bg-indigo-700" disabled={accept.isPending} onClick={() => accept.mutate({ clause_index: idx, accepted: true })}>
                             <Check className="size-3" /> Apply edit

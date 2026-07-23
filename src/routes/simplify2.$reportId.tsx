@@ -23,6 +23,7 @@ import {
   bulkSetSimplificationDecision,
   applySimplifyV2Report,
   bulkSetV2FindingDecision,
+  requestTargetedEdit,
 } from "@/lib/compliance.functions";
 import type { Finding } from "@/lib/recommend";
 import { SIMPLIFY_TYPE_LABEL } from "@/lib/simplify";
@@ -30,8 +31,12 @@ import type { VerifiedAction, ActionDecision } from "@/lib/simplify";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import {
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter,
+} from "@/components/ui/dialog";
+import { Textarea } from "@/components/ui/textarea";
+import {
   ArrowLeft, Loader2, RotateCcw, Check, X, Sparkles, SearchCheck, FileEdit,
-  FileDown, AlertTriangle, Link2Off, Quote, Info,
+  FileDown, AlertTriangle, Link2Off, Quote, Info, Wand2,
 } from "lucide-react";
 
 export const Route = createFileRoute("/simplify2/$reportId")({
@@ -375,9 +380,11 @@ function SimplifyV2ReportPage() {
                         reportId={reportId}
                         findings={findings}
                         restructure={restructure}
+                        apply={sj.apply ?? null}
                         comparing={false}
                         onCompareToggle={(on) => setView(on ? "compare" : "document")}
                         onGenerated={() => qc.invalidateQueries({ queryKey: ["report", reportId] })}
+                        onApplied={() => qc.invalidateQueries({ queryKey: ["report", reportId] })}
                       />
                     </div>
                   </div>
@@ -411,14 +418,22 @@ function SimplifyV2ReportPage() {
         ) : (
           <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_380px]">
             {/* document viewer */}
-            <div className="min-h-0 min-w-0 border-r overflow-hidden">
+            <div className="min-h-0 min-w-0 border-r flex flex-col overflow-hidden">
+              <div className="flex items-center justify-between px-3 py-1.5 border-b bg-muted/40 shrink-0">
+                <span className="text-[11px] font-semibold text-muted-foreground">Document</span>
+                <EditWithAiButton
+                  reportId={reportId}
+                  workflowMode={workflowMode}
+                  onApplied={(id) => setActiveId(id)}
+                />
+              </div>
               <DocViewer
                 fileUrl={sourceUrl}
                 highlights={highlights}
                 activeId={activeId}
                 onSelect={setActiveId}
                 onAnchorStatus={setAnchorStatus}
-                className="h-full"
+                className="flex-1"
               />
             </div>
 
@@ -445,9 +460,11 @@ function SimplifyV2ReportPage() {
                       reportId={reportId}
                       findings={findings}
                       restructure={restructure}
+                      apply={sj.apply ?? null}
                       comparing={view === "compare"}
                       onCompareToggle={(on) => setView(on ? "compare" : "document")}
                       onGenerated={() => qc.invalidateQueries({ queryKey: ["report", reportId] })}
+                      onApplied={() => qc.invalidateQueries({ queryKey: ["report", reportId] })}
                     />
                   )}
                   <div className="flex-1 min-h-0">
@@ -508,6 +525,102 @@ function AnalyzingView({ mode, title }: { mode: string; title: string }) {
         result is saved to the report.
       </p>
     </div>
+  );
+}
+
+// ── "Edit with AI" — free-text-instruction-driven targeted edit ─────────────
+// Distinct from the per-finding pencil edit (which only refines an already-
+// discovered finding's fix): this scans the WHOLE document for passages
+// relevant to an arbitrary reviewer instruction and proposes new ones,
+// running through the same verification gate as the initial audit before
+// anything is added to the rail.
+
+function EditWithAiButton({
+  reportId, workflowMode, onApplied,
+}: {
+  reportId: string;
+  workflowMode: string;
+  onApplied: (id: string) => void;
+}) {
+  const qc = useQueryClient();
+  const editFn = useServerFn(requestTargetedEdit);
+  const [open, setOpen] = useState(false);
+  const [instruction, setInstruction] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit() {
+    const trimmed = instruction.trim();
+    if (trimmed.length < 3) return;
+    setBusy(true);
+    try {
+      const r = await editFn({ data: { reportId, instruction: trimmed } });
+      await qc.invalidateQueries({ queryKey: ["report", reportId] });
+      if (workflowMode === "simplify") {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const idx = (r as any).addedIndexes?.[0];
+        if (typeof idx === "number") onApplied(`a-${idx}`);
+        toast.success(`Added ${(r as any).addedIndexes?.length ?? 1} suggested edit(s)`, {
+          description: "Review it in the rail on the right.",
+        });
+      } else {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const id = (r as any).addedIds?.[0];
+        if (typeof id === "string") onApplied(id);
+        toast.success(`Added ${(r as any).addedIds?.length ?? 1} suggested finding(s)`, {
+          description: "Review it in the rail on the right.",
+        });
+      }
+      setInstruction("");
+      setOpen(false);
+    } catch (e) {
+      toast.error("Couldn't produce an edit", { description: (e as Error)?.message });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={(v) => { if (!busy) setOpen(v); }}>
+      <Button
+        size="sm"
+        variant="outline"
+        className="h-6 px-2 text-[11px]"
+        onClick={() => setOpen(true)}
+      >
+        <Wand2 className="size-3 mr-1" /> Edit with AI
+      </Button>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Edit with AI</DialogTitle>
+          <DialogDescription>
+            Describe the change you want. The AI scans the whole document for relevant
+            passages and proposes edits — every suggestion is verified against the
+            document before it's added to the rail.
+          </DialogDescription>
+        </DialogHeader>
+        <Textarea
+          autoFocus
+          placeholder='e.g. "Tighten the indemnity cap to a fixed amount" or "Flag every place that references the old notice period"'
+          value={instruction}
+          onChange={(e) => setInstruction(e.target.value)}
+          disabled={busy}
+          rows={4}
+          maxLength={2000}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submit();
+          }}
+        />
+        <DialogFooter>
+          <Button variant="outline" size="sm" onClick={() => setOpen(false)} disabled={busy}>
+            Cancel
+          </Button>
+          <Button size="sm" onClick={submit} disabled={busy || instruction.trim().length < 3}>
+            {busy ? <Loader2 className="size-3.5 mr-1.5 animate-spin" /> : <Wand2 className="size-3.5 mr-1.5" />}
+            {busy ? "Scanning document…" : "Suggest edit"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 

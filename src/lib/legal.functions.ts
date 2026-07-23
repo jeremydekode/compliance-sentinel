@@ -2,7 +2,7 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import { generateWithFallback } from "@/lib/gemini";
-import { docxToText, looksLikeDocx, applyEditsToDocx, type DocxEdit } from "@/lib/docx-editor";
+import { docxToText, looksLikeDocx, applyEditsToDocx, applySimplificationToDocx, buildRedlineDocx, type DocxEdit, type SimplifyDocxEdit } from "@/lib/docx-editor";
 import { extractPdfPages } from "@/lib/pdf-pages";
 import { LEGAL_KB_SEED, baselinePlaybookText } from "@/lib/legal.knowledge";
 import { assertRowTenant, getCallerTenant } from "@/lib/tenant.functions";
@@ -208,7 +208,7 @@ async function runAiTriage(
   description: string,
   matterType: string,
 ): Promise<{ summary: string; riskFlags: Array<{ severity: "high"|"medium"|"low"; flag: string; recommendation: string }> }> {
-  const prompt = `You are a legal AI triage system for the Company — a Malaysian financial institution (also reused by other industries). Apply Malaysian law and, where relevant, BNM / Financial Services Act 2013 / PDPA 2010 / AMLA 2001. Analyze this legal matter and produce a structured triage report.
+  const prompt = `You are the Head of Legal for the Company — a sophisticated corporate legal advisor, not sector-specific. Apply Malaysian law as the governing framework (Contracts Act 1950, PDPA 2010, Companies Act 2016) and general commercial principles where statute doesn't speak directly to the issue; apply sector-specific rules (e.g. BNM policy, Financial Services Act 2013, AMLA 2001) only if the matter itself indicates a regulated financial-services relationship. Analyze this legal matter and produce a structured triage report.
 
 MATTER:
 Title: ${title}
@@ -247,7 +247,7 @@ async function generateSimpleAdvisoryResponse(
   const kbBlock = kbEntries.length
     ? `\n\nPUBLISHED KNOWLEDGE BASE (prior sign-off by General Counsel — prefer these positions where relevant):\n${kbEntries.map((e, i) => `${i + 1}. ${e.title}: ${e.takeaways}`).join("\n")}`
     : "";
-  const prompt = `You are an AI legal assistant for the Company — a Malaysian financial institution (this platform is also reused across other industries, so apply general Malaysian law where the query is not bank-specific). Answer this simple legal query grounded in the baseline playbook, the published knowledge base, and applicable Malaysian law (e.g. Contracts Act 1950, PDPA 2010, Companies Act 2016, Employment Act 1955; for financial services, BNM policy documents, Financial Services Act 2013 / IFSA 2013, AMLA 2001).
+  const prompt = `You are the Head of Legal for the Company — a sophisticated corporate legal advisor, not sector-specific. Answer this simple legal query grounded in the baseline playbook, the published knowledge base, and applicable Malaysian law (e.g. Contracts Act 1950, PDPA 2010, Companies Act 2016, Employment Act 1955), applying sector-specific rules (e.g. BNM policy documents, Financial Services Act 2013 / IFSA 2013, AMLA 2001) only if the query itself indicates a regulated financial-services relationship.
 
 BASELINE PLAYBOOK:
 ${baselinePlaybookText()}
@@ -927,7 +927,7 @@ export const archiveLegalMatter = createServerFn({ method: "POST" })
 // enough context — proposes a structured request draft for confirmation.
 // ---------------------------------------------------------------------------
 
-const INTAKE_SYSTEM = `You are the Company's Legal Intake Assistant — the conversational gatekeeper that replaces the traditional legal Requisition Form. The Company is a Malaysian financial institution, but this platform is also reused across other industries, so apply general Malaysian law unless the request is bank-specific (then also consider BNM policy, Financial Services Act 2013, PDPA 2010, AMLA 2001).
+const INTAKE_SYSTEM = `You are the Company's Legal Intake Assistant — the conversational gatekeeper that replaces the traditional legal Requisition Form, speaking with the voice of the Head of Legal: a sophisticated corporate legal advisor, not sector-specific. Apply general Malaysian law by default (Contracts Act 1950, PDPA 2010, Companies Act 2016), and only bring in sector-specific rules (e.g. BNM policy, Financial Services Act 2013, AMLA 2001) if the request itself indicates a regulated financial-services relationship.
 
 YOUR JOB — a short exploratory interview:
 1. Understand what the requester needs. Ask AT MOST ONE clarifying question per turn, and at most 2-3 questions total before proposing. Be warm, efficient, plain-English.
@@ -1064,6 +1064,43 @@ export const attachLegalDocument = createServerFn({ method: "POST" })
     return doc as any;
   });
 
+// What a Head of Legal actually checks, by document type — not a single
+// generic checklist blended across every contract shape. The model is asked
+// to identify the document type first, then apply the matching section.
+const CLAUSE_SWEEP_GUIDANCE = `First work out what kind of document this is, then review it against the checklist a Head of Legal actually runs for that document type — don't apply a generic checklist blended across contract types.
+
+If it's an NDA / confidentiality agreement, check:
+- Definition of "Confidential Information" — carve-outs for information that's public, already known, independently developed, or received from a third party without restriction
+- Mutual vs. one-way obligations — does the paper match who's actually disclosing what
+- Permitted purpose — is use of the information tied to a stated purpose, not left open-ended
+- Standard of care and permitted recipients (employees/advisers on a need-to-know basis, bound by equivalent confidentiality)
+- Term of the agreement, and separately, how long confidentiality survives after termination
+- Compelled disclosure carve-out (notice before complying with a subpoena or regulator)
+- Return or destruction of information on request or termination
+- Remedies — is injunctive relief acknowledged, since damages alone rarely undo a leak
+- Liability — does a cap improperly limit exposure for the confidentiality breach itself
+- Data protection (PDPA 2010) if personal data is in scope
+- Governing law and dispute resolution
+
+If it's a services / vendor / supply agreement, check:
+- Scope of services and deliverables — specific enough to be enforceable, not open to scope creep
+- Payment terms — amount, currency, invoicing cadence, payment period, late-payment interest, disputed-invoice process
+- Term and renewal — fixed term or auto-renewal, and whether the notice period to stop renewal is workable (auto-renewal traps)
+- Termination rights — for convenience, for cause with a cure period, and on insolvency
+- Effect of termination — wind-down, return of materials, accrued fees
+- Service levels and remedies for failure to meet them
+- IP ownership of deliverables / work product — assignment vs. licence-back
+- Confidentiality and its survival period
+- Data protection (PDPA 2010) — processing terms, sub-processor consent, breach-notification timelines, if the vendor touches personal data
+- Indemnification — scope (IP infringement, confidentiality/data breach, third-party claims), whether it's mutual, and whether indemnities are carved out of any liability cap
+- Limitation of liability — cap basis (e.g. fees paid in the prior 12 months), exclusions for indirect/consequential loss, and carve-outs for gross negligence, wilful misconduct, IP infringement, and confidentiality breach
+- Force majeure — does it improperly excuse payment obligations, not just performance
+- Warranties — service quality, non-infringement, compliance with law
+- Assignment and subcontracting restrictions
+- Governing law and dispute resolution
+
+For any other kind of commercial document, check at minimum: payment terms, term and termination, indemnity, limitation of liability, IP ownership, confidentiality, data protection, force majeure, and governing law.`;
+
 export const reviewLegalDocument = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator(z.object({ document_id: z.string().uuid() }))
@@ -1096,9 +1133,9 @@ export const reviewLegalDocument = createServerFn({ method: "POST" })
       if (!resp.ok) throw new Error(`Could not fetch document (${resp.status})`);
       const buffer = Buffer.from(await resp.arrayBuffer());
       const mime = doc.mime_type || resp.headers.get("content-type") || "application/octet-stream";
-      const instruction = `You are senior legal counsel AI for the Company — a Malaysian financial institution (the platform is also reused by other industries, so apply general Malaysian law where the matter is not bank-specific). Perform a clause-by-clause first-cut review of the attached document for the matter "${matter?.title ?? doc.file_name}".
+      const instruction = `You are the Head of Legal for the Company, reviewing on behalf of the business generally — not a single regulated sector. Apply Malaysian law as the governing framework (Contracts Act 1950 — note penalty clauses are void under s.75, PDPA 2010, Companies Act 2016) and general commercial contract principles where statute doesn't speak directly to the issue; apply sector-specific rules (e.g. BNM policy, Financial Services Act 2013) only if the document itself indicates a regulated financial-services relationship. Perform a clause-by-clause first-cut review of the attached document for the matter "${matter?.title ?? doc.file_name}".
 
-Assess against standard company playbook positions and Malaysian law: liability caps (never unlimited; penalties void under s.75 Contracts Act 1950), indemnities, termination rights, confidentiality, data protection (PDPA 2010) and — for a bank — customer secrecy (Financial Services Act 2013 s.133) and BNM outsourcing audit-access requirements, IP ownership, force majeure, governing law (prefer Malaysian law / AIAC arbitration), payment & stamp-duty terms, auto-renewal traps.
+${CLAUSE_SWEEP_GUIDANCE}
 
 Return ONLY valid JSON:
 {
@@ -1118,11 +1155,14 @@ Return ONLY valid JSON:
       "severity": "red_flag" | "caution" | "compliant",
       "category": "financial" | "regulatory" | "operational" | "reputational",
       "comment": "what the issue or confirmation is",
-      "suggestion": "the SUGGESTED REDLINE — the exact replacement wording the Company should propose (empty string if compliant)"
+      "suggestion": "the SUGGESTED REDLINE — the exact replacement wording the Company should propose (empty string if compliant)",
+      "confidence": "high" | "medium" | "low"
     }
   ]
 }
-Cover the 4-10 most significant clauses. verdict = worst severity found. Make suggestions concrete, drop-in replacement wording a lawyer could accept as-is.`;
+Cover the 4-10 most significant clauses. verdict = worst severity found. Make suggestions concrete, drop-in replacement wording a lawyer could accept as-is.
+"confidence" = how certain you are that this exact redline is REQUIRED and safe to apply as-is: use "high" ONLY when the change is clearly required (a legal defect, a non-negotiable protection, or standard market position) and your replacement wording is a clean drop-in a lawyer would accept without editing; use "medium"/"low" for judgement calls, negotiable positions, or wording that needs a human's eye. High-confidence required changes are auto-applied to the amended draft, so reserve "high" for changes you are confident are correct.
+To DELETE or remove a clause entirely, keep "excerpt" to a SHORT distinctive phrase from anywhere in that clause (just enough to locate it — the system strikes the whole clause) and set "suggestion" to exactly "Clause <ref> intentionally omitted." — do NOT partially reword it, or the original sentence will be left dangling.`;
 
       let parts: any[];
       // Reuse text already extracted on the review (amended drafts carry their
@@ -1157,6 +1197,23 @@ Cover the 4-10 most significant clauses. verdict = worst severity found. Make su
       if (!review || !Array.isArray(review.clauses)) throw new Error("AI review returned an unexpected format");
       // Stash a truncated copy of the document text for the co-pilot editor view.
       review.documentText = documentText.slice(0, 60_000);
+
+      // AUTO-ACCEPT high-confidence required changes. When the model is confident
+      // a redline is required AND its wording is a clean drop-in (severity is a
+      // real issue, a concrete suggestion exists, confidence "high"), pre-accept
+      // it so "Generate amended version" is immediately actionable. Each stays
+      // flagged (autoApplied) and undoable — the reviewer keeps the final say.
+      let autoApplied = 0;
+      for (const c of review.clauses) {
+        const hasFix = typeof c.suggestion === "string" && c.suggestion.trim().length > 0;
+        if (c.severity !== "compliant" && hasFix && c.confidence === "high") {
+          c.accepted = true;
+          c.autoApplied = true;
+          autoApplied++;
+        }
+      }
+      review.autoAppliedCount = autoApplied;
+
       // PRESERVE user-authored data across a re-run: reviewer highlight-to-comment
       // annotations, and (for amended drafts) the redline + change history live INSIDE
       // ai_review — a naive overwrite would silently delete them.
@@ -1182,7 +1239,7 @@ Cover the 4-10 most significant clauses. verdict = worst severity found. Make su
       await logComment(sb, {
         matter_id:    doc.matter_id,
         author_name:  "AI Triage Scanner",
-        content:      `First-cut review of "${doc.file_name}" complete — ${counts.red_flag} red flag${counts.red_flag !== 1 ? "s" : ""}, ${counts.caution} caution${counts.caution !== 1 ? "s" : ""}, ${counts.compliant} compliant. ${review.summary ?? ""}`,
+        content:      `First-cut review of "${doc.file_name}" complete — ${counts.red_flag} red flag${counts.red_flag !== 1 ? "s" : ""}, ${counts.caution} caution${counts.caution !== 1 ? "s" : ""}, ${counts.compliant} compliant.${autoApplied ? ` ${autoApplied} high-confidence change${autoApplied !== 1 ? "s" : ""} auto-applied.` : ""} ${review.summary ?? ""}`,
         comment_type: "ai_note",
       });
 
@@ -1262,7 +1319,7 @@ export const reviewCounterpartyMarkup = createServerFn({ method: "POST" })
         throw new Error("Could not read text from one of the documents to compare.");
       }
 
-      const instruction = `You are senior legal counsel AI for the Company. The Company sent the ORIGINAL document below out to a counterparty. The counterparty has returned a marked-up version with their proposed changes. Compare the two and identify every clause where the counterparty added, removed, or reworded something — skip clauses that are unchanged.
+      const instruction = `You are the Head of Legal for the Company, reviewing on behalf of the business generally — not a single regulated sector. The Company sent the ORIGINAL document below out to a counterparty. The counterparty has returned a marked-up version with their proposed changes. Compare the two and identify every clause where the counterparty added, removed, or reworded something — skip clauses that are unchanged.
 
 ORIGINAL (as sent by the Company):
 ${originalText.slice(0, 100_000)}
@@ -1270,7 +1327,9 @@ ${originalText.slice(0, 100_000)}
 COUNTERPARTY'S VERSION (their proposed changes):
 ${markupText.slice(0, 100_000)}
 
-For each changed clause, assess it against standard company playbook positions and Malaysian law (liability caps — never unlimited, indemnities, termination rights, confidentiality, PDPA 2010, IP ownership, force majeure, governing law, payment terms).
+${CLAUSE_SWEEP_GUIDANCE}
+
+For each changed clause, assess it against the checklist above and against Malaysian law generally (Contracts Act 1950, PDPA 2010, Companies Act 2016), applying sector-specific rules only if the document itself indicates a regulated relationship.
 
 Return ONLY valid JSON:
 {
@@ -1289,10 +1348,12 @@ Return ONLY valid JSON:
       "severity": "red_flag" | "caution" | "compliant",
       "category": "financial" | "regulatory" | "operational" | "reputational",
       "comment": "what the counterparty changed and why it matters — describe the shift from our original position and the risk it creates",
-      "suggestion": "the EXACT replacement clause wording we would counter-propose, written as final contract language ready to be inserted into the draft — NOT commentary, NOT instructions like 'revert to...' (empty string if their change is acceptable as-is)"
+      "suggestion": "the EXACT replacement clause wording we would counter-propose, written as final contract language ready to be inserted into the draft — NOT commentary, NOT instructions like 'revert to...' (empty string if their change is acceptable as-is)",
+      "confidence": "high" | "medium" | "low"
     }
   ]
 }
+"confidence" = how certain you are this counter-position is REQUIRED and safe to apply as-is: use "high" ONLY when reverting/countering their change is clearly necessary to protect the Company AND your wording is a clean drop-in a lawyer would accept without editing; use "medium"/"low" for negotiable positions or wording that needs a human's eye. High-confidence changes are auto-applied to the counter-draft, so reserve "high" for changes you are confident are correct.
 Only include clauses that actually differ between the two versions. If nothing of substance changed, return an empty clauses array and verdict "compliant".
 IMPORTANT: "suggestion" must read as contract prose (e.g. "Each Party's aggregate liability shall not exceed the total fees paid in the twelve (12) months preceding the claim..."), never as advice about what to do.`;
 
@@ -1307,6 +1368,20 @@ IMPORTANT: "suggestion" must read as contract prose (e.g. "Each Party's aggregat
       review.documentText = markupText.slice(0, 60_000);
       review.counterpartyReview = true;
       review.compareAgainst = original.file_name;
+
+      // AUTO-ACCEPT high-confidence counter-positions (see reviewLegalDocument):
+      // pre-select clean, clearly-required counters so the counter-draft is ready,
+      // each still flagged (autoApplied) and undoable.
+      let autoApplied = 0;
+      for (const c of review.clauses) {
+        const hasFix = typeof c.suggestion === "string" && c.suggestion.trim().length > 0;
+        if (c.severity !== "compliant" && hasFix && c.confidence === "high") {
+          c.accepted = true;
+          c.autoApplied = true;
+          autoApplied++;
+        }
+      }
+      review.autoAppliedCount = autoApplied;
       // Keep the original's text on the review so the viewer can render a
       // side-by-side comparison without re-fetching/re-extracting the original.
       review.originalDocumentText = originalText.slice(0, 60_000);
@@ -1475,9 +1550,77 @@ export const acceptClauseSuggestion = createServerFn({ method: "POST" })
     return { ok: true };
   });
 
-function escHtml(s: string): string {
-  return (s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
+// AI-assisted redraft of a single clause's suggested redline. The reviewer gives
+// a free-text instruction ("make it mutual", "cap liability at 12 months' fees",
+// "soften this") and the AI rewrites the drop-in replacement wording for THAT
+// clause only, grounded in the clause text and why it was flagged. Persisted as
+// the clause's suggestion so "Generate amended version" applies the new wording.
+export const refineClauseSuggestion = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(z.object({
+    document_id:  z.string().uuid(),
+    clause_index: z.number().int().min(0),
+    instruction:  z.string().min(2).max(2000),
+  }))
+  .handler(async ({ data, context }) => {
+    const sb = context.supabase as any;
+    const { userId, userEmail } = actor(context);
+
+    const { data: doc } = await sb
+      .from("legal_matter_documents")
+      .select("ai_review, matter_id, file_name")
+      .eq("id", data.document_id)
+      .single();
+    const clause = doc?.ai_review?.clauses?.[data.clause_index];
+    if (!clause) throw new Error("Clause not found");
+    // Tenant boundary: the parent matter's tenant must match the caller's.
+    const { data: parentMatter } = await sb.from("legal_matters").select("tenant_id, title").eq("id", doc.matter_id).single();
+    assertRowTenant(parentMatter?.tenant_id, (await getCallerTenant(context.userId)).tenantId);
+
+    const review = doc.ai_review;
+    const isCounterparty = !!review?.counterpartyReview;
+    const prompt = `You are the Head of Legal for the Company, refining ONE clause's proposed redline for the matter "${parentMatter?.title ?? doc.file_name}". Apply Malaysian law (Contracts Act 1950 — penalty clauses void under s.75, PDPA 2010, Companies Act 2016) and general commercial contract principles; invoke sector-specific rules only if the clause itself indicates a regulated relationship.
+
+CLAUSE REFERENCE: ${clause.ref ?? "(unlabelled)"}
+${isCounterparty && clause.originalExcerpt ? `OUR ORIGINAL WORDING:\n"${clause.originalExcerpt}"\n` : ""}CURRENT CLAUSE TEXT${isCounterparty ? " (counterparty's version)" : ""}:
+"${clause.excerpt ?? ""}"
+
+WHY IT WAS FLAGGED:
+${clause.comment ?? "(no note)"}
+
+CURRENT PROPOSED REDLINE:
+"${clause.suggestion ?? "(none yet)"}"
+
+REVIEWER'S INSTRUCTION:
+${data.instruction}
+
+Rewrite the proposed redline to satisfy the reviewer's instruction while resolving the flagged issue. Return ONLY valid JSON:
+{ "suggestion": "the revised drop-in replacement clause wording, ready to insert as-is — no commentary, no markdown", "note": "one short sentence on what you changed" }`;
+
+    const res = await generateWithFallback(
+      { contents: [{ role: "user", parts: [{ text: prompt }] }], config: { responseMimeType: "application/json", maxOutputTokens: 4096 } },
+      { tier: "quality" },
+    );
+    const text = res.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+    const parsed = parseAiJson(text);
+    const suggestion = String(parsed?.suggestion ?? "").trim();
+    if (!suggestion) throw new Error("The AI couldn't produce a revised wording — try rephrasing your instruction.");
+
+    clause.suggestion = suggestion;
+    clause.suggestionEditedBy = `AI · ${userEmail ?? "Reviewer"}`;
+    const { error } = await sb.from("legal_matter_documents").update({ ai_review: review }).eq("id", data.document_id);
+    if (error) throw new Error(error.message);
+
+    await logEvent(sb, {
+      matter_id:  doc.matter_id,
+      event_type: "suggestion_edited",
+      actor_id:   userId,
+      actor_name: userEmail ?? "User",
+      payload:    { file_name: doc.file_name, ref: clause.ref, ai_assisted: true },
+    });
+
+    return { suggestion, note: String(parsed?.note ?? "").trim() };
+  });
 
 // Normalize a string for whitespace/quote/dash-insensitive matching (lowercased,
 // smart-quotes → straight, whitespace collapsed to single spaces, trimmed).
@@ -1659,6 +1802,41 @@ export const deleteLegalDocument = createServerFn({ method: "POST" })
     return { ok: true };
   });
 
+// Does this accepted suggestion delete/omit the whole clause rather than reword
+// part of it? Such a change must strike the ENTIRE clause — a partial excerpt
+// swap leaves a dangling fragment of the original sentence (e.g. "…Intentionally
+// Omitted., suffered, paid or payable by…"). Matches the standard legal phrasings
+// for a removed clause; empty suggestion (pure deletion) also counts.
+function isOmissionSuggestion(after: string): boolean {
+  const s = (after ?? "").trim().toLowerCase();
+  if (!s) return true;
+  return (
+    (/intentional/.test(s) && /(omit|blank|delet|left)/.test(s)) ||
+    /(omitted|deleted)\s+in\s+its\s+entirety|deleted\s+and\s+reserved|struck\s+(out|through)/.test(s) ||
+    /^\[?\s*(clause[\s\d.]*(is|has been)?\s*)?(intentionally\s+)?(omitted|deleted|reserved|removed|left\s+blank)\b/.test(s)
+  );
+}
+
+// Grow a located span to the whole enclosing clause/paragraph in extracted text,
+// so an omission strikes the entire clause. Stops at a blank line or a newline
+// that begins the next numbered clause (e.g. "\n8.6"), so it can't bleed into the
+// neighbouring clause. Used only on the PDF/plain-text redline fallback (the DOCX
+// path replaces the whole paragraph structurally via applySimplificationToDocx).
+function enclosingClauseSpan(text: string, start: number, end: number): { start: number; end: number } {
+  const CLAUSE_START = /^\s*\d+(\.\d+)*[.)\s]/;
+  let s = Math.max(0, Math.min(start, text.length));
+  while (s > 0) {
+    if (text[s - 1] === "\n" && (text[s - 2] === "\n" || CLAUSE_START.test(text.slice(s, s + 14)))) break;
+    s--;
+  }
+  let e = Math.max(s, Math.min(end, text.length));
+  while (e < text.length) {
+    if (text[e] === "\n" && (text[e + 1] === "\n" || CLAUSE_START.test(text.slice(e + 1, e + 15)))) break;
+    e++;
+  }
+  return { start: s, end: e };
+}
+
 // Generate a NEW document version from the accepted AI Co-Pilot suggestions.
 // For DOCX sources the accepted redlines are applied into the real Word file
 // (highlighted); for other sources an amended .doc is generated from the
@@ -1692,118 +1870,186 @@ export const createAmendedVersion = createServerFn({ method: "POST" })
       .or(`id.eq.${rootId},parent_document_id.eq.${rootId}`);
     const nextVersion = Math.max(1, ...(group ?? []).map((g: any) => Number(g.version) || 1)) + 1;
 
-    // Source text: prefer text already extracted on the review; otherwise pull it
-    // from the source file (DOCX / PDF / plain text). We work at the text level so
-    // the amended draft is both viewable in-app and correct.
-    let sourceText = String(review?.documentText ?? "");
-    if (!sourceText.trim()) {
-      const resp = await fetch(doc.file_url);
-      if (!resp.ok) throw new Error(`Could not fetch source document (${resp.status})`);
-      const buffer = Buffer.from(await resp.arrayBuffer());
-      const mime = doc.mime_type || resp.headers.get("content-type") || "";
-      if (looksLikeDocx(mime, doc.file_name)) {
-        sourceText = await docxToText(buffer);
-      } else if (mime.includes("pdf") || /\.pdf($|\?)/i.test(doc.file_name)) {
-        const pages = await extractPdfPages(buffer);
-        sourceText = pages.map((pg) => pg.text).filter(Boolean).join("\n\n");
-      } else {
-        sourceText = buffer.toString("utf8");
-      }
-    }
-    if (!sourceText.trim()) throw new Error("Could not read the document text to apply changes.");
-
-    // Apply the accepted suggestions as a REDLINE: the old term is struck through
-    // and the new term inserted, so the amended draft shows exactly what changed.
-    // Four control-char markers delimit deletions and insertions.
-    const DEL_O = String.fromCharCode(1), DEL_C = String.fromCharCode(2);
-    const INS_O = String.fromCharCode(3), INS_C = String.fromCharCode(4);
-    // Locate each accepted clause with a whitespace/quote-insensitive match against a
-    // normalized copy of the source, then map back to the EXACT original span, so the
-    // redline replaces the clause in place instead of appending it at the bottom.
-    const { norm, map } = buildNormMap(sourceText);
-    let normMut = norm;
-    type Span = { start: number; end: number; before: string; after: string; comment: string; category: any; ref: string };
-    const spans: Span[] = [];
-    const unmatched: any[] = [];
-    for (const c of accepted) {
-      const suggestion = String(c.suggestion ?? "").trim();
-      const ne = normStr(String(c.excerpt ?? ""));
-      const found = locateClauseSpan(normMut, map, ne);
-      if (found) {
-        spans.push({ start: found.origStart, end: found.origEnd, before: sourceText.slice(found.origStart, found.origEnd), after: suggestion, comment: String(c.comment ?? "").trim(), category: c.category ?? null, ref: c.ref });
-        // blank the matched NORM region (same length) so a later clause can't re-match it
-        normMut = normMut.slice(0, found.normStart) + " ".repeat(found.normEnd - found.normStart) + normMut.slice(found.normEnd);
-      } else {
-        unmatched.push(c);
-      }
-    }
-
-    // Apply located replacements right-to-left so earlier offsets don't shift.
-    let redline = sourceText;
-    for (const sp of [...spans].sort((a, b) => b.start - a.start)) {
-      redline = redline.slice(0, sp.start) + DEL_O + sp.before + DEL_C + INS_O + sp.after + INS_C + redline.slice(sp.end);
-    }
-
-    // Change history in DOCUMENT order (located first, then any that had to be appended).
-    const located = [...spans].sort((a, b) => a.start - b.start);
-    const changes: any[] = located.map((sp) => ({ ref: sp.ref, before: sp.before, after: sp.after, comment: sp.comment, category: sp.category, located: true }));
-    for (const c of unmatched) {
-      changes.push({ ref: c.ref, before: String(c.excerpt ?? "").trim(), after: String(c.suggestion ?? "").trim(), comment: String(c.comment ?? "").trim(), category: c.category ?? null, located: false });
-    }
-    const appliedCount = located.length;
-    const unmatchedCount = unmatched.length;
-    const appliedClauses: any[] = changes.map((ch) => ({
-      ref: ch.ref, excerpt: ch.after, severity: ch.located ? "compliant" : "caution", category: ch.category,
-      comment: ch.located ? `New term (replaced: "${String(ch.before).slice(0, 120)}")` : "Appended (could not be located inline).",
-      suggestion: "", accepted: true,
-    }));
-    if (unmatchedCount) {
-      redline += "\n\n--- ADDITIONAL ACCEPTED AMENDMENTS ---\n" +
-        unmatched.map((c) => INS_O + `${c.ref}: ${String(c.suggestion ?? "").trim()}` + INS_C).join("\n");
-    }
-
-    // Clean amended text (deletions removed, insertions kept) — used for the clean
-    // view and for re-analysis of the draft.
-    const amendedPlain = redline
-      .replace(new RegExp(DEL_O + "[\\s\\S]*?" + DEL_C, "g"), "")
-      .split(INS_O).join("").split(INS_C).join("");
-
-    // Downloadable .doc rendered as a redline (strikethrough old / highlighted new).
     const baseName = String(doc.file_name).replace(/\.(docx?|pdf|txt)$/i, "").replace(/^v\d+\s*[—-]\s*/, "");
-    const bodyHtml = escHtml(redline)
-      .split(DEL_O).join('<del style="color:#b91c1c;background:#fee2e2">')
-      .split(DEL_C).join("</del>")
-      .split(INS_O).join('<ins style="color:#065f46;background:#d1fae5;text-decoration:none;font-weight:bold">')
-      .split(INS_C).join("</ins>")
-      .replace(/\n/g, "<br>");
-    const html = `<html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word'>
-<head><meta charset="utf-8"><title>Amended draft v${nextVersion}</title>
-<style>body{font-family:'Times New Roman',serif;font-size:11pt;line-height:1.5;margin:2.5cm}.notice{font-size:9pt;color:#555;border:1px solid #999;padding:8pt;margin-bottom:18pt}del{color:#b91c1c}ins{color:#065f46;text-decoration:none}</style></head>
-<body><div class="notice">AMENDED DRAFT v${nextVersion} (redline) — AI review suggestions applied. Struck-through = removed, highlighted = new term. Derived from "${escHtml(baseName)}". Review before execution.</div>
-<div>${bodyHtml}</div></body></html>`;
-    const outBuffer = Buffer.from(html, "utf8");
-    const outMime = "application/msword";
-    const ext = "doc";
+
+    // Fetch the ORIGINAL file bytes once. When it's a DOCX we edit it IN PLACE so
+    // the amended draft keeps the exact original styling, headers, logo and
+    // tables — only the accepted clauses change. PDFs / plain text (no DOCX
+    // package to preserve) fall back to the text-level redline .doc below.
+    const resp = await fetch(doc.file_url);
+    if (!resp.ok) throw new Error(`Could not fetch source document (${resp.status})`);
+    const srcBuffer = Buffer.from(await resp.arrayBuffer());
+    const srcMime = doc.mime_type || resp.headers.get("content-type") || "";
+    const isDocxSource = looksLikeDocx(srcMime, doc.file_name);
+
+    let outBuffer: Buffer;
+    let outMime: string;
+    let ext: string;
+    let appliedCount: number;
+    let unmatchedCount: number;
+    let newReview: any;
+
+    if (isDocxSource) {
+      // ── In-place DOCX edit (original formatting preserved) ──────────────────
+      // `excerpt` is the verbatim clause text (the "before"), `suggestion` the
+      // accepted replacement (the "after") — same engine Simplify v2 uses. Tracked
+      // changes + a rationale comment per edit so the recipient reviews it in Word.
+      const edits: SimplifyDocxEdit[] = accepted
+        .map((c: any) => ({
+          before: String(c.excerpt ?? "").trim(),
+          after: String(c.suggestion ?? "").trim(),
+          rationale: [c.ref, String(c.comment ?? "").trim()].filter(Boolean).join(" — ") || undefined,
+          // An omission replaces the WHOLE clause, so a partial excerpt can't
+          // leave a dangling fragment of the original sentence behind.
+          replaceParagraph: isOmissionSuggestion(String(c.suggestion ?? "")),
+        }))
+        // An empty before OR after would delete/mismatch text — never apply those.
+        .filter((e: SimplifyDocxEdit) => !!e.before && !!e.after);
+      const result = applySimplificationToDocx(srcBuffer, edits, {
+        author: userEmail ?? "Legal",
+        mode: "redline",
+        redlineComments: true,
+      });
+      outBuffer = result.buffer;
+      outMime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+      ext = "docx";
+      appliedCount = result.appliedCount;
+
+      // Change history + synthetic clauses for the in-app viewer. A clause counts
+      // as "located" only if it had a usable before/after AND wasn't skipped.
+      const skippedBefores = new Set(result.skipped.map((s) => s.before));
+      // For an omission we struck the whole paragraph — report that full original
+      // as the "was", not the partial excerpt the AI quoted to anchor it.
+      const locatedByBefore = new Map(result.applied.map((a) => [a.before, a.locatedText]));
+      const changes: any[] = accepted.map((c: any) => {
+        const rawBefore = String(c.excerpt ?? "").trim();
+        const after = String(c.suggestion ?? "").trim();
+        const located = !!rawBefore && !!after && !skippedBefores.has(rawBefore);
+        const omitted = isOmissionSuggestion(after);
+        const before = omitted ? (locatedByBefore.get(rawBefore) ?? rawBefore) : rawBefore;
+        return { ref: c.ref, before, after, comment: String(c.comment ?? "").trim(), category: c.category ?? null, located, omitted };
+      });
+      unmatchedCount = changes.filter((ch) => !ch.located).length;
+      const appliedClauses: any[] = changes.map((ch) => ({
+        ref: ch.ref, excerpt: ch.after, severity: ch.located ? "compliant" : "caution", category: ch.category,
+        comment: ch.located
+          ? (ch.omitted ? `Clause omitted (was: "${String(ch.before).slice(0, 120)}…")` : `New term (replaced: "${String(ch.before).slice(0, 120)}")`)
+          : "Could not be located in the document — place this change manually.",
+        suggestion: "", accepted: true,
+      }));
+      // Clean text of the amended docx for the viewer + any re-analysis.
+      let amendedText = "";
+      try { amendedText = await docxToText(outBuffer); } catch { /* viewer re-extracts from file_url */ }
+      newReview = {
+        documentText: amendedText.slice(0, 200_000),
+        changes,
+        clauses: appliedClauses,
+        verdict: unmatchedCount ? "caution" : "compliant",
+        riskScore: 0,
+        exposure: { financial: "low", regulatory: "low", operational: "low", reputational: "low" },
+        summary: `Amended draft — ${appliedCount} change${appliedCount !== 1 ? "s" : ""} applied in place from the AI review${unmatchedCount ? `; ${unmatchedCount} could not be located and need manual placement` : ""}. Original formatting preserved. Re-run analysis to re-assess risk.`,
+        amendedFrom: doc.file_name,
+        inPlace: true,
+      };
+    } else {
+      // ── Text-level redline fallback (PDF / plain text) ─────────────────────
+      let sourceText = String(review?.documentText ?? "");
+      if (!sourceText.trim()) {
+        if (srcMime.includes("pdf") || /\.pdf($|\?)/i.test(doc.file_name)) {
+          const pages = await extractPdfPages(srcBuffer);
+          sourceText = pages.map((pg) => pg.text).filter(Boolean).join("\n\n");
+        } else {
+          sourceText = srcBuffer.toString("utf8");
+        }
+      }
+      if (!sourceText.trim()) throw new Error("Could not read the document text to apply changes.");
+
+      // Apply the accepted suggestions as a REDLINE: the old term is struck through
+      // and the new term inserted, so the amended draft shows exactly what changed.
+      // Four control-char markers delimit deletions and insertions.
+      const DEL_O = String.fromCharCode(1), DEL_C = String.fromCharCode(2);
+      const INS_O = String.fromCharCode(3), INS_C = String.fromCharCode(4);
+      // Locate each accepted clause with a whitespace/quote-insensitive match against a
+      // normalized copy of the source, then map back to the EXACT original span, so the
+      // redline replaces the clause in place instead of appending it at the bottom.
+      const { norm, map } = buildNormMap(sourceText);
+      let normMut = norm;
+      type Span = { start: number; end: number; before: string; after: string; comment: string; category: any; ref: string };
+      const spans: Span[] = [];
+      const unmatched: any[] = [];
+      for (const c of accepted) {
+        const suggestion = String(c.suggestion ?? "").trim();
+        const ne = normStr(String(c.excerpt ?? ""));
+        const found = locateClauseSpan(normMut, map, ne);
+        if (found) {
+          let s = found.origStart, e = found.origEnd;
+          // An omission strikes the whole clause, not just the quoted excerpt.
+          if (isOmissionSuggestion(suggestion)) {
+            const span = enclosingClauseSpan(sourceText, s, e);
+            s = span.start; e = span.end;
+          }
+          spans.push({ start: s, end: e, before: sourceText.slice(s, e), after: suggestion, comment: String(c.comment ?? "").trim(), category: c.category ?? null, ref: c.ref });
+          // blank the matched NORM region (same length) so a later clause can't re-match it
+          normMut = normMut.slice(0, found.normStart) + " ".repeat(found.normEnd - found.normStart) + normMut.slice(found.normEnd);
+        } else {
+          unmatched.push(c);
+        }
+      }
+
+      // Apply located replacements right-to-left so earlier offsets don't shift.
+      let redline = sourceText;
+      for (const sp of [...spans].sort((a, b) => b.start - a.start)) {
+        redline = redline.slice(0, sp.start) + DEL_O + sp.before + DEL_C + INS_O + sp.after + INS_C + redline.slice(sp.end);
+      }
+
+      // Change history in DOCUMENT order (located first, then any that had to be appended).
+      const located = [...spans].sort((a, b) => a.start - b.start);
+      const changes: any[] = located.map((sp) => ({ ref: sp.ref, before: sp.before, after: sp.after, comment: sp.comment, category: sp.category, located: true }));
+      for (const c of unmatched) {
+        changes.push({ ref: c.ref, before: String(c.excerpt ?? "").trim(), after: String(c.suggestion ?? "").trim(), comment: String(c.comment ?? "").trim(), category: c.category ?? null, located: false });
+      }
+      appliedCount = located.length;
+      unmatchedCount = unmatched.length;
+      const appliedClauses: any[] = changes.map((ch) => ({
+        ref: ch.ref, excerpt: ch.after, severity: ch.located ? "compliant" : "caution", category: ch.category,
+        comment: ch.located ? `New term (replaced: "${String(ch.before).slice(0, 120)}")` : "Appended (could not be located inline).",
+        suggestion: "", accepted: true,
+      }));
+      if (unmatchedCount) {
+        redline += "\n\n--- ADDITIONAL ACCEPTED AMENDMENTS ---\n" +
+          unmatched.map((c) => INS_O + `${c.ref}: ${String(c.suggestion ?? "").trim()}` + INS_C).join("\n");
+      }
+
+      // Clean amended text (deletions removed, insertions kept) — used for the clean
+      // view and for re-analysis of the draft.
+      const amendedPlain = redline
+        .replace(new RegExp(DEL_O + "[\\s\\S]*?" + DEL_C, "g"), "")
+        .split(INS_O).join("").split(INS_C).join("");
+
+      // Downloadable file: a clean, self-contained .docx with REAL Word tracked
+      // changes (no HTML .doc artefacts, no notice banner) — client-ready and
+      // editable. The in-app viewer still renders `redlineText` below.
+      outBuffer = buildRedlineDocx(redline, { author: userEmail ?? "Legal" });
+      outMime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+      ext = "docx";
+      newReview = {
+        documentText: amendedPlain.slice(0, 200_000),
+        redlineText: redline.slice(0, 250_000),
+        changes,
+        clauses: appliedClauses,
+        verdict: unmatchedCount ? "caution" : "compliant",
+        riskScore: 0,
+        exposure: { financial: "low", regulatory: "low", operational: "low", reputational: "low" },
+        summary: `Amended draft — ${appliedCount} change${appliedCount !== 1 ? "s" : ""} applied from the AI review${unmatchedCount ? `; ${unmatchedCount} appended for manual placement` : ""}. Re-run analysis to re-assess risk.`,
+        amendedFrom: doc.file_name,
+      };
+    }
 
     // Upload with a safe storage key; keep a human file name for display.
     const path = `legal/${Date.now()}-v${nextVersion}-amended.${ext}`;
     const up = await sb.storage.from("policies").upload(path, outBuffer, { upsert: false, contentType: outMime });
     if (up.error) throw new Error(`Upload failed: ${up.error.message}`);
     const fileUrl = sb.storage.from("policies").getPublicUrl(path).data.publicUrl;
-
-    // Synthetic review so the amended draft opens in the viewer with the redline +
-    // change history visible, without needing to re-run analysis.
-    const newReview = {
-      documentText: amendedPlain.slice(0, 200_000),
-      redlineText: redline.slice(0, 250_000),
-      changes,
-      clauses: appliedClauses,
-      verdict: unmatchedCount ? "caution" : "compliant",
-      riskScore: 0,
-      exposure: { financial: "low", regulatory: "low", operational: "low", reputational: "low" },
-      summary: `Amended draft — ${appliedCount} change${appliedCount !== 1 ? "s" : ""} applied from the AI review${unmatchedCount ? `; ${unmatchedCount} appended for manual placement` : ""}. Re-run analysis to re-assess risk.`,
-      amendedFrom: doc.file_name,
-    };
 
     const { data: newDoc, error: insErr } = await sb
       .from("legal_matter_documents")
@@ -1886,7 +2132,7 @@ export const generateProposedResponse = createServerFn({ method: "POST" })
       ? `\n\nKNOWLEDGE BASE (signed-off positions):\n${(kb ?? []).map((e: any) => `- ${e.title}: ${e.takeaways}`).join("\n")}`
       : "";
 
-    const prompt = `You are senior legal counsel AI for the Company — a Malaysian financial institution (also reused by other industries). Prepare a proposed advisory response for a legal manager to review, grounded in Malaysian law (Contracts Act 1950, PDPA 2010, Companies Act 2016; for financial services BNM policy, FSA 2013 / IFSA 2013, AMLA 2001) plus the knowledge base and precedents below.
+    const prompt = `You are the Head of Legal for the Company — a sophisticated corporate legal advisor, not sector-specific. Prepare a proposed advisory response for a legal manager to review, grounded in Malaysian law (Contracts Act 1950, PDPA 2010, Companies Act 2016) plus the knowledge base and precedents below, bringing in sector-specific rules (e.g. BNM policy, FSA 2013 / IFSA 2013, AMLA 2001) only if the matter itself indicates a regulated financial-services relationship.
 
 MATTER: ${m.title}
 DETAILS: ${m.description}${kbBlock}${precedentBlock}
@@ -2260,6 +2506,15 @@ export const recordShareDownload = createServerFn({ method: "POST" })
   .handler(async ({ data, context }) => {
     const sb = context.supabase as any;
     const { data: share } = await sb.from("legal_matter_shares").select("matter_id, recipient_name").eq("id", data.share_id).single();
+    if (!share) throw new Error("Share not found");
+    // Tenant boundary: a share id from another tenant must behave like a 404 —
+    // without this, any authenticated user could forge a download event and stamp
+    // downloaded_at on another tenant's share. (Tier-2 RLS isn't deployed yet, so
+    // this guard is the enforcement layer, matching every sibling mutation.)
+    if (share.matter_id) {
+      const { data: matterRow } = await sb.from("legal_matters").select("tenant_id").eq("id", share.matter_id).single();
+      assertRowTenant(matterRow?.tenant_id, (await getCallerTenant(context.userId)).tenantId);
+    }
     const { error } = await sb
       .from("legal_matter_shares")
       .update({ downloaded_at: new Date().toISOString() })

@@ -14,6 +14,7 @@ import {
   setV2FindingDecision,
   bulkSetV2FindingDecision,
   generateRestructuredV2Document,
+  applyFindingsInPlaceV2Report,
 } from "@/lib/compliance.functions";
 import { FINDING_CATEGORY_META, type Finding, type FindingSeverity } from "@/lib/recommend";
 import { Button } from "@/components/ui/button";
@@ -21,7 +22,7 @@ import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import {
   Check, X, RotateCcw, AlertTriangle, AlertOctagon, Info, CircleAlert,
-  Loader2, FileDown, Sparkles, Quote, Link2Off, ShieldCheck, ChevronDown,
+  Loader2, FileDown, Sparkles, Quote, Link2Off, ShieldCheck, ChevronDown, PenLine,
 } from "lucide-react";
 
 // ── severity presentation ────────────────────────────────────────────────────
@@ -319,24 +320,28 @@ function QuarantineGroup({ findings }: { findings: Finding[] }) {
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function RestructurePanel({
-  reportId, findings, restructure, onGenerated, onCompareToggle, comparing,
+  reportId, findings, restructure, apply, onGenerated, onApplied, onCompareToggle, comparing,
 }: {
   reportId: string;
   findings: Finding[];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   restructure: any | null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  apply: any | null;
   onGenerated: () => void;
+  onApplied: () => void;
   onCompareToggle: (on: boolean) => void;
   comparing: boolean;
 }) {
   const generate = useServerFn(generateRestructuredV2Document);
-  const [running, setRunning] = useState(false);
+  const applyInPlace = useServerFn(applyFindingsInPlaceV2Report);
+  const [running, setRunning] = useState<null | "redraft" | "apply">(null);
   const accepted = findings.filter(
     (f) => f.decision === "accepted" && f.verification.status !== "rejected",
   );
 
   async function run() {
-    setRunning(true);
+    setRunning("redraft");
     try {
       await generate({ data: { reportId } });
       toast.success("Restructured document generated");
@@ -344,7 +349,23 @@ export function RestructurePanel({
     } catch (e) {
       toast.error("Generation failed", { description: (e as Error)?.message });
     } finally {
-      setRunning(false);
+      setRunning(null);
+    }
+  }
+
+  async function runApply(exportMode: "clean" | "annotated") {
+    setRunning("apply");
+    try {
+      const r = await applyInPlace({ data: { reportId, exportMode } });
+      const skippedTotal = (r.skipped?.length ?? 0) + (r.ineligible?.length ?? 0);
+      toast.success(`Applied ${r.appliedCount}/${r.totalAccepted} accepted finding(s) in place`, {
+        description: skippedTotal > 0 ? `${skippedTotal} need manual review — see below.` : "Original formatting preserved exactly.",
+      });
+      onApplied();
+    } catch (e) {
+      toast.error("Apply failed", { description: (e as Error)?.message });
+    } finally {
+      setRunning(null);
     }
   }
 
@@ -352,31 +373,96 @@ export function RestructurePanel({
   const pct = preservation?.sourceClaims
     ? Math.round((preservation.preserved / preservation.sourceClaims) * 100)
     : null;
+  const needsReview = [...(apply?.ineligible ?? []), ...(apply?.skipped ?? [])];
 
   return (
     <div className="border-b bg-card/60 p-3 space-y-2.5 shrink-0">
       <div className="flex items-center gap-2">
         <Sparkles className="size-4 text-primary" />
-        <span className="text-sm font-semibold">Restructured document</span>
+        <span className="text-sm font-semibold">Apply accepted fixes</span>
       </div>
 
-      {!restructure && (
-        <>
-          {/* The action leads; the explanation follows. This is the primary
-              thing to do in Recommend & Edit, so it must be the first thing
-              the eye lands on — not a button under a paragraph. */}
-          <Button className="w-full h-9 text-sm font-semibold" disabled={accepted.length === 0 || running} onClick={run}>
-            {running ? (<><Loader2 className="size-4 mr-2 animate-spin" /> Generating — takes a few minutes…</>)
-              : accepted.length === 0 ? "Accept at least one finding first"
-              : `Generate redraft from ${accepted.length} finding${accepted.length === 1 ? "" : "s"}`}
-          </Button>
-          <p className="text-[11px] text-muted-foreground leading-relaxed">
-            Rebuilds the document body with every <b>accepted</b> fix applied, carrying over
-            the template, headers, footers, tables and figures. The body is regenerated, so
-            expect to re-apply house numbering and fine layout before issuing it. Every source
-            claim is checked against the output; losses are reported, never hidden.
-          </p>
-        </>
+      {/* Two ways to apply the same accepted findings: an in-place swap that
+          preserves the original document byte-for-byte outside the matched
+          sentences (same engine as Simplify mode), or a full section rebuild
+          that can resolve findings an in-place swap can't (insertions,
+          restructuring) at the cost of exact formatting fidelity. */}
+      <div className="space-y-1.5">
+        <Button
+          className="w-full h-9 text-sm font-semibold"
+          variant={apply ? "outline" : "default"}
+          disabled={accepted.length === 0 || running !== null}
+          onClick={() => runApply("clean")}
+        >
+          {running === "apply" ? (<><Loader2 className="size-4 mr-2 animate-spin" /> Applying…</>)
+            : apply ? (<><PenLine className="size-4 mr-2" /> Re-apply in place</>)
+            : accepted.length === 0 ? "Accept at least one finding first"
+            : `Apply ${accepted.length} finding${accepted.length === 1 ? "" : "s"} in place`}
+        </Button>
+        <p className="text-[11px] text-muted-foreground leading-relaxed">
+          Swaps each finding's quoted text for its fix directly in the original file — exact
+          original styling, headers and layout preserved. Findings that insert new content or
+          span multiple locations are skipped and listed for manual review, never guessed at.
+        </p>
+      </div>
+
+      <div className="space-y-1.5">
+        {/* The action leads; the explanation follows. */}
+        <Button
+          className="w-full h-9 text-sm font-semibold"
+          variant={restructure ? "outline" : "default"}
+          disabled={accepted.length === 0 || running !== null}
+          onClick={run}
+        >
+          {running === "redraft" ? (<><Loader2 className="size-4 mr-2 animate-spin" /> Generating — takes a few minutes…</>)
+            : restructure ? (<><RotateCcw className="size-4 mr-2" /> Regenerate redraft</>)
+            : accepted.length === 0 ? "Accept at least one finding first"
+            : `Generate redraft from ${accepted.length} finding${accepted.length === 1 ? "" : "s"}`}
+        </Button>
+        <p className="text-[11px] text-muted-foreground leading-relaxed">
+          Rebuilds the document body with every <b>accepted</b> fix applied, carrying over
+          the template, headers, footers, tables and figures. The body is regenerated, so
+          expect to re-apply house numbering and fine layout before issuing it. Every source
+          claim is checked against the output; losses are reported, never hidden.
+        </p>
+      </div>
+
+      {apply && (
+        <div className="space-y-2 rounded-lg border bg-card p-2.5">
+          <div className="text-xs font-semibold flex items-center gap-1.5">
+            <PenLine className="size-3.5 text-primary" /> In-place edit
+          </div>
+          <div className={cn("rounded-lg border px-2.5 py-2 text-xs",
+            needsReview.length === 0 ? "bg-emerald-50 border-emerald-200 text-emerald-800" : "bg-amber-50 border-amber-200 text-amber-800")}>
+            <div className="font-semibold">
+              {apply.appliedCount}/{apply.totalAccepted} accepted finding(s) applied
+            </div>
+            {needsReview.length > 0 && (
+              <details className="mt-1">
+                <summary className="cursor-pointer text-[11px] font-medium">{needsReview.length} need manual review</summary>
+                <ul className="mt-1 space-y-1">
+                  {needsReview.map((n, i) => (
+                    <li key={i} className="text-[11px] italic">
+                      {n.title ? `${n.title} — ` : ""}{n.reason ?? `"${n.before}" — not found in a single paragraph`}
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            )}
+          </div>
+          <div className="flex gap-1.5">
+            {apply.cleanUrl && (
+              <a href={apply.cleanUrl} target="_blank" rel="noreferrer" className="flex-1">
+                <Button size="sm" variant="outline" className="w-full h-7 px-2.5 text-xs">
+                  <FileDown className="size-3.5 mr-1" /> Clean copy
+                </Button>
+              </a>
+            )}
+            <Button size="sm" variant="outline" className="flex-1 h-7 px-2.5 text-xs" disabled={running !== null || accepted.length === 0} onClick={() => runApply("annotated")}>
+              <FileDown className="size-3.5 mr-1" /> {apply.annotatedUrl ? "Re-annotated copy" : "With comments"}
+            </Button>
+          </div>
+        </div>
       )}
 
       {restructure && (
@@ -465,10 +551,6 @@ export function RestructurePanel({
               </div>
             </details>
           )}
-
-          <Button size="sm" variant="ghost" className="w-full h-7 text-[11px] text-muted-foreground" disabled={running} onClick={run}>
-            {running ? (<><Loader2 className="size-3 mr-1 animate-spin" /> Regenerating…</>) : (<><RotateCcw className="size-3 mr-1" /> Regenerate from current decisions</>)}
-          </Button>
         </div>
       )}
     </div>

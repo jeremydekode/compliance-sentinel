@@ -637,6 +637,11 @@ export type SimplifyDocxEdit = {
   after: string;
   /** Optional context appended after "Before:" in the Word comment. */
   rationale?: string;
+  /** Replace the ENTIRE located paragraph, not just the `before` span. Used for
+   *  clause omissions / whole-clause rewrites: `before` only needs to anchor the
+   *  right paragraph, and the whole clause is struck and replaced with `after` —
+   *  so a partial quote can't leave a dangling fragment of the original sentence. */
+  replaceParagraph?: boolean;
   /** COMMENT-ONLY edit: no text change — attach `comment` to the paragraph whose
    *  drawing references `anchorRelId` (figures/charts can't be redlined). */
   commentOnly?: boolean;
@@ -648,6 +653,11 @@ export type SimplifyDocxResult = {
   buffer: Buffer;
   appliedCount: number;
   skipped: { reason: string; before: string }[];
+  /** One entry per applied text edit: the `before` that anchored, the `after`
+   *  inserted, and `locatedText` — the exact original span that was struck (the
+   *  whole paragraph for a replaceParagraph edit). Lets callers report the true
+   *  "was" in a change history instead of a partial excerpt. */
+  applied: { before: string; after: string; locatedText: string }[];
 };
 
 const COMMENTS_CTYPE =
@@ -690,6 +700,68 @@ function tolerantLocate(paraText: string, before: string): { start: number; end:
   if (at < 0) at = p.toLowerCase().indexOf(b.toLowerCase());
   if (at < 0) return null;
   return { start: at, end: at + b.length };
+}
+
+/**
+ * Whitespace-tolerant "does this paragraph hold this clause?" test — for
+ * WHOLE-PARAGRAPH replacements (omissions) only, where we just need to IDENTIFY
+ * the paragraph, not compute an exact span. `tolerantLocate` does an exact
+ * substring match (quotes/case only); a long omission excerpt drifts on a single
+ * tab→space or double space somewhere across its ~50 words and fails, silently
+ * skipping the deletion. Here both sides are whitespace-collapsed, and a
+ * distinctive prefix of the excerpt is tried as a fallback, so the clause still
+ * anchors. Short paragraphs are guarded against false "b contains p" matches.
+ */
+function paragraphContainsLoose(paraText: string, before: string): boolean {
+  const norm = (s: string) =>
+    (s ?? "").replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/\s+/g, " ").trim().toLowerCase();
+  const p = norm(paraText);
+  const b = norm(before);
+  if (p.length < 8 || b.length < 8) return false;
+  if (p.includes(b)) return true;              // paragraph holds the excerpt
+  if (p.length >= 40 && b.includes(p)) return true; // excerpt spans ≥ this paragraph
+  // Whitespace-AGNOSTIC compare: run extraction can glue a clause number to its
+  // text ("7.2The…" when a tab sits between runs) or drift a tab→space, so a
+  // single-space collapse still misses. Strip ALL whitespace and compare — a
+  // long excerpt is distinctive enough that collisions aren't a real risk.
+  const ps = p.replace(/\s/g, "");
+  const bs = b.replace(/\s/g, "");
+  if (bs.length >= 12 && (ps.includes(bs) || (ps.length >= 40 && bs.includes(ps)))) return true;
+  // Distinctive leading fragment of the excerpt (carries the clause number).
+  const words = b.split(" ");
+  for (const n of [12, 8, 6]) {
+    const frag = words.slice(0, n).join(" ").replace(/\s/g, "");
+    if (frag.length >= 18 && ps.includes(frag)) return true;
+  }
+  return false;
+}
+
+/**
+ * Whitespace/glue-tolerant span locator: finds `before` inside `paraText` and
+ * returns the ORIGINAL [start,end) span, even when run extraction dropped a tab
+ * (gluing a clause number to its text, "13.1The…") or drifted spacing — cases
+ * where `tolerantLocate`'s exact substring search fails and the edit gets
+ * skipped. It compares with ALL whitespace removed, keeping a map from each kept
+ * character back to its original index, so the redline still strikes the real
+ * text region. Used as the FALLBACK after an exact match fails, so precise sub-
+ * span swaps keep their exact fidelity when the exact match succeeds.
+ */
+function looseLocateSpan(paraText: string, before: string): { start: number; end: number } | null {
+  const q = (s: string) => s.replace(/[‘’]/g, "'").replace(/[“”]/g, '"').toLowerCase();
+  const pq = q(paraText); // 1:1 length with paraText (quote-swap + lowercase preserve length)
+  const kept: string[] = [];
+  const map: number[] = []; // index in `kept` → index in paraText
+  for (let i = 0; i < pq.length; i++) {
+    if (/\s/.test(pq[i])) continue;
+    kept.push(pq[i]);
+    map.push(i);
+  }
+  const p = kept.join("");
+  const b = q(before).replace(/\s+/g, "");
+  if (b.length < 8) return null;
+  const at = p.indexOf(b);
+  if (at < 0) return null;
+  return { start: map[at], end: map[at + b.length - 1] + 1 };
 }
 
 /**
@@ -967,6 +1039,7 @@ export function applySimplificationToDocx(
   let nextRevId = 1000; // <w:ins>/<w:del> revision ids (kept clear of any in the source)
   let appliedCount = 0;
   const skipped: { reason: string; before: string }[] = [];
+  const applied: { before: string; after: string; locatedText: string }[] = [];
 
   for (const edit of edits) {
     // ── Figure comment: anchor a Word comment on the paragraph containing the
@@ -1022,14 +1095,28 @@ export function applySimplificationToDocx(
       const paraText = getParagraphText(m[0]);
       if (!paraText) continue;
 
+      // Anchor `before` in this paragraph. Exact match first (best fidelity for a
+      // precise sub-span swap); on failure fall back to a whitespace/glue-tolerant
+      // locator, so an edit whose quote drifted on a dropped tab ("13.1The…") or
+      // stray space still lands instead of being skipped as "not located". For a
+      // whole-clause replacement (replaceParagraph — e.g. an omission) the span is
+      // the ENTIRE paragraph, so a partial `before` strikes the whole clause
+      // rather than leaving a dangling fragment.
+      const anchor = tolerantLocate(paraText, before) ?? looseLocateSpan(paraText, before);
+      let loc: { start: number; end: number };
+      if (edit.replaceParagraph) {
+        if (!anchor && !paragraphContainsLoose(paraText, before)) continue;
+        loc = { start: 0, end: paraText.length };
+      } else {
+        if (!anchor) continue;
+        loc = anchor;
+      }
+      const locatedText = paraText.slice(loc.start, loc.end);
+
       let newPara: string;
       if (mode === "clean") {
-        const loc = tolerantLocate(paraText, before);
-        if (!loc) continue;
         newPara = buildCleanParagraph(m[0], paraText, loc, edit.after ?? "");
       } else if (mode === "redline") {
-        const loc = tolerantLocate(paraText, before);
-        if (!loc) continue;
         newPara = buildRedlineParagraph(
           m[0], paraText, loc, edit.after ?? "", nextRevId++, nextRevId++, author, dateIso,
         );
@@ -1041,7 +1128,11 @@ export function applySimplificationToDocx(
           newPara = wrapParagraphWithComment(newPara, commentId);
         }
       } else {
-        const amended = tolerantReplace(paraText, before, edit.after ?? "");
+        // highlight mode: swap the located span, or the whole paragraph for an
+        // omission/whole-clause replacement.
+        const amended = edit.replaceParagraph
+          ? (edit.after ?? "")
+          : tolerantReplace(paraText, before, edit.after ?? "");
         if (amended === null) continue;
         const commentId = nextCommentId++;
         // 8-char hex paraId — unique per comment, matches what commentsExtended uses.
@@ -1049,14 +1140,15 @@ export function applySimplificationToDocx(
         paraIds.push(paraId);
         newPara = buildHighlightedParaWithComment(amended, commentId);
         const commentContent = edit.rationale
-          ? `Before: ${before}\n\n${edit.rationale}`
-          : `Before: ${before}`;
+          ? `Before: ${locatedText}\n\n${edit.rationale}`
+          : `Before: ${locatedText}`;
         commentEntries.push(buildCommentEntry(commentId, commentContent, author, dateIso, paraId));
       }
 
       documentXml =
         documentXml.slice(0, m.index) + newPara + documentXml.slice(m.index + m[0].length);
       appliedCount++;
+      applied.push({ before, after: edit.after ?? "", locatedText });
       matched = true;
       break; // next edit re-walks from the start (indices shifted)
     }
@@ -1067,7 +1159,7 @@ export function applySimplificationToDocx(
   if (commentEntries.length > 0) attachComments(zip, commentEntries, paraIds);
 
   const out = zip.generate({ type: "nodebuffer", compression: "DEFLATE" }) as Buffer;
-  return { buffer: out, appliedCount, skipped };
+  return { buffer: out, appliedCount, skipped, applied };
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1240,5 +1332,83 @@ export function rebuildDocxBody(
   zip.file("word/document.xml", newXml);
   if (commentEntries.length > 0) attachComments(zip, commentEntries, paraIds);
 
+  return zip.generate({ type: "nodebuffer", compression: "DEFLATE" }) as Buffer;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// FROM-SCRATCH REDLINE DOCX
+// Builds a clean, self-contained .docx (real Word tracked changes) from an
+// amended-text redline string — used when there is NO source DOCX to preserve
+// (e.g. the original was a PDF or plain text). The redline string uses four
+// control-char markers to delimit deletions and insertions:
+//   \x01 …deleted… \x02   and   \x03 …inserted… \x04
+// Deletions become <w:del>/<w:delText> (red strikethrough in Word); insertions
+// become <w:ins>/<w:t> (underlined). The result is a valid, editable Word
+// document in Calibri 11 with 1" margins — presentable to a client, no HTML
+// artefacts, no notice banners.
+// ════════════════════════════════════════════════════════════════════════════
+
+export function buildRedlineDocx(redline: string, opts: { author?: string } = {}): Buffer {
+  const author = escapeXml((opts.author ?? "AI Document Workflow").slice(0, 60));
+  const dateIso = new Date().toISOString();
+  const D_O = String.fromCharCode(1), D_C = String.fromCharCode(2);
+  const I_O = String.fromCharCode(3), I_C = String.fromCharCode(4);
+
+  type Run = { mode: "text" | "del" | "ins"; text: string };
+  const paragraphs: Run[][] = [];
+  let cur: Run[] = [];
+  let mode: "text" | "del" | "ins" = "text";
+  let buf = "";
+  const flush = () => { if (buf) { cur.push({ mode, text: buf }); buf = ""; } };
+  for (const ch of redline) {
+    if (ch === D_O) { flush(); mode = "del"; }
+    else if (ch === D_C) { flush(); mode = "text"; }
+    else if (ch === I_O) { flush(); mode = "ins"; }
+    else if (ch === I_C) { flush(); mode = "text"; }
+    else if (ch === "\n") { flush(); paragraphs.push(cur); cur = []; }
+    else if (ch === "\r") { /* drop CR */ }
+    else { buf += ch; }
+  }
+  flush();
+  paragraphs.push(cur);
+
+  let revId = 1;
+  const pXml = paragraphs.map((runs) => {
+    if (runs.length === 0) return "<w:p/>";
+    const runsXml = runs.map((r) => {
+      if (!r.text) return "";
+      const t = escapeXml(r.text);
+      if (r.mode === "del") {
+        return `<w:del w:id="${revId++}" w:author="${author}" w:date="${dateIso}"><w:r><w:delText xml:space="preserve">${t}</w:delText></w:r></w:del>`;
+      }
+      if (r.mode === "ins") {
+        return `<w:ins w:id="${revId++}" w:author="${author}" w:date="${dateIso}"><w:r><w:t xml:space="preserve">${t}</w:t></w:r></w:ins>`;
+      }
+      return `<w:r><w:t xml:space="preserve">${t}</w:t></w:r>`;
+    }).join("");
+    return `<w:p>${runsXml}</w:p>`;
+  }).join("");
+
+  const documentXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>${pXml}<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/></w:sectPr></w:body></w:document>`;
+
+  const contentTypes = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/></Types>`;
+
+  const rels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>`;
+
+  const docRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`;
+
+  const styles = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after="160" w:line="259" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults></w:styles>`;
+
+  const zip = new PizZip();
+  zip.file("[Content_Types].xml", contentTypes);
+  zip.file("_rels/.rels", rels);
+  zip.file("word/_rels/document.xml.rels", docRels);
+  zip.file("word/document.xml", documentXml);
+  zip.file("word/styles.xml", styles);
   return zip.generate({ type: "nodebuffer", compression: "DEFLATE" }) as Buffer;
 }

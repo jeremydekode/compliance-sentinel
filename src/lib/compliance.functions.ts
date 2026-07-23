@@ -7,8 +7,9 @@ import { attachEvidence } from "./credit-evidence";
 import PizZip from "pizzip";
 import { applyEditsToDocx, looksLikeDocx, docxToText, docxToHtml, docxToSimplifyText, docxToSimplifyUnits, docxToStructuredUnits, dominantBodyProps, extractDocxFigures, applySimplificationToDocx, rebuildDocxBody, type SimplifyDocxEdit } from "./docx-editor";
 import { verifyActions, analyzeStructure, crossCheckSections, DEFAULT_SIMPLIFY_GUIDANCE, AGGRESSIVE_SIMPLIFY_ADDENDUM, initialDecision } from "./simplify";
-import type { VerificationSummary, DocStructure, SectionCrossCheck } from "./simplify";
-import { runAuditPipeline, countFindings, generateRestructured, generateDocumentFromBrief, DEFAULT_RECOMMEND_GUIDANCE, type Finding, type ClaimUnit } from "./recommend";
+import type { VerificationSummary, DocStructure, SectionCrossCheck, VerifiedAction } from "./simplify";
+import { runAuditPipeline, countFindings, generateRestructured, generateDocumentFromBrief, DEFAULT_RECOMMEND_GUIDANCE, proposeTargetedEdits, verifyFindings, type Finding, type ClaimUnit, type FindingCategory, type FindingSeverity } from "./recommend";
+import type { SimplificationAction } from "./gemini";
 import { getCallerTenant, assertRowTenant, ALL_TENANT_FEATURES } from "./tenant.functions";
 import { computeCost, addUsage, type RunCost } from "./pricing";
 import {
@@ -5027,6 +5028,101 @@ export const updateV2ActionAfter = createServerFn({ method: "POST" })
     return { ok: true };
   });
 
+/** Reviewer-driven "Edit with AI": scans the whole source document for
+ *  passages relevant to a free-text instruction and appends verified
+ *  candidates as new actions/findings (mode-dependent), same trust
+ *  boundary as the initial run — nothing reaches the reviewer ungrounded. */
+export const requestTargetedEdit = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    z.object({
+      reportId: z.string(),
+      instruction: z.string().min(3).max(2000),
+    }),
+  )
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report, error } = await (supabase as any)
+      .from("analysis_reports").select("*").eq("id", data.reportId).single();
+    if (error || !report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, (await getCallerTenant(context.userId)).tenantId);
+    if (!report.source_file_url) throw new Error("Report has no source file");
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const prevJson = ((report.summary_json as any) ?? {}) as Record<string, any>;
+    const workflowMode: string = prevJson.workflow_mode ?? "simplify";
+    const title = (report.policy_name as string) ?? "Document";
+
+    const src = await readV2Source(report.source_file_url);
+    const { candidates } = await proposeTargetedEdits(title, src.text, data.instruction);
+    if (candidates.length === 0) {
+      throw new Error("Nothing in the document matched that request — try rephrasing or pointing to a specific section.");
+    }
+
+    if (workflowMode === "simplify") {
+      const newActions: SimplificationAction[] = candidates.map((c) => ({
+        section: c.section,
+        type: "plain_english",
+        before: c.quote,
+        after: c.suggestion,
+        rule: "User-requested edit",
+        rationale: c.rationale,
+        confidence: c.confidence,
+      }));
+      const verified = verifyActions(newActions, src.text);
+      const acceptedVerified = verified.actions.filter((a) => a.verification.status !== "rejected");
+      if (acceptedVerified.length === 0) {
+        throw new Error("The AI's suggestion couldn't be verified against the document — try rephrasing your request.");
+      }
+      const existingActions: VerifiedAction[] = Array.isArray(prevJson.actions) ? prevJson.actions : [];
+      const added = acceptedVerified.map((a) => ({ ...a, decision: initialDecision(a) }));
+      const merged = [...existingActions, ...added];
+      // Adding an edit changes the action set, so any prior export/restructure is
+      // now stale (its download wouldn't include this edit) — clear them, exactly
+      // as a re-run does, so no mismatched artefact survives next to fresh results.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { error: upErr } = await (supabase as any)
+        .from("analysis_reports")
+        .update({ summary_json: { ...prevJson, actions: merged, apply: null, restructure: null } })
+        .eq("id", report.id);
+      if (upErr) throw new Error(`Failed to save edit: ${upErr.message}`);
+      return { addedIndexes: added.map((_, i) => existingActions.length + i) };
+    } else {
+      const newFindings: Finding[] = candidates.map((c, i) => ({
+        id: `AI-${Date.now()}-${i}`,
+        category: "user_requested" as FindingCategory,
+        severity: "info" as FindingSeverity,
+        title: c.rationale || "Requested edit",
+        description: c.rationale,
+        evidence: [{ section: c.section, quote: c.quote }],
+        suggestedFix: c.suggestion,
+        confidence: c.confidence,
+        source: "llm" as const,
+        verification: { status: "review" as const },
+        decision: "pending" as const,
+      }));
+      const { findings: verified } = await verifyFindings(newFindings, src.text);
+      const survivors = verified.filter((f) => f.verification.status !== "rejected");
+      if (survivors.length === 0) {
+        throw new Error("The AI's suggestion couldn't be verified against the document — try rephrasing your request.");
+      }
+      const existingFindings: Finding[] = Array.isArray(prevJson.findings) ? prevJson.findings : [];
+      const merged = [...existingFindings, ...survivors];
+      // Adding a finding changes the finding set, so a prior in-place export or
+      // redraft is now stale (wouldn't include this finding) — clear them, exactly
+      // as a re-run does, so no mismatched artefact survives next to fresh results.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { error: upErr } = await (supabase as any)
+        .from("analysis_reports")
+        .update({ summary_json: { ...prevJson, findings: merged, apply: null, restructure: null } })
+        .eq("id", report.id);
+      if (upErr) throw new Error(`Failed to save edit: ${upErr.message}`);
+      return { addedIds: survivors.map((f) => f.id) };
+    }
+  });
+
 /** Bulk Accept/Dismiss/Pending over findings — optionally scoped to ids.
  *  Quarantined findings are never touched. */
 export const bulkSetV2FindingDecision = createServerFn({ method: "POST" })
@@ -5137,14 +5233,136 @@ export const applySimplifyV2Report = createServerFn({ method: "POST" })
     if (up.error) throw new Error(`Storage upload failed: ${up.error.message}`);
     const downloadUrl = supabase.storage.from("policies").getPublicUrl(path).data.publicUrl;
 
+    // Keep the OTHER export mode's copy only if it was built from the same
+    // accepted set (reviewer may want both clean + tracked-changes). If the
+    // accepted actions changed since, both prior URLs are dropped as stale.
+    // `sig` fingerprints the accepted set by original action index.
+    const sig = allActions.map((a, i) => (a?.decision === "accepted" ? i : -1)).filter((i) => i >= 0).join(",");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const prevApply = (sj.apply ?? {}) as Record<string, any>;
+    const carry = prevApply.sig === sig ? prevApply : {};
+    const isClean = data.exportMode === "clean";
     const apply = {
-      ...(sj.apply ?? {}),
+      ...carry,
       kind: "local" as const,
-      [data.exportMode === "clean" ? "cleanUrl" : "annotatedUrl"]: downloadUrl,
-      [`${data.exportMode}Name`]: `${safeName}-${data.exportMode}.docx`,
+      sig,
+      [isClean ? "cleanUrl" : "annotatedUrl"]: downloadUrl,
+      [isClean ? "cleanName" : "annotatedName"]: `${safeName}-${data.exportMode}.docx`,
       appliedCount: result.appliedCount,
       totalAccepted: accepted.length,
       skipped: result.skipped,
+      appliedAt: new Date().toISOString(),
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase as any)
+      .from("analysis_reports")
+      .update({ summary_json: { ...sj, apply } })
+      .eq("id", report.id);
+    return apply;
+  });
+
+/**
+ * Recommend & Edit — RHB-style alternative to the full redraft. Applies each
+ * accepted finding's evidence quote → suggestedFix as an in-place edit into
+ * the ORIGINAL docx, via the exact same engine as Simplify mode — so the
+ * original package (logo, headers, styles, tables) is preserved untouched.
+ * Only findings with ONE evidence quote confined to a single paragraph
+ * qualify for a clean swap: "incompleteness" findings describe content to
+ * INSERT (no real "before" to replace), and contradiction/redundancy findings
+ * carry evidence from two different locations. Those are skipped and reported
+ * for manual review rather than guessed at — same for any quote the apply
+ * engine can't anchor (e.g. one spanning a paragraph boundary).
+ */
+export const applyFindingsInPlaceV2Report = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(z.object({
+    reportId: z.string(),
+    exportMode: z.enum(["clean", "annotated"]),
+  }))
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    const { data: report, error: repErr } = await supabase
+      .from("analysis_reports").select("*").eq("id", data.reportId).single();
+    if (repErr || !report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, (await getCallerTenant(context.userId)).tenantId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sj = ((report.summary_json as any) ?? {}) as Record<string, any>;
+    const allFindings: Finding[] = Array.isArray(sj.findings) ? sj.findings : [];
+    const accepted = allFindings.filter((f) => f.decision === "accepted" && f.verification.status !== "rejected");
+    if (accepted.length === 0) throw new Error("No accepted findings to apply.");
+    if (!report.source_file_url) throw new Error("Report has no source file URL");
+
+    const file = await fetchFile(report.source_file_url);
+    if (!looksLikeDocx(file.mimeType, report.source_file_url)) {
+      throw new Error("Export currently supports DOCX sources only. For PDFs, re-upload as DOCX.");
+    }
+
+    const ineligible: { id: string; title: string; reason: string }[] = [];
+    const eligible = accepted.filter((f) => {
+      if (f.category === "incompleteness") {
+        ineligible.push({ id: f.id, title: f.title, reason: "Inserts new content — no single passage to replace" });
+        return false;
+      }
+      if (f.evidence.length !== 1) {
+        ineligible.push({ id: f.id, title: f.title, reason: "Evidence spans multiple locations in the document" });
+        return false;
+      }
+      // An empty fix would replace the quoted clause with nothing — a silent
+      // deletion, never what a reviewer means by an in-place edit. Skip it.
+      if (!f.suggestedFix?.trim()) {
+        ineligible.push({ id: f.id, title: f.title, reason: "No replacement text on the finding — nothing to apply" });
+        return false;
+      }
+      if (!f.evidence[0]?.quote?.trim()) {
+        ineligible.push({ id: f.id, title: f.title, reason: "No quoted passage to locate in the document" });
+        return false;
+      }
+      return true;
+    });
+
+    const title = (report.policy_name as string) ?? "Document";
+    const edits: SimplifyDocxEdit[] = eligible.map((f) => ({
+      before: f.evidence[0].quote,
+      after: f.suggestedFix,
+      rationale: f.title || f.description || undefined,
+    }));
+
+    const result = applySimplificationToDocx(file.buffer, edits, {
+      author: "AI Document Workflow",
+      mode: data.exportMode === "clean" ? "clean" : "redline",
+      redlineComments: data.exportMode === "annotated",
+    });
+
+    const safeName = title.replace(/[^A-Za-z0-9_.-]+/g, "_").slice(0, 80) || "amended";
+    const path = `simplify-v2/${data.exportMode}-${Date.now()}-${safeName}.docx`;
+    const up = await supabase.storage.from("policies").upload(path, result.buffer, {
+      upsert: false,
+      contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    });
+    if (up.error) throw new Error(`Storage upload failed: ${up.error.message}`);
+    const downloadUrl = supabase.storage.from("policies").getPublicUrl(path).data.publicUrl;
+
+    // Keep the OTHER export mode's copy only if it was built from the exact same
+    // accepted set (so a reviewer can hold both clean + tracked-changes). If the
+    // accepted findings changed since, its download would be stale/mismatched, so
+    // both prior URLs are dropped. `sig` fingerprints the accepted set.
+    const sig = accepted.map((f) => f.id).sort().join(",");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const prevApply = (sj.apply ?? {}) as Record<string, any>;
+    const carry = prevApply.sig === sig ? prevApply : {};
+    const isClean = data.exportMode === "clean";
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const apply: Record<string, any> = {
+      ...carry,
+      kind: "local" as const,
+      sig,
+      [isClean ? "cleanUrl" : "annotatedUrl"]: downloadUrl,
+      [isClean ? "cleanName" : "annotatedName"]: `${safeName}-${data.exportMode}.docx`,
+      appliedCount: result.appliedCount,
+      totalAccepted: accepted.length,
+      skipped: result.skipped,
+      ineligible,
       appliedAt: new Date().toISOString(),
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

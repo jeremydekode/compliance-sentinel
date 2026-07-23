@@ -7,7 +7,8 @@
 // ============================================================================
 
 import { useRef, useState, useEffect } from "react";
-import { useNavigate } from "@tanstack/react-router";
+import { useNavigate, useParams, useRouterState } from "@tanstack/react-router";
+import { useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
 import { rudyChat, type RudyAction, type RudyReply } from "@/lib/rudy.functions";
 import { createSimplifyV2Report } from "@/lib/compliance.functions";
@@ -53,7 +54,21 @@ export function RudyChat() {
   const [confirming, setConfirming] = useState(false);
   const [attachment, setAttachment] = useState<Attachment | null>(null);
   const [uploading, setUploading] = useState(false);
+  const [hintDismissed, setHintDismissed] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+
+  // Page-sensitive context: when the user is on a Legal CMS review screen, Rudy
+  // answers about THAT document directly (its risks/clauses/amendments) — no
+  // "which document?" round-trip. The name is read from the review query cache
+  // that page already populated, so there's no extra fetch just to label it.
+  const pathname = useRouterState({ select: (s) => s.location.pathname });
+  const routeParams = useParams({ strict: false }) as Record<string, string | undefined>;
+  const qc = useQueryClient();
+  const legalDocId = /^\/legal\/review\//.test(pathname) ? routeParams.documentId ?? null : null;
+  const docContext = legalDocId ? ({ kind: "legal_document" as const, id: legalDocId }) : null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const cachedLegalDoc = legalDocId ? (qc.getQueryData(["legal-doc", legalDocId]) as any) : null;
+  const contextDocName: string | null = cachedLegalDoc?.document?.file_name ?? null;
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -101,6 +116,7 @@ export function RudyChat() {
           message: text,
           history,
           ...(attachment ? { fileUrl: attachment.fileUrl, filename: attachment.filename } : {}),
+          ...(docContext ? { context: docContext } : {}),
         },
       });
       setMessages((m) => [...m, { role: "assistant", content: r.reply, action: r.action, resolvedDoc: r.resolvedDoc }]);
@@ -171,25 +187,50 @@ export function RudyChat() {
     setAttachment(null);
   }
 
-  const display: Msg[] = messages.length === 0 ? [{ role: "assistant", content: GREETING }] : messages;
+  // When the user is reviewing a document, greet with that context so it's clear
+  // Rudy already knows what they're looking at.
+  const greeting = docContext
+    ? `Hi, I'm **Rudy**. You're reviewing **${contextDocName ?? "this document"}** — ask me anything about it: its key risks, a specific clause, what was changed, or how it compares to your policies.`
+    : GREETING;
+  const display: Msg[] = messages.length === 0 ? [{ role: "assistant", content: greeting }] : messages;
 
   return (
     <>
-      {/* floating button */}
+      {/* floating button (+ a page-context hint bubble when reviewing a document) */}
       {!open && (
-        <button
-          onClick={() => setOpen(true)}
-          title={`Rudy · ${auth.tenant.name}`}
-          className="fixed bottom-5 right-5 z-40 flex items-center gap-2 rounded-full bg-primary text-primary-foreground shadow-lg shadow-primary/30 pl-3 pr-4 py-2.5 text-sm font-semibold transition-transform hover:scale-105 active:scale-95"
-        >
-          <Bot className="size-5" />
-          Ask Rudy
-        </button>
+        <div className="fixed bottom-5 right-5 z-40 flex flex-col items-end gap-2">
+          {docContext && !hintDismissed && (
+            <div className="relative max-w-[240px] rounded-2xl rounded-br-sm border bg-card px-3.5 py-2.5 pr-7 text-xs leading-relaxed shadow-lg animate-in fade-in slide-in-from-bottom-2">
+              <button
+                onClick={(e) => { e.stopPropagation(); setHintDismissed(true); }}
+                className="absolute top-1.5 right-1.5 p-0.5 rounded hover:bg-muted text-muted-foreground"
+                title="Dismiss"
+              >
+                <X className="size-3" />
+              </button>
+              <button onClick={() => setOpen(true)} className="text-left block">
+                <span className="font-semibold">Ask me anything about this document</span>
+                <span className="block text-muted-foreground mt-0.5">Its risks, a specific clause, what changed…</span>
+              </button>
+            </div>
+          )}
+          <button
+            onClick={() => setOpen(true)}
+            title={`Rudy · ${auth.tenant.name}`}
+            className={cn(
+              "flex items-center gap-2 rounded-full bg-primary text-primary-foreground shadow-lg shadow-primary/30 pl-3 pr-4 py-2.5 text-sm font-semibold transition-transform hover:scale-105 active:scale-95",
+              docContext && !hintDismissed && "ring-2 ring-primary/30",
+            )}
+          >
+            <Bot className="size-5" />
+            {docContext ? "Ask about this document" : "Ask Rudy"}
+          </button>
+        </div>
       )}
 
       {/* slide-over panel */}
       {open && (
-        <div className="fixed bottom-5 right-5 z-40 flex h-[600px] max-h-[80vh] w-[400px] max-w-[calc(100vw-2.5rem)] flex-col rounded-2xl border bg-card shadow-2xl overflow-hidden">
+        <div className="fixed bottom-5 right-5 z-40 flex h-[760px] max-h-[88vh] w-[520px] max-w-[calc(100vw-2.5rem)] flex-col rounded-2xl border bg-card shadow-2xl overflow-hidden">
           {/* header */}
           <div className="flex items-center gap-2.5 border-b bg-sidebar px-4 py-3 text-sidebar-foreground">
             <div className="size-8 rounded-lg bg-sidebar-primary/20 grid place-items-center ring-1 ring-sidebar-primary/30">
@@ -204,6 +245,14 @@ export function RudyChat() {
             </button>
           </div>
 
+          {/* page-context bar — makes it explicit which document Rudy is answering about */}
+          {docContext && (
+            <div className="flex items-center gap-1.5 border-b bg-primary/5 px-4 py-1.5 text-[11px] text-foreground/80">
+              <FileText className="size-3 text-primary shrink-0" />
+              <span className="truncate">Answering about <span className="font-semibold">{contextDocName ?? "this document"}</span></span>
+            </div>
+          )}
+
           {/* messages */}
           <div className="flex-1 overflow-y-auto px-3 py-3 space-y-3 bg-muted/20">
             {display.map((m, i) => (
@@ -215,7 +264,22 @@ export function RudyChat() {
                     : "bg-card border rounded-bl-sm",
                 )}>
                   {m.role === "assistant" ? (
-                    <div className="prose prose-sm max-w-none [&_p]:my-1 [&_ul]:my-1 [&_li]:my-0 text-sm">
+                    // Explicit markdown styling — this project has no tailwind
+                    // typography plugin, and preflight strips list bullets/indent,
+                    // so `prose` alone renders a wall of text. space-y gaps the
+                    // top-level blocks; list-disc + pl restore real bullets.
+                    <div className={cn(
+                      "text-sm leading-relaxed [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
+                      "[&_p]:my-2",
+                      "[&_ul]:my-2 [&_ul]:list-disc [&_ul]:pl-5",
+                      "[&_ol]:my-2 [&_ol]:list-decimal [&_ol]:pl-5",
+                      "[&_li]:pl-0.5 [&_li+li]:mt-1 [&_li>p]:my-0 [&_li]:marker:text-muted-foreground",
+                      "[&_strong]:font-semibold [&_strong]:text-foreground",
+                      "[&_h1]:text-sm [&_h1]:font-bold [&_h1]:mt-2 [&_h1]:mb-1",
+                      "[&_h2]:text-sm [&_h2]:font-bold [&_h2]:mt-2 [&_h2]:mb-1",
+                      "[&_h3]:text-[13px] [&_h3]:font-semibold [&_h3]:mt-2 [&_h3]:mb-1",
+                      "[&_a]:text-primary [&_a]:underline [&_a]:underline-offset-2",
+                    )}>
                       <ReactMarkdown>{m.content}</ReactMarkdown>
                     </div>
                   ) : (

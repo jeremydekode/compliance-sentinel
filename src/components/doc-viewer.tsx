@@ -40,6 +40,11 @@ interface DocViewerProps {
   onSelect?: (id: string) => void;
   /** Reports which highlight ids anchored successfully. */
   onAnchorStatus?: (status: AnchorStatus) => void;
+  /** Render Word tracked changes (`<w:ins>`/`<w:del>`) inline as a visible
+   *  redline — struck-through deletions + highlighted insertions. Use for an
+   *  amended draft so reviewers see exactly what changed on top of the original
+   *  document. Off by default (the source doc renders clean). */
+  renderChanges?: boolean;
   className?: string;
 }
 
@@ -167,6 +172,7 @@ export function DocViewer({
   activeId,
   onSelect,
   onAnchorStatus,
+  renderChanges = false,
   className,
 }: DocViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -228,6 +234,9 @@ export function DocViewer({
           inWrapper: true,
           ignoreLastRenderedPageBreak: true,
           experimental: true,
+          // Amended drafts carry real Word tracked changes; render them so the
+          // redline (struck deletions + inserted new wording) shows in-document.
+          renderChanges,
         });
         if (cancelled) return;
         naturalPageWidthRef.current = null;
@@ -242,7 +251,7 @@ export function DocViewer({
     setPhase("loading");
     render();
     return () => { cancelled = true; };
-  }, [fileUrl, fallbackText]);
+  }, [fileUrl, fallbackText, renderChanges]);
 
   // 2 — anchor highlights over the rendered content (Custom Highlight API).
   useEffect(() => {
@@ -333,7 +342,16 @@ export function DocViewer({
       <div
         ref={containerRef}
         onClick={handleClick}
-        className={cn("doc-viewer-pages py-6 [&_.docx-wrapper]:bg-transparent [&_.docx-wrapper]:p-0 [&_.docx-wrapper>section.docx]:shadow-md [&_.docx-wrapper>section.docx]:mx-auto [&_.docx-wrapper>section.docx]:mb-6", phase !== "docx" && "hidden")}
+        className={cn(
+          "doc-viewer-pages py-6 [&_.docx-wrapper]:bg-transparent [&_.docx-wrapper]:p-0 [&_.docx-wrapper>section.docx]:shadow-md [&_.docx-wrapper>section.docx]:mx-auto [&_.docx-wrapper>section.docx]:mb-6",
+          // Tracked-change redline styling (renderChanges): deletions struck in
+          // red, insertions highlighted green. Scoped to the rendered page so it
+          // never touches the app chrome. The page is always white, so fixed
+          // red/green reads correctly in either app theme.
+          "[&_del]:text-red-600 [&_del]:line-through [&_del]:decoration-red-400 [&_del]:bg-red-50",
+          "[&_ins]:text-emerald-700 [&_ins]:no-underline [&_ins]:font-semibold [&_ins]:bg-emerald-100/70 [&_ins]:rounded-sm",
+          phase !== "docx" && "hidden",
+        )}
       />
       {phase === "text" && (
         <div className="mx-auto max-w-3xl bg-card border rounded-xl shadow-sm my-6 p-8">

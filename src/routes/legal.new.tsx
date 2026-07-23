@@ -130,18 +130,33 @@ function NewLegalMatter() {
 
   async function openRequest(payload: DraftPayload, files: File[]) {
     setPhase("Opening request — AI screening, routing & triage…");
-    try {
-      const matter: any = await createFn({ data: { ...payload, has_attachments: files.length > 0 } });
 
-      const uploaded: any[] = [];
-      for (const file of files) {
+    // Create the matter first. If THIS fails, nothing was persisted, so it's safe
+    // to bounce back to the form and let the user retry.
+    let matter: any;
+    try {
+      matter = await createFn({ data: { ...payload, has_attachments: files.length > 0 } });
+    } catch (e: any) {
+      toast.error(e?.message ?? "Failed to open the request");
+      setPhase(null);
+      return;
+    }
+
+    // The matter now EXISTS. From here we never send the user back to the form —
+    // doing so would leave this matter orphaned and create a DUPLICATE on retry.
+    // A failed upload/attach is collected and reported; the user still lands on
+    // the matter and can re-add the file there.
+    const uploaded: any[] = [];
+    const failedFiles: string[] = [];
+    for (const file of files) {
+      try {
         setPhase(`Uploading ${file.name}…`);
         const path = `legal/${Date.now()}-${file.name}`;
         const up = await supabase.storage.from("policies").upload(path, file, {
           upsert: false,
           contentType: file.type || "application/octet-stream",
         });
-        if (up.error) throw new Error(`Upload failed: ${up.error.message}`);
+        if (up.error) throw new Error(up.error.message);
         const fileUrl = supabase.storage.from("policies").getPublicUrl(path).data.publicUrl;
         const doc = await attachFn({
           data: {
@@ -154,25 +169,30 @@ function NewLegalMatter() {
           },
         });
         uploaded.push(doc);
+      } catch {
+        failedFiles.push(file.name);
       }
-
-      // Clause-by-clause first cut on each submitted document
-      for (const doc of uploaded) {
-        setPhase(`AI reviewing ${doc.file_name} clause-by-clause…`);
-        try {
-          await reviewFn({ data: { document_id: doc.id } });
-        } catch (e: any) {
-          toast.warning(`AI review of ${doc.file_name} failed — you can re-run it from the matter page.`);
-        }
-      }
-
-      queryClient.invalidateQueries({ queryKey: ["legal-matters"] });
-      toast.success(`Matter ${matter.reference_number ?? ""} opened — Route ${matter.route}`);
-      navigate({ to: "/legal/$matterId", params: { matterId: matter.id } });
-    } catch (e: any) {
-      toast.error(e?.message ?? "Failed to open the request");
-      setPhase(null);
     }
+
+    // Clause-by-clause first cut on each successfully-attached document
+    for (const doc of uploaded) {
+      setPhase(`AI reviewing ${doc.file_name} clause-by-clause…`);
+      try {
+        await reviewFn({ data: { document_id: doc.id } });
+      } catch {
+        toast.warning(`AI review of ${doc.file_name} failed — you can re-run it from the matter page.`);
+      }
+    }
+
+    queryClient.invalidateQueries({ queryKey: ["legal-matters"] });
+    if (failedFiles.length > 0) {
+      toast.warning(
+        `Matter ${matter.reference_number ?? ""} opened, but ${failedFiles.length} attachment${failedFiles.length === 1 ? "" : "s"} failed to upload (${failedFiles.join(", ")}). Re-add ${failedFiles.length === 1 ? "it" : "them"} from the matter page.`,
+      );
+    } else {
+      toast.success(`Matter ${matter.reference_number ?? ""} opened — Route ${matter.route}`);
+    }
+    navigate({ to: "/legal/$matterId", params: { matterId: matter.id } });
   }
 
   return (
@@ -875,7 +895,7 @@ function FormIntake({
 
             <div>
               <label className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">
-                Describe your request
+                Describe your request <span className="normal-case font-normal opacity-60">(at least a full sentence — ~5 words)</span>
               </label>
               <textarea
                 value={description}
@@ -884,6 +904,9 @@ function FormIntake({
                 placeholder="What do you need from Legal? Include counterparty names, deadlines, commercial context…"
                 className="mt-1.5 w-full rounded-lg border bg-background px-3 py-2 text-sm leading-relaxed resize-y focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-400"
               />
+              {description.trim().length > 0 && description.trim().length < 10 && (
+                <p className="text-[10px] text-amber-600 mt-1">A bit more detail needed before you can submit.</p>
+              )}
             </div>
 
             {/* Attachments */}

@@ -492,7 +492,7 @@ function LegalMatterDetail() {
   const taggedFunctions: string[] = Array.isArray(m.tagged_functions) ? m.tagged_functions : [];
   const routeMeta = m.route ? ROUTE_META[m.route] : null;
   const typeLabel = MATTER_TYPES.find((t) => t.value === m.matter_type)?.label ?? m.matter_type;
-  const busy = assign.isPending || advance.isPending || archive.isPending;
+  const busy = assign.isPending || advance.isPending || archive.isPending || escalate.isPending;
   const isRouteD = m.route === "D";
   const terminal = m.status === "approved" || m.status === "archived";
 

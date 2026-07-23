@@ -43,7 +43,10 @@ export type FindingCategory =
   | "redundancy"
   | "sequencing"
   | "structural"
-  | "non_verifiable";
+  | "non_verifiable"
+  // Not an audit defect — a reviewer's ad-hoc "Edit with AI" request, kept in
+  // its own category so it never reads as a discovered risk in the dashboard.
+  | "user_requested";
 
 export type FindingSeverity = "critical" | "high" | "medium" | "info";
 
@@ -57,6 +60,7 @@ export const FINDING_CATEGORY_META: Record<FindingCategory, { label: string; hin
   sequencing:      { label: "Sequencing",           hint: "Steps out of order or forward-referencing" },
   structural:      { label: "Structure",            hint: "Numbering, heading or formatting decay" },
   non_verifiable:  { label: "Non-verifiable",       hint: "Obligation with no measurable criterion" },
+  user_requested:  { label: "Requested edit",       hint: "Change requested directly by a reviewer" },
 };
 
 export interface ClaimUnit {
@@ -654,7 +658,7 @@ function coerceLlmFinding(raw: any): Finding | null {
 
 // ── Pass 6: verification (deterministic + evidence-only LLM re-check) ───────
 
-async function verifyFindings(
+export async function verifyFindings(
   findings: Finding[],
   docText: string,
 ): Promise<{ findings: Finding[]; usage: TokenUsage }> {
@@ -725,6 +729,53 @@ ${block}
   }
 
   return { findings, usage: results.reduce((acc, r) => addUsage(acc, r.usage), EMPTY_USAGE) };
+}
+
+// ── Reviewer-requested targeted edits ────────────────────────────────────────
+
+export interface TargetedEditCandidate {
+  section: string;
+  quote: string; // verbatim from the document — the passage to change
+  suggestion: string; // the proposed replacement text
+  rationale: string; // why this passage matches the user's request
+  confidence: number; // 0-100
+}
+
+export async function proposeTargetedEdits(
+  title: string,
+  text: string,
+  instruction: string,
+): Promise<{ candidates: TargetedEditCandidate[]; usage: TokenUsage }> {
+  const prompt = `# ROLE: TARGETED EDIT ASSISTANT
+A reviewer is reading "${title}" and has asked for a specific change. Scan the ENTIRE document below and find every passage that's actually relevant to their request — do not invent passages that aren't there.
+
+# REVIEWER'S REQUEST
+${instruction}
+
+# DOCUMENT
+${text.slice(0, 400_000)}
+
+# OUTPUT — ONLY a JSON array, 1 to 5 items, ordered by relevance:
+[{
+  "section": "the heading/section this passage is under",
+  "quote": "the EXACT verbatim passage to change — copied character-for-character from the document, no paraphrase, under 60 words",
+  "suggestion": "the proposed replacement text, ready to insert as-is",
+  "rationale": "one sentence: why this passage matches the request",
+  "confidence": 0-100
+}]
+If nothing in the document is actually relevant to the request, return an empty array — never invent a passage.`;
+
+  const { items, usage } = await askJson(prompt, "quality", 16384);
+  const candidates: TargetedEditCandidate[] = (items as any[]) // eslint-disable-line @typescript-eslint/no-explicit-any
+    .filter((it) => it && typeof it.quote === "string" && typeof it.suggestion === "string")
+    .map((it) => ({
+      section: String(it.section ?? ""),
+      quote: String(it.quote),
+      suggestion: String(it.suggestion),
+      rationale: String(it.rationale ?? ""),
+      confidence: Number.isFinite(it.confidence) ? Math.max(0, Math.min(100, it.confidence)) : 60,
+    }));
+  return { candidates, usage };
 }
 
 // ── Orchestrator ─────────────────────────────────────────────────────────────

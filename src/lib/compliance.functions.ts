@@ -5547,8 +5547,10 @@ export const buildFinalDocument = createServerFn({ method: "POST" })
     }
 
     const { createHash } = await import("node:crypto");
+    // "v2" engine salt: bumping it invalidates finals built by an older engine
+    // (e.g. the pre-hardening build that misplaced glossary insertions).
     const sig = createHash("sha1")
-      .update(JSON.stringify({ ids: accepted.map((f) => f.id).sort(), inputs }))
+      .update(JSON.stringify({ v: "v2", ids: accepted.map((f) => f.id).sort(), inputs }))
       .digest("hex").slice(0, 16);
     if (sj.finalDoc?.url && sj.finalDoc.sig === sig) return sj.finalDoc;
 
@@ -5565,9 +5567,11 @@ export const buildFinalDocument = createServerFn({ method: "POST" })
     if (!edits.length) throw new Error("No applicable edits could be derived — see unresolved findings.");
 
     const simplifyEdits: SimplifyDocxEdit[] = edits.map((e) =>
-      e.insert_after
-        ? { before: "", after: e.replace_text, insertAfter: e.insert_after, rationale: e.rationale }
-        : { before: e.find_text, after: e.replace_text, rationale: e.rationale },
+      e.insert_row_after
+        ? { before: "", after: "", insertRowAfter: e.insert_row_after, cells: e.cells ?? [], rationale: e.rationale }
+        : e.insert_after
+          ? { before: "", after: e.replace_text, insertAfter: e.insert_after, rationale: e.rationale }
+          : { before: e.find_text, after: e.replace_text, rationale: e.rationale },
     );
     const result = applySimplificationToDocx(file.buffer, simplifyEdits, {
       author: "AI Document Workflow",
@@ -5584,6 +5588,18 @@ export const buildFinalDocument = createServerFn({ method: "POST" })
     if (up.error) throw new Error(`Storage upload failed: ${up.error.message}`);
     const url = supabase.storage.from("policies").getPublicUrl(path).data.publicUrl;
 
+    // Per-edit application report: which finding each edit served and whether
+    // the engine landed it — so "18 accepted, how many are in?" is answerable
+    // from the dashboard instead of by asking.
+    const skippedAnchors = new Set((result.skipped ?? []).map((s) => s.before));
+    const editReport = edits.map((e) => {
+      const anchor = e.find_text || e.insert_after || e.insert_row_after || "";
+      const kind = e.insert_row_after ? "table row" : e.insert_after ? "insertion" : "replacement";
+      const skip = skippedAnchors.has(anchor) ? (result.skipped ?? []).find((s) => s.before === anchor) : null;
+      return { findingId: e.findingId, kind, status: skip ? "skipped" : "applied", reason: skip?.reason };
+    });
+    const coveredIds = new Set(editReport.filter((r) => r.status === "applied").map((r) => r.findingId));
+
     const finalDoc = {
       url,
       sig,
@@ -5593,6 +5609,8 @@ export const buildFinalDocument = createServerFn({ method: "POST" })
       builtAt: new Date().toISOString(),
       derived: edits.length,
       appliedCount: result.appliedCount,
+      coveredFindings: coveredIds.size,
+      editReport,
       skipped: result.skipped,
       unresolved,
       totalAccepted: accepted.length,

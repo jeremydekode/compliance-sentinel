@@ -703,6 +703,7 @@ function SimplifyV2ReportPage() {
                   restructure={restructure}
                   execSummary={execSum ?? sj.execSummary ?? null}
                   execBusy={execBusy}
+                  finalDoc={sj.finalDoc ?? null}
                 />
                 {restructure && (
                   <RedraftDashboard

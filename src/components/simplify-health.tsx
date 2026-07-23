@@ -1036,7 +1036,7 @@ const SEV_COLORS: Record<string, string> = {
 };
 
 export function FindingsAnalyticsDashboard({
-  findings, restructure, execSummary, execBusy,
+  findings, restructure, execSummary, execBusy, finalDoc,
 }: {
   findings: Finding[];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1045,6 +1045,9 @@ export function FindingsAnalyticsDashboard({
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   execSummary?: any | null;
   execBusy?: boolean;
+  /** Final-document build record — powers the coverage card. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  finalDoc?: any | null;
 }) {
   const active = useMemo(() => findings.filter((f) => f.verification?.status !== "rejected"), [findings]);
 
@@ -1180,6 +1183,50 @@ export function FindingsAnalyticsDashboard({
           </div>
         </div>
 
+        {/* final-document coverage: which accepted findings actually landed */}
+        {finalDoc?.url && (
+          <div className="rounded-2xl border bg-card p-4 lg:col-span-3">
+            <div className="flex items-center justify-between gap-2 mb-2">
+              <div className="text-xs font-bold">Final document coverage</div>
+              <span className={cn(
+                "text-[10px] font-bold rounded-full px-2 py-0.5",
+                (finalDoc.unresolved?.length ?? 0) === 0 && (finalDoc.skipped?.length ?? 0) === 0
+                  ? "bg-emerald-100 text-emerald-700"
+                  : "bg-amber-100 text-amber-700",
+              )}>
+                {finalDoc.appliedCount} edit{finalDoc.appliedCount === 1 ? "" : "s"} applied · {finalDoc.coveredFindings ?? "?"} of {finalDoc.totalAccepted} accepted findings covered
+              </span>
+            </div>
+            {(finalDoc.unresolved?.length ?? 0) > 0 && (
+              <div className="grid gap-1.5 md:grid-cols-2">
+                {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
+                {finalDoc.unresolved.map((u: any, i: number) => (
+                  <div key={i} className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50/50 px-2.5 py-1.5">
+                    <span className="text-[10px] font-bold text-amber-700 shrink-0 mt-0.5">{u.findingId}</span>
+                    <div className="min-w-0">
+                      <div className="text-[11px] font-medium truncate">{u.title}</div>
+                      <div className="text-[10px] text-muted-foreground">{u.reason} — apply manually in the editor</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+            {(finalDoc.skipped?.length ?? 0) > 0 && (
+              <div className="mt-1.5 grid gap-1.5 md:grid-cols-2">
+                {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
+                {finalDoc.skipped.map((s: any, i: number) => (
+                  <div key={i} className="flex items-start gap-2 rounded-lg border border-orange-200 bg-orange-50/50 px-2.5 py-1.5">
+                    <span className="text-[10px] font-bold text-orange-700 shrink-0 mt-0.5">engine</span>
+                    <div className="text-[10px] text-muted-foreground">{s.reason} — "{String(s.before ?? "").slice(0, 60)}…"</div>
+                  </div>
+                ))}
+              </div>
+            )}
+            {(finalDoc.unresolved?.length ?? 0) === 0 && (finalDoc.skipped?.length ?? 0) === 0 && (
+              <p className="text-xs text-muted-foreground">Every accepted finding was applied — nothing needs manual attention.</p>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

@@ -889,12 +889,16 @@ Rules: 2–4 groups, 2–4 bullets each, ordered by importance. Group by THEME (
 
 export interface ConcreteEdit {
   findingId: string;
-  /** Replacement edit: verbatim span to replace. Empty for insertions. */
+  /** Replacement edit: verbatim span to replace. Empty for insertions/rows. */
   find_text: string;
   /** The corrected passage (replacement) or the NEW content (insertion). */
   replace_text: string;
   /** Insertion edit: verbatim anchor paragraph the new content follows. */
   insert_after?: string;
+  /** Table-row edit: verbatim cell text identifying the row it follows. */
+  insert_row_after?: string;
+  /** Table-row edit: one string per column, in order ("" = leave empty). */
+  cells?: string[];
   rationale: string;
 }
 
@@ -938,8 +942,10 @@ export async function deriveConcreteEdits(
 1. "find_text" MUST be copied CHARACTER-FOR-CHARACTER from the document (the flagged passage, or the smallest span that must change). Never paraphrase it. It must not span more than one paragraph.
 2. "replace_text" is the corrected passage: the SAME text with ONLY the fix applied. Keep everything else identical — same terminology, same tone, no gratuitous rewriting.
 3. Where a REVIEWER-PROVIDED VALUE is given, use it verbatim in replace_text.
-4. ADDITIONS (a missing step, exception path, escalation rule): use the insertion form instead — "insert_after" is the EXACT verbatim text of the existing paragraph the new content should follow (one paragraph, copied character-for-character), and "replace_text" is the complete new content. Match the document's voice; never renumber existing steps — interpolate ("Step 5a") instead. Use a blank line inside replace_text to make multiple paragraphs.
-5. If a finding cannot be fixed by one replacement or one insertion, put it in "unresolved" with a one-sentence reason. Never force a bad edit.
+4. ADDITIONS (a missing step, exception path, escalation rule): use the insertion form instead — "insert_after" is the EXACT verbatim text of the existing paragraph the new content should follow (one paragraph, copied character-for-character), and "replace_text" is ONLY the new content — never restate the anchor text. The anchor must be UNIQUE in the document (pick a longer span if a short one repeats elsewhere). Do NOT anchor additions inside tables (e.g. glossary rows) — put those in "unresolved" ("needs a table row"). Match the document's voice; never renumber existing steps — interpolate ("Step 5a") instead. Use a blank line inside replace_text to make multiple paragraphs.
+5. A finding MAY need SEVERAL edits — fix BOTH copies of a contradiction, BOTH meanings of a polysemous acronym, EVERY affected row or reference. Emit one edit object PER passage and repeat the findingId. If a change spans a paragraph boundary, SPLIT it into one edit per paragraph instead of quoting across the boundary.
+6. TABLE ROW ADDITIONS (e.g. a new glossary entry): use the row form — "insert_row_after" is verbatim text that uniquely identifies an existing row (quote one cell's full text, e.g. the definition text of the row it should follow), and "cells" is an array with one string per column of that table, in column order (use "" for cells to leave empty, e.g. an auto-number column). Never use insert_after for content that belongs in a table.
+7. Only if a finding truly cannot be expressed as replacements, insertions, or table rows, put it in "unresolved" with a one-sentence reason. Never force a bad edit.
 
 # FINDINGS
 ${findingBlocks}
@@ -947,10 +953,13 @@ ${findingBlocks}
 # DOCUMENT
 ${text.slice(0, 400_000)}
 
-# OUTPUT — ONLY JSON. Each edit is EITHER a replacement OR an insertion:
+# OUTPUT — ONLY JSON. Each edit is a replacement, an insertion, OR a table row.
+# A findingId may appear on MULTIPLE edits (multi-location fixes).
 {"edits": [
   {"findingId": "F-001", "find_text": "…", "replace_text": "…", "rationale": "one sentence"},
-  {"findingId": "F-002", "insert_after": "…exact existing paragraph…", "replace_text": "…new content…", "rationale": "one sentence"}
+  {"findingId": "F-001", "find_text": "…second passage…", "replace_text": "…", "rationale": "one sentence"},
+  {"findingId": "F-002", "insert_after": "…exact existing paragraph…", "replace_text": "…new content…", "rationale": "one sentence"},
+  {"findingId": "F-004", "insert_row_after": "…verbatim cell text of the row it follows…", "cells": ["", "SIC", "Standard Industry Classification"], "rationale": "one sentence"}
  ],
  "unresolved": [{"findingId": "F-00X", "reason": "…"}]}`;
 
@@ -970,52 +979,100 @@ ${text.slice(0, 400_000)}
   const paraNorms = text.split(/\n+/).map(norm).filter(Boolean);
   const byId = new Map(workable.map((f) => [f.id, f]));
   const edits: ConcreteEdit[] = [];
+  // A finding may carry SEVERAL edits (multi-location fixes) — count coverage
+  // instead of consuming the id on first sight, and report each finding once.
+  const editedIds = new Set<string>();
+  const unresolvedIds = new Set<string>();
+  const markUnresolved = (id: string, title: string, reason: string) => {
+    // An id with at least one VALID edit is partially covered — don't list it
+    // as unresolved just because a second edit for it failed; the application
+    // report shows per-edit outcomes.
+    if (unresolvedIds.has(id)) return;
+    unresolvedIds.add(id);
+    unresolved.push({ findingId: id, title, reason });
+  };
 
   for (const e of rawEdits) {
     const id = String(e?.findingId ?? "");
     const f = byId.get(id);
-    const replace = String(e?.replace_text ?? "").trim();
-    if (!f || !replace) continue;
+    if (!f) continue;
     const find = String(e?.find_text ?? "").trim();
     const insertAfter = String(e?.insert_after ?? "").trim();
+    const insertRowAfter = String(e?.insert_row_after ?? "").trim();
+    const cells = Array.isArray(e?.cells) ? e.cells.map((c: unknown) => String(c ?? "")) : null;
+    const replace = String(e?.replace_text ?? "").trim();
+    const rationale = String(e?.rationale ?? f.title);
 
-    // Insertion form: the anchor paragraph must locate; the new text is free.
-    if (!find && insertAfter) {
-      const aNorm = norm(insertAfter);
-      if (!paraNorms.some((p) => p.includes(aNorm))) {
-        unresolved.push({ findingId: id, title: f.title, reason: "Insertion anchor not found verbatim in the document" });
+    // ── Table-row form: anchor cell text must locate. ──
+    if (insertRowAfter && cells?.some((c: string) => c.trim())) {
+      const aNorm = norm(insertRowAfter);
+      if (aNorm.length < 6 || !paraNorms.some((p) => p.includes(aNorm))) {
+        markUnresolved(id, f.title, "Table-row anchor not found verbatim in the document");
         continue;
       }
-      edits.push({ findingId: id, find_text: "", insert_after: insertAfter, replace_text: replace, rationale: String(e?.rationale ?? f.title) });
-      byId.delete(id);
+      edits.push({ findingId: id, find_text: "", replace_text: "", insert_row_after: insertRowAfter, cells, rationale });
+      editedIds.add(id);
+      continue;
+    }
+
+    if (!replace) continue;
+
+    // ── Insertion form: the anchor paragraph must locate — UNIQUELY. ──
+    if (!find && insertAfter) {
+      const aNorm = norm(insertAfter);
+      const hits = paraNorms.filter((p) => p.includes(aNorm)).length;
+      if (hits === 0) {
+        markUnresolved(id, f.title, "Insertion anchor not found verbatim in the document");
+        continue;
+      }
+      if (hits > 1) {
+        markUnresolved(id, f.title, `Insertion anchor appears in ${hits} places — ambiguous, needs a manual edit`);
+        continue;
+      }
+      // Models tend to restate the anchor at the head of the new content —
+      // that would print the anchor paragraph twice. Trim it.
+      let content = replace;
+      if (norm(content).startsWith(aNorm)) {
+        const idx = content.toLowerCase().indexOf(insertAfter.slice(-12).toLowerCase());
+        if (idx >= 0) content = content.slice(idx + 12).replace(/^[\s.,;:–—-]+/, "").trim();
+      }
+      if (!content) {
+        markUnresolved(id, f.title, "Insertion content was only a restatement of the anchor");
+        continue;
+      }
+      edits.push({ findingId: id, find_text: "", insert_after: insertAfter, replace_text: content, rationale });
+      editedIds.add(id);
       continue;
     }
 
     if (!find) continue;
-    // Deterministic anchor check — a claimed edit must actually locate.
+    // ── Replacement form: deterministic anchor check. ──
     const fNorm = norm(find);
     if (!paraNorms.some((p) => p.includes(fNorm))) {
-      unresolved.push({
-        findingId: id,
-        title: f.title,
-        reason: paraNorms.length && norm(text).includes(fNorm)
+      markUnresolved(
+        id, f.title,
+        paraNorms.length && norm(text).includes(fNorm)
           ? "Passage spans a paragraph boundary — needs a manual edit"
           : "Proposed passage not found verbatim in the document",
-      });
+      );
       continue;
     }
-    edits.push({ findingId: id, find_text: find, replace_text: replace, rationale: String(e?.rationale ?? f.title) });
-    byId.delete(id);
+    edits.push({ findingId: id, find_text: find, replace_text: replace, rationale });
+    editedIds.add(id);
   }
+
   for (const u of rawUnresolved) {
     const id = String(u?.findingId ?? "");
     const f = byId.get(id);
-    if (f) { unresolved.push({ findingId: id, title: f.title, reason: String(u?.reason ?? "Model could not derive a single-passage edit") }); byId.delete(id); }
+    if (f && !editedIds.has(id)) markUnresolved(id, f.title, String(u?.reason ?? "Model could not derive a concrete edit"));
   }
   for (const f of byId.values()) {
-    unresolved.push({ findingId: f.id, title: f.title, reason: "No edit returned for this finding" });
+    if (!editedIds.has(f.id)) markUnresolved(f.id, f.title, "No edit returned for this finding");
   }
-  return { edits, unresolved, usage };
+  // A finding that got at least one valid edit is covered — drop it from the
+  // unresolved list (partial multi-edit failures show up per-edit downstream).
+  const finalUnresolved = unresolved.filter((u) => !editedIds.has(u.findingId));
+  return { edits, unresolved: finalUnresolved, usage };
 }
 
 // ── Orchestrator ─────────────────────────────────────────────────────────────

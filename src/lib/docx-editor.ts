@@ -782,6 +782,12 @@ export type SimplifyDocxEdit = {
    *  are wrapped in <w:ins> tracked-insert in redline mode. Word repaginates
    *  around them automatically. */
   insertAfter?: string;
+  /** TABLE-ROW edit: insert a NEW row after the row whose text contains this
+   *  anchor (e.g. a glossary entry). `cells` holds one string per column, in
+   *  order ("" leaves the cell empty). The new row clones the anchor row's
+   *  cell formatting; in redline mode it is a Word tracked row-insert. */
+  insertRowAfter?: string;
+  cells?: string[];
 };
 
 export type SimplifyDocxResult = {
@@ -1150,6 +1156,46 @@ function attachComments(zip: PizZip, commentEntries: string[], paraIds: string[]
  * Edits whose `before` cannot be located in any paragraph are SKIPPED and
  * returned in `skipped` — they are never silently dropped.
  */
+/** Innermost <w:TAG>…</w:TAG> block containing `pos` (depth-aware — survives
+ *  nested tables). Returns null if pos isn't inside such a block. */
+function findEnclosingBlock(xml: string, pos: number, tag: string): { start: number; end: number } | null {
+  const re = new RegExp(`<w:${tag}(?=[ >])[^>]*>|</w:${tag}>`, "g");
+  const stack: number[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(xml)) !== null) {
+    if (m[0].startsWith(`</`)) {
+      const start = stack.pop();
+      if (start !== undefined && start < pos && m.index + m[0].length > pos) {
+        return { start, end: m.index + m[0].length };
+      }
+      if (m.index > pos && stack.length === 0) return null; // passed pos, nothing open
+    } else {
+      if (m.index > pos) { if (!stack.length) return null; continue; }
+      stack.push(m.index);
+    }
+  }
+  return null;
+}
+
+/** Top-level <w:TAG>…</w:TAG> blocks directly inside `xml` (depth-aware). */
+function splitTopLevelBlocks(xml: string, tag: string): { start: number; end: number }[] {
+  const re = new RegExp(`<w:${tag}(?=[ >])[^>]*>|</w:${tag}>`, "g");
+  const out: { start: number; end: number }[] = [];
+  let depth = 0;
+  let open = -1;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(xml)) !== null) {
+    if (m[0].startsWith(`</`)) {
+      depth--;
+      if (depth === 0 && open >= 0) { out.push({ start: open, end: m.index + m[0].length }); open = -1; }
+    } else {
+      if (depth === 0) open = m.index;
+      depth++;
+    }
+  }
+  return out;
+}
+
 export function applySimplificationToDocx(
   sourceBuffer: Buffer,
   edits: SimplifyDocxEdit[],
@@ -1216,6 +1262,71 @@ export function applySimplificationToDocx(
       continue;
     }
 
+    // ── Table-row insertion: new row after the row containing the anchor. ──
+    if (edit.insertRowAfter?.trim() && edit.cells?.some((c) => c.trim())) {
+      const anchorText = edit.insertRowAfter.trim();
+      const pRegex = /<w:p\b[^>]*>(?:(?!<w:p\b)[\s\S])*?<\/w:p>/g;
+      let am: RegExpExecArray | null;
+      let placedRow = false;
+      while ((am = pRegex.exec(documentXml)) !== null) {
+        const paraText = getParagraphText(am[0]);
+        if (!paraText || !paragraphContainsLoose(paraText, anchorText)) continue;
+        const row = findEnclosingBlock(documentXml, am.index, "tr");
+        if (!row) {
+          skipped.push({ reason: "row anchor is not inside a table row", before: anchorText });
+          placedRow = true;
+          break;
+        }
+        const rowXml = documentXml.slice(row.start, row.end);
+        const tcs = splitTopLevelBlocks(rowXml, "tc");
+        if (!tcs.length) {
+          skipped.push({ reason: "anchor row has no readable cells", before: anchorText });
+          placedRow = true;
+          break;
+        }
+        const a = escapeXml(author);
+        // Clone per-column formatting from the anchor row's cells; missing
+        // template cells (more values than columns) reuse the last one.
+        const newCells = edit.cells.slice(0, Math.max(tcs.length, edit.cells.length)).map((val, i) => {
+          const tpl = rowXml.slice(tcs[Math.min(i, tcs.length - 1)].start, tcs[Math.min(i, tcs.length - 1)].end);
+          const tcPr = tpl.match(/<w:tcPr\b[\s\S]*?<\/w:tcPr>/)?.[0] ?? "";
+          const pPr = (tpl.match(/<w:pPr\b[\s\S]*?<\/w:pPr>/)?.[0] ?? "").replace(/<w:numPr\b[\s\S]*?<\/w:numPr>/, "");
+          const rPr = tpl.match(/<w:r\b[^>]*>\s*(<w:rPr\b[\s\S]*?<\/w:rPr>)/)?.[1] ?? "";
+          const t = val.trim();
+          const run = t ? `<w:r>${rPr}<w:t xml:space="preserve">${escapeXml(t)}</w:t></w:r>` : "";
+          const content = t && mode === "redline"
+            ? `<w:ins w:id="${nextRevId++}" w:author="${a}" w:date="${dateIso}">${run}</w:ins>`
+            : run;
+          return { xml: `<w:tc>${tcPr}<w:p>${pPr}${content}</w:p></w:tc>`, hasText: !!t, pPr, content };
+        });
+        // Row-level tracked insert so Word offers Accept/Reject on the ROW.
+        const trPr = mode === "redline"
+          ? `<w:trPr><w:ins w:id="${nextRevId++}" w:author="${a}" w:date="${dateIso}"/></w:trPr>`
+          : (rowXml.match(/<w:trPr\b[\s\S]*?<\/w:trPr>/)?.[0] ?? "");
+        let cellsXml = newCells.map((c) => c.xml).join("");
+        // Rationale comment on the first non-empty cell's paragraph.
+        if (opts.redlineComments && edit.rationale) {
+          const target = newCells.find((c) => c.hasText);
+          if (target) {
+            const commentId = nextCommentId++;
+            const paraId = (commentId + 1).toString(16).padStart(8, "0").toUpperCase();
+            paraIds.push(paraId);
+            commentEntries.push(buildCommentEntry(commentId, `[ADDED ROW] ${edit.rationale}`, author, dateIso, paraId));
+            const wrapped = wrapParagraphWithComment(`<w:p>${target.pPr}${target.content}</w:p>`, commentId);
+            cellsXml = cellsXml.replace(`<w:p>${target.pPr}${target.content}</w:p>`, wrapped);
+          }
+        }
+        const newRow = `<w:tr>${trPr}${cellsXml}</w:tr>`;
+        documentXml = documentXml.slice(0, row.end) + newRow + documentXml.slice(row.end);
+        applied.push({ before: `[insert row after] ${anchorText}`, after: edit.cells.filter(Boolean).join(" | "), locatedText: paraText });
+        appliedCount++;
+        placedRow = true;
+        break;
+      }
+      if (!placedRow) skipped.push({ reason: "row anchor not located in any paragraph", before: anchorText });
+      continue;
+    }
+
     // ── Insertion: new standalone paragraph(s) after an anchor paragraph. ──
     if (edit.insertAfter?.trim()) {
       const anchorText = edit.insertAfter.trim();
@@ -1230,6 +1341,16 @@ export function applySimplificationToDocx(
       while ((am = pRegex.exec(documentXml)) !== null) {
         const paraText = getParagraphText(am[0]);
         if (!paraText || !paragraphContainsLoose(paraText, anchorText)) continue;
+        // Refuse to insert paragraphs INSIDE a table cell: an "addition" there
+        // is almost always meant as a new table ROW (e.g. a glossary entry),
+        // which needs <w:tr> insertion — appending paragraphs into the cell
+        // corrupts the table's content. Honest skip until row-insert support.
+        const back = documentXml.slice(0, am.index);
+        if (back.lastIndexOf("<w:tc") > back.lastIndexOf("</w:tc>")) {
+          skipped.push({ reason: "insertion anchor is inside a table — needs row insertion (not yet supported), apply manually", before: anchorText });
+          placed = true; // handled: reported, not silently retried on later matches
+          break;
+        }
         // Inherit the anchor's paragraph + run formatting; strip list numbering
         // so auto-numbering never renumbers existing steps (inserted steps carry
         // their own literal labels per the fix format).

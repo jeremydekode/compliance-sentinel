@@ -17,7 +17,7 @@ import { ExactEditor } from "@/components/onlyoffice-editor";
 import { FindingsRail, RestructurePanel, ChangesRail } from "@/components/simplify-findings";
 import { AuditHealthDashboard, SimplifyChangesDashboard, RedraftDashboard, FindingsAnalyticsDashboard } from "@/components/simplify-health";
 import type { FindingSeverity } from "@/lib/recommend";
-import { findingNeedsInput } from "@/lib/recommend";
+import { findingNeedsInput, findingInputSuggestion } from "@/lib/recommend";
 import { Button } from "@/components/ui/button";
 import { supabase } from "@/integrations/supabase/client";
 import {
@@ -32,6 +32,7 @@ import {
   finalizeEdit,
   buildFinalDocument,
   saveDecisionInputs,
+  generateExecSummaryV2,
 } from "@/lib/compliance.functions";
 import type { Finding } from "@/lib/recommend";
 import { SIMPLIFY_TYPE_LABEL } from "@/lib/simplify";
@@ -138,6 +139,13 @@ function SimplifyV2ReportPage() {
   const [editorTarget, setEditorTarget] = useState<"redraft" | "source" | "final">("final");
   const buildFinal = useServerFn(buildFinalDocument);
   const [finalBusy, setFinalBusy] = useState(false);
+  // Executive summary — fetched once per mount when the dashboard shows; the
+  // server returns the cached copy (zero AI) unless the findings changed.
+  const genExec = useServerFn(generateExecSummaryV2);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const [execSum, setExecSum] = useState<any | null>(null);
+  const [execBusy, setExecBusy] = useState(false);
+  const execRequested = useRef(false);
   const [editKey, setEditKey] = useState<string | null>(null);
   const [editorDocUrl, setEditorDocUrl] = useState<string | null>(null);
   const [savingEdit, setSavingEdit] = useState(false);
@@ -168,6 +176,26 @@ function SimplifyV2ReportPage() {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const saved = ((report.data as any)?.summary_json?.decisionInputs ?? {}) as Record<string, string>;
     if (Object.keys(saved).length) setDecisions((d) => ({ ...saved, ...d }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [report.data]);
+
+  // Executive summary: request once when the R&E dashboard first shows.
+  // Server-side cache makes repeats free; a fresh generation (~$0.01–0.02)
+  // happens only when the finding set changed, and it lands in the cost ledger.
+  useEffect(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sjNow = ((report.data as any)?.summary_json ?? {}) as Record<string, any>;
+    const findingsNow = Array.isArray(sjNow.findings) ? sjNow.findings : [];
+    if (execRequested.current || sjNow.workflow_mode !== "recommend_edit" || !findingsNow.length) return;
+    execRequested.current = true;
+    setExecBusy(true);
+    genExec({ data: { reportId } })
+      .then((r) => {
+        setExecSum(r);
+        if (!r.cached) qc.invalidateQueries({ queryKey: ["report", reportId] }); // refresh cost ledger
+      })
+      .catch(() => { /* summary is decorative — never block the dashboard */ })
+      .finally(() => setExecBusy(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [report.data]);
 
@@ -305,6 +333,31 @@ function SimplifyV2ReportPage() {
       })
       .filter((h): h is { id: string; text: string; kind: "input" | "critical" | "high" | "medium" | "info" } => !!h);
   }, [workflowMode, findings]);
+
+  // Is the cached final document still current? Mirrors the server's basis
+  // (accepted ids + effective inputs) so the button can honestly say "opens
+  // instantly — no AI" vs "will re-derive (~1–2 min)".
+  const finalUpToDate = useMemo(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const basis = (sj.finalDoc as any)?.basis;
+    if (!basis || !sj.finalDoc?.url) return false;
+    const acceptedF = findings.filter((f) => f.decision === "accepted" && f.verification?.status !== "rejected");
+    const ids = acceptedF.map((f) => f.id).sort();
+    const saved = (sj.decisionInputs ?? {}) as Record<string, string>;
+    const inputs: Record<string, string> = {};
+    for (const f of acceptedF) {
+      const typed = decisions[f.id]?.trim();
+      const sv = saved[f.id]?.trim();
+      if (typed) inputs[f.id] = typed;
+      else if (sv) inputs[f.id] = sv;
+      else if (findingNeedsInput(f)) {
+        const s = findingInputSuggestion(f)?.trim();
+        if (s) inputs[f.id] = s;
+      }
+    }
+    return JSON.stringify(ids) === JSON.stringify(basis.ids ?? [])
+      && JSON.stringify(inputs) === JSON.stringify(basis.inputs ?? {});
+  }, [sj.finalDoc, sj.decisionInputs, findings, decisions]);
 
   if (report.isLoading) {
     return (
@@ -488,11 +541,25 @@ function SimplifyV2ReportPage() {
           <span className={cn("inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[10px] font-semibold ring-1 shrink-0", meta.chip)}>
             <ModeIcon className="size-3" /> {meta.label}
           </span>
-          {sj.cost?.usd != null && (
-            <span title="Metered AI cost of the last run" className="text-[10px] text-muted-foreground inline-flex items-center gap-1 shrink-0">
-              <Info className="size-3" /> ${Number(sj.cost.usd).toFixed(2)}
-            </span>
-          )}
+          {(() => {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const log: any[] = Array.isArray(sj.costLog) ? sj.costLog : [];
+            const total = log.length ? log.reduce((a, e) => a + (Number(e.usd) || 0), 0) : Number(sj.cost?.usd ?? 0);
+            if (!(total > 0)) return null;
+            const breakdown = log.length
+              ? `Cumulative AI spend — ${log.length} operation(s):\n` + [...log].reverse().map((e) =>
+                  `• ${e.op} — $${Number(e.usd).toFixed(2)}${e.at ? ` (${new Date(e.at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })})` : ""}`,
+                ).join("\n")
+              : "AI cost of the last run (per-operation ledger starts with the next AI operation)";
+            return (
+              <span
+                title={breakdown}
+                className="text-[10px] text-muted-foreground inline-flex items-center gap-1 shrink-0 cursor-help"
+              >
+                <Info className="size-3" /> ${total.toFixed(2)}{log.length > 1 ? ` · ${log.length} ops` : ""}
+              </span>
+            );
+          })()}
           <div className="ml-auto flex items-center gap-2 shrink-0">
             {autoStep === "accepting" && (
               <span className="inline-flex items-center gap-1.5 rounded-md bg-fuchsia-100 text-fuchsia-700 ring-1 ring-fuchsia-200 px-2 py-1 text-[11px] font-semibold">
@@ -500,21 +567,21 @@ function SimplifyV2ReportPage() {
                 Pre-selecting verified fixes…
               </span>
             )}
-            {reviewReady && !restructure && !autoStep && (
+            {reviewReady && !sj.finalDoc?.url && !autoStep && (
               <span className="inline-flex items-center gap-1.5 rounded-md bg-amber-100 text-amber-800 ring-1 ring-amber-200 px-2 py-1 text-[11px] font-semibold">
-                Review findings, then Generate redraft
+                Review amendments, then open the Final document
               </span>
             )}
-            {/* view toggle: dashboard ↔ document (compare lives on the R&E dashboard) */}
+            {/* view toggle: dashboard ↔ review workspace (R&E) / document (simplify) */}
             <div className="flex rounded-lg border overflow-hidden text-[11px] font-medium">
-              {(["dashboard", "document"] as const).map((v) => (
+              {(workflowMode === "recommend_edit" ? (["dashboard", "review"] as const) : (["dashboard", "document"] as const)).map((v) => (
                 <button
                   key={v}
-                  onClick={() => setView(v)}
+                  onClick={() => (v === "review" ? openReview() : setView(v))}
                   className={cn(
                     "px-2.5 py-1 transition-colors capitalize",
                     view === v ? "bg-primary text-primary-foreground" : "bg-card hover:bg-muted/50",
-                    v === "document" && "border-l",
+                    v !== "dashboard" && "border-l",
                   )}
                 >
                   {v}
@@ -605,7 +672,11 @@ function SimplifyV2ReportPage() {
                       <div className="text-sm text-emerald-700/80 dark:text-emerald-300/70">
                         {finalBusy
                           ? "Deriving each accepted fix and applying it to the original as tracked changes — takes 1–2 minutes."
-                          : "Every accepted fix applied to the ORIGINAL document as Word tracked changes — removals struck through, rationale in comments. Edit and download."}
+                          : finalUpToDate
+                            ? "Up to date — opens instantly, no AI cost. Tracked changes on the original, rationale in comments."
+                            : sj.finalDoc?.url
+                              ? "Decisions changed since the last build — will re-derive and re-apply (~1–2 min, one AI run)."
+                              : "Every accepted fix applied to the ORIGINAL document as Word tracked changes (~1–2 min, one AI run)."}
                       </div>
                     </div>
                     <ArrowRight className="size-5 text-emerald-500 group-hover:translate-x-1 transition-transform shrink-0" />
@@ -627,7 +698,12 @@ function SimplifyV2ReportPage() {
                  the review workspace; generation lives in its rail — no
                  duplicated panels or findings lists here. */
               <>
-                <FindingsAnalyticsDashboard findings={findings} restructure={restructure} />
+                <FindingsAnalyticsDashboard
+                  findings={findings}
+                  restructure={restructure}
+                  execSummary={execSum ?? sj.execSummary ?? null}
+                  execBusy={execBusy}
+                />
                 {restructure && (
                   <RedraftDashboard
                     restructure={restructure}
@@ -800,6 +876,7 @@ function SimplifyV2ReportPage() {
                   onReviewEdits={() => setView("edits")}
                   onExactView={openExact}
                   onEditExact={openFinal}
+                  onOpenDraft={() => openEditor("redraft")}
                   decisions={decisions}
                 />
               )}
@@ -918,6 +995,7 @@ function SimplifyV2ReportPage() {
                         onReviewEdits={() => setView("edits")}
                         onExactView={openExact}
                         onEditExact={openFinal}
+                  onOpenDraft={() => openEditor("redraft")}
                         decisions={decisions}
                     />
                   )}

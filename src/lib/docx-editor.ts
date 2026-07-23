@@ -774,6 +774,14 @@ export type SimplifyDocxEdit = {
   commentOnly?: boolean;
   anchorRelId?: string;
   comment?: string;
+  /** INSERTION edit: add `after` as NEW standalone paragraph(s) immediately
+   *  after the first paragraph whose text contains this anchor (verbatim from
+   *  the source). `before` is ignored. Inserted paragraphs inherit the anchor's
+   *  paragraph/run formatting (numbering stripped — new steps carry their own
+   *  literal numbering like "5a." so existing steps are never renumbered) and
+   *  are wrapped in <w:ins> tracked-insert in redline mode. Word repaginates
+   *  around them automatically. */
+  insertAfter?: string;
 };
 
 export type SimplifyDocxResult = {
@@ -1205,6 +1213,60 @@ export function applySimplificationToDocx(
         `</w:p>`;
       documentXml = documentXml.slice(0, span.start) + newPara + documentXml.slice(span.end);
       appliedCount++;
+      continue;
+    }
+
+    // ── Insertion: new standalone paragraph(s) after an anchor paragraph. ──
+    if (edit.insertAfter?.trim()) {
+      const anchorText = edit.insertAfter.trim();
+      const newText = (edit.after ?? "").trim();
+      if (!newText) {
+        skipped.push({ reason: "insertion with empty content", before: anchorText });
+        continue;
+      }
+      const pRegex = /<w:p\b[^>]*>(?:(?!<w:p\b)[\s\S])*?<\/w:p>/g;
+      let am: RegExpExecArray | null;
+      let placed = false;
+      while ((am = pRegex.exec(documentXml)) !== null) {
+        const paraText = getParagraphText(am[0]);
+        if (!paraText || !paragraphContainsLoose(paraText, anchorText)) continue;
+        // Inherit the anchor's paragraph + run formatting; strip list numbering
+        // so auto-numbering never renumbers existing steps (inserted steps carry
+        // their own literal labels per the fix format).
+        const pPr = (am[0].match(/<w:pPr\b[\s\S]*?<\/w:pPr>/)?.[0] ?? "")
+          .replace(/<w:numPr\b[\s\S]*?<\/w:numPr>/, "");
+        const rPr = am[0].match(/<w:r\b[^>]*>\s*(<w:rPr\b[\s\S]*?<\/w:rPr>)/)?.[1] ?? "";
+        const a = escapeXml(author);
+        const mkRun = (line: string) =>
+          `<w:r>${rPr}<w:t xml:space="preserve">${escapeXml(line)}</w:t></w:r>`;
+        const mkBreak = () => `<w:r>${rPr}<w:br/></w:r>`;
+        const paras = newText.split(/\n{2,}/).map((t) => t.trim()).filter(Boolean);
+        const builtParas = paras.map((t) => {
+          const lines = t.split(/\n/);
+          const inner = lines
+            .map((line, i) => mkRun(line) + (i < lines.length - 1 ? mkBreak() : ""))
+            .join("");
+          const content = mode === "redline"
+            ? `<w:ins w:id="${nextRevId++}" w:author="${a}" w:date="${dateIso}">${inner}</w:ins>`
+            : inner;
+          return `<w:p>${pPr}${content}</w:p>`;
+        });
+        // Rationale comment rides on the FIRST inserted paragraph.
+        if (opts.redlineComments && edit.rationale && builtParas.length) {
+          const commentId = nextCommentId++;
+          const paraId = (commentId + 1).toString(16).padStart(8, "0").toUpperCase();
+          paraIds.push(paraId);
+          commentEntries.push(buildCommentEntry(commentId, `[ADDED] ${edit.rationale}`, author, dateIso, paraId));
+          builtParas[0] = wrapParagraphWithComment(builtParas[0], commentId);
+        }
+        const insertAt = am.index + am[0].length;
+        documentXml = documentXml.slice(0, insertAt) + builtParas.join("") + documentXml.slice(insertAt);
+        applied.push({ before: `[insert after] ${anchorText}`, after: newText, locatedText: paraText });
+        appliedCount++;
+        placed = true;
+        break;
+      }
+      if (!placed) skipped.push({ reason: "insert anchor not located in any paragraph", before: anchorText });
       continue;
     }
 

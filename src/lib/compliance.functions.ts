@@ -8,10 +8,31 @@ import PizZip from "pizzip";
 import { applyEditsToDocx, looksLikeDocx, docxToText, docxToHtml, docxToSimplifyText, docxToSimplifyUnits, docxToStructuredUnits, dominantBodyProps, extractDocxFigures, applySimplificationToDocx, rebuildDocxBody, type SimplifyDocxEdit } from "./docx-editor";
 import { verifyActions, analyzeStructure, crossCheckSections, DEFAULT_SIMPLIFY_GUIDANCE, AGGRESSIVE_SIMPLIFY_ADDENDUM, initialDecision } from "./simplify";
 import type { VerificationSummary, DocStructure, SectionCrossCheck, VerifiedAction } from "./simplify";
-import { runAuditPipeline, countFindings, generateRestructured, generateDocumentFromBrief, DEFAULT_RECOMMEND_GUIDANCE, proposeTargetedEdits, verifyFindings, deriveConcreteEdits, findingNeedsInput, findingInputSuggestion, type Finding, type ClaimUnit, type FindingCategory, type FindingSeverity } from "./recommend";
+import { runAuditPipeline, countFindings, generateRestructured, generateDocumentFromBrief, DEFAULT_RECOMMEND_GUIDANCE, proposeTargetedEdits, verifyFindings, deriveConcreteEdits, findingNeedsInput, findingInputSuggestion, generateFindingsExecSummary, type Finding, type ClaimUnit, type FindingCategory, type FindingSeverity } from "./recommend";
 import type { SimplificationAction } from "./gemini";
 import { getCallerTenant, assertRowTenant, ALL_TENANT_FEATURES } from "./tenant.functions";
 import { computeCost, addUsage, type RunCost } from "./pricing";
+
+/**
+ * Appends one AI-spend entry to the report's cumulative cost ledger
+ * (summary_json.costLog). Every metered operation records here so the reviewer
+ * can audit total spend across re-runs — the legacy `cost` field only ever
+ * showed the LAST analysis run. Capped at the 50 most recent entries.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function appendCostLog(sj: Record<string, any>, op: string, cost: RunCost | null | undefined): Record<string, any> {
+  if (!cost || !(cost.usd > 0)) return sj;
+  const log = Array.isArray(sj.costLog) ? sj.costLog.slice(-49) : [];
+  log.push({
+    op,
+    usd: Number(cost.usd.toFixed(4)),
+    calls: cost.calls,
+    inputTokens: cost.inputTokens,
+    outputTokens: cost.outputTokens + (cost.thinkingTokens ?? 0),
+    at: new Date().toISOString(),
+  });
+  return { ...sj, costLog: log };
+}
 import {
   buildAuthUrl,
   buildRedirectUri,
@@ -4919,7 +4940,7 @@ export const runSimplifyV2Report = createServerFn({ method: "POST" })
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (supabase as any).from("analysis_reports").update({
-      summary_json: {
+      summary_json: appendCostLog({
         ...prevJson,
         // A re-run INVALIDATES prior outputs: stale exports/restructures from
         // the previous action/finding set must not survive next to fresh
@@ -4935,7 +4956,8 @@ export const runSimplifyV2Report = createServerFn({ method: "POST" })
         simplification_status: status,
         simplification_error: errorMsg,
         last_run_at: new Date().toISOString(),
-      },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      }, "Analysis run", (patch as any).cost),
     }).eq("id", report.id);
 
     return { reportId: report.id as string, status, error: errorMsg };
@@ -5436,6 +5458,49 @@ export const applyFindingsInPlaceV2Report = createServerFn({ method: "POST" })
   });
 
 /**
+ * Executive summary for the dashboard — generated from the findings already on
+ * the report (never re-reads the document, so it costs ~1–2 cents). Cached by
+ * a hash of the finding set: repeat calls with unchanged findings return the
+ * stored copy with zero AI spend. Spend is recorded in the cost ledger.
+ */
+export const generateExecSummaryV2 = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(z.object({ reportId: z.string() }))
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    const { data: report, error } = await supabase
+      .from("analysis_reports").select("*").eq("id", data.reportId).single();
+    if (error || !report) throw new Error("Report not found");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assertRowTenant((report as any).tenant_id, (await getCallerTenant(context.userId)).tenantId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sj = ((report.summary_json as any) ?? {}) as Record<string, any>;
+    const findings: Finding[] = Array.isArray(sj.findings) ? sj.findings : [];
+    if (!findings.length) throw new Error("No findings to summarise yet.");
+
+    const { createHash } = await import("node:crypto");
+    const hash = createHash("sha1")
+      .update(JSON.stringify(findings.map((f) => [f.id, f.title, f.severity])))
+      .digest("hex").slice(0, 16);
+    if (sj.execSummary?.hash === hash) return { ...sj.execSummary, cached: true };
+
+    const title = (report.policy_name as string) ?? "Document";
+    const { summary, groups, usage } = await generateFindingsExecSummary(title, findings);
+    if (!summary) throw new Error("Summary generation returned nothing.");
+    const execSummary = { hash, summary, groups, generatedAt: new Date().toISOString() };
+    await supabase.from("analysis_reports")
+      .update({
+        summary_json: appendCostLog(
+          { ...sj, execSummary },
+          "Executive summary",
+          computeCost(usage, await getDefaultModel()),
+        ),
+      })
+      .eq("id", data.reportId);
+    return { ...execSummary, cached: false };
+  });
+
+/**
  * THE FINAL DOCUMENT — the reliable path. One LLM call derives a verbatim
  * find→replace pair per accepted finding (reviewer decisions baked in), each
  * pair is verified to anchor in the source, then the deterministic redline
@@ -5496,14 +5561,14 @@ export const buildFinalDocument = createServerFn({ method: "POST" })
     try { srcText = docxToSimplifyText(file.buffer); } catch { /* validated below */ }
     if (!srcText.trim()) throw new Error("Could not extract text from the source document.");
 
-    const { edits, unresolved } = await deriveConcreteEdits(title, srcText, accepted, inputs);
+    const { edits, unresolved, usage: deriveUsage } = await deriveConcreteEdits(title, srcText, accepted, inputs);
     if (!edits.length) throw new Error("No applicable edits could be derived — see unresolved findings.");
 
-    const simplifyEdits: SimplifyDocxEdit[] = edits.map((e) => ({
-      before: e.find_text,
-      after: e.replace_text,
-      rationale: e.rationale,
-    }));
+    const simplifyEdits: SimplifyDocxEdit[] = edits.map((e) =>
+      e.insert_after
+        ? { before: "", after: e.replace_text, insertAfter: e.insert_after, rationale: e.rationale }
+        : { before: e.find_text, after: e.replace_text, rationale: e.rationale },
+    );
     const result = applySimplificationToDocx(file.buffer, simplifyEdits, {
       author: "AI Document Workflow",
       mode: "redline",          // Word tracked changes: deletions struck through, insertions marked
@@ -5522,6 +5587,9 @@ export const buildFinalDocument = createServerFn({ method: "POST" })
     const finalDoc = {
       url,
       sig,
+      // Basis lets the CLIENT tell whether the cached build is still current
+      // (button shows "opens instantly" vs "will re-derive") without a call.
+      basis: { ids: accepted.map((f) => f.id).sort(), inputs },
       builtAt: new Date().toISOString(),
       derived: edits.length,
       appliedCount: result.appliedCount,
@@ -5530,7 +5598,13 @@ export const buildFinalDocument = createServerFn({ method: "POST" })
       totalAccepted: accepted.length,
     };
     await supabase.from("analysis_reports")
-      .update({ summary_json: { ...sj, finalDoc } })
+      .update({
+        summary_json: appendCostLog(
+          { ...sj, finalDoc },
+          "Final document build",
+          computeCost(deriveUsage, await getDefaultModel()),
+        ),
+      })
       .eq("id", report.id);
     return finalDoc;
   });
@@ -5668,7 +5742,7 @@ export const generateRestructuredV2Document = createServerFn({ method: "POST" })
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (supabase as any)
       .from("analysis_reports")
-      .update({ summary_json: { ...sj, restructure } })
+      .update({ summary_json: appendCostLog({ ...sj, restructure }, "Redraft generation", restructure.cost) })
       .eq("id", report.id);
     return restructure;
   });

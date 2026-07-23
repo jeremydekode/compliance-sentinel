@@ -1036,11 +1036,15 @@ const SEV_COLORS: Record<string, string> = {
 };
 
 export function FindingsAnalyticsDashboard({
-  findings, restructure,
+  findings, restructure, execSummary, execBusy,
 }: {
   findings: Finding[];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   restructure: any | null;
+  /** Executive summary { summary, groups } — cached on the report. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  execSummary?: any | null;
+  execBusy?: boolean;
 }) {
   const active = useMemo(() => findings.filter((f) => f.verification?.status !== "rejected"), [findings]);
 
@@ -1069,6 +1073,42 @@ export function FindingsAnalyticsDashboard({
 
   return (
     <div className="px-6 py-5 space-y-5">
+      {/* executive summary */}
+      {(execSummary?.summary || execBusy) && (
+        <div className="rounded-2xl border bg-card p-5">
+          <div className="text-xs font-bold mb-2 flex items-center gap-2">
+            Executive summary
+            {execBusy && !execSummary?.summary && <Loader2 className="size-3 animate-spin text-muted-foreground" />}
+          </div>
+          {execSummary?.summary ? (
+            <>
+              <p className="text-sm leading-relaxed">{execSummary.summary}</p>
+              {Array.isArray(execSummary.groups) && execSummary.groups.length > 0 && (
+                <div className="grid gap-3 md:grid-cols-2 mt-4">
+                  {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
+                  {execSummary.groups.map((g: any, i: number) => (
+                    <div key={i} className="rounded-xl border bg-muted/30 px-4 py-3">
+                      <div className="text-xs font-semibold mb-1.5">{g.title}</div>
+                      <ul className="space-y-1">
+                        {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
+                        {(g.bullets ?? []).map((b: any, j: number) => (
+                          <li key={j} className="text-[12px] text-muted-foreground leading-relaxed flex gap-1.5">
+                            <span className="text-indigo-500 shrink-0">•</span>
+                            <span>{String(b)}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          ) : (
+            <p className="text-xs text-muted-foreground">Summarising the findings…</p>
+          )}
+        </div>
+      )}
+
       {/* status band */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-2">
         <StatTile icon={ListChecks} value={total} label="Findings raised" className="border-fuchsia-200 bg-fuchsia-50 text-fuchsia-700" />
@@ -1139,6 +1179,7 @@ export function FindingsAnalyticsDashboard({
             )}
           </div>
         </div>
+
       </div>
     </div>
   );

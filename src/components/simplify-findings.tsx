@@ -350,7 +350,7 @@ function QuarantineGroup({ findings }: { findings: Finding[] }) {
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function RestructurePanel({
-  reportId, findings, restructure, apply, onGenerated, onApplied, onCompareToggle, comparing, onReviewEdits, onExactView, onEditExact, decisions,
+  reportId, findings, restructure, apply, onGenerated, onApplied, onCompareToggle, comparing, onReviewEdits, onExactView, onEditExact, onOpenDraft, decisions,
 }: {
   reportId: string;
   findings: Finding[];
@@ -366,8 +366,10 @@ export function RestructurePanel({
   onReviewEdits?: () => void;
   /** Open the EXACT (PDF) render of the redraft. */
   onExactView?: () => void;
-  /** Open the EXACT in-app editor (OnlyOffice) for the redraft. */
+  /** Open the FINAL DOCUMENT (tracked changes on the original). */
   onEditExact?: () => void;
+  /** Open the generated redraft in the exact editor. */
+  onOpenDraft?: () => void;
   /** Reviewer decisions (findingId → value) entered inline on the finding cards,
    *  passed into generation so the redraft bakes them in. */
   decisions?: Record<string, string>;
@@ -506,6 +508,11 @@ export function RestructurePanel({
               )}
               {restructure && (
                 <div className="ml-auto flex gap-1">
+                  {onOpenDraft && restructure.downloadUrl && (
+                    <Button size="sm" className="h-6 px-2 text-[10px] gap-1 bg-fuchsia-600 hover:bg-fuchsia-700 text-white" onClick={onOpenDraft}>
+                      <PenLine className="size-3" /> Open draft
+                    </Button>
+                  )}
                   {onReviewEdits && (restructure.changeReport?.length ?? 0) > 0 && (
                     <Button size="sm" variant="outline" className="h-6 px-2 text-[10px] gap-1" onClick={onReviewEdits}>
                       <Sparkles className="size-3" /> Review edits ({restructure.changeReport.length})

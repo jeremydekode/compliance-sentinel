@@ -44,6 +44,9 @@ export type FindingCategory =
   | "sequencing"
   | "structural"
   | "non_verifiable"
+  // Comprehension-risk wording (over-complex sentences a reader could
+  // misexecute) — narrow by design; the Simplify mode owns style-level work.
+  | "simplification"
   // Not an audit defect — a reviewer's ad-hoc "Edit with AI" request, kept in
   // its own category so it never reads as a discovered risk in the dashboard.
   | "user_requested";
@@ -60,6 +63,7 @@ export const FINDING_CATEGORY_META: Record<FindingCategory, { label: string; hin
   sequencing:      { label: "Sequencing",           hint: "Steps out of order or forward-referencing" },
   structural:      { label: "Structure",            hint: "Numbering, heading or formatting decay" },
   non_verifiable:  { label: "Non-verifiable",       hint: "Obligation with no measurable criterion" },
+  simplification:  { label: "Over-complex wording", hint: "Sentence complexity a careful reader could misexecute" },
   user_requested:  { label: "Requested edit",       hint: "Change requested directly by a reviewer" },
 };
 
@@ -108,53 +112,106 @@ const SEVERITY_ORDER: Record<FindingSeverity, number> = { critical: 0, high: 1, 
 
 // ── Default guidance (editable in Settings under "simplify_v2_recommend") ────
 
-export const DEFAULT_RECOMMEND_GUIDANCE = `DOCUMENT QUALITY AUDIT — RHB HOUSE RULES
+export const DEFAULT_RECOMMEND_GUIDANCE = `DOCUMENT QUALITY AUDIT — OPERATIONS & POLICY DOCUMENTS
 
 # ROLE
-You are a senior process-quality auditor reviewing bank SOP / policy / operations
-manuals that have degraded through years of layered edits. Your job is to find
-DEFECTS IN THE DOCUMENT ITSELF — not to critique the underlying policy choices.
+You are a senior process-quality auditor reviewing operational documents (SOPs,
+policies, operations manuals, procedures) that have degraded through years of
+layered edits. Find DEFECTS IN THE DOCUMENT ITSELF — never critique the
+underlying policy choices.
 
-# DEFECT CATEGORIES — the only nine you may report
+# DEFECT CATEGORIES — the only ten you may report
 1. contradiction — two places impose conflicting requirements.
    e.g. "Section 4.2 requires escalation after 2 failed matches; Section 7.1 says after 3."
-2. incompleteness — a procedure is missing steps, prerequisites, inputs,
-   exception handling, or an escalation path.
-   e.g. "Step 5 references the completed Form CD-11 but no step produces it."
-   e.g. "The rejection branch says 'refer for review' with no named recipient or SLA."
-3. ambiguous_actor — an obligation with no clear owner.
-   e.g. "'The officer shall verify the signature' where three officer roles are defined."
-4. undefined_term — an acronym or capitalised defined term used but never defined.
-5. stale_reference — a cross-reference to a section/appendix that does not exist.
-6. redundancy — the same rule stated in multiple places, especially DIVERGENT
-   copies (the most dangerous decay: two versions of one rule drifting apart).
-7. sequencing — steps presented out of execution order, or a step consuming an
-   output produced only in a later step.
-8. structural — numbering gaps, orphan headings, inconsistent list/format
-   conventions that impede navigation.
-9. non_verifiable — an obligation with no measurable criterion.
-   e.g. "'reviews must be performed regularly' — no frequency stated."
+2. incompleteness — missing steps, prerequisites, inputs, exception handling,
+   or an escalation path (e.g. a rejection branch with no named recipient/SLA).
+3. ambiguous_actor — an obligation with no clear owner. Includes passive-voice
+   obligations ("documents are to be forwarded") and OWNER DRIFT: the same
+   control assigned to different roles in different sections.
+4. undefined_term — a term or acronym the reader cannot resolve. Check ALL of:
+   a) acronym used but never expanded AND absent from any glossary/definitions
+      section the document contains;
+   b) acronym in the glossary but not expanded at FIRST body use;
+   c) POLYSEMY: one acronym plausibly meaning different things in different
+      places (e.g. "GL" as general-ledger in one section, a legal team in
+      another) — this is HIGH severity, not medium;
+   d) a defined term whose definition conflicts with how a section uses it.
+5. stale_reference — a cross-reference to a section/appendix/form that does not
+   exist in this document.
+6. redundancy — the same rule stated in more than one place. Hunt PARAPHRASED
+   restatements, not just verbatim copies: overview/summary sections routinely
+   restate detailed sections. For every rule that appears in both an overview
+   AND a detail section, COMPARE THEM WORD BY WORD for drift in actor,
+   threshold, scope, or sequence — divergent restatements are the most
+   dangerous decay in layered documents. Quote BOTH locations.
+7. sequencing — steps out of execution order; a step consuming an output no
+   earlier step produced; a loop-back/branch target that does not match what
+   the target step actually does (verify by READING the target step's text and
+   quoting it).
+8. structural — numbering gaps, orphan headings, format conventions that
+   impede navigation.
+9. non_verifiable — an obligation with no measurable criterion. Includes VAGUE
+   TRIGGERS on controls: "complicated matters", "if required", "where
+   necessary", "as soon as possible", "immediately" (no SLA), and OPEN-ENDED
+   scopes in checklists ("amongst others", "including but not limited to")
+   where the list is the control.
+10. simplification — wording whose complexity creates COMPREHENSION RISK in a
+    control document: a sentence over ~40 words carrying 2+ conditions; nested
+    exceptions ("unless… except where…"); double negatives; a paragraph mixing
+    obligation, rationale and exception that should be separate sentences.
+    This is NOT style polish — flag only where a careful reader could
+    misexecute. Cap: report only the worst instances, max ~6 per document.
+
+# CARVE-OUTS — do NOT report
+- "issued/amended from time to time" attached to EXTERNAL laws, regulators or
+  standards bodies — that is correct legal boilerplate. (Internal documents
+  referenced this way ARE reportable if no owning team or location is named.)
+- Policy disagreements ("2 approvals should be 3") — out of scope.
+- Pure prose taste with no misexecution risk — the Simplify workflow owns that.
+- Anything a verbatim quote cannot prove.
 
 # SEVERITY CALIBRATION — be honest; this drives triage
-- critical — contradictory obligations, or a missing escalation/exception path
-  with regulatory or financial exposure. A person following the document could
-  act wrongly.
-- high     — execution-blocking: a missing prerequisite/step, or actor ambiguity
-  on a control activity. A person following the document gets stuck or guesses.
-- medium   — undefined terms, stale references, divergent duplicates, sequencing
-  problems. Causes confusion and rework but a careful reader can recover.
-- info     — structural/format decay and style-level observations.
+- critical — contradictory obligations; missing escalation/exception path with
+  regulatory or financial exposure; acronym polysemy on a financial/control
+  term. A person following the document could act wrongly.
+- high — execution-blocking: missing prerequisite, actor ambiguity or owner
+  drift on a control activity, wrong branch/loop target, vague trigger gating
+  a control. A person following the document gets stuck or guesses.
+- medium — undefined terms (non-polysemous), stale references, divergent
+  duplicates with immaterial drift, sequencing that context recovers,
+  simplification findings.
+- info — structural/format decay.
 
 # EVIDENCE RULES — non-negotiable
-- Every finding MUST quote the document VERBATIM (no paraphrase) with its section.
-- contradiction and redundancy findings MUST quote BOTH locations.
-- Keep each quote under 60 words — the shortest span that proves the issue.
+- Every finding MUST quote the document VERBATIM (no paraphrase) with section.
+- contradiction and redundancy MUST quote BOTH locations.
+- sequencing findings about a branch/loop target MUST also quote the TARGET
+  step's text — if you did not read the target, do not report it.
+- Keep each quote under 60 words — the shortest span proving the issue.
 - If you cannot quote it, do not report it.
 
-# WHAT NOT TO REPORT
-- Policy disagreements ("2 approvals should be 3") — out of scope.
-- Prose style/verbosity — the separate simplification pass owns that.
-- Anything a quoted span cannot prove.
+# SUGGESTED-FIX FORMAT — fixes feed an automated editor; follow exactly
+- Phrase every fix as a SINGLE-PASSAGE replacement of the quoted text where
+  possible, and include the concrete replacement wording in quotes:
+  … such as: 'the Reviewer shall forward the legal documents to Group Legal'.
+- undefined_term fixes: expand at first use in the standard form — such as:
+  'Group Legal ("GL")' — and state that later uses keep the bare acronym; if
+  the document has a glossary, add "and add a Glossary row" as a secondary
+  instruction.
+- ambiguous_actor fixes: name a PLACEHOLDER role in the example and keep it
+  obviously replaceable — the reviewer supplies the real owner.
+- redundancy fixes: state which copy is canonical (the detail section unless
+  context says otherwise) and replace the other with a cross-reference — such
+  as: 'Refer to Section D.2 for the verification requirements.'
+- incompleteness fixes MAY propose NEW standalone content (a missing step,
+  exception path, or escalation rule). Format: state the insertion point by
+  quoting the EXACT paragraph it follows — "Insert after: '<verbatim anchor>'"
+  — then give the full new text in quotes. New content must match the
+  document's voice and numbering; never renumber existing steps, use
+  "Step 5a"-style interpolation instead.
+- If a fix genuinely needs a value only the organisation knows (owner, SLA,
+  threshold, definition), still provide your best-guess example in quotes so
+  the reviewer can confirm or replace it.
 
 # CONFIDENCE
 - 90-100: the quotes alone prove the defect to any reader.
@@ -778,12 +835,66 @@ If nothing in the document is actually relevant to the request, return an empty 
   return { candidates, usage };
 }
 
+// ── Executive summary (from stored findings — no document re-read) ───────────
+
+/**
+ * Management-level narrative built from the findings ALREADY on the report:
+ * a 3–5 sentence executive summary plus themed what-needs-fixing bullets.
+ * Deliberately cheap — it reads the findings JSON, not the document, so it
+ * costs ~1–2 cents and is cached by the caller until the findings change.
+ */
+export async function generateFindingsExecSummary(
+  title: string,
+  findings: Finding[],
+): Promise<{ summary: string; groups: { title: string; bullets: string[] }[]; usage: TokenUsage }> {
+  const active = findings.filter((f) => f.verification?.status !== "rejected");
+  const compact = active.map((f) => ({
+    id: f.id,
+    category: f.category,
+    severity: f.severity,
+    title: f.title,
+    issue: (f.description ?? "").slice(0, 240),
+    where: f.evidence?.[0]?.section ?? "",
+  }));
+
+  const prompt = `# ROLE: DOCUMENT QUALITY BRIEFING WRITER
+An automated audit of "${title}" produced the findings below. Write a briefing a department head reads in 30 seconds.
+
+# FINDINGS (JSON)
+${JSON.stringify(compact)}
+
+# OUTPUT — ONLY JSON:
+{
+  "summary": "3–5 sentences: the document's overall condition, the dominant weakness patterns, the concrete risk they pose to operations/compliance, and what fixing them achieves. Plain business English — no AI-speak, no hedging.",
+  "groups": [
+    { "title": "short theme name (e.g. 'Unclear ownership of actions')",
+      "bullets": ["one plain-English bullet per key change needed — WHAT to change and WHY it matters, grounded in the findings; 1–2 lines each"] }
+  ]
+}
+Rules: 2–4 groups, 2–4 bullets each, ordered by importance. Group by THEME (what's wrong for the business), not by internal category names. Never invent issues not present in the findings.`;
+
+  const { items, usage } = await askJson(prompt, "fast", 8192);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const root: any = Array.isArray(items) ? (items[0] ?? {}) : items;
+  const summary = String(root?.summary ?? "").trim();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const groups = (Array.isArray(root?.groups) ? root.groups : []).map((g: any) => ({
+    title: String(g?.title ?? "").trim(),
+    bullets: (Array.isArray(g?.bullets) ? g.bullets : []).map((b: unknown) => String(b).trim()).filter(Boolean).slice(0, 5),
+  })).filter((g: { title: string; bullets: string[] }) => g.title && g.bullets.length).slice(0, 5);
+  return { summary, groups, usage };
+}
+
 // ── Concrete edit derivation (final document) ────────────────────────────────
 
 export interface ConcreteEdit {
   findingId: string;
+  /** Replacement edit: verbatim span to replace. Empty for insertions. */
   find_text: string;
+  /** The corrected passage (replacement) or the NEW content (insertion). */
   replace_text: string;
+  /** Insertion edit: verbatim anchor paragraph the new content follows. */
+  insert_after?: string;
   rationale: string;
 }
 
@@ -824,11 +935,11 @@ export async function deriveConcreteEdits(
 "${title}" has been audited. For EACH finding below, produce ONE concrete edit that fixes it — as an exact find→replace pair against the document.
 
 # HARD RULES
-1. "find_text" MUST be copied CHARACTER-FOR-CHARACTER from the document (the flagged passage, or the smallest span that must change). Never paraphrase it.
+1. "find_text" MUST be copied CHARACTER-FOR-CHARACTER from the document (the flagged passage, or the smallest span that must change). Never paraphrase it. It must not span more than one paragraph.
 2. "replace_text" is the corrected passage: the SAME text with ONLY the fix applied. Keep everything else identical — same terminology, same tone, no gratuitous rewriting.
 3. Where a REVIEWER-PROVIDED VALUE is given, use it verbatim in replace_text.
-4. Single passage only — no new paragraphs, headings or lists. If the fix genuinely needs new standalone content, append the new sentence(s) to the end of the flagged passage inside replace_text.
-5. If a finding cannot be fixed by replacing one passage, put it in "unresolved" with a one-sentence reason. Never force a bad edit.
+4. ADDITIONS (a missing step, exception path, escalation rule): use the insertion form instead — "insert_after" is the EXACT verbatim text of the existing paragraph the new content should follow (one paragraph, copied character-for-character), and "replace_text" is the complete new content. Match the document's voice; never renumber existing steps — interpolate ("Step 5a") instead. Use a blank line inside replace_text to make multiple paragraphs.
+5. If a finding cannot be fixed by one replacement or one insertion, put it in "unresolved" with a one-sentence reason. Never force a bad edit.
 
 # FINDINGS
 ${findingBlocks}
@@ -836,8 +947,11 @@ ${findingBlocks}
 # DOCUMENT
 ${text.slice(0, 400_000)}
 
-# OUTPUT — ONLY JSON:
-{"edits": [{"findingId": "F-001", "find_text": "…", "replace_text": "…", "rationale": "one sentence"}],
+# OUTPUT — ONLY JSON. Each edit is EITHER a replacement OR an insertion:
+{"edits": [
+  {"findingId": "F-001", "find_text": "…", "replace_text": "…", "rationale": "one sentence"},
+  {"findingId": "F-002", "insert_after": "…exact existing paragraph…", "replace_text": "…new content…", "rationale": "one sentence"}
+ ],
  "unresolved": [{"findingId": "F-00X", "reason": "…"}]}`;
 
   const { items, usage } = await askJson(prompt, "quality", 32768);
@@ -860,9 +974,24 @@ ${text.slice(0, 400_000)}
   for (const e of rawEdits) {
     const id = String(e?.findingId ?? "");
     const f = byId.get(id);
-    const find = String(e?.find_text ?? "").trim();
     const replace = String(e?.replace_text ?? "").trim();
-    if (!f || !find || !replace) continue;
+    if (!f || !replace) continue;
+    const find = String(e?.find_text ?? "").trim();
+    const insertAfter = String(e?.insert_after ?? "").trim();
+
+    // Insertion form: the anchor paragraph must locate; the new text is free.
+    if (!find && insertAfter) {
+      const aNorm = norm(insertAfter);
+      if (!paraNorms.some((p) => p.includes(aNorm))) {
+        unresolved.push({ findingId: id, title: f.title, reason: "Insertion anchor not found verbatim in the document" });
+        continue;
+      }
+      edits.push({ findingId: id, find_text: "", insert_after: insertAfter, replace_text: replace, rationale: String(e?.rationale ?? f.title) });
+      byId.delete(id);
+      continue;
+    }
+
+    if (!find) continue;
     // Deterministic anchor check — a claimed edit must actually locate.
     const fNorm = norm(find);
     if (!paraNorms.some((p) => p.includes(fNorm))) {

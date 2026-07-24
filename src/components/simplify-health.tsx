@@ -13,10 +13,6 @@ import { useServerFn } from "@tanstack/react-start";
 import { useQueryClient } from "@tanstack/react-query";
 import type { Finding, FindingSeverity } from "@/lib/recommend";
 import { FINDING_CATEGORY_META, findingNeedsInput } from "@/lib/recommend";
-import {
-  ResponsiveContainer, PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis,
-  Tooltip as ChartTooltip,
-} from "recharts";
 import { SIMPLIFY_TYPE_LABEL, type VerifiedAction } from "@/lib/simplify";
 import {
   setV2FindingDecision,
@@ -1126,18 +1122,25 @@ export function FindingsAnalyticsDashboard({
       </div>
 
       <div className="grid gap-4 lg:grid-cols-3">
-        {/* severity donut */}
+        {/* severity donut — pure CSS conic-gradient (no chart lib / ResizeObserver) */}
         <div className="rounded-2xl border bg-card p-4">
           <div className="text-xs font-bold mb-1">Severity mix</div>
-          <div className="h-44">
-            <ResponsiveContainer width="100%" height="100%">
-              <PieChart>
-                <Pie data={sevData} dataKey="value" nameKey="label" innerRadius={42} outerRadius={64} paddingAngle={2} strokeWidth={0}>
-                  {sevData.map((d) => <Cell key={d.name} fill={SEV_COLORS[d.name]} />)}
-                </Pie>
-                <ChartTooltip formatter={(v: number, n: string) => [`${v} finding${v === 1 ? "" : "s"}`, n]} />
-              </PieChart>
-            </ResponsiveContainer>
+          <div className="h-44 grid place-items-center">
+            {(() => {
+              const tot = sevData.reduce((a, d) => a + d.value, 0) || 1;
+              let acc = 0;
+              const stops = sevData.map((d) => {
+                const s = (acc / tot) * 360; acc += d.value; const e = (acc / tot) * 360;
+                return `${SEV_COLORS[d.name]} ${s}deg ${e}deg`;
+              }).join(", ");
+              return (
+                <div className="relative size-32 rounded-full" style={{ background: `conic-gradient(${stops})` }}>
+                  <div className="absolute inset-[26%] rounded-full bg-card grid place-items-center">
+                    <span className="text-lg font-black leading-none">{tot}</span>
+                  </div>
+                </div>
+              );
+            })()}
           </div>
           <div className="flex flex-wrap gap-x-3 gap-y-1 justify-center">
             {sevData.map((d) => (
@@ -1149,18 +1152,23 @@ export function FindingsAnalyticsDashboard({
           </div>
         </div>
 
-        {/* category bars */}
+        {/* category bars — plain flex bars (no chart lib) */}
         <div className="rounded-2xl border bg-card p-4">
-          <div className="text-xs font-bold mb-1">Issue categories</div>
-          <div style={{ height: Math.max(176, catData.length * 34) }}>
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={catData} layout="vertical" margin={{ left: 4, right: 16, top: 4, bottom: 4 }}>
-                <XAxis type="number" hide domain={[0, "dataMax"]} />
-                <YAxis type="category" dataKey="label" width={104} tick={{ fontSize: 11 }} axisLine={false} tickLine={false} />
-                <ChartTooltip formatter={(v: number) => [`${v} finding${v === 1 ? "" : "s"}`, ""]} />
-                <Bar dataKey="count" fill="#6366f1" radius={[0, 4, 4, 0]} barSize={16} />
-              </BarChart>
-            </ResponsiveContainer>
+          <div className="text-xs font-bold mb-2">Issue categories</div>
+          <div className="space-y-1.5">
+            {(() => {
+              const max = Math.max(1, ...catData.map((c) => c.count));
+              return catData.map((c) => (
+                <div key={c.cat} className="flex items-center gap-2">
+                  <span className="w-24 shrink-0 text-[11px] text-muted-foreground truncate" title={c.label}>{c.label}</span>
+                  <div className="flex-1 h-4 rounded bg-muted/60 overflow-hidden">
+                    <div className="h-full rounded bg-indigo-500" style={{ width: `${(c.count / max) * 100}%` }} />
+                  </div>
+                  <span className="w-5 shrink-0 text-right text-[11px] font-semibold">{c.count}</span>
+                </div>
+              ));
+            })()}
+            {catData.length === 0 && <p className="text-xs text-muted-foreground">No categorised findings.</p>}
           </div>
         </div>
 

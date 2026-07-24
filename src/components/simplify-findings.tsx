@@ -403,8 +403,15 @@ export function RestructurePanel({
         const v = decisionValue(f).trim();
         if (v) userInputs[f.id] = v;
       }
-      await generate({ data: { reportId, ...(Object.keys(userInputs).length ? { userInputs } : {}) } });
-      toast.success("Restructured document generated");
+      const r = await generate({ data: { reportId, ...(Object.keys(userInputs).length ? { userInputs } : {}) } });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      if ((r as any)?.cached) {
+        toast.success("Redraft is already up to date", {
+          description: "Nothing changed since the last generation — served from cache, no AI cost.",
+        });
+      } else {
+        toast.success("Restructured document generated");
+      }
       onGenerated();
     } catch (e) {
       toast.error("Generation failed", { description: (e as Error)?.message });
@@ -642,11 +649,15 @@ export function RestructurePanel({
                       <Button size="sm" variant="ghost" className="w-full h-6 px-2 text-[10px] gap-1"><FileDown className="size-3" /> Redraft + comments</Button>
                     </a>
                   )}
-                  {apply && (
+                  {apply?.annotatedUrl ? (
+                    <a href={apply.annotatedUrl} target="_blank" rel="noreferrer" className="flex-1 min-w-[110px]">
+                      <Button size="sm" variant="ghost" className="w-full h-6 px-2 text-[10px] gap-1"><FileDown className="size-3" /> In-place + comments</Button>
+                    </a>
+                  ) : apply ? (
                     <Button size="sm" variant="ghost" className="flex-1 min-w-[110px] h-6 px-2 text-[10px] gap-1" disabled={running !== null || accepted.length === 0} onClick={() => runApply("annotated")}>
-                      <FileDown className="size-3" /> {apply.annotatedUrl ? "In-place + comments" : "In-place + comments"}
+                      <FileDown className="size-3" /> In-place + comments
                     </Button>
-                  )}
+                  ) : null}
                 </div>
 
                 {Array.isArray(restructure?.changeReport) && restructure.changeReport.length > 0 && (

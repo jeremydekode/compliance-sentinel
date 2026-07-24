@@ -33,6 +33,32 @@ function appendCostLog(sj: Record<string, any>, op: string, cost: RunCost | null
   });
   return { ...sj, costLog: log };
 }
+
+/** Today's date (YYYY-MM-DD) in the organisation's timezone. A raw UTC slice
+ *  stamps YESTERDAY's date for a Malaysian reviewer working before 8am local —
+ *  wrong on change-history rows and reviewer-value traceability comments. */
+function localToday(): string {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kuala_Lumpur" }).format(new Date());
+}
+
+/** Fresh summary_json read immediately before a write. The v2 server fns read
+ *  sj, then spend seconds-to-minutes in AI / CloudConvert / uploads before
+ *  writing `{ ...sj, patch }` — a decision, typed input, or cost entry saved
+ *  meanwhile would be silently clobbered by that stale spread. Re-reading
+ *  narrows the lost-update window from minutes to milliseconds. (The complete
+ *  fix is a jsonb_set RPC per key; deliberately not adding a migration to the
+ *  shared local+prod database for this.) */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function freshSj(supabase: any, reportId: string, fallback: Record<string, any>): Promise<Record<string, any>> {
+  try {
+    const { data } = await supabase
+      .from("analysis_reports").select("summary_json").eq("id", reportId).single();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return ((data?.summary_json as any) ?? fallback) as Record<string, any>;
+  } catch {
+    return fallback;
+  }
+}
 import {
   buildAuthUrl,
   buildRedirectUri,
@@ -1474,7 +1500,7 @@ export const publishToKB = createServerFn({ method: "POST" })
       chapter: string | null;
     }>;
 
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localToday();
     let updated = 0;
     const seen = new Set<string>();
 
@@ -1667,17 +1693,31 @@ export const chatWithReport = createServerFn({ method: "POST" })
       .order("created_at", { ascending: true })
       .limit(40);
 
+    // Context pruning: summary_json accumulates bookkeeping (cost ledger,
+    // reviewer inputs, apply/final-doc blobs, editor keys) that is useless to
+    // the assistant but re-billed as input tokens on EVERY chat message. Send
+    // only the analysis substance, compact-serialized, with a hard size cap.
+    const {
+      costLog: _cl, decisionInputs: _di, execSummary: _es, finalDoc: _fd,
+      apply: _ap, restructure: _rs, findings: _fi, actions: _ac,
+      structure: _st, cost: _co, editKeys: _ek, claims: _cm, cross_check: _cc,
+      ...summaryCtx
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } = ((report?.summary_json as any) ?? {}) as Record<string, any>;
+    let summaryJsonCtx = JSON.stringify(summaryCtx);
+    if (summaryJsonCtx.length > 60_000) summaryJsonCtx = summaryJsonCtx.slice(0, 60_000) + '…(truncated)"}';
+
     const system = `You are a compliance analyst assistant for the report "${report?.title}" (${report?.policy_name}).
 You have full context on the regulatory changes and the impacted internal SOPs below. Answer concisely with markdown, cite chapter refs, and stay grounded in this data.
 
 REGULATORY CHANGES (JSON):
-${JSON.stringify(changes ?? [], null, 2)}
+${JSON.stringify(changes ?? [])}
 
 SOP IMPACTS (JSON):
-${JSON.stringify(impacts ?? [], null, 2)}
+${JSON.stringify(impacts ?? [])}
 
 EXECUTIVE SUMMARY (JSON):
-${JSON.stringify(report?.summary_json ?? {}, null, 2)}`;
+${summaryJsonCtx}`;
 
     await supabase
       .from("chat_messages")
@@ -1686,6 +1726,9 @@ ${JSON.stringify(report?.summary_json ?? {}, null, 2)}`;
     const CHAT_MODELS = ["gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash"];
 
     let buffer = "";
+    let usedModel = CHAT_MODELS[0];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let usageMeta: any = null;
     try {
       const { GoogleGenAI } = await import("@google/genai");
       const ai = new GoogleGenAI({ apiKey: process.env.GOOGLE_GENERATIVE_AI_API_KEY || "" });
@@ -1702,6 +1745,7 @@ ${JSON.stringify(report?.summary_json ?? {}, null, 2)}`;
       for (const model of CHAT_MODELS) {
         try {
           stream = await ai.models.generateContentStream({ model, contents, config: { systemInstruction: system } });
+          usedModel = model;
           break;
         } catch (e: any) {
           const msg: string = e?.message ?? "";
@@ -1715,6 +1759,7 @@ ${JSON.stringify(report?.summary_json ?? {}, null, 2)}`;
       if (!stream) throw new Error("All chat models are currently unavailable. Please try again shortly.");
 
       for await (const chunk of stream) {
+        if (chunk.usageMetadata) usageMeta = chunk.usageMetadata; // final chunk carries totals
         const text = chunk.text ?? "";
         if (text) {
           buffer += text;
@@ -1726,6 +1771,27 @@ ${JSON.stringify(report?.summary_json ?? {}, null, 2)}`;
         await supabase
           .from("chat_messages")
           .insert({ report_id: data.reportId, role: "assistant", content: buffer });
+      }
+      // Chat spend was invisible before — it never reached the cost ledger, so
+      // the audit undercounted. Re-fetch sj fresh to minimise clobbering a
+      // concurrent writer, then append one "Report chat" entry per message.
+      if (usageMeta) {
+        try {
+          const cost = computeCost({
+            inputTokens: usageMeta.promptTokenCount ?? 0,
+            outputTokens: usageMeta.candidatesTokenCount ?? 0,
+            thinkingTokens: usageMeta.thoughtsTokenCount ?? 0,
+            calls: 1,
+          }, usedModel);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const { data: fresh } = await (supabase as any)
+            .from("analysis_reports").select("summary_json").eq("id", data.reportId).single();
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const freshSj = ((fresh?.summary_json as any) ?? {}) as Record<string, any>;
+          await supabase.from("analysis_reports")
+            .update({ summary_json: appendCostLog(freshSj, "Report chat", cost) })
+            .eq("id", data.reportId);
+        } catch { /* metering is best-effort — never break the chat reply */ }
       }
     }
   });
@@ -2617,7 +2683,7 @@ export const createFormUpdateReport = createServerFn({ method: "POST" })
             `Form ${data.formId} updated with ${data.fieldChanges.length} field change(s).`,
             `Analysis in progress…`,
           ],
-          effective_date: new Date().toISOString().slice(0, 10),
+          effective_date: localToday(),
           before_count: data.fieldChanges.length,
           after_count: data.fieldChanges.length,
           structural: { added: [], renamed: [], restructured: [] },
@@ -3808,7 +3874,7 @@ export const generateAmendedDraft = createServerFn({ method: "POST" })
 
     const drafts: any[] = [];
     const skipped: { title: string; reason: string }[] = [];
-    const stamp = new Date().toISOString().slice(0, 10);
+    const stamp = localToday();
 
     for (const [sopId, imps] of bySop.entries()) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -4816,7 +4882,10 @@ export const runSimplifyV2Report = createServerFn({ method: "POST" })
         status = "ok";
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         await (supabase as any).from("analysis_reports").update({
-          summary_json: {
+          // appendCostLog: without a ledger entry the brief-generation spend
+          // vanishes from the cumulative total the moment any later metered op
+          // appends its first costLog entry (the total prefers the ledger).
+          summary_json: appendCostLog({
             ...prevJson,
             ...patch,
             kind: "simplification_v2",
@@ -4825,7 +4894,7 @@ export const runSimplifyV2Report = createServerFn({ method: "POST" })
             simplification_status: status,
             simplification_error: null,
             last_run_at: new Date().toISOString(),
-          },
+          }, "Document draft", patch.cost),
         }).eq("id", report.id);
         return { reportId: report.id as string, status, error: null };
       }
@@ -4859,6 +4928,9 @@ export const runSimplifyV2Report = createServerFn({ method: "POST" })
         const actions = [...main.actions, ...dedup.actions];
         let usage = addUsage(addUsage(main.usage, dedup.usage), docSum.usage);
         if (actions.length === 0) {
+          // The three passes were still billed — meter them before failing, or
+          // the ledger under-reports exactly the runs users ask about.
+          patch.cost = computeCost(usage, await getDefaultModel());
           throw new Error("No simplification actions were produced — the model was likely overloaded. Please re-run.");
         }
         const summary = verifyActions(actions, src.text);
@@ -5304,8 +5376,9 @@ export const applySimplifyV2Report = createServerFn({ method: "POST" })
       }
     }
 
+    const reviewer = data.author?.trim() || "AI Doc Reviewer";
     const result = applySimplificationToDocx(file.buffer, edits, {
-      author: data.author?.trim() || "AI Doc Reviewer",
+      author: reviewer,
       mode: data.exportMode === "clean" ? "clean" : "redline",
       redlineComments: data.exportMode === "annotated",
     });
@@ -5325,7 +5398,11 @@ export const applySimplifyV2Report = createServerFn({ method: "POST" })
     // `sig` fingerprints the accepted set by original action index.
     // "v2:" prefix invalidates copies built before the "AI Doc Reviewer"
     // authorship change, so re-opening the final document rebuilds with it.
-    const sig = "v2:" + allActions.map((a, i) => (a?.decision === "accepted" ? i : -1)).filter((i) => i >= 0).join(",");
+    // A NON-DEFAULT author is folded into the sig (default authors keep the
+    // sig unchanged so existing caches and the client's copy stay in lockstep)
+    // — otherwise reviewer B could be handed a copy authored as reviewer A.
+    const sig = "v2:" + allActions.map((a, i) => (a?.decision === "accepted" ? i : -1)).filter((i) => i >= 0).join(",")
+      + (reviewer !== "AI Doc Reviewer" ? `|a:${reviewer}` : "");
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const prevApply = (sj.apply ?? {}) as Record<string, any>;
     const carry = prevApply.sig === sig ? prevApply : {};
@@ -5344,7 +5421,7 @@ export const applySimplifyV2Report = createServerFn({ method: "POST" })
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (supabase as any)
       .from("analysis_reports")
-      .update({ summary_json: { ...sj, apply } })
+      .update({ summary_json: { ...(await freshSj(supabase, data.reportId, sj)), apply } })
       .eq("id", report.id);
     return apply;
   });
@@ -5418,8 +5495,9 @@ export const applyFindingsInPlaceV2Report = createServerFn({ method: "POST" })
       rationale: f.title || f.description || undefined,
     }));
 
+    const reviewer = data.author?.trim() || "AI Doc Reviewer";
     const result = applySimplificationToDocx(file.buffer, edits, {
-      author: data.author?.trim() || "AI Doc Reviewer",
+      author: reviewer,
       mode: data.exportMode === "clean" ? "clean" : "redline",
       redlineComments: data.exportMode === "annotated",
     });
@@ -5436,8 +5514,10 @@ export const applyFindingsInPlaceV2Report = createServerFn({ method: "POST" })
     // Keep the OTHER export mode's copy only if it was built from the exact same
     // accepted set (so a reviewer can hold both clean + tracked-changes). If the
     // accepted findings changed since, its download would be stale/mismatched, so
-    // both prior URLs are dropped. `sig` fingerprints the accepted set.
-    const sig = accepted.map((f) => f.id).sort().join(",");
+    // both prior URLs are dropped. `sig` fingerprints the accepted set (plus a
+    // non-default author, so one reviewer's copy is never carried for another).
+    const sig = accepted.map((f) => f.id).sort().join(",")
+      + (reviewer !== "AI Doc Reviewer" ? `|a:${reviewer}` : "");
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const prevApply = (sj.apply ?? {}) as Record<string, any>;
     const carry = prevApply.sig === sig ? prevApply : {};
@@ -5458,7 +5538,7 @@ export const applyFindingsInPlaceV2Report = createServerFn({ method: "POST" })
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (supabase as any)
       .from("analysis_reports")
-      .update({ summary_json: { ...sj, apply } })
+      .update({ summary_json: { ...(await freshSj(supabase, data.reportId, sj)), apply } })
       .eq("id", report.id);
     return apply;
   });
@@ -5492,14 +5572,25 @@ export const generateExecSummaryV2 = createServerFn({ method: "POST" })
 
     const title = (report.policy_name as string) ?? "Document";
     const { summary, groups, usage } = await generateFindingsExecSummary(title, findings);
-    if (!summary) throw new Error("Summary generation returned nothing.");
+    const cost = computeCost(usage, await getDefaultModel());
+    // The auto-fired summary races the reviewer's first decisions (and, on
+    // redraft_auto reports, the bulk pre-accept) — writing from the pre-AI
+    // snapshot would silently revert them. Re-read before writing, always —
+    // including the empty-summary failure, so the spend still reaches the
+    // ledger.
+    if (!summary) {
+      await supabase.from("analysis_reports")
+        .update({ summary_json: appendCostLog(await freshSj(supabase, data.reportId, sj), "Executive summary (failed)", cost) })
+        .eq("id", data.reportId);
+      throw new Error("Summary generation returned nothing.");
+    }
     const execSummary = { hash, summary, groups, generatedAt: new Date().toISOString() };
     await supabase.from("analysis_reports")
       .update({
         summary_json: appendCostLog(
-          { ...sj, execSummary },
+          { ...(await freshSj(supabase, data.reportId, sj)), execSummary },
           "Executive summary",
-          computeCost(usage, await getDefaultModel()),
+          cost,
         ),
       })
       .eq("id", data.reportId);
@@ -5555,10 +5646,20 @@ export const buildFinalDocument = createServerFn({ method: "POST" })
     }
 
     const { createHash } = await import("node:crypto");
+    // Tracked changes + comments carry the REVIEWER's name; a NON-default
+    // author folds into the sig so one reviewer is never handed a cached copy
+    // authored as somebody else. The default omits the key, keeping existing
+    // v6 caches valid (no forced AI re-derive).
+    const reviewer = data.author?.trim() || "AI Doc Reviewer";
     // "v6" engine salt: authorship changed to "AI Doc Reviewer" — bump so a
     // re-open rebuilds with the new author instead of returning the cached copy.
     const sig = createHash("sha1")
-      .update(JSON.stringify({ v: "v6", ids: accepted.map((f) => f.id).sort(), inputs }))
+      .update(JSON.stringify({
+        v: "v6",
+        ids: accepted.map((f) => f.id).sort(),
+        inputs,
+        ...(reviewer !== "AI Doc Reviewer" ? { author: reviewer } : {}),
+      }))
       .digest("hex").slice(0, 16);
     if (sj.finalDoc?.url && sj.finalDoc.sig === sig) return sj.finalDoc;
 
@@ -5571,14 +5672,27 @@ export const buildFinalDocument = createServerFn({ method: "POST" })
     try { srcText = docxToSimplifyText(file.buffer); } catch { /* validated below */ }
     if (!srcText.trim()) throw new Error("Could not extract text from the source document.");
 
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localToday();
     const { edits, unresolved, usage: deriveUsage } = await deriveConcreteEdits(title, srcText, accepted, inputs, { today });
-    if (!edits.length) throw new Error("No applicable edits could be derived — see unresolved findings.");
+    // The derive call is billed whether or not anything downstream succeeds —
+    // meter it now so a failed build still reaches the cost ledger.
+    const deriveCost = computeCost(deriveUsage, await getDefaultModel());
+    const logSpendOnFailure = async (label: string) => {
+      try {
+        await supabase.from("analysis_reports")
+          .update({ summary_json: appendCostLog(await freshSj(supabase, data.reportId, sj), label, deriveCost) })
+          .eq("id", report.id);
+      } catch { /* metering is best-effort */ }
+    };
+    if (!edits.length) {
+      await logSpendOnFailure("Final document build (no applicable edits)");
+      throw new Error("No applicable edits could be derived — see unresolved findings.");
+    }
 
+    try {
     // Traceability: when a reviewer-supplied value backed an edit, the comment
     // cites who supplied it and when — "reviewer-provided" alone doesn't
     // survive an audit.
-    const reviewer = data.author?.trim() || "AI Doc Reviewer";
     const simplifyEdits: SimplifyDocxEdit[] = edits.map((e) => {
       let rationale = e.rationale;
       if (inputs[e.findingId]) {
@@ -5638,13 +5752,20 @@ export const buildFinalDocument = createServerFn({ method: "POST" })
     await supabase.from("analysis_reports")
       .update({
         summary_json: appendCostLog(
-          { ...sj, finalDoc },
+          // Fresh read: this fn holds its sj snapshot across 1–2 min of AI +
+          // docx + upload — decisions or cost entries written meanwhile would
+          // be clobbered by the stale spread.
+          { ...(await freshSj(supabase, data.reportId, sj)), finalDoc },
           "Final document build",
-          computeCost(deriveUsage, await getDefaultModel()),
+          deriveCost,
         ),
       })
       .eq("id", report.id);
     return finalDoc;
+    } catch (e) {
+      await logSpendOnFailure("Final document build (failed)");
+      throw e;
+    }
   });
 
 /**
@@ -5676,9 +5797,27 @@ export const generateRestructuredV2Document = createServerFn({ method: "POST" })
       throw new Error("Restructure generation is only available in Recommend & Edit mode.");
     }
     const findings: Finding[] = Array.isArray(sj.findings) ? sj.findings : [];
-    const accepted = findings.filter((f) => f?.decision === "accepted");
+    // verification guard for parity with buildFinalDocument / apply-in-place —
+    // the redraft must never work from a different accepted set than they do.
+    const accepted = findings.filter((f) => f?.decision === "accepted" && f?.verification?.status !== "rejected");
     if (accepted.length === 0) throw new Error("Accept at least one finding before generating.");
     if (!report.source_file_url) throw new Error("Report has no source file URL");
+
+    // Result cache — the redraft is the priciest AI op in the flow, and the
+    // "Regenerate redraft" button re-ran it for an IDENTICAL accepted set +
+    // inputs on every click. Same basis ⇒ return the stored copy, zero spend.
+    const { createHash: createHashR } = await import("node:crypto");
+    const sigInputs: Record<string, string> = {};
+    for (const f of accepted) {
+      const v = data.userInputs?.[f.id]?.trim();
+      if (v) sigInputs[f.id] = v;
+    }
+    const sig = createHashR("sha1")
+      .update(JSON.stringify({ v: "r1", ids: accepted.map((f) => f.id).sort(), inputs: sigInputs }))
+      .digest("hex").slice(0, 16);
+    if (sj.restructure?.downloadUrl && sj.restructure.sig === sig) {
+      return { ...sj.restructure, cached: true };
+    }
 
     const file = await fetchFile(report.source_file_url);
     if (!looksLikeDocx(file.mimeType, report.source_file_url)) {
@@ -5695,7 +5834,10 @@ export const generateRestructuredV2Document = createServerFn({ method: "POST" })
       || DEFAULT_SIMPLIFY_GUIDANCE;
 
     const result = await generateRestructured(title, units, claims, accepted, simplifyGuidance, data.userInputs);
+    // Metered from here on even if a later step throws — the AI ran either way.
+    const redraftCost = computeCost(result.usage, await getDefaultModel());
 
+    try {
     // Per-section change notes → Word comments on the annotated copy.
     const sectionComments: Record<string, string> = {};
     for (const c of result.changeReport) {
@@ -5772,17 +5914,29 @@ export const generateRestructuredV2Document = createServerFn({ method: "POST" })
       annotatedUrl: urls.annotatedUrl,
       downloadName: `${safeName}-restructured.docx`,
       generatedAt: new Date().toISOString(),
+      sig,
       changeReport: result.changeReport,
       preservation: { ...result.preservation, figuresInSource, figuresCarried },
       placeholders,
-      cost: computeCost(result.usage, await getDefaultModel()),
+      cost: redraftCost,
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (supabase as any)
       .from("analysis_reports")
-      .update({ summary_json: appendCostLog({ ...sj, restructure }, "Redraft generation", restructure.cost) })
+      // Fresh read: minutes elapsed since sj was snapshotted — see freshSj.
+      .update({ summary_json: appendCostLog({ ...(await freshSj(supabase, data.reportId, sj)), restructure }, "Redraft generation", restructure.cost) })
       .eq("id", report.id);
     return restructure;
+    } catch (e) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        await (supabase as any)
+          .from("analysis_reports")
+          .update({ summary_json: appendCostLog(await freshSj(supabase, data.reportId, sj), "Redraft generation (failed)", redraftCost) })
+          .eq("id", report.id);
+      } catch { /* metering is best-effort */ }
+      throw e;
+    }
   });
 
 /**
@@ -5846,7 +6000,7 @@ export const resolveRedraftPlaceholders = createServerFn({ method: "POST" })
     });
     const newRestructure = { ...restructure, downloadUrl, annotatedUrl, placeholders };
     await supabase.from("analysis_reports")
-      .update({ summary_json: { ...sj, restructure: newRestructure } })
+      .update({ summary_json: { ...(await freshSj(supabase, data.reportId, sj)), restructure: newRestructure } })
       .eq("id", data.reportId);
     return newRestructure;
   });
@@ -5879,9 +6033,14 @@ export const getRedraftPdf = createServerFn({ method: "POST" })
     const up = await supabase.storage.from("policies").upload(path, pdf, { upsert: false, contentType: "application/pdf" });
     if (up.error) throw new Error(`Upload failed: ${up.error.message}`);
     const pdfUrl = supabase.storage.from("policies").getPublicUrl(path).data.publicUrl;
-    await supabase.from("analysis_reports")
-      .update({ summary_json: { ...sj, restructure: { ...rs, pdfUrl, pdfFromUrl: rs.downloadUrl } } })
-      .eq("id", data.reportId);
+    // Fresh read: CloudConvert took seconds while the finding cards stayed
+    // interactive — a decision saved meanwhile must not be clobbered.
+    {
+      const fresh = await freshSj(supabase, data.reportId, sj);
+      await supabase.from("analysis_reports")
+        .update({ summary_json: { ...fresh, restructure: { ...(fresh.restructure ?? rs), pdfUrl, pdfFromUrl: rs.downloadUrl } } })
+        .eq("id", data.reportId);
+    }
     return { pdfUrl };
   });
 
@@ -5914,8 +6073,10 @@ export const getSourcePdf = createServerFn({ method: "POST" })
     const up = await supabase.storage.from("policies").upload(path, pdf, { upsert: false, contentType: "application/pdf" });
     if (up.error) throw new Error(`Upload failed: ${up.error.message}`);
     const pdfUrl = supabase.storage.from("policies").getPublicUrl(path).data.publicUrl;
+    // Fresh read: CloudConvert took seconds while the finding cards stayed
+    // interactive — a decision saved meanwhile must not be clobbered.
     await supabase.from("analysis_reports")
-      .update({ summary_json: { ...sj, sourcePdfUrl: pdfUrl, sourcePdfFromUrl: sourceUrl } })
+      .update({ summary_json: { ...(await freshSj(supabase, data.reportId, sj)), sourcePdfUrl: pdfUrl, sourcePdfFromUrl: sourceUrl } })
       .eq("id", data.reportId);
     return { pdfUrl };
   });
@@ -5999,8 +6160,9 @@ export const getEditorConfig = createServerFn({ method: "POST" })
             });
             if (!up.error) {
               docUrl = supabase.storage.from("policies").getPublicUrl(cpath).data.publicUrl;
+              const fresh = await freshSj(supabase, data.reportId, sj);
               await supabase.from("analysis_reports")
-                .update({ summary_json: { ...sj, restructure: { ...rs, editorDocUrl: docUrl, editorDocHash: cHash } } })
+                .update({ summary_json: { ...fresh, restructure: { ...(fresh.restructure ?? rs), editorDocUrl: docUrl, editorDocHash: cHash } } })
                 .eq("id", data.reportId);
             }
           }
@@ -6032,7 +6194,7 @@ export const getEditorConfig = createServerFn({ method: "POST" })
             if (!up.error) {
               docUrl = supabase.storage.from("policies").getPublicUrl(cpath).data.publicUrl;
               await supabase.from("analysis_reports")
-                .update({ summary_json: { ...sj, commentedSourceUrl: docUrl, commentedHash: cHash } })
+                .update({ summary_json: { ...(await freshSj(supabase, data.reportId, sj)), commentedSourceUrl: docUrl, commentedHash: cHash } })
                 .eq("id", data.reportId);
             }
           }

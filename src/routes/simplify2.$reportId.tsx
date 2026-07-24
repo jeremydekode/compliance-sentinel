@@ -114,16 +114,26 @@ function SimplifyV2ReportPage() {
   const saveInputsFn = useServerFn(saveDecisionInputs);
   const decisionsHydrated = useRef(false);
   const saveTimer = useRef<number | null>(null);
+  // Latest not-yet-saved inputs — flushed on unmount so typing then navigating
+  // away within the debounce window doesn't lose the reviewer's value.
+  const pendingInputs = useRef<Record<string, string> | null>(null);
   function updateDecision(id: string, v: string) {
     setDecisions((d) => {
       const next = { ...d, [id]: v };
+      pendingInputs.current = next;
       if (saveTimer.current) window.clearTimeout(saveTimer.current);
       saveTimer.current = window.setTimeout(() => {
+        pendingInputs.current = null;
         saveInputsFn({ data: { reportId, inputs: next } }).catch(() => { /* retried on next keystroke */ });
       }, 800);
       return next;
     });
   }
+  useEffect(() => () => {
+    if (saveTimer.current) window.clearTimeout(saveTimer.current);
+    if (pendingInputs.current) saveInputsFn({ data: { reportId, inputs: pendingInputs.current } }).catch(() => { /* best-effort flush */ });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   // "exact" view: the redraft rendered as a real PDF (pdf.js) — faithful to Word.
   const getPdf = useServerFn(getRedraftPdf);
   const [pdfUrl, setPdfUrl] = useState<string | null>(null);
@@ -1333,6 +1343,10 @@ function SimplifyRail({
     setLocal((d) => ({ ...d, [index]: decision }));
     try {
       await saveDecision({ data: { reportId, index, decision } });
+      // Refresh the page's report copy: the apply-sig / "up to date" indicator
+      // and the final-document button gates all derive from sj.actions — without
+      // this, a cached final doc could be served as current after a new accept.
+      await qc.invalidateQueries({ queryKey: ["report", reportId] });
     } catch (e) {
       setLocal((d) => ({ ...d, [index]: prev }));
       toast.error("Couldn't save that decision", { description: (e as Error)?.message });

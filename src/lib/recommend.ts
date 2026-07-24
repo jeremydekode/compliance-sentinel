@@ -386,8 +386,10 @@ export function detectUndefinedAcronyms(
   for (const [acr, { n, firstUnit }] of counts) {
     if (n < 2) continue; // one-off tokens are more likely codes than acronyms
     // Defined if "Long Form (ACR)" appears anywhere, or it's in the glossary.
+    // Glossary match must be word-bounded: a naive substring finds "GL" inside
+    // "GLOBAL" or "IT" inside "AUDIT" and wrongly suppresses the finding.
     const expanded = new RegExp(`\\([\\s]*${acr}[\\s]*\\)`).test(text);
-    const inGlossary = glossaryText.includes(acr);
+    const inGlossary = new RegExp(`\\b${acr}\\b`).test(glossaryText);
     if (expanded || inGlossary) continue;
     findings.push({
       id: "",
@@ -1024,8 +1026,12 @@ ${text.slice(0, 400_000)}
       const phrase = norm(rm[0]);
       if (norm(findT).includes(phrase)) continue;  // pre-existing, not introduced
       if (textNorm.includes(phrase)) continue;     // full phrase exists in the doc
+      // Identifier fallback: accept only when the identifier opens a paragraph
+      // in heading position ("5.", "A)", "12 —"). A free-text scan for a bare
+      // " 5 " passes on virtually any document and defeats the whole guard.
       const ident = rm[2].toLowerCase().replace(/[.,;:]$/, "");
-      if (ident.length >= 2 && (textNorm.includes(` ${ident} `) || paraNorms.some((p) => p.startsWith(ident)))) continue;
+      const identRe = new RegExp(`^${ident.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[\\s.():–—-]`);
+      if (ident.length >= 2 && paraNorms.some((p) => identRe.test(p))) continue;
       return rm[0];
     }
     return null;
@@ -1040,12 +1046,21 @@ ${text.slice(0, 400_000)}
     const replace = String(e?.replace_text ?? "").trim();
 
     // Synthetic governance edit: the change-history row (no backing finding).
+    // The prompt calls a content change without a history row "a governance
+    // failure" — so a dropped row must SURFACE in unresolved, never vanish.
     if (id === "CHANGE-LOG") {
       if (insertRowAfter && cells?.some((c: string) => c.trim())) {
         const aNorm = norm(insertRowAfter);
-        if (aNorm.length >= 6 && paraNorms.filter((p) => p.includes(aNorm)).length === 1) {
+        const hits = aNorm.length >= 6 ? paraNorms.filter((p) => p.includes(aNorm)).length : 0;
+        if (hits === 1) {
           edits.push({ findingId: id, find_text: "", replace_text: "", insert_row_after: insertRowAfter, cells, rationale: String(e?.rationale ?? "Change-history row for this revision") });
+        } else {
+          markUnresolved(id, "Change History row", hits === 0
+            ? "Change-history anchor not found in the document — add the row manually"
+            : `Change-history anchor appears in ${hits} places — add the row manually`);
         }
+      } else {
+        markUnresolved(id, "Change History row", "Model returned no usable change-history row — add it manually");
       }
       continue;
     }
@@ -1089,11 +1104,14 @@ ${text.slice(0, 400_000)}
         continue;
       }
       // Models tend to restate the anchor at the head of the new content —
-      // that would print the anchor paragraph twice. Trim it.
+      // that would print the anchor paragraph twice. Trim it. Advance by the
+      // matched fragment's REAL length (an anchor shorter than 12 chars would
+      // otherwise over-cut the start of the genuinely new content).
       let content = replace;
       if (norm(content).startsWith(aNorm)) {
-        const idx = content.toLowerCase().indexOf(insertAfter.slice(-12).toLowerCase());
-        if (idx >= 0) content = content.slice(idx + 12).replace(/^[\s.,;:–—-]+/, "").trim();
+        const frag = insertAfter.slice(-12);
+        const idx = content.toLowerCase().indexOf(frag.toLowerCase());
+        if (idx >= 0) content = content.slice(idx + frag.length).replace(/^[\s.,;:–—-]+/, "").trim();
       }
       if (!content) {
         markUnresolved(id, f.title, "Insertion content was only a restatement of the anchor");
@@ -1110,15 +1128,22 @@ ${text.slice(0, 400_000)}
     }
 
     if (!find) continue;
-    // ── Replacement form: deterministic anchor check. ──
+    // ── Replacement form: deterministic anchor check — UNIQUE, like the other
+    // forms. The apply engine replaces the FIRST occurrence, so a passage that
+    // appears twice would redline an arbitrary one of them. ──
     const fNorm = norm(find);
-    if (!paraNorms.some((p) => p.includes(fNorm))) {
+    const fHits = paraNorms.filter((p) => p.includes(fNorm)).length;
+    if (fHits === 0) {
       markUnresolved(
         id, f.title,
         paraNorms.length && norm(text).includes(fNorm)
           ? "Passage spans a paragraph boundary — needs a manual edit"
           : "Proposed passage not found verbatim in the document",
       );
+      continue;
+    }
+    if (fHits > 1) {
+      markUnresolved(id, f.title, `Passage appears in ${fHits} paragraphs — ambiguous, needs a manual edit`);
       continue;
     }
     const dref = danglingRef(replace, find);

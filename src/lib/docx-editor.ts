@@ -59,14 +59,16 @@ function getParagraphText(pXml: string): string {
   while ((m = re.exec(normalised)) !== null) {
     out.push(m[1]);
   }
-  // Unescape XML entities so we compare against plain text from the AI
+  // Unescape XML entities so we compare against plain text from the AI.
+  // &amp; must be decoded LAST: doing it first turns a literal "&amp;lt;"
+  // (an escaped "&lt;") into "&lt;" and then wrongly into "<".
   return out
     .join("")
-    .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
     .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -141,10 +143,14 @@ export function applyEditsToDocx(sourceBuffer: Buffer, edits: DocxEdit[]): DocxE
       const pText = normaliseForCompare(getParagraphText(candidate.full));
       if (!pText) continue;
 
-      // Match if either side contains the other (handles partial finds and superset paragraphs)
+      // Match if either side contains the other (handles partial finds and
+      // superset paragraphs). The reverse direction is gated on paragraph
+      // length: without it a long find_text absorbs any short paragraph whose
+      // whole text happens to appear inside it ("Approved", "N/A", a heading
+      // word) and replaces the wrong paragraph.
       const isHit =
         findNorm.length > 10
-          ? (pText.includes(findNorm) || findNorm.includes(pText))
+          ? (pText.includes(findNorm) || (pText.length >= 20 && findNorm.includes(pText)))
           : pText === findNorm;
 
       if (isHit) {
@@ -1086,12 +1092,62 @@ function buildCommentEntry(
   return `<w:comment w:id="${id}" w:author="${escapeXml(author)}" w:initials="${escapeXml(initials)}" w:date="${dateIso}">${ps}</w:comment>`;
 }
 
+/** Locates THE paragraph an insertion anchor refers to. Precision-first: the
+ *  derive-time validator guaranteed the anchor is an exact (normalised)
+ *  substring of exactly ONE paragraph, so exact matches take priority; the
+ *  loose prefix matcher is only a fallback and only when unambiguous — its
+ *  first-match behaviour can land on an earlier sibling that merely shares the
+ *  anchor's opening words, silently inserting content in the wrong place. */
+function locateAnchorParagraph(
+  documentXml: string,
+  anchorText: string,
+): { index: number; para: string } | { ambiguous: true } | null {
+  const pRegex = /<w:p\b[^>]*>(?:(?!<w:p\b)[\s\S])*?<\/w:p>/g;
+  const aNorm = normaliseForCompare(anchorText);
+  const exact: { index: number; para: string }[] = [];
+  const loose: { index: number; para: string }[] = [];
+  let am: RegExpExecArray | null;
+  while ((am = pRegex.exec(documentXml)) !== null) {
+    const t = getParagraphText(am[0]);
+    if (!t) continue;
+    if (aNorm && normaliseForCompare(t).includes(aNorm)) exact.push({ index: am.index, para: am[0] });
+    else if (paragraphContainsLoose(t, anchorText)) loose.push({ index: am.index, para: am[0] });
+  }
+  const pool = exact.length ? exact : loose;
+  if (pool.length === 1) return pool[0];
+  if (pool.length === 0) return null;
+  return { ambiguous: true };
+}
+
+/** Comment entries already present in the source package, plus the highest
+ *  comment id in use. New comments must MERGE with these and number PAST them:
+ *  the edit engines preserve untouched body XML verbatim, so any existing
+ *  <w:commentRangeStart w:id="N"> markers survive — overwriting comments.xml
+ *  from id 0 would delete the original comments' text AND re-bind their
+ *  surviving body markers to our new comments (wrong comment on wrong text). */
+function existingComments(zip: PizZip): { entries: string; exEntries: string; maxId: number } {
+  let entries = "", exEntries = "", maxId = -1;
+  const cf = zip.file("word/comments.xml");
+  if (cf) {
+    const xml = cf.asText();
+    entries = (/<w:comments\b[^>]*>([\s\S]*)<\/w:comments>/.exec(xml)?.[1] ?? "").trim();
+    for (const m of xml.matchAll(/<w:comment\b[^>]*w:id="(\d+)"/g)) maxId = Math.max(maxId, Number(m[1]));
+  }
+  const xf = zip.file("word/commentsExtended.xml");
+  if (xf) {
+    exEntries = (/<w15:commentsEx\b[^>]*>([\s\S]*)<\/w15:commentsEx>/.exec(xf.asText())?.[1] ?? "").trim();
+  }
+  return { entries, exEntries, maxId };
+}
+
 /** Writes word/comments.xml + word/commentsExtended.xml and registers both in
  *  document.xml.rels and [Content_Types].xml. The commentsExtended part is what
  *  modern Word reads to actually link the comment to its in-document text range —
- *  without it, comments show in the pane but the anchor highlight is broken. */
+ *  without it, comments show in the pane but the anchor highlight is broken.
+ *  Existing comments in the source are preserved (merged in front of ours). */
 function attachComments(zip: PizZip, commentEntries: string[], paraIds: string[]): void {
   if (commentEntries.length === 0) return;
+  const prior = existingComments(zip);
 
   // 1. word/comments.xml with the full namespace set Word 365 expects.
   const commentsNs =
@@ -1100,7 +1156,7 @@ function attachComments(zip: PizZip, commentEntries: string[], paraIds: string[]
     ` xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml"` +
     ` xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"` +
     ` mc:Ignorable="w14 w15"`;
-  const commentsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:comments ${commentsNs}>${commentEntries.join("")}</w:comments>`;
+  const commentsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:comments ${commentsNs}>${prior.entries}${commentEntries.join("")}</w:comments>`;
   zip.file("word/comments.xml", commentsXml);
 
   // 2. word/commentsExtended.xml — one <w15:commentEx> per comment, anchored by
@@ -1113,7 +1169,7 @@ function attachComments(zip: PizZip, commentEntries: string[], paraIds: string[]
     `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n` +
     `<w15:commentsEx xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml"` +
     ` xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"` +
-    ` mc:Ignorable="w14">${exEntries}</w15:commentsEx>`;
+    ` mc:Ignorable="w14">${prior.exEntries}${exEntries}</w15:commentsEx>`;
   zip.file("word/commentsExtended.xml", commentsExtendedXml);
 
   // 3. word/_rels/document.xml.rels — register both relationships.
@@ -1220,8 +1276,16 @@ export function applySimplificationToDocx(
   const commentEntries: string[] = [];
   const paraIds: string[] = []; // one per comment — links commentsExtended.xml back
 
-  let nextCommentId = 0;
-  let nextRevId = 1000; // <w:ins>/<w:del> revision ids (kept clear of any in the source)
+  // Seed both counters PAST anything the source already uses: comment-id
+  // collisions re-bind the document's surviving comment markers to our new
+  // comments, and revision-id collisions make Word group unrelated tracked
+  // changes under one Accept/Reject.
+  let nextCommentId = existingComments(zip).maxId + 1;
+  let maxRev = 999;
+  for (const rm of documentXml.matchAll(/<w:(?:ins|del|moveFrom|moveTo)\b[^>]*w:id="(\d+)"/g)) {
+    maxRev = Math.max(maxRev, Number(rm[1]));
+  }
+  let nextRevId = maxRev + 1;
   let appliedCount = 0;
   const skipped: { reason: string; before: string }[] = [];
   const applied: { before: string; after: string; locatedText: string }[] = [];
@@ -1269,73 +1333,73 @@ export function applySimplificationToDocx(
     // ── Table-row insertion: new row after the row containing the anchor. ──
     if (edit.insertRowAfter?.trim() && edit.cells?.some((c) => c.trim())) {
       const anchorText = edit.insertRowAfter.trim();
-      const pRegex = /<w:p\b[^>]*>(?:(?!<w:p\b)[\s\S])*?<\/w:p>/g;
-      let am: RegExpExecArray | null;
-      let placedRow = false;
-      while ((am = pRegex.exec(documentXml)) !== null) {
-        const paraText = getParagraphText(am[0]);
-        if (!paraText || !paragraphContainsLoose(paraText, anchorText)) continue;
-        const row = findEnclosingBlock(documentXml, am.index, "tr");
-        if (!row) {
-          skipped.push({ reason: "row anchor is not inside a table row", before: anchorText });
-          placedRow = true;
-          break;
-        }
-        const rowXml = documentXml.slice(row.start, row.end);
-        const tcs = splitTopLevelBlocks(rowXml, "tc");
-        if (!tcs.length) {
-          skipped.push({ reason: "anchor row has no readable cells", before: anchorText });
-          placedRow = true;
-          break;
-        }
-        // A row must match its table's shape. More values than columns means
-        // the anchor matched the WRONG table (duplicated text elsewhere) — a
-        // malformed row that sticks out sideways. Refuse, don't improvise.
-        if (edit.cells.length > tcs.length) {
-          skipped.push({ reason: `anchor row has ${tcs.length} column(s) but ${edit.cells.length} values were provided — likely the wrong table`, before: anchorText });
-          placedRow = true;
-          break;
-        }
-        const a = escapeXml(author);
-        // Clone per-column formatting from the anchor row's cells, one new cell
-        // per EXISTING column (pad missing values with empty cells).
-        const newCells = Array.from({ length: tcs.length }, (_, i) => edit.cells![i] ?? "").map((val, i) => {
-          const tpl = rowXml.slice(tcs[i].start, tcs[i].end);
-          const tcPr = tpl.match(/<w:tcPr\b[\s\S]*?<\/w:tcPr>/)?.[0] ?? "";
-          const pPr = (tpl.match(/<w:pPr\b[\s\S]*?<\/w:pPr>/)?.[0] ?? "").replace(/<w:numPr\b[\s\S]*?<\/w:numPr>/, "");
-          const rPr = tpl.match(/<w:r\b[^>]*>\s*(<w:rPr\b[\s\S]*?<\/w:rPr>)/)?.[1] ?? "";
-          const t = val.trim();
-          const run = t ? `<w:r>${rPr}<w:t xml:space="preserve">${escapeXml(t)}</w:t></w:r>` : "";
-          const content = t && mode === "redline"
-            ? `<w:ins w:id="${nextRevId++}" w:author="${a}" w:date="${dateIso}">${run}</w:ins>`
-            : run;
-          return { xml: `<w:tc>${tcPr}<w:p>${pPr}${content}</w:p></w:tc>`, hasText: !!t, pPr, content };
-        });
-        // Row-level tracked insert so Word offers Accept/Reject on the ROW.
-        const trPr = mode === "redline"
-          ? `<w:trPr><w:ins w:id="${nextRevId++}" w:author="${a}" w:date="${dateIso}"/></w:trPr>`
-          : (rowXml.match(/<w:trPr\b[\s\S]*?<\/w:trPr>/)?.[0] ?? "");
-        let cellsXml = newCells.map((c) => c.xml).join("");
-        // Rationale comment on the first non-empty cell's paragraph.
-        if (opts.redlineComments && edit.rationale) {
-          const target = newCells.find((c) => c.hasText);
-          if (target) {
-            const commentId = nextCommentId++;
-            const paraId = (commentId + 1).toString(16).padStart(8, "0").toUpperCase();
-            paraIds.push(paraId);
-            commentEntries.push(buildCommentEntry(commentId, `[ADDED ROW] ${edit.rationale}`, author, dateIso, paraId));
-            const wrapped = wrapParagraphWithComment(`<w:p>${target.pPr}${target.content}</w:p>`, commentId);
-            cellsXml = cellsXml.replace(`<w:p>${target.pPr}${target.content}</w:p>`, wrapped);
-          }
-        }
-        const newRow = `<w:tr>${trPr}${cellsXml}</w:tr>`;
-        documentXml = documentXml.slice(0, row.end) + newRow + documentXml.slice(row.end);
-        applied.push({ before: `[insert row after] ${anchorText}`, after: edit.cells.filter(Boolean).join(" | "), locatedText: paraText });
-        appliedCount++;
-        placedRow = true;
-        break;
+      // Precision-first anchoring (matches the derive-time validator): a loose
+      // first-match could land on a sibling row sharing the anchor's opening
+      // words and put the new row in the wrong table.
+      const anchor = locateAnchorParagraph(documentXml, anchorText);
+      if (!anchor) {
+        skipped.push({ reason: "row anchor not located in any paragraph", before: anchorText });
+        continue;
       }
-      if (!placedRow) skipped.push({ reason: "row anchor not located in any paragraph", before: anchorText });
+      if ("ambiguous" in anchor) {
+        skipped.push({ reason: "row anchor matches more than one paragraph — ambiguous, add the row manually", before: anchorText });
+        continue;
+      }
+      const paraText = getParagraphText(anchor.para);
+      const row = findEnclosingBlock(documentXml, anchor.index, "tr");
+      if (!row) {
+        skipped.push({ reason: "row anchor is not inside a table row", before: anchorText });
+        continue;
+      }
+      const rowXml = documentXml.slice(row.start, row.end);
+      const tcs = splitTopLevelBlocks(rowXml, "tc");
+      if (!tcs.length) {
+        skipped.push({ reason: "anchor row has no readable cells", before: anchorText });
+        continue;
+      }
+      // A row must match its table's shape. More values than columns means
+      // the anchor matched the WRONG table (duplicated text elsewhere) — a
+      // malformed row that sticks out sideways. Refuse, don't improvise.
+      if (edit.cells.length > tcs.length) {
+        skipped.push({ reason: `anchor row has ${tcs.length} column(s) but ${edit.cells.length} values were provided — likely the wrong table`, before: anchorText });
+        continue;
+      }
+      const a = escapeXml(author);
+      // Clone per-column formatting from the anchor row's cells, one new cell
+      // per EXISTING column (pad missing values with empty cells).
+      const newCells = Array.from({ length: tcs.length }, (_, i) => edit.cells![i] ?? "").map((val, i) => {
+        const tpl = rowXml.slice(tcs[i].start, tcs[i].end);
+        const tcPr = tpl.match(/<w:tcPr\b[\s\S]*?<\/w:tcPr>/)?.[0] ?? "";
+        const pPr = (tpl.match(/<w:pPr\b[\s\S]*?<\/w:pPr>/)?.[0] ?? "").replace(/<w:numPr\b[\s\S]*?<\/w:numPr>/, "");
+        const rPr = tpl.match(/<w:r\b[^>]*>\s*(<w:rPr\b[\s\S]*?<\/w:rPr>)/)?.[1] ?? "";
+        const t = val.trim();
+        const run = t ? `<w:r>${rPr}<w:t xml:space="preserve">${escapeXml(t)}</w:t></w:r>` : "";
+        const content = t && mode === "redline"
+          ? `<w:ins w:id="${nextRevId++}" w:author="${a}" w:date="${dateIso}">${run}</w:ins>`
+          : run;
+        return { xml: `<w:tc>${tcPr}<w:p>${pPr}${content}</w:p></w:tc>`, hasText: !!t, pPr, content };
+      });
+      // Row-level tracked insert so Word offers Accept/Reject on the ROW.
+      const trPr = mode === "redline"
+        ? `<w:trPr><w:ins w:id="${nextRevId++}" w:author="${a}" w:date="${dateIso}"/></w:trPr>`
+        : (rowXml.match(/<w:trPr\b[\s\S]*?<\/w:trPr>/)?.[0] ?? "");
+      let cellsXml = newCells.map((c) => c.xml).join("");
+      // Rationale comment on the first non-empty cell's paragraph.
+      if (opts.redlineComments && edit.rationale) {
+        const target = newCells.find((c) => c.hasText);
+        if (target) {
+          const commentId = nextCommentId++;
+          const paraId = (commentId + 1).toString(16).padStart(8, "0").toUpperCase();
+          paraIds.push(paraId);
+          commentEntries.push(buildCommentEntry(commentId, `[ADDED ROW] ${edit.rationale}`, author, dateIso, paraId));
+          const wrapped = wrapParagraphWithComment(`<w:p>${target.pPr}${target.content}</w:p>`, commentId);
+          cellsXml = cellsXml.replace(`<w:p>${target.pPr}${target.content}</w:p>`, wrapped);
+        }
+      }
+      const newRow = `<w:tr>${trPr}${cellsXml}</w:tr>`;
+      documentXml = documentXml.slice(0, row.end) + newRow + documentXml.slice(row.end);
+      applied.push({ before: `[insert row after] ${anchorText}`, after: edit.cells.filter(Boolean).join(" | "), locatedText: paraText });
+      appliedCount++;
       continue;
     }
 
@@ -1347,59 +1411,61 @@ export function applySimplificationToDocx(
         skipped.push({ reason: "insertion with empty content", before: anchorText });
         continue;
       }
-      const pRegex = /<w:p\b[^>]*>(?:(?!<w:p\b)[\s\S])*?<\/w:p>/g;
-      let am: RegExpExecArray | null;
-      let placed = false;
-      while ((am = pRegex.exec(documentXml)) !== null) {
-        const paraText = getParagraphText(am[0]);
-        if (!paraText || !paragraphContainsLoose(paraText, anchorText)) continue;
-        // Refuse to insert paragraphs INSIDE a table cell: an "addition" there
-        // is almost always meant as a new table ROW (e.g. a glossary entry),
-        // which needs <w:tr> insertion — appending paragraphs into the cell
-        // corrupts the table's content. Honest skip until row-insert support.
-        const back = documentXml.slice(0, am.index);
-        if (back.lastIndexOf("<w:tc") > back.lastIndexOf("</w:tc>")) {
-          skipped.push({ reason: "insertion anchor is inside a table — needs row insertion (not yet supported), apply manually", before: anchorText });
-          placed = true; // handled: reported, not silently retried on later matches
-          break;
-        }
-        // Inherit the anchor's paragraph + run formatting; strip list numbering
-        // so auto-numbering never renumbers existing steps (inserted steps carry
-        // their own literal labels per the fix format).
-        const pPr = (am[0].match(/<w:pPr\b[\s\S]*?<\/w:pPr>/)?.[0] ?? "")
-          .replace(/<w:numPr\b[\s\S]*?<\/w:numPr>/, "");
-        const rPr = am[0].match(/<w:r\b[^>]*>\s*(<w:rPr\b[\s\S]*?<\/w:rPr>)/)?.[1] ?? "";
-        const a = escapeXml(author);
-        const mkRun = (line: string) =>
-          `<w:r>${rPr}<w:t xml:space="preserve">${escapeXml(line)}</w:t></w:r>`;
-        const mkBreak = () => `<w:r>${rPr}<w:br/></w:r>`;
-        const paras = newText.split(/\n{2,}/).map((t) => t.trim()).filter(Boolean);
-        const builtParas = paras.map((t) => {
-          const lines = t.split(/\n/);
-          const inner = lines
-            .map((line, i) => mkRun(line) + (i < lines.length - 1 ? mkBreak() : ""))
-            .join("");
-          const content = mode === "redline"
-            ? `<w:ins w:id="${nextRevId++}" w:author="${a}" w:date="${dateIso}">${inner}</w:ins>`
-            : inner;
-          return `<w:p>${pPr}${content}</w:p>`;
-        });
-        // Rationale comment rides on the FIRST inserted paragraph.
-        if (opts.redlineComments && edit.rationale && builtParas.length) {
-          const commentId = nextCommentId++;
-          const paraId = (commentId + 1).toString(16).padStart(8, "0").toUpperCase();
-          paraIds.push(paraId);
-          commentEntries.push(buildCommentEntry(commentId, `[ADDED] ${edit.rationale}`, author, dateIso, paraId));
-          builtParas[0] = wrapParagraphWithComment(builtParas[0], commentId);
-        }
-        const insertAt = am.index + am[0].length;
-        documentXml = documentXml.slice(0, insertAt) + builtParas.join("") + documentXml.slice(insertAt);
-        applied.push({ before: `[insert after] ${anchorText}`, after: newText, locatedText: paraText });
-        appliedCount++;
-        placed = true;
-        break;
+      // Precision-first anchoring (see locateAnchorParagraph): a loose
+      // first-match can land on an earlier paragraph that shares the anchor's
+      // opening words, silently inserting the new content in the wrong place.
+      const anchor = locateAnchorParagraph(documentXml, anchorText);
+      if (!anchor) {
+        skipped.push({ reason: "insert anchor not located in any paragraph", before: anchorText });
+        continue;
       }
-      if (!placed) skipped.push({ reason: "insert anchor not located in any paragraph", before: anchorText });
+      if ("ambiguous" in anchor) {
+        skipped.push({ reason: "insert anchor matches more than one paragraph — ambiguous, apply manually", before: anchorText });
+        continue;
+      }
+      const paraText = getParagraphText(anchor.para);
+      // Refuse to insert paragraphs INSIDE a table cell: an "addition" there
+      // is almost always meant as a new table ROW (e.g. a glossary entry),
+      // which needs <w:tr> insertion — appending paragraphs into the cell
+      // corrupts the table's content. Honest skip until row-insert support.
+      const back = documentXml.slice(0, anchor.index);
+      if (back.lastIndexOf("<w:tc") > back.lastIndexOf("</w:tc>")) {
+        skipped.push({ reason: "insertion anchor is inside a table — needs row insertion (not yet supported), apply manually", before: anchorText });
+        continue;
+      }
+      // Inherit the anchor's paragraph + run formatting; strip list numbering
+      // so auto-numbering never renumbers existing steps (inserted steps carry
+      // their own literal labels per the fix format).
+      const pPr = (anchor.para.match(/<w:pPr\b[\s\S]*?<\/w:pPr>/)?.[0] ?? "")
+        .replace(/<w:numPr\b[\s\S]*?<\/w:numPr>/, "");
+      const rPr = anchor.para.match(/<w:r\b[^>]*>\s*(<w:rPr\b[\s\S]*?<\/w:rPr>)/)?.[1] ?? "";
+      const a = escapeXml(author);
+      const mkRun = (line: string) =>
+        `<w:r>${rPr}<w:t xml:space="preserve">${escapeXml(line)}</w:t></w:r>`;
+      const mkBreak = () => `<w:r>${rPr}<w:br/></w:r>`;
+      const paras = newText.split(/\n{2,}/).map((t) => t.trim()).filter(Boolean);
+      const builtParas = paras.map((t) => {
+        const lines = t.split(/\n/);
+        const inner = lines
+          .map((line, i) => mkRun(line) + (i < lines.length - 1 ? mkBreak() : ""))
+          .join("");
+        const content = mode === "redline"
+          ? `<w:ins w:id="${nextRevId++}" w:author="${a}" w:date="${dateIso}">${inner}</w:ins>`
+          : inner;
+        return `<w:p>${pPr}${content}</w:p>`;
+      });
+      // Rationale comment rides on the FIRST inserted paragraph.
+      if (opts.redlineComments && edit.rationale && builtParas.length) {
+        const commentId = nextCommentId++;
+        const paraId = (commentId + 1).toString(16).padStart(8, "0").toUpperCase();
+        paraIds.push(paraId);
+        commentEntries.push(buildCommentEntry(commentId, `[ADDED] ${edit.rationale}`, author, dateIso, paraId));
+        builtParas[0] = wrapParagraphWithComment(builtParas[0], commentId);
+      }
+      const insertAt = anchor.index + anchor.para.length;
+      documentXml = documentXml.slice(0, insertAt) + builtParas.join("") + documentXml.slice(insertAt);
+      applied.push({ before: `[insert after] ${anchorText}`, after: newText, locatedText: paraText });
+      appliedCount++;
       continue;
     }
 
@@ -1738,7 +1804,10 @@ export function rebuildDocxBody(
   const dateIso = new Date().toISOString();
   const commentEntries: string[] = [];
   const paraIds: string[] = [];
-  let nextCommentId = 0;
+  // attachComments merges any comments already in the package (their body
+  // anchors are gone after the rebuild, but their text survives in the pane),
+  // so new ids must start past the existing ones or the part is invalid.
+  let nextCommentId = existingComments(zip).maxId + 1;
 
   // Body run font (keeps the document's real typeface) + native list numbering
   // (only wired when the redraft actually has lists, so an all-prose document

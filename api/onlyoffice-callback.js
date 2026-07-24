@@ -66,12 +66,21 @@ export default async function handler(req, res) {
   const downloadUrl = signed.url ?? body.url;
 
   // 2 = ready to save (all editors closed); 6 = force-save (save, keep editing).
-  if ((status === 2 || status === 6) && downloadUrl) {
+  if (status === 2 || status === 6) {
+    // A final-save with no download URL means OnlyOffice has nothing to give
+    // us — acknowledging it with error:0 would let the server discard the
+    // edited document as "handled". Refuse instead so it retries/preserves.
+    if (!downloadUrl) {
+      console.error(`[onlyoffice-callback] status ${status} with no url — refusing to acknowledge`);
+      res.status(200).json({ error: 1 });
+      return;
+    }
+    let supabase;
     try {
       const r = await fetch(downloadUrl);
       if (!r.ok) throw new Error(`fetch edited doc ${r.status}`);
       const buf = Buffer.from(await r.arrayBuffer());
-      const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
+      supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
         auth: { persistSession: false, autoRefreshToken: false },
       });
       const up = await supabase.storage.from("policies").upload(pinned.path, buf, {
@@ -79,21 +88,32 @@ export default async function handler(req, res) {
         contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       });
       if (up.error) throw up.error;
-      // Stamp a marker so the app can detect the save actually landed (used by
-      // finalizeEdit to wait before letting the reviewer reopen the doc).
-      if (pinned.reportId) {
+    } catch (e) {
+      console.error("[onlyoffice-callback] save failed:", e?.message);
+      res.status(200).json({ error: 1 }); // signal OnlyOffice to retry
+      return;
+    }
+    // Stamp a marker so the app can detect the save actually landed (used by
+    // finalizeEdit to wait before letting the reviewer reopen the doc).
+    // OUTSIDE the try above: the upload has already landed, so a marker
+    // failure must NOT return error:1 — that would make OnlyOffice retry a
+    // save that succeeded (and can wedge finalizeEdit's saved:false poll).
+    if (pinned.reportId) {
+      try {
         const { data: rep } = await supabase
           .from("analysis_reports").select("summary_json").eq("id", pinned.reportId).single();
         const sj = rep?.summary_json ?? {};
         await supabase.from("analysis_reports")
           .update({ summary_json: { ...sj, editSavedAt: Date.now() } })
           .eq("id", pinned.reportId);
+      } catch (e) {
+        console.error("[onlyoffice-callback] saved OK but marker update failed:", e?.message);
       }
-    } catch (e) {
-      console.error("[onlyoffice-callback] save failed:", e?.message);
-      res.status(200).json({ error: 1 }); // signal OnlyOffice to retry
-      return;
     }
+  } else if (status === 3 || status === 7) {
+    // 3 = save error, 7 = force-save error — the Document Server itself failed;
+    // nothing to persist, but never silently: leave a trace for diagnosis.
+    console.error(`[onlyoffice-callback] document server reported save error status=${status}`);
   }
 
   res.status(200).json({ error: 0 });

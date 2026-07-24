@@ -46,6 +46,7 @@ export const MODEL_PRICES: Record<string, { inputUsdPer1M: number; outputUsdPer1
   "gemini-3.5-flash":      { inputUsdPer1M: 0.3,  outputUsdPer1M: 2.5 },
   "gemini-2.5-flash":      { inputUsdPer1M: 0.3,  outputUsdPer1M: 2.5 },
   "gemini-3.1-flash-lite": { inputUsdPer1M: 0.1,  outputUsdPer1M: 0.4 },
+  "gemini-2.0-flash":      { inputUsdPer1M: 0.1,  outputUsdPer1M: 0.4 },
 };
 
 /** Legacy single-rate constant — kept for old call sites; rates = 3.5-flash. */

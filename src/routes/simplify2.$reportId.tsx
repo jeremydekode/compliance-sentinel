@@ -141,6 +141,10 @@ function SimplifyV2ReportPage() {
   const [editorTarget, setEditorTarget] = useState<"redraft" | "source" | "final" | "apply">("final");
   const buildFinal = useServerFn(buildFinalDocument);
   const [finalBusy, setFinalBusy] = useState(false);
+  // Simplify-mode final document (deterministic apply). Declared here with the
+  // other hooks — NEVER after the early returns below, or the hook order breaks.
+  const applySimplifyFn = useServerFn(applySimplifyV2Report);
+  const [simplifyFinalBusy, setSimplifyFinalBusy] = useState(false);
   // Executive summary — fetched once per mount when the dashboard shows; the
   // server returns the cached copy (zero AI) unless the findings changed.
   const genExec = useServerFn(generateExecSummaryV2);
@@ -440,8 +444,6 @@ function SimplifyV2ReportPage() {
   // SIMPLIFY final document: accepted simplifications applied to the ORIGINAL
   // as tracked changes. Fully deterministic (no LLM) — building/refreshing it
   // costs nothing; we re-apply whenever the accepted set changed.
-  const applySimplifyFn = useServerFn(applySimplifyV2Report);
-  const [simplifyFinalBusy, setSimplifyFinalBusy] = useState(false);
   const simplifyApplySig = actions.map((a, i) => (a?.decision === "accepted" ? i : -1)).filter((i) => i >= 0).join(",");
   const simplifyFinalCurrent = !!(sj.apply?.annotatedUrl && sj.apply?.sig === simplifyApplySig);
   async function openSimplifyFinal() {

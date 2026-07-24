@@ -45,7 +45,7 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import {
   ArrowLeft, ArrowRight, Loader2, RotateCcw, Check, X, Sparkles, SearchCheck, FileEdit,
-  FileDown, AlertTriangle, Link2Off, Quote, Info, Wand2, PenLine,
+  FileDown, AlertTriangle, Link2Off, Quote, Info, Wand2, PenLine, RefreshCw,
 } from "lucide-react";
 
 export const Route = createFileRoute("/simplify2/$reportId")({
@@ -717,30 +717,60 @@ function SimplifyV2ReportPage() {
                   </button>
                 )}
                 {findings.some((f) => f.decision === "accepted") && (
-                  <button
-                    onClick={openFinal}
-                    disabled={finalBusy}
-                    className="w-full rounded-2xl border-2 border-emerald-300 dark:border-emerald-800 bg-gradient-to-r from-emerald-50 to-teal-50 dark:from-emerald-950/30 dark:to-teal-950/20 p-5 flex items-center gap-4 hover:shadow-md transition-shadow text-left group disabled:opacity-70"
-                  >
-                    <div className="size-12 rounded-xl bg-emerald-600 grid place-items-center shrink-0">
-                      {finalBusy ? <Loader2 className="size-6 text-white animate-spin" /> : <PenLine className="size-6 text-white" />}
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <div className="text-base font-bold text-emerald-900 dark:text-emerald-200">
-                        {finalBusy ? "Building final document…" : "Open final document"}
+                  <>
+                    {/* Primary card: opens instantly, no AI. When nothing's been
+                        built yet it builds (one AI run); once a build exists it
+                        just opens that cached copy for free. */}
+                    <button
+                      onClick={sj.finalDoc?.url ? () => openEditor("final") : openFinal}
+                      disabled={finalBusy}
+                      className="w-full rounded-2xl border-2 border-emerald-300 dark:border-emerald-800 bg-gradient-to-r from-emerald-50 to-teal-50 dark:from-emerald-950/30 dark:to-teal-950/20 p-5 flex items-center gap-4 hover:shadow-md transition-shadow text-left group disabled:opacity-70"
+                    >
+                      <div className="size-12 rounded-xl bg-emerald-600 grid place-items-center shrink-0">
+                        {finalBusy ? <Loader2 className="size-6 text-white animate-spin" /> : <PenLine className="size-6 text-white" />}
                       </div>
-                      <div className="text-sm text-emerald-700/80 dark:text-emerald-300/70">
-                        {finalBusy
-                          ? "Deriving each accepted fix and applying it to the original as tracked changes — takes 1–2 minutes."
-                          : finalUpToDate
-                            ? "Up to date — opens instantly, no AI cost. Tracked changes on the original, rationale in comments."
-                            : sj.finalDoc?.url
-                              ? "Decisions changed since the last build — will re-derive and re-apply (~1–2 min, one AI run)."
-                              : "Every accepted fix applied to the ORIGINAL document as Word tracked changes (~1–2 min, one AI run)."}
+                      <div className="flex-1 min-w-0">
+                        <div className="text-base font-bold text-emerald-900 dark:text-emerald-200">
+                          {finalBusy
+                            ? "Building final document…"
+                            : !sj.finalDoc?.url
+                              ? "Build final document"
+                              : finalUpToDate
+                                ? "Open final document"
+                                : "Open last built version"}
+                        </div>
+                        <div className="text-sm text-emerald-700/80 dark:text-emerald-300/70">
+                          {finalBusy
+                            ? "Deriving each accepted fix and applying it to the original as tracked changes — takes 1–2 minutes."
+                            : !sj.finalDoc?.url
+                              ? "Every accepted fix applied to the ORIGINAL document as Word tracked changes (~1–2 min, one AI run)."
+                              : finalUpToDate
+                                ? "Up to date — opens instantly, no AI cost. Tracked changes on the original, rationale in comments."
+                                : "Opens the version you built earlier — instant, no AI cost. Doesn't include decisions changed since."}
+                        </div>
                       </div>
-                    </div>
-                    <ArrowRight className="size-5 text-emerald-500 group-hover:translate-x-1 transition-transform shrink-0" />
-                  </button>
+                      <ArrowRight className="size-5 text-emerald-500 group-hover:translate-x-1 transition-transform shrink-0" />
+                    </button>
+                    {/* Secondary: only when a build exists but decisions have moved
+                        on — the deliberate, paid re-run. */}
+                    {sj.finalDoc?.url && !finalUpToDate && (
+                      <button
+                        onClick={openFinal}
+                        disabled={finalBusy}
+                        className="w-full rounded-xl border border-amber-300 dark:border-amber-800/70 bg-amber-50/60 dark:bg-amber-950/20 px-4 py-3 flex items-center gap-3 hover:bg-amber-50 dark:hover:bg-amber-950/30 transition-colors text-left disabled:opacity-70"
+                      >
+                        {finalBusy ? <Loader2 className="size-4 text-amber-600 animate-spin shrink-0" /> : <RefreshCw className="size-4 text-amber-600 shrink-0" />}
+                        <div className="flex-1 min-w-0">
+                          <div className="text-sm font-semibold text-amber-900 dark:text-amber-200">
+                            Re-run to apply your latest changes
+                          </div>
+                          <div className="text-xs text-amber-700/80 dark:text-amber-300/70">
+                            Your decisions changed since the last build — re-derives and rebuilds (~1–2 min, one AI run).
+                          </div>
+                        </div>
+                      </button>
+                    )}
+                  </>
                 )}
               </div>
             )}
@@ -970,6 +1000,10 @@ function SimplifyV2ReportPage() {
                   onReviewEdits={() => setView("edits")}
                   onExactView={openExact}
                   onEditExact={openFinal}
+                  onOpenFinalCached={() => openEditor("final")}
+                  finalBuilt={!!sj.finalDoc?.url}
+                  finalUpToDate={finalUpToDate}
+                  finalBusy={finalBusy}
                   onOpenDraft={() => openEditor("redraft")}
                   decisions={decisions}
                 />
@@ -1091,6 +1125,10 @@ function SimplifyV2ReportPage() {
                         onReviewEdits={() => setView("edits")}
                         onExactView={openExact}
                         onEditExact={openFinal}
+                        onOpenFinalCached={() => openEditor("final")}
+                        finalBuilt={!!sj.finalDoc?.url}
+                        finalUpToDate={finalUpToDate}
+                        finalBusy={finalBusy}
                   onOpenDraft={() => openEditor("redraft")}
                         decisions={decisions}
                     />

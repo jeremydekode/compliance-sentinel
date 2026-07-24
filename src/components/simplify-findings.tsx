@@ -23,7 +23,7 @@ import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import {
   Check, X, RotateCcw, AlertTriangle, AlertOctagon, Info, CircleAlert,
-  Loader2, FileDown, Sparkles, Quote, Link2Off, ShieldCheck, ChevronDown, PenLine, FileText,
+  Loader2, FileDown, Sparkles, Quote, Link2Off, ShieldCheck, ChevronDown, PenLine, FileText, RefreshCw,
 } from "lucide-react";
 
 // ── severity presentation ────────────────────────────────────────────────────
@@ -349,7 +349,7 @@ function QuarantineGroup({ findings }: { findings: Finding[] }) {
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function RestructurePanel({
-  reportId, findings, restructure, apply, onGenerated, onApplied, onCompareToggle, comparing, onReviewEdits, onExactView, onEditExact, onOpenDraft, decisions,
+  reportId, findings, restructure, apply, onGenerated, onApplied, onCompareToggle, comparing, onReviewEdits, onExactView, onEditExact, onOpenFinalCached, finalBuilt, finalUpToDate, finalBusy, onOpenDraft, decisions,
 }: {
   reportId: string;
   findings: Finding[];
@@ -365,8 +365,17 @@ export function RestructurePanel({
   onReviewEdits?: () => void;
   /** Open the EXACT (PDF) render of the redraft. */
   onExactView?: () => void;
-  /** Open the FINAL DOCUMENT (tracked changes on the original). */
+  /** Build/re-run the FINAL DOCUMENT (derive edits with AI, apply as tracked
+   *  changes on the original). Costs one AI run. */
   onEditExact?: () => void;
+  /** Open the LAST-BUILT final document straight from cache — no AI cost. */
+  onOpenFinalCached?: () => void;
+  /** Whether a final document has been built before (a cached copy exists). */
+  finalBuilt?: boolean;
+  /** Whether the cached final document reflects the current accepted set + inputs. */
+  finalUpToDate?: boolean;
+  /** Whether a build/re-run is in flight. */
+  finalBusy?: boolean;
   /** Open the generated redraft in the exact editor. */
   onOpenDraft?: () => void;
   /** Reviewer decisions (findingId → value) entered inline on the finding cards,
@@ -514,15 +523,59 @@ export function RestructurePanel({
 
             {/* THE payoff action — full-width and loud, not a chip in a row.
                 Needs only accepted findings (it applies them to the ORIGINAL);
-                no redraft required. */}
+                no redraft required.
+
+                Three states so the reviewer controls AI spend:
+                  • never built  → one button, builds (one AI run)
+                  • up to date   → one button, opens the cached copy (no AI)
+                  • stale        → CHOICE: open last built copy (no AI), or
+                                    re-run to fold in the newer decisions (AI). */}
             {onEditExact && findings.some((f) => f.decision === "accepted") && (
-              <Button
-                size="sm"
-                className="w-full h-8 text-xs gap-1.5 bg-indigo-600 hover:bg-indigo-700 text-white"
-                onClick={onEditExact}
-              >
-                <PenLine className="size-3.5" /> Open final document
-              </Button>
+              !finalBuilt ? (
+                <Button
+                  size="sm"
+                  disabled={finalBusy}
+                  className="w-full h-8 text-xs gap-1.5 bg-indigo-600 hover:bg-indigo-700 text-white disabled:opacity-70"
+                  onClick={onEditExact}
+                  title="Derives each accepted fix and applies it to the original as tracked changes (one AI run)."
+                >
+                  {finalBusy ? <Loader2 className="size-3.5 animate-spin" /> : <PenLine className="size-3.5" />}
+                  {finalBusy ? "Building…" : "Build final document"}
+                </Button>
+              ) : finalUpToDate ? (
+                <Button
+                  size="sm"
+                  disabled={finalBusy}
+                  className="w-full h-8 text-xs gap-1.5 bg-indigo-600 hover:bg-indigo-700 text-white disabled:opacity-70"
+                  onClick={onOpenFinalCached}
+                  title="Opens the last built version instantly — up to date, no AI cost."
+                >
+                  <PenLine className="size-3.5" /> Open final document
+                </Button>
+              ) : (
+                <div className="space-y-1.5">
+                  <Button
+                    size="sm"
+                    disabled={finalBusy}
+                    className="w-full h-8 text-xs gap-1.5 bg-indigo-600 hover:bg-indigo-700 text-white disabled:opacity-70"
+                    onClick={onOpenFinalCached}
+                    title="Opens the version you built earlier — instant, no AI cost. Does not include decisions changed since."
+                  >
+                    <PenLine className="size-3.5" /> Open last built version
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={finalBusy}
+                    className="w-full h-7 text-[11px] gap-1.5 disabled:opacity-70"
+                    onClick={onEditExact}
+                    title="Re-derives from your current decisions and rebuilds — takes ~1–2 min and uses one AI run."
+                  >
+                    {finalBusy ? <Loader2 className="size-3 animate-spin" /> : <RefreshCw className="size-3" />}
+                    {finalBusy ? "Re-running…" : "Re-run to apply latest changes (uses AI)"}
+                  </Button>
+                </div>
+              )
             )}
 
             <div className="flex gap-1 flex-wrap">

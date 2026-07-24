@@ -5305,7 +5305,7 @@ export const applySimplifyV2Report = createServerFn({ method: "POST" })
     }
 
     const result = applySimplificationToDocx(file.buffer, edits, {
-      author: data.author?.trim() || "Reviewer",
+      author: data.author?.trim() || "AI Doc Reviewer",
       mode: data.exportMode === "clean" ? "clean" : "redline",
       redlineComments: data.exportMode === "annotated",
     });
@@ -5323,7 +5323,9 @@ export const applySimplifyV2Report = createServerFn({ method: "POST" })
     // accepted set (reviewer may want both clean + tracked-changes). If the
     // accepted actions changed since, both prior URLs are dropped as stale.
     // `sig` fingerprints the accepted set by original action index.
-    const sig = allActions.map((a, i) => (a?.decision === "accepted" ? i : -1)).filter((i) => i >= 0).join(",");
+    // "v2:" prefix invalidates copies built before the "AI Doc Reviewer"
+    // authorship change, so re-opening the final document rebuilds with it.
+    const sig = "v2:" + allActions.map((a, i) => (a?.decision === "accepted" ? i : -1)).filter((i) => i >= 0).join(",");
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const prevApply = (sj.apply ?? {}) as Record<string, any>;
     const carry = prevApply.sig === sig ? prevApply : {};
@@ -5417,7 +5419,7 @@ export const applyFindingsInPlaceV2Report = createServerFn({ method: "POST" })
     }));
 
     const result = applySimplificationToDocx(file.buffer, edits, {
-      author: data.author?.trim() || "Reviewer",
+      author: data.author?.trim() || "AI Doc Reviewer",
       mode: data.exportMode === "clean" ? "clean" : "redline",
       redlineComments: data.exportMode === "annotated",
     });
@@ -5553,10 +5555,10 @@ export const buildFinalDocument = createServerFn({ method: "POST" })
     }
 
     const { createHash } = await import("node:crypto");
-    // "v5" engine salt: reviewer authorship, value traceability, dangling-ref
-    // guard, glossary-primary definitions, change-history row.
+    // "v6" engine salt: authorship changed to "AI Doc Reviewer" — bump so a
+    // re-open rebuilds with the new author instead of returning the cached copy.
     const sig = createHash("sha1")
-      .update(JSON.stringify({ v: "v5", ids: accepted.map((f) => f.id).sort(), inputs }))
+      .update(JSON.stringify({ v: "v6", ids: accepted.map((f) => f.id).sort(), inputs }))
       .digest("hex").slice(0, 16);
     if (sj.finalDoc?.url && sj.finalDoc.sig === sig) return sj.finalDoc;
 
@@ -5576,7 +5578,7 @@ export const buildFinalDocument = createServerFn({ method: "POST" })
     // Traceability: when a reviewer-supplied value backed an edit, the comment
     // cites who supplied it and when — "reviewer-provided" alone doesn't
     // survive an audit.
-    const reviewer = data.author?.trim() || "Reviewer";
+    const reviewer = data.author?.trim() || "AI Doc Reviewer";
     const simplifyEdits: SimplifyDocxEdit[] = edits.map((e) => {
       let rationale = e.rationale;
       if (inputs[e.findingId]) {

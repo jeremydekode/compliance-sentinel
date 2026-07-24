@@ -19,7 +19,6 @@ import {
 } from "@/lib/compliance.functions";
 import { FINDING_CATEGORY_META, findingNeedsInput, findingInputLabel, findingInputSuggestion, type Finding, type FindingSeverity } from "@/lib/recommend";
 import { Button } from "@/components/ui/button";
-import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import {
@@ -428,25 +427,20 @@ export function RestructurePanel({
   const needsReview = [...(apply?.ineligible ?? []), ...(apply?.skipped ?? [])];
 
   return (
-    <TooltipProvider delayDuration={150}>
-      {/* Compact toolbar: two primary actions with their explanations moved to
-          tooltips, and all results/downloads folded into a small strip — so the
-          panel no longer freezes half the rail and the findings list keeps the
-          room to review. */}
+    <>
+      {/* Compact toolbar: two primary actions. Explanations use native title
+          tooltips — Radix Popper's floating-ui repositioning looped (React #185)
+          inside the review page's PDF+grid layout, so we avoid it here. */}
       <div className="border-b bg-card/60 px-3 py-2 space-y-2 shrink-0">
         <div className="flex items-center gap-1.5">
           <Sparkles className="size-3.5 text-primary" />
           <span className="text-[13px] font-semibold">Apply accepted fixes</span>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button type="button" className="text-muted-foreground hover:text-foreground" aria-label="How the two modes differ">
-                <Info className="size-3.5" />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent className="max-w-[280px] text-[11px] leading-relaxed">
-              Two ways to apply the same accepted findings. <b>Apply in place</b> keeps the original file exact and only swaps changed sentences. <b>Generate redraft</b> rebuilds the body (can reorganise/insert) but you'll re-apply fine layout before issuing.
-            </TooltipContent>
-          </Tooltip>
+          <span
+            className="text-muted-foreground hover:text-foreground cursor-help"
+            title="Two ways to apply the same accepted findings. Apply in place keeps the original file exact and only swaps changed sentences. Generate redraft rebuilds the body (can reorganise/insert) but you'll re-apply fine layout before issuing."
+          >
+            <Info className="size-3.5" />
+          </span>
           <span className="ml-auto text-[11px] text-muted-foreground">{accepted.length} accepted</span>
         </div>
 
@@ -464,30 +458,18 @@ export function RestructurePanel({
         )}
 
         <div className="flex gap-1.5">
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button size="sm" className="flex-1 h-8 text-xs gap-1.5" variant={apply ? "outline" : "default"}
-                disabled={accepted.length === 0 || running !== null} onClick={() => runApply("clean")}>
-                {running === "apply" ? <Loader2 className="size-3.5 animate-spin" /> : <PenLine className="size-3.5" />}
-                {apply ? "Re-apply in place" : "Apply in place"}
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent className="max-w-[260px] text-[11px] leading-relaxed">
-              Swaps each finding's quoted text for its fix directly in the original file — exact original styling, headers and layout preserved. Findings that insert new content or span multiple locations are skipped and listed for manual review, never guessed at.
-            </TooltipContent>
-          </Tooltip>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button size="sm" className="flex-1 h-8 text-xs gap-1.5" variant={restructure ? "outline" : "default"}
-                disabled={accepted.length === 0 || running !== null} onClick={run}>
-                {running === "redraft" ? <Loader2 className="size-3.5 animate-spin" /> : restructure ? <RotateCcw className="size-3.5" /> : <Sparkles className="size-3.5" />}
-                {running === "redraft" ? "Generating…" : restructure ? "Regenerate redraft" : "Generate redraft"}
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent className="max-w-[260px] text-[11px] leading-relaxed">
-              Rebuilds the document body with every accepted fix applied, carrying over the template, headers, footers, tables and figures. The body is regenerated, so expect to re-apply house numbering and fine layout before issuing. Every source claim is checked against the output; losses are reported, never hidden.
-            </TooltipContent>
-          </Tooltip>
+          <Button size="sm" className="flex-1 h-8 text-xs gap-1.5" variant={apply ? "outline" : "default"}
+            disabled={accepted.length === 0 || running !== null} onClick={() => runApply("clean")}
+            title="Swaps each finding's quoted text for its fix directly in the original file — exact original styling, headers and layout preserved. Findings that insert new content or span multiple locations are skipped and listed for manual review, never guessed at.">
+            {running === "apply" ? <Loader2 className="size-3.5 animate-spin" /> : <PenLine className="size-3.5" />}
+            {apply ? "Re-apply in place" : "Apply in place"}
+          </Button>
+          <Button size="sm" className="flex-1 h-8 text-xs gap-1.5" variant={restructure ? "outline" : "default"}
+            disabled={accepted.length === 0 || running !== null} onClick={run}
+            title="Rebuilds the document body with every accepted fix applied, carrying over the template, headers, footers, tables and figures. The body is regenerated, so expect to re-apply house numbering and fine layout before issuing. Every source claim is checked against the output; losses are reported, never hidden.">
+            {running === "redraft" ? <Loader2 className="size-3.5 animate-spin" /> : restructure ? <RotateCcw className="size-3.5" /> : <Sparkles className="size-3.5" />}
+            {running === "redraft" ? "Generating…" : restructure ? "Regenerate redraft" : "Generate redraft"}
+          </Button>
         </div>
         {accepted.length === 0 && (
           <p className="text-[10px] text-muted-foreground">Accept at least one finding below to enable these.</p>
@@ -639,7 +621,7 @@ export function RestructurePanel({
           <PlaceholderInputs reportId={reportId} placeholders={restructure.placeholders} onResolved={onGenerated} />
         )}
       </div>
-    </TooltipProvider>
+    </>
   );
 }
 

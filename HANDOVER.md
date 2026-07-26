@@ -1,156 +1,99 @@
-# Handover — RHB demo week: tenant scoping, Simplify v2, Rudy.ai
+# Handover — Document AI Sandbox
 
-Branch: `feat/auth-login-rls-policy-workflow` · **Nothing committed** — every change below is an uncommitted working-tree edit · `npx tsc --noEmit` clean and `npm run build` passes as of last check.
+_Last updated: 2026-07-26. Supersedes the "RHB demo week" handover (its items were verified closed: all flagged server fns now carry tenant checks, layout is tenant-scoped, everything is committed and deployed). Covers: the OnlyOffice reachability saga, the React #185 crash, the AI-cost work, and the full bug-audit sweep (commit `83911a1`)._
 
-Paste this whole file into a new chat to pick up where this session left off. The next session's job is stated in **§6 — what to do next**; everything before that is context to make those fixes correctly instead of re-discovering this from scratch.
-
----
-
-## 1. Why this happened
-
-Client demo for **RHB** (a Malaysian bank) on **Friday 24 Jul**. Across several sessions this grew from "reskin the app for RHB" into: a real multi-tenant system (so other banks can be demoed without ever seeing RHB's files), a rebuilt "Simplify v2" workspace (audit / simplify / redraft an existing doc, or draft a new one from a brief), "Rudy.ai" — a chat concierge that routes requests to the right workflow, and a full code-review pass that found and fixed 8 confirmed bugs. **None of this has been used by a real signed-in human yet** — verification so far is typecheck + prod build + one $0.05 automated pipeline test + read-only DB checks. See §5 for exactly what is and isn't proven.
-
-Standing constraints (still binding, carried from the project's memory):
-- Local + prod Supabase share **one** database — every migration pasted into the SQL editor hits both at once, immediately.
-- Give migration SQL as fenced ` ```sql ` blocks in chat — never `pbcopy`.
-- Never print service-role/secret keys. Scratch scripts using the service role (via `node --env-file=.env`) for read-only verification or seeding are an established, fine pattern this session — just never echo the key itself.
-- Only commit or deploy when the user explicitly asks. Nothing this session has been committed or deployed.
-- `.env` and `scratch/` are gitignored.
+**Next step (owner): manual debug pass — checklist in §6.**
 
 ---
 
-## 2. What was built, in order
+## 1. System snapshot
 
-### A. Multi-tenant document scoping (the foundation everything else sits on)
-Every document (`analysis_reports`, `sop_documents`, `legal_matters`, `legal_kb_entries`) now belongs to a tenant. A DB trigger (`stamp_tenant_id`, in `20260720_tenant_scoping.sql`) auto-stamps `tenant_id` on every insert from the caller's `profiles.tenant_id` — can't be forgotten. Server functions resolve the caller's tenant via `getCallerTenant(userId)` (`src/lib/tenant.functions.ts`) and filter reads by it. Tenants also carry a `features text[]` column (workspace ids + `legal_cms`/`rudy`/`create_document`) that gates the sidebar, workspace switcher, and Rudy per tenant (Settings → Tenants → checkboxes).
+- **App:** TanStack Start on Vercel — stable alias **documentai-sandbox.vercel.app**. Deploy: `npx vercel --prod --yes`, then `npx vercel alias set <deployment-url> documentai-sandbox.vercel.app`.
+- **DB/storage:** Supabase — **one shared database for local and prod**. Migrations hit both at once; apply via SQL editor paste, guard with `to_regclass`.
+- **AI:** Gemini via `generateWithFallback` (`src/lib/gemini.ts`; quality chain led by the admin-picked model), priced in `src/lib/pricing.ts`, metered into `summary_json.costLog` via `appendCostLog` (`compliance.functions.ts` top).
+- **Exact editor:** OnlyOffice Document Server on Railway (project `impartial-fascination`), served at **https://docs.vertexagrowth.com** through a **Cloudflare Tunnel**: a `cloudflared` service inside the same Railway project → `http://documentserver.railway.internal:80` (private networking, never Railway's public edge). App reads `ONLYOFFICE_URL` (Vercel Production env + local `.env`). Save-back webhook: `api/onlyoffice-callback.js` (vercel.json rewrite carve-out).
+- **Active demo workspaces:** Simplify v2 (`/simplify2/…`, modes `recommend_edit` / `simplify`) and Legal CMS. Also live: v1 simplify, regulatory (RMiT/FATF), forms, credit-risk, layout.
 
-**This is Tier 1 (application-level) enforcement only.** RLS is still role-only (`using(true)` for any approved user) — a real DB-level tenant boundary (Tier 2) was explicitly deferred to after the demo. This matters a lot for §6.
+## 2. What went wrong → lessons
 
-Two tenants exist today: `rhb` (real content, backfilled) and `acme` ("Document Demo" — generic branding, seeded with a full clone of RHB's library for showing other prospects without exposing RHB's name/files).
+### 2.1 React #185 crash (review page)
+- **What went wrong:** two confident wrong fixes first — a hooks-order cleanup, then removing recharts — neither reproduced nor resolved the crash. Both were plausible pattern-matches, not diagnoses.
+- **What found it:** forcing a React dev build (`define: NODE_ENV`, `minify:false`) + a temporary class ErrorBoundary printing `errorInfo.componentStack` → named `RestructurePanel → Tooltip → Popper`. Radix Tooltip's floating-ui reposition loop inside the PDF+grid layout.
+- **Fix:** native `title` attributes in `RestructurePanel` (no Radix Tooltip there).
+- **Lessons:** (1) Never claim a fix you haven't reproduced — the componentStack was the first real evidence. (2) A "still broken" report after a deploy may be a **cached build**; ask for a hard refresh before re-diagnosing.
 
-### B. The clone/seed tool
-`clone_demo_to_tenant` Postgres function (`20260721_clone_demo_tool.sql`) copies reports + KB docs **with their embedding chunks** into another tenant, entirely in Postgres (no re-upload, no re-embedding — files are shared by URL). Exposed as **Settings → Tenants → "Seed demos"** — a popup listing RHB's library with checkboxes, calling `listSeedableContent`/`seedTenantDemo` (`compliance.functions.ts`). This button was found broken (state set, nothing rendered) and fixed in the last exchange — untested since the fix, worth a click-through.
+### 2.2 Editor unreachable — the Maxis saga
+- **Layer 1 — DNS:** Maxis (user's ISP) **blocks all `railway.app`/`railway.com` hostnames**. Server perfectly healthy; the user's resolver simply never answered. (Hotspot worked → the tell.)
+- **Layer 2 — concurrency:** first fix (Cloudflare orange-proxy on `docs.dekode.ai` → Railway) passed every single-request test, yet the editor stayed blank with **HTTP 525** on core assets. The editor fires ~50 parallel requests; Railway's public edge drops concurrent TLS handshakes (measured **15/40** through the proxy, 0/40 direct). It had only ever worked because a lone browser multiplexes one HTTP/2 connection.
+- **Fix:** Cloudflare **Tunnel** — `cloudflared` inside Railway, traffic over its persistent connection, OnlyOffice reached via Railway **private networking**. Measured **40/40** after.
+- **Railway deploy gotchas (cost three failed deploys):**
+  1. Custom Start Command **replaces the entrypoint** → must start with the binary: `cloudflared tunnel --no-autoupdate run …`.
+  2. Railway does **not expand `$VAR`** in start commands → `--token $TUNNEL_TOKEN` passes the literal string ("Provided Tunnel token is not valid"). Paste the token literally.
+- **Lessons:** (1) "200 from my machine" says nothing about the user's network path — have the user run the probe (`/healthcheck` in their browser); suspect ISP DNS when hotspot≠wifi. (2) **Single-request healthchecks lie about concurrency** — burst-test (40 parallel curls) before declaring infrastructure fixed. (3) When a proxy leg is flaky, remove the leg (tunnel) rather than tuning it (cache rules).
 
-### C. Simplify v2 — new workspace, three modes
-Lives in `src/routes/simplify2.$reportId.tsx` + `src/components/simplify-v2-upload-dialog.tsx`, `simplify-findings.tsx`, `simplify-health.tsx`, `doc-viewer.tsx`, engine in `src/lib/recommend.ts`. **The old Simplify workspace (`simplify.$reportId.tsx` etc.) is completely untouched** — kept as a working backup.
+### 2.3 What the audit sweep caught (commit `83911a1`)
+Three parallel reviewers (client / v2 server / docx+AI pipeline) + a manual AI-cost trace; every finding verified against code before fixing. The classes, with their standing lessons:
 
-- **Simplify** — same per-paragraph rewrite engine as v1, new document-centric UI.
-- **Recommendation** — a 6-pass audit pipeline (`runAuditPipeline`): claim extraction → cross-section clustering → consistency check → completeness check → dual-gate verification (deterministic quote-match + evidence-only LLM re-check). Produces `Finding[]` across 9 categories (contradiction, incompleteness, ambiguous_actor, undefined_term, stale_reference, redundancy, sequencing, structural, non_verifiable), each with verbatim evidence and a confidence score. Two categories (`stale_reference`, `undefined_term`) are found by **deterministic code**, not AI.
-- **Recommend & Edit** — audit, then (after a human reviews findings) `generateRestructured`: outline pass → per-section regeneration → bidirectional content-preservation check (claims extracted from the output must trace back to the source or an accepted finding) with a capped 2-iteration repair loop. Output is written back into the **original DOCX package** via `rebuildDocxBody` (`docx-editor.ts`) — logo/headers/styles survive; only the body is regenerated.
+| Class | Worst instance | Standing rule |
+|---|---|---|
+| **Lost-update races** | Auto-fired exec summary wrote a pre-AI snapshot back, silently reverting an Accept made during generation | Any write after an `await` gap must re-read via `freshSj()` (next to `appendCostLog`) and spread the fresh copy |
+| **Destructive docx handling** | `comments.xml` rebuilt from id 0 — source documents' own comments deleted, surviving markers re-bound to wrong comments | Engine now merges via `existingComments()` and seeds comment/revision ids past the source's; keep any new part-writer merge-aware |
+| **Matcher divergence** | Validator proved anchors unique with exact matching; apply engine located them with loose prefix matching and took first hit → content inserted after lookalike paragraphs | Validator and apply engine must share matching semantics (`locateAnchorParagraph`: exact-first, loose only if unambiguous, ambiguous → honest skip) |
+| **Unmetered / uncached AI** | "Regenerate redraft" re-billed the priciest op for identical inputs; chat resent the whole summary blob every message, never metered | Every expensive op needs a sig cache (inputs that change output, client/server identical, bumps that don't force paid rebuilds) and a ledger entry — **including failure paths** (cost captured right after the AI call) |
+| **Stale client cache** | Simplify rail accept didn't invalidate → old final doc served labeled "up to date" | Every decision mutation invalidates `["report", reportId]` |
 
-**Intake is scan-first**: upload → `scanDocumentV2` (cheap, ~15s, ~pennies) returns stats + observations + a recommended action → user picks Find gaps / Light simplify / Max simplify (aggressive page-reduction profile) / Full redraft, only then does the expensive pipeline run.
+Full fix list: commit message `83911a1`.
 
-**Dashboards** (`simplify-health.tsx`): every report lands on a full-width card-grid dashboard (severity tiles, category bars, a section "heat map", clean-sections list) instead of the raw findings list. Each card has three actions: 👁 **View** (popup: document scrolled to the highlight, with a reason/evidence/suggested-fix rail beside it), ✓ **Accept**, ✎ **Edit** (refine the suggested fix/replacement text — persisted via `updateV2FindingFix`/`updateV2ActionAfter`, and what the restructure stage actually implements).
+## 3. What worked — keep doing these
 
-**Export**: clean copy (no markup) or annotated copy (Word tracked-changes + comments for Simplify mode; anchored Word comments per change for restructures, since tracked-changes is unreadable on a whole-document rewrite).
+- **Evidence-first debugging:** componentStack for the crash; `dig @1.1.1.1` to bypass local DNS cache; 40-parallel curl bursts for the 525s; a synthetic-docx engine test (10/10 checks) proving the OOXML fixes. Each replaced a guess with a measurement.
+- **Deterministic verification around the AI:** unique-anchor validation, per-edit application reports, verification gates. AI proposes; deterministic code decides what lands; ambiguity is reported, never guessed.
+- **Tracked changes on the ORIGINAL docx** as the reliable final-document path (fidelity by construction). The full redraft exists but is the riskier path.
+- **Cost transparency as a product feature:** the ledger, "opens instantly — no AI cost" labels, the deliberate amber "Re-run (uses AI)" button. This is what the client notices.
+- **Parallel scoped review + adversarial verification before fixing** — two reviewer claims were already-fixed/moot; verification caught that instead of double-fixing.
+- **Download-to-Word as the firewall-proof fallback** — carried every demo while the editor was unreachable.
+- **Conditional cache-key components** (e.g. author folds into the sig only when non-default) — lets behavior change without invalidating everyone's paid caches.
 
-### D. Rudy.ai
-`src/lib/rudy.functions.ts` + `src/components/rudy-chat.tsx`. Floating chat button on every page (tenant-branded, hidden if the tenant lacks the `rudy` feature). Interviews the user, can accept an uploaded document and answer "how does this impact us" against the tenant's KB (RAG via `match_sop_chunks`), then proposes **one** action as a confirmation card (`{reply, action}` JSON contract) — the model never triggers anything; the user must click Confirm. Routes to: `simplify_v2` (any of the 3 modes), `redraft` (auto-chain: audit → auto-accept *verified-only* findings → generate, with a progress banner in the simplify2 header), `regulatory`, `create_document`.
+## 4. Gaps found and how they were solved
 
-### E. Model picker
-Settings → AI Model: pick the app-wide default (gemini-2.5-pro / 3.5-flash / 2.5-flash / 3.1-flash-lite). It leads the "quality" tier's fallback chain; on failure (any error, not just capacity) it falls through to the standard chain rather than aborting. Fast-tier (mechanical batch calls) is untouched by this picker. Cost is priced per-model (`pricing.ts` `MODEL_PRICES` map) — **but only at the v2 call sites**; see §6.
+1. **Editor unreachable on client networks** → Cloudflare Tunnel + private networking (§2.2). Ongoing check: tunnel `onlyoffice` in Cloudflare Zero Trust should show HEALTHY.
+2. **Re-opening the final document billed AI** → sig-cached three-state UX: never-built = build (1 run) / current = open free / stale = choose "open last built (free)" vs amber "re-run (billed)".
+3. **Email address as tracked-change author** → fixed "AI Doc Reviewer" server-side default; caches bumped (v6 salt, `v2:` apply prefix) so the change actually surfaced.
+4. **Ledger blind spots** → chat, brief-generation, and all failure paths now metered; `gemini-2.0-flash` priced.
+5. **Documents-with-comments corruption, wrong-paragraph insertions, races, stale client cache** → §2.3 table.
 
-### F. Create document from brief
-Settings-free: New Analysis → "Create new document" → title/type/brief + a "donor" doc (any tenant-scoped DOCX) whose package the draft wears. `generateDocumentFromBrief` (`recommend.ts`) plans an outline (house skeleton: Purpose/Scope/Definitions/Policy Statements/Procedures/Roles/Escalation/Review Cycle/Appendices), generates each section, marks unknowns as `[OWNER TO CONFIRM: ...]` instead of inventing specifics.
+## 5. Open debt (deliberate, ranked)
 
-### G. Code-review pass (8 confirmed bugs, all fixed)
-A 5-angle multi-agent review of the whole diff found ~30 candidates; 8 were verified as real bugs and fixed:
-1. **By-id server functions had no tenant check** — a report/matter UUID from another tenant could be read/re-run/exported/deleted cross-tenant. Fixed via `assertRowTenant(rowTenant, callerTenant)` on `deleteReport`, `runSimplifyV2Report`, `setV2FindingDecision`, `updateV2FindingFix`, `bulkSetV2FindingDecision`, `applySimplifyV2Report`, `generateRestructuredV2Document`, and `getLegalMatter`. **This fix is NOT applied everywhere — see §6.a, it's the top item.**
-2. `getCallerTenant` failed open on any DB error (wrong-tenant fallback + bypassed feature gates) — now throws on real errors, only a genuinely-missing profile falls back to `default`.
-3. Rudy's redraft auto-chain accepted every non-quarantined finding, including unverified (`review`-status) ones — now verified-only.
-4. Simplify-mode highlight ids were built from a filtered array index while the rail used the original index — clicking a card could highlight the wrong text once anything was quarantined. Fixed.
-5. Re-running a v2 report left stale `apply`/`restructure` outputs next to the fresh results (and blocked the redraft auto-chain forever). Runs now null both out.
-6. `detectStaleCrossRefs` false-positived on documents with unnumbered headings + one appendix. Fixed (each namespace guards its own emptiness).
-7. Rudy could silently substitute a stale chat attachment for the wrong indexed document. Fixed (attachment only stands in when the action explicitly targets `"uploaded"`).
-8. Plus: v1 simplify cost was mis-priced at a flat rate regardless of the picked model (partially fixed, see §6); the admin-picked model could abort a whole run on an incompatible-config error instead of falling back (fixed); legal KB seed dedupe wasn't tenant-scoped (fixed); a Firefox click-to-select fallback was missing (fixed); several duplicated constants/dead helpers were consolidated (`ALL_FEATURES`, `SIMPLIFY_TYPE_LABEL`, Rudy's workflow registry now derives from one `CATALOG` array instead of four hand-synced lists).
+1. **Legal CMS is unmetered** — 11 AI call sites (review, markup comparison, intake triage, clause refine, amended version…), no cost ledger. All user-triggered (no waste), just invisible spend. Port `appendCostLog` if wanted.
+2. **`summary_json` concurrency narrowed, not atomic** — `freshSj()` shrinks the lost-update window to ms. Complete fix = `jsonb_set` RPC per key; parked because migrations hit the shared local+prod DB.
+3. **Orphaned storage objects** — uploads (`upsert:false`, timestamped names) that succeed before a later failure are never referenced or cleaned. Slow unbounded growth in `policies` bucket.
+4. **v1 Simplify workspace still live** with the near-duplicate heavier pipeline; hide via workspace visibility if unused, or fold into v2.
+5. **Tier-2 RLS** (DB-level tenant wall) still deferred — Tier-1 (server-fn guards, now comprehensive) is the enforcement layer; direct-client reads rely on route-level filters.
+6. **`match_sop_chunks` RPC is global** (app-level tenant post-filter) — fine at current scale, watch as tenants/chunks grow.
+7. **Cosmetic:** `docs.dekode.ai` leftovers (Cloudflare CNAME + TXT, Railway custom domain) can be deleted; editor-saved source copies don't refresh the "Exact" PDF (keyed to `source_file_url`).
+8. **Existing cached final docs predate the engine fixes** — served as-is by design (no forced re-billing); any decision change + re-run rebuilds on the fixed engine.
 
-Plus a layout pass: the "View in document" popup was cropping its right-hand rail (fixed-width Word pages forced grid overflow). Fixed with `minmax(0,1fr)` grid tracks + `min-w-0` everywhere the doc viewer sits, plus a **zoom-to-fit** mechanism in `doc-viewer.tsx` that scales the rendered page down to whatever pane it's in.
+## 6. Debug checklist — the owner's next pass
 
----
+Hard-refresh (Cmd-Shift-R) before starting. Each item names the exact promise a recent fix makes.
 
-## 3. Data model reference
+**A. Cost / caching**
+1. Open a previously built report → **Open final document** → opens instantly, **no new ledger entry**.
+2. Change one decision → amber **"Re-run to apply your latest changes"** appears; **"Open last built version"** still opens free.
+3. Re-run once → exactly **one** new "Final document build" ledger entry.
+4. **Generate redraft** twice, nothing changed between → second click: instant, "already up to date — no AI cost" toast, no ledger entry.
+5. Send a chat message on a regulatory report → **"Report chat"** ledger entry appears.
+6. Revisit the R&E dashboard several times → no repeat "Executive summary" entries.
 
-| Migration (all applied to the live shared DB) | What it does |
-|---|---|
-| `20260716_tenant_branding.sql` | `tenants` table (slug, name, tagline, logo_url, 4 color columns) |
-| `20260720_tenant_scoping.sql` | `tenants.features`, `tenant_id` on the 4 document tables, `stamp_tenant_id` trigger, backfill to `'rhb'`, `app_settings` table (holds the model-picker value) |
-| `20260721_clone_demo_tool.sql` | `clone_demo_to_tenant(report_ids, sop_ids, target)` — service-role only |
+**B. Correctness**
+7. Simplify mode: accept one edit in the rail → "Open final document" reacts **immediately** (no manual refresh); build it, then accept one more → the button must show **stale**, not "up to date", and the stale copy must not be silently served as current.
+8. Upload a docx that **already has Word comments** → R&E → build final doc → download: original comments intact, new "AI Doc Reviewer" comments alongside, no Word repair prompt.
+9. In Word: tracked changes authored **"AI Doc Reviewer"**; change-history row dated **today (MYT)**; inserted rows/paragraphs in the right places (glossary rows in the glossary table).
+10. Type a decision value, navigate away within a second, return → value persisted.
+11. On first dashboard load (exec summary still generating), quickly Accept a finding → reload → the Accept **sticks**.
 
-`analysis_reports.summary_json` (jsonb) is where almost everything lives for v2 reports — no dedicated tables. Key shape by `workflow_mode`:
-- `"simplify"`: `actions[]` (VerifiedAction), `apply: {cleanUrl?, annotatedUrl?}`
-- `"recommend"` / `"recommend_edit"`: `findings[]` (Finding), `claims[]`, `audit: {counts}`, `structure`, and for R&E after generation: `restructure: {downloadUrl, annotatedUrl, changeReport[], preservation}`
-- `"create"`: `created: {downloadUrl, outline}`, `doc_brief: {title, docType, brief, donorReportId}`
+**C. Infrastructure**
+12. On Maxis (no hotspot/VPN): `https://docs.vertexagrowth.com/healthcheck` → `true`; in-app editor renders a document (no blank canvas, no 525s in the Network tab).
+13. Edit in the editor → close → reopen → the edit persisted (save-back + forcesave path).
 
-`analysis_guidance` table holds editable prompts, keyed by a string (workspace id, or `"simplify_v2_recommend"` for the audit-mode prompt) — shared across tenants, not tenant-scoped.
-
----
-
-## 4. Key files
-
-| Area | File |
-|---|---|
-| Tenant resolution + guards | `src/lib/tenant.functions.ts` (server), `src/lib/tenant.ts` (client, `ALL_FEATURES` single source) |
-| Audit + restructure + create-from-brief engine | `src/lib/recommend.ts` |
-| All v2 server functions | `src/lib/compliance.functions.ts` (search `Simplify V2`, `Rudy`, `Demo seeding`, `AI model settings`) |
-| Rudy | `src/lib/rudy.functions.ts`, `src/components/rudy-chat.tsx` |
-| Document rendering + highlight/zoom-fit | `src/components/doc-viewer.tsx` |
-| Dashboards | `src/components/simplify-health.tsx` |
-| Findings/actions review rail | `src/components/simplify-findings.tsx` |
-| Simplify v2 route (all 3 modes + create) | `src/routes/simplify2.$reportId.tsx` |
-| Upload/scan/intent dialog | `src/components/simplify-v2-upload-dialog.tsx` |
-| DOCX mutation (clean/redline/rebuild) | `src/lib/docx-editor.ts` |
-| Model pricing + fallback chain | `src/lib/pricing.ts`, `src/lib/gemini.ts` |
-| Tenants admin + model picker UI | `src/routes/settings.tsx` |
-| Deploy config (Vercel fn timeout) | `vercel.json` — `"functions": {"api/server.js": {"maxDuration": 300}}` |
-
----
-
-## 5. What's actually been verified vs. not
-
-**Verified**: `npx tsc --noEmit` clean, `npm run build` passes, dev server loads with no console errors, a per-workspace/per-tenant data-isolation query matrix (zero cross-tenant leakage, zero stranded null-tenant rows), and **one** real pipeline run: the full 6-pass audit executed on a **25k-character truncated slice** of a real SOP (not the whole document), cost $0.049, took 28s, produced plausible findings with the verification gate correctly rejecting one.
-
-**Not verified — this is the gap**: no human has clicked through Rudy, the scan→intent→run flow, the redraft auto-chain, create-from-brief, or the export/download paths in a real browser session (Google OAuth blocks automation, so an agent can't sign in). More importantly: **no workflow has been run on a full-size real document** — only the truncated slice. The 6-pass audit, the restructure generation (outline + N section-generation calls + repair loop), and create-from-brief have an unknown wall-clock time at real scale.
-
----
-
-## 6. What to do next (the actual ask)
-
-Go through the code thoroughly for bugs, wrong-altitude architecture, timeout risk, and prompt/tool quality. Concretely:
-
-### a. Finish the by-id tenant-check pass (highest priority — security gap, not just perf)
-The 8 v2 functions + `getLegalMatter` got `assertRowTenant`/inline tenant checks. **These did not**, and carry the identical class of bug (any signed-in user who has/guesses a report ID can read/mutate it regardless of tenant):
-- v1 Simplify: `setSimplificationDecision`, `bulkSetSimplificationDecision`, `applySimplificationReport`, `runSimplificationReport`, `createSimplificationReport`'s downstream reads.
-- Regulatory/RMiT/FATF/Forms/Policy: `startRegulatoryRerun`, `mapRegulatoryChange`, `analyzeRegulatorySop`, `finalizeRegulatoryReport`, `chatWithReport`, `updateImpact`, `markPendingManual`, `confirmManualCompletion`, `generateDocumentPreview`, `finalizeDocumentAmendment`, `createFormUpdateReport`/`rerunFormUpdateReport`.
-- Credit Risk: everything in `credit.$reportId.tsx`'s backing functions (`analyzeCreditRisk`, `askCreditRisk`, mitigation/anomaly/adverse-news functions).
-- Legal: `requestLegalSignOff`, `finalizeLegalSignOff`, `attachLegalDocument`, `createAmendedVersion`, `publishToKnowledgeBase`.
-- Layout: the entire `layout.functions.ts` / `layout_jobs` table has **no `tenant_id` column at all** — it was outside the audited read-path inventory. Either add the column + stamping trigger + checks, or (faster) untick "Retail Layout Planner" in the feature checkboxes for any non-`rhb` tenant so the gap is unreachable.
-
-Pattern to reuse: `getCallerTenant(context.userId)` → `assertRowTenant(row.tenant_id, tenantId)` (both in `tenant.functions.ts`), same shape as the fixed functions.
-
-### b. Timeout / architecture risk — nothing has been load-tested
-- `vercel.json` sets `maxDuration: 300` for `api/server.js`. **Confirm this matches the actual Vercel plan tier** (Hobby/Pro/Enterprise have different real ceilings and some require Fluid Compute or an Enterprise plan to reach 300s/5min — verify against current Vercel docs and the account's plan, don't assume the config value is honored).
-- Run the **full, untruncated** audit pipeline (`runAuditPipeline`) on a real 100+ page SOP and measure wall-clock. It's 6 sequential-ish passes with internal concurrency (batches of 50 units at concurrency 4 for claims; concurrency 4 for cluster-consistency; concurrency 3 for completeness chunks) — on a large enough document this could plausibly approach or exceed 300s. If it does, the fix is architectural, not a tweak: split the pipeline across multiple serverFn calls (e.g. claims-extraction as call 1, clustering+consistency as call 2, completeness+verification as call 3), have the client chain them with a status field in `summary_json` between calls, so no single request needs the whole budget and partial progress survives a timeout.
-- Same concern for `generateRestructured` (outline + concurrency-3 per-section generation + up to 2 repair iterations) and `generateDocumentFromBrief` — more outline sections = more sequential-ish LLM calls.
-- Rudy's uploaded-document path (`rudyChat` with `fileUrl` set) does a fresh download + text extraction + embedding + `match_sop_chunks` RPC **on every chat message** while the attachment stays set (not cached) — for a large attached file, latency and embedding spend scale with conversation length instead of once per attachment. Worth fixing regardless of timeout risk (it's also a cost bug).
-- Supabase side: `match_sop_chunks` is a **global, non-tenant-scoped** RPC — every caller over-fetches across all tenants' chunks and relies on an app-level id-set post-filter. Fine at today's scale (a few thousand chunks); worth watching as more tenants/documents accumulate (both for correctness — a tenant with more KB docs than the id-set's row cap could get incomplete RAG — and for the query's own latency).
-- Every Accept/Reject/Edit click does a **whole-`summary_json`-blob** read-modify-write (no JSONB path update, no version check) — on a large report (100+ findings/actions) this is a lot of data moved per click, and two fast clicks can race (last write wins, silently reverting the earlier one). Not urgent, but real.
-
-### c. Prompt/quality tuning — needs a real document, not the truncated slice
-`DEFAULT_RECOMMEND_GUIDANCE` and the pass-level prompts in `recommend.ts` (extractClaims, checkClusterConsistency, checkCompleteness, planOutline, generateSection, generateDocumentFromBrief's outline/section prompts) were designed but only exercised against a 25k-char slice. Run each mode against a full real RHB SOP and judge: are findings actually useful (not noisy), is severity calibration sane, does Max Simplify actually hit the ~30% reduction target, does a redraft's preservation score stay high on a real document. Tune the guidance text (editable live in Settings, or the `DEFAULT_*` constants) based on what you see — this is the "right tools/prompts for optimal results" part of the ask.
-
-### d. Known, deliberately-deferred or lower-priority debt (don't need to fix unless you have time)
-- Tier 2 RLS (a real DB-level tenant wall) — deferred by design, not a bug.
-- `computeCost` still prices at the flat 3.5-flash rate (ignoring the picked model) at the credit-risk, layout, and legal call sites — only the v1/v2 Simplify sites were fixed to pass the actual model.
-- `SEVERITY_META`/`SEV_META` are duplicated between `simplify-findings.tsx` and `simplify-health.tsx` (same values, two places — a color/label tweak needs both). `parseRudyJson` duplicates existing JSON-salvage logic elsewhere in `gemini.ts`/`layout.functions.ts` rather than sharing it.
-- v1 and v2 Simplify's analysis orchestration (`runSimplificationReport` vs the simplify-mode branch of `runSimplifyV2Report`) are near-identical copies, not a shared engine — a future fix to one won't propagate to the other.
-- Rudy's document index caps at 60 reports / 200 KB docs (ordered by recency) — a tenant with more than that has an incomplete index with no search fallback.
-- Document Demo (`acme`) has 0 legal matters — the clone tool only covers reports + KB docs, not legal.
-- **Operational note, not a bug**: any *new* workspace added to `WORKSPACES` in `workspace.ts` in the future needs to be added to each tenant's `features` array (or the DB column default) or it silently won't appear for anyone.
-
----
-
-## 7. Test accounts / tenants right now
-
-- `rhb` — real content (162 reports, 121 KB docs), branded RHB, all features on.
-- `acme` ("Document Demo") — full clone of RHB's library (163 reports incl. one leftover test report titled "Pipeline Test (small slice) — safe to delete", 121 KB docs), teal branding, all features on. Legal CMS is empty here (see §6.d).
-- Profiles: `jeremy@dekode.ai`, `shann@dekode.ai`, `jeremy@cloud-space.co` → `acme`, super_admin. `dabraj2004@gmail.com` → `rhb`, member.
+**When something misbehaves, capture three things:** browser console (red errors), the failing Network request (domain + status), and the report's cost ledger. Those localize almost everything from this handover.

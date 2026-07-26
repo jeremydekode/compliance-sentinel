@@ -2,7 +2,7 @@
 
 _Last updated: 2026-07-26. Supersedes the "RHB demo week" handover (its items were verified closed: all flagged server fns now carry tenant checks, layout is tenant-scoped, everything is committed and deployed). Covers: the OnlyOffice reachability saga, the React #185 crash, the AI-cost work, and the full bug-audit sweep (commit `83911a1`)._
 
-**Next step (owner): manual debug pass — checklist in §6.**
+**Next step (owner): manual debug pass — checklist in §6, plus the new §7 (full-app audit, 2026-07-26).**
 
 ---
 
@@ -97,3 +97,122 @@ Hard-refresh (Cmd-Shift-R) before starting. Each item names the exact promise a 
 13. Edit in the editor → close → reopen → the edit persisted (save-back + forcesave path).
 
 **When something misbehaves, capture three things:** browser console (red errors), the failing Network request (domain + status), and the report's cost ledger. Those localize almost everything from this handover.
+
+---
+
+## 7. Full-app audit — 2026-07-26
+
+Five parallel scoped reviewers (routes / shared components / server fns / docx+AI / redundancy), every
+claim re-verified against source before any edit. `tsc` and `npm run build` green throughout. Split into
+two local commits so the risk-free half can ship independently of the fixes that change analysis/document
+output — see the note at the end of this section for what's staged separately and why.
+
+### 7.1 The React #185 loop — actually found this time (landed in this commit)
+
+§2.1 named `RestructurePanel → Tooltip → Popper` and fixed it by removing the Radix Tooltip. That
+silenced the *throw* without removing the *loop*. **There is no live Radix Tooltip left in the app**
+(the `Tooltip` in `routes/index.tsx` is recharts'), yet the loop remained:
+
+- `simplify2.$reportId.tsx` wrote `Array.isArray(sj.findings) ? sj.findings : []`. A report only ever
+  carries ONE of `findings`/`actions` (`compliance.functions.ts:4941` vs `:4971`), so the other branch
+  minted a **new array every render**.
+- That invalidated the `pdfHighlights` useMemo → new `highlights` prop → `PdfViewer`'s highlight effect
+  keyed on **array identity** (`[highlights, pagesReady]`) → re-ran → called `onAnchorStatus` with a
+  **freshly-allocated object** → `setAnchorStatus` → render → repeat. `Object.is` never bails on a new
+  object, so it never terminates. It armed as soon as the first PDF page painted, in BOTH modes.
+
+Why it read as "sometimes a crash": a passive-effect-only cycle spins rather than throwing; it becomes a
+thrown #185 only when something in the same subtree also schedules a sync-lane update per cycle — which
+is exactly what the Radix Tooltip did. That is why removing the Tooltip "fixed" it and the reports kept
+coming back.
+
+**Fixed:** stable module-level empties in the route, and `PdfViewer` now keys both highlight effects on a
+content string (the pattern `doc-viewer.tsx` already used and why DocViewer was immune) and suppresses
+`onAnchorStatus` when the map is unchanged — so no future caller can re-arm it.
+
+**Standing rule:** a component that calls a parent setter from an effect must key that effect on content,
+not on array/object identity, and must not emit an equal-but-new value.
+
+### 7.2 Also landed in this commit — pure UI/infra, zero effect on analysis or document output
+
+- `pdf-viewer.tsx` monkey-patched `window.requestAnimationFrame` per render and restored unconditionally;
+  overlapping renders made one install capture another's wrapper as "native", leaving a wrapper installed
+  **permanently** that returns `setTimeout` ids — every `cancelAnimationFrame` in the app becomes a no-op.
+  Now refcounted.
+- `pdf-highlight.tsx` never called `doc.destroy()` — one pdf.js worker leaked per evidence card.
+- `api/server.js` catch could re-set headers after streaming started → `ERR_HTTP_HEADERS_SENT` → hung
+  socket until platform timeout on a mid-stream client disconnect.
+- `pdf-convert.ts` unguarded `.json()` on CloudConvert HTML error pages.
+- Double-billing guard (`runLanded`) existed only on simplify v2; ported to simplify v1 and credit, where
+  a long run that outlived its HTTP request showed "failed" and invited a re-run.
+- `reports.$reportId` now keyed by id — "Raise policy change" navigates within the same route, so state
+  carried over and the new report opened stuck on "Select a change from the register on the left."
+- **Defensive XML-character stripping** in all three docx escapers (`docx-editor.ts`, `docx-comments.ts`,
+  `credit-docx.ts`): text pasted from a PDF into a comment box can carry control characters that are
+  illegal in XML 1.0 anywhere, corrupting the docx and triggering Word's "unreadable content" repair
+  prompt — no AI involved. Stripping only removes characters that were never valid; a normal document's
+  output is byte-identical, so this ships with the safe batch even though it lives in files that also
+  carry the held-back matching fixes below.
+
+### 7.3 Fixed, verified, but held back — changes analysis/document output, staged as a separate local commit
+
+These are real, tested fixes (real-document round-trip test against the RHB fixture in `scratch/`) but
+deliberately **not** in this commit because they change what a reviewer sees during a demo — e.g. an edit
+that used to auto-accept now goes to review. Shipping them is an explicit choice, not a side effect of
+shipping the crash/leak fixes above.
+
+- **Matcher divergence, second instance** (§2.3 said validator and engine must share semantics — they
+  still didn't): the validator (`simplify.ts`) folded 7 dash glyphs + the NBSP/zero-width family; the
+  apply engine (`docx-editor.ts`) folded only 2 quote pairs. An edit whose `before` held an en-dash
+  verified at 100% and then silently failed to apply — the AI's suggestion just vanished, no error shown.
+- **Ambiguity gate on the simplify path**: `verifyActions` proved existence, never uniqueness, while the
+  engine replaces the FIRST match — repeated boilerplate (or a heading also in a TOC) got auto-accepted
+  and redlined in an arbitrary location. (`recommend_edit` already had this gate; simplify never got it.)
+- `docx-comments.ts` decoded `&amp;` FIRST — the exact bug `docx-editor.ts` documents and guards against.
+  A paragraph containing literal `&lt;` text (a placeholder like `<Owner>`, or a policy with code samples)
+  would fail to anchor its AI comment, silently.
+- Truncated `deriveConcreteEdits` salvage (`recommend.ts`) only recognised `find_text` edits, discarding
+  a salvaged batch whose first entry was an insertion — every finding reported unresolved after the
+  priciest call was billed.
+
+### 7.4 NOT fixed — needs an owner decision (ranked)
+
+1. **`api/onlyoffice-callback.js` token-purpose confusion → SSRF with service-role write.** The path token
+   minted at `compliance.functions.ts:6217` carries no purpose claim, so it satisfies the `body.token`
+   check; `signed.status ?? body.status` / `signed.url ?? body.url` then fall through to the unsigned
+   body. Result: any authenticated user can make the server fetch an arbitrary URL and write the response
+   into the `policies` bucket (public SELECT), then read it back. **Treat as the top item.**
+2. **`workspace_google_connections` and `analysis_guidance` have no `tenant_id`** and are reached via
+   `supabaseAdmin` with no tenant guard — cross-tenant Drive listing/import, and a cross-tenant write that
+   is also a prompt-injection channel into another tenant's analysis.
+3. **`freshSj` lost-update misses** (~8 sites incl. `runSimplifyV2Report`, `runSimplificationReport`,
+   `applySimplificationReport`) — reviewer decisions made during a run are reverted.
+4. **A failed re-run wipes `decisionInputs`** (`compliance.functions.ts:5024` writes `carried` even when
+   the run produced no findings).
+5. **Destroy-before-work**: `reindexSop` deletes chunks before embedding; `startRegulatoryRerun` wipes
+   impacts+changes before a stage that can fail.
+6. **Regulatory + credit pipelines are structurally unmeterable** — 9 `gemini.ts` helpers return no
+   `usage`, so no call site can meter them. Larger unmetered surface than the known Legal CMS debt.
+7. **Paragraph rebuild is destructive** — `buildRedlineParagraph`/`buildCleanParagraph` reconstruct from
+   `<w:t>` text only, dropping inline images, hyperlinks, footnotes and the source's own comment anchors,
+   and silently ACCEPTING pre-existing tracked changes. Splice at run level, or refuse the edit.
+8. Merged `comments.xml` re-parents preserved comments under a root declaring only `w/w14/w15/mc`; a
+   source comment containing a hyperlink or image uses an unbound prefix → fatal XML → repair.
+9. Dead code, verified unreferenced: `src/lib/mock-pipeline.ts`, `src/components/overview-tab.tsx`,
+   `impacts-tab.tsx`, `ai-assistant.tsx`, `ui/chart.tsx` (~1.9k lines), plus the `@tanstack/start@1.120.20`
+   dependency (zero imports; the real one is `@tanstack/react-start`). Deleting these was blocked by a
+   permission prompt in the audit session — safe to remove.
+10. `.claude/worktrees/` holds two orphaned Jun-1 worktrees (4.8MB) that are no longer registered and that
+    ESLint still walks, producing phantom duplicate findings.
+
+### 7.5 Lessons added
+- **A "fix" that removes the symptom is not a diagnosis.** The Tooltip removal made #185 stop throwing
+  while the loop kept running. Confirm the mechanism is gone, not just the crash.
+- **Invisible characters do not survive round-tripping through tooling.** Rewriting `normalizeForMatch`
+  silently turned NBSP/figure-space/narrow-NBSP into ordinary spaces — caught only because a test asserted
+  the 1:1 property. Character classes in this repo now use explicit `\uXXXX` escapes.
+- **Assert the invariant, not the outcome.** The matcher test initially demanded "both sides match"; the
+  right invariant is "both sides AGREE" — a mutual no-match is an honest skip, which is the goal.
+- **"Safe to deploy" and "one commit" are different questions.** A single review session can produce fixes
+  at different risk tiers; splitting the commit by risk (crash/leak/infra vs analysis-behavior-changing)
+  let the safe half ship without waiting on a product decision about the riskier half.

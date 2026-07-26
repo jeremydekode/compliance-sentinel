@@ -12,6 +12,7 @@
 // ============================================================================
 
 import { CREDIT_RISK_SEGMENTS, type CreditRiskAnalysis, type CreditRiskIndicator } from "./gemini";
+import { stripInvalidXmlChars } from "./docx-editor";
 
 const DOCX_MIME =
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
@@ -26,7 +27,10 @@ const IND: Record<CreditRiskIndicator, { label: string; color: string }> = {
 // ── XML primitives ───────────────────────────────────────────────────────────
 
 function xml(s: unknown): string {
-  return String(s ?? "")
+  // stripInvalidXmlChars first: escaping does not save us from C0 controls or
+  // lone surrogates, which are illegal anywhere in an XML 1.0 document and make
+  // Word offer to "repair" the file (dropping content).
+  return stripInvalidXmlChars(String(s ?? ""))
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")

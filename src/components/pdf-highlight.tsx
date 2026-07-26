@@ -77,6 +77,15 @@ export function PdfHighlight({
     let cancelled = false;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let renderTask: any;
+    // Held outside the IIFE so it can be destroyed on unmount. Each pdf.js
+    // document owns a worker transport; the credit report renders one of these
+    // per evidence card, so leaking them accumulates workers until the tab dies.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let doc: any = null;
+    const releaseDoc = () => {
+      try { doc?.destroy?.(); } catch { /* noop */ }
+      doc = null;
+    };
     (async () => {
       try {
         setStatus("loading");
@@ -84,7 +93,7 @@ export function PdfHighlight({
         const pdfjs = await import("pdfjs-dist");
         pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
-        const doc = await pdfjs.getDocument({ url }).promise;
+        doc = await pdfjs.getDocument({ url }).promise;
         if (cancelled) return;
         const pg = await doc.getPage(Math.min(pageNum, doc.numPages));
         const base = pg.getViewport({ scale: 1 });
@@ -125,10 +134,15 @@ export function PdfHighlight({
         }
       } catch {
         if (!cancelled) setStatus("error");
+      } finally {
+        // Unmounted mid-load: cleanup already ran and saw `doc` still null, so
+        // release it here instead of leaking the just-resolved document.
+        if (cancelled) releaseDoc();
       }
     })();
     return () => {
       cancelled = true;
+      releaseDoc();
       try {
         renderTask?.cancel();
       } catch {

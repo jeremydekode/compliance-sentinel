@@ -30,8 +30,21 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+/**
+ * Keyed by reportId. "Raise policy change" navigates from one report to another
+ * on this SAME route (see the nav call in handleRaisePolicyChange), and the
+ * router reuses the component instance for a param-only change — so selectedId,
+ * viewMode, activeTab and autoRunStartedRef would all carry over from the
+ * previous report, leaving the new one stuck on "Select a change from the
+ * register on the left." Same fix simplify2.$reportId.tsx already uses.
+ */
+function ReportRoute() {
+  const { reportId } = Route.useParams();
+  return <ReportPage key={reportId} />;
+}
+
 export const Route = createFileRoute("/reports/$reportId")({
-  component: ReportPage,
+  component: ReportRoute,
   errorComponent: ({ error }) => (
     <AppShell><div className="p-10 text-sm text-destructive">{error.message}</div></AppShell>
   ),

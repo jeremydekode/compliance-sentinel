@@ -8,6 +8,7 @@
 // ============================================================================
 
 import PizZip from "pizzip";
+import { stripInvalidXmlChars } from "./docx-editor";
 
 export interface DocxComment {
   quote: string; // anchor text (a distinctive snippet of the flagged text)
@@ -36,7 +37,10 @@ export function buildFindingComments(findings: any[]): DocxComment[] {
 }
 
 function escapeXml(s: string): string {
-  return (s ?? "")
+  // stripInvalidXmlChars first (shared with docx-editor.ts): escaping alone
+  // does not save us from C0 controls or lone surrogates, which are illegal
+  // anywhere in an XML 1.0 document and make Word offer to "repair" the file.
+  return stripInvalidXmlChars(s ?? "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")

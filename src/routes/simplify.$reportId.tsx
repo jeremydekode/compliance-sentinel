@@ -217,6 +217,24 @@ function SimplifyReportPage() {
     }
   }
 
+  /** Did the run actually land, regardless of what the HTTP call reported? A long
+   *  audit can outlive the request (gateway timeout / dropped connection) and
+   *  still finish server-side. Reporting that as a failure told the user the
+   *  analysis failed on a SUCCESSFUL run — and an obliging re-run billed them a
+   *  second time for an audit they already had. The report row is the truth. */
+  async function runLanded(): Promise<boolean> {
+    try {
+      const { data, error } = await supabase
+        .from("analysis_reports").select("summary_json").eq("id", reportId).single();
+      if (error || !data) return false;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const s = ((data.summary_json as any) ?? {}) as any;
+      return !s.pending_analysis && s.simplification_status !== "failed";
+    } catch {
+      return false;
+    }
+  }
+
   async function runAnalysis(runMode?: "thorough" | "quick") {
     setFailed(false);
     setAnalyzing(true);
@@ -226,10 +244,11 @@ function SimplifyReportPage() {
       const r = await runSimplify({ data: { reportId, ...(runMode ? { mode: runMode } : {}) } });
       setLocalDecisions({}); // decisions are recomputed by the run
       await qc.invalidateQueries({ queryKey: ["simplify_report", reportId] });
-      if (r.status !== "ok") setFailed(true);
+      if (r.status !== "ok" && !(await runLanded())) setFailed(true);
     } catch {
-      setFailed(true);
+      if (!(await runLanded())) setFailed(true);
     } finally {
+      await qc.invalidateQueries({ queryKey: ["simplify_report", reportId] });
       setAnalyzing(false);
     }
   }

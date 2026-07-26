@@ -261,6 +261,22 @@ function CreditReportPage() {
   const sj = ((report.data as any)?.summary_json ?? {}) as any;
   const analysis: CreditRiskAnalysis | undefined = sj.credit_analysis;
 
+  /** Did the run actually land, regardless of what the HTTP call reported? A long
+   *  analysis can outlive the request and still finish server-side; calling that
+   *  a failure invites a re-run that bills the whole (~5-call) analysis twice. */
+  async function runLanded(): Promise<boolean> {
+    try {
+      const { data, error } = await supabase
+        .from("analysis_reports").select("summary_json").eq("id", reportId).single();
+      if (error || !data) return false;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const s = ((data.summary_json as any) ?? {}) as any;
+      return !s.pending_analysis && !!s.credit_analysis && s.credit_status !== "failed";
+    } catch {
+      return false;
+    }
+  }
+
   async function runAnalysis() {
     setFailed(false);
     setAnalyzing(true);
@@ -269,8 +285,12 @@ function CreditReportPage() {
       await runAnalysisFn({ data: { reportId } });
       await qc.invalidateQueries({ queryKey: ["credit_report", reportId] });
     } catch (e: any) {
-      setFailed(true);
-      toast.error("Credit risk analysis didn't finish", { description: e?.message?.slice(0, 200) });
+      if (await runLanded()) {
+        await qc.invalidateQueries({ queryKey: ["credit_report", reportId] });
+      } else {
+        setFailed(true);
+        toast.error("Credit risk analysis didn't finish", { description: e?.message?.slice(0, 200) });
+      }
     } finally {
       setAnalyzing(false);
     }

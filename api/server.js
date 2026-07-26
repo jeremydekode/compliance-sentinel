@@ -52,8 +52,16 @@ export default async function handler(req, res) {
     res.end();
   } catch (err) {
     console.error("[api/server] handler crashed:", err);
-    res.statusCode = 500;
-    res.setHeader("content-type", "text/plain; charset=utf-8");
-    res.end(`Internal Server Error: ${err?.message ?? String(err)}`);
+    // Headers are already flushed once the first res.write() lands, so a failure
+    // mid-stream (client navigated away -> EPIPE) would make these throw
+    // ERR_HTTP_HEADERS_SENT *inside the catch* — an unhandled rejection that
+    // leaves the socket hanging until the platform timeout.
+    if (!res.headersSent) {
+      res.statusCode = 500;
+      res.setHeader("content-type", "text/plain; charset=utf-8");
+      res.end(`Internal Server Error: ${err?.message ?? String(err)}`);
+    } else {
+      res.end();
+    }
   }
 }

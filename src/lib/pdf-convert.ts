@@ -29,8 +29,11 @@ export async function convertDocxToPdf(fileUrl: string): Promise<Buffer> {
       },
     }),
   });
+  // .catch: CloudConvert behind a 502/Cloudflare error page returns HTML, and a
+  // bare .json() then throws "Unexpected token '<'", bypassing the readable
+  // message below.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const job: any = await jobResp.json();
+  const job: any = await jobResp.json().catch(() => ({}));
   if (!job?.data?.id) throw new Error(`Conversion could not start: ${job?.message ?? `HTTP ${jobResp.status}`}`);
 
   // Long-poll until the job finishes (typical: a few seconds).
@@ -38,7 +41,7 @@ export async function convertDocxToPdf(fileUrl: string): Promise<Buffer> {
     headers: { Authorization: `Bearer ${key}` },
   });
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const done: any = (await waitResp.json())?.data;
+  const done: any = (await waitResp.json().catch(() => ({})))?.data;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const exp = done?.tasks?.find((t: any) => t.name === "exp");
   const url = exp?.result?.files?.[0]?.url;

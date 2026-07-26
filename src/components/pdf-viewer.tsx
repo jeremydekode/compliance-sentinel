@@ -43,17 +43,39 @@ interface PdfViewerProps {
 // firing). In a visible tab native rAF (~16ms) always wins, so behaviour is
 // unchanged; when hidden, the timer keeps rendering moving. Installed only for
 // the duration of a render, then restored.
+// Refcounted, because renders overlap: changing `fileUrl` or resizing the pane
+// re-runs the effect while the previous render is still awaiting. Patching per
+// render would let the second install capture the FIRST install's wrapper as its
+// "native", so the last restore reinstates a wrapper permanently. That wrapper
+// returns a setTimeout id, which turns every cancelAnimationFrame in the app
+// into a silent no-op. Install once, restore the true native once.
+let frameFallbackDepth = 0;
+let frameFallbackNative: typeof window.requestAnimationFrame | null = null;
+
 function installFrameFallback(): () => void {
   if (typeof window === "undefined") return () => {};
-  const native = window.requestAnimationFrame?.bind(window);
-  window.requestAnimationFrame = ((cb: FrameRequestCallback) => {
-    let done = false;
-    const run = (t: number) => { if (done) return; done = true; cb(t); };
-    if (native) native(run);
-    const id = window.setTimeout(() => run(performance.now()), 32);
-    return id as unknown as number;
-  }) as typeof window.requestAnimationFrame;
-  return () => { if (native) window.requestAnimationFrame = native; };
+  if (frameFallbackDepth === 0) {
+    const native = window.requestAnimationFrame?.bind(window);
+    frameFallbackNative = native ?? null;
+    window.requestAnimationFrame = ((cb: FrameRequestCallback) => {
+      let done = false;
+      const run = (t: number) => { if (done) return; done = true; cb(t); };
+      if (native) native(run);
+      const id = window.setTimeout(() => run(performance.now()), 32);
+      return id as unknown as number;
+    }) as typeof window.requestAnimationFrame;
+  }
+  frameFallbackDepth++;
+  let released = false;
+  return () => {
+    if (released) return; // cleanup + the async finally can both call this
+    released = true;
+    frameFallbackDepth--;
+    if (frameFallbackDepth === 0 && frameFallbackNative) {
+      window.requestAnimationFrame = frameFallbackNative;
+      frameFallbackNative = null;
+    }
+  };
 }
 
 /** Highlight fill colors: [resting, active]. multiply-blended over the canvas. */
@@ -102,6 +124,23 @@ export function PdfViewer({ fileUrl, className, highlights, activeId, onSelect, 
   onSelectRef.current = onSelect;
   const onAnchorStatusRef = useRef(onAnchorStatus);
   onAnchorStatusRef.current = onAnchorStatus;
+  // Callers park this map in state. Emitting an equal-but-newly-allocated object
+  // would fail React's Object.is bailout and schedule a render, which re-runs the
+  // pass, which emits again — an endless render↔effect cycle. Only report real
+  // changes, so a caller passing an unstable `highlights` array can't spin us.
+  const lastStatusRef = useRef<Record<string, boolean> | null>(null);
+  function emitAnchorStatus(next: Record<string, boolean>) {
+    const prev = lastStatusRef.current;
+    if (
+      prev &&
+      Object.keys(prev).length === Object.keys(next).length &&
+      Object.keys(prev).every((k) => prev[k] === next[k])
+    ) {
+      return;
+    }
+    lastStatusRef.current = next;
+    onAnchorStatusRef.current?.(next);
+  }
 
   useEffect(() => {
     const root = rootRef.current;
@@ -211,6 +250,9 @@ export function PdfViewer({ fileUrl, className, highlights, activeId, onSelect, 
       cancelled = true;
       try { task?.cancel(); } catch { /* noop */ }
       try { doc?.destroy?.(); } catch { /* noop */ }
+      // Release on unmount too, not only in the async finally — otherwise a
+      // render torn down mid-await holds the shim installed. Idempotent.
+      restoreFrames();
     };
   }, [fileUrl, width]);
 
@@ -220,7 +262,7 @@ export function PdfViewer({ fileUrl, className, highlights, activeId, onSelect, 
     const Util = utilRef.current;
     if (!pages.length || !Util) return;
     for (const p of pages) p.div.querySelectorAll("[data-hl]").forEach((el) => el.remove());
-    if (!highlights?.length) { onAnchorStatusRef.current?.({}); return; }
+    if (!highlights?.length) { emitAnchorStatus({}); return; }
 
     // Per-page: normalized text buffer + span→item offset map.
     const pageData = pages.map((p) => {
@@ -289,8 +331,12 @@ export function PdfViewer({ fileUrl, className, highlights, activeId, onSelect, 
         page.div.appendChild(el);
       }
     }
-    onAnchorStatusRef.current?.(status);
-  }, [highlights, pagesReady]);
+    emitAnchorStatus(status);
+    // Key on highlight CONTENT, not array identity — the same fix doc-viewer.tsx
+    // already uses. Depending on the raw reference re-anchors (and re-emits) on
+    // every unrelated parent render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pagesReady, (highlights ?? []).map((h) => `${h.id} ${h.kind} ${h.text}`).join("|")]);
 
   // ── Active highlight: stronger fill + outline + scroll into view ───────────
   useEffect(() => {
@@ -309,7 +355,13 @@ export function PdfViewer({ fileUrl, className, highlights, activeId, onSelect, 
     // Instant jump (not smooth): smooth scrolling animates on rAF, which is
     // suspended in hidden/backgrounded documents — the jump silently no-ops.
     if (first) (first as HTMLElement).scrollIntoView({ behavior: "auto", block: "center" });
-  }, [activeId, pagesReady, highlights]);
+    // Same content key as the pass above (NOT the raw array): this must re-run
+    // after a real highlight change, because that pass rebuilds the [data-hl]
+    // elements and drops the active styling. Keying on identity instead would
+    // re-scroll the PDF back to the selected finding on every parent render —
+    // e.g. mid-keystroke while typing a decision input.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId, pagesReady, (highlights ?? []).map((h) => `${h.id} ${h.kind} ${h.text}`).join("|")]);
 
   return (
     <div

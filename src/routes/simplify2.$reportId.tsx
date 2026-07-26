@@ -87,6 +87,11 @@ function editAnchorText(after: unknown): string {
   return afterColon.length >= 12 ? afterColon : s;
 }
 
+// Shared stable empties. Returning a fresh `[]` for the absent branch would give
+// every render a new array identity — see the note where these are used.
+const NO_FINDINGS: Finding[] = [];
+const NO_ACTIONS: VerifiedAction[] = [];
+
 const MODE_META: Record<string, { label: string; icon: React.ElementType; chip: string }> = {
   simplify: { label: "Simplify", icon: Sparkles, chip: "bg-violet-100 text-violet-700 ring-violet-200" },
   recommend: { label: "Recommendation", icon: SearchCheck, chip: "bg-sky-100 text-sky-700 ring-sky-200" },
@@ -216,8 +221,13 @@ function SimplifyV2ReportPage() {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const sj = ((report.data as any)?.summary_json ?? {}) as any;
   const workflowMode: string = sj.workflow_mode ?? "simplify";
-  const findings: Finding[] = Array.isArray(sj.findings) ? sj.findings : [];
-  const actions: VerifiedAction[] = Array.isArray(sj.actions) ? sj.actions : [];
+  // A report only ever carries ONE of these — the simplify branch writes
+  // `actions`, the recommend/recommend_edit branch writes `findings`. The other
+  // key is undefined, so a `: []` literal here would hand every consumer a brand
+  // new array on every render, invalidating downstream useMemos and restarting
+  // PdfViewer's highlight pass forever. Stable module-level empties instead.
+  const findings: Finding[] = Array.isArray(sj.findings) ? sj.findings : NO_FINDINGS;
+  const actions: VerifiedAction[] = Array.isArray(sj.actions) ? sj.actions : NO_ACTIONS;
 
   /** Did the run actually land, regardless of what the HTTP call reported?
    *  A long audit can outlive the request (gateway/proxy timeout, dropped

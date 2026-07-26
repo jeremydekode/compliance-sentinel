@@ -33,8 +33,24 @@ export type DocxEditResult = {
 
 const NS = `xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"`;
 
-function escapeXml(s: string): string {
-  return s
+/**
+ * Remove characters XML 1.0 forbids outright. Escaping alone is not enough:
+ * C0 controls (except tab/LF/CR), U+FFFE/U+FFFF and lone surrogates are illegal
+ * in an XML document at ANY position, so writing one into a part makes the whole
+ * file unparseable and Word shows "unreadable content" and offers to repair —
+ * repair then drops the part. These reach us without any AI involvement: text
+ * pasted out of a PDF routinely carries U+000C/U+0002, and JSON.parse turns
+ * "\u0007"-style escapes in model output into real control characters.
+ */
+export function stripInvalidXmlChars(s: string): string {
+  return String(s ?? "")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g, "")
+    .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, "")
+    .replace(/(^|[^\uD800-\uDBFF])([\uDC00-\uDFFF])/g, "$1");
+}
+
+export function escapeXml(s: string): string {
+  return stripInvalidXmlChars(s)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
@@ -43,7 +59,7 @@ function escapeXml(s: string): string {
 }
 
 /** Extract concatenated text content of a <w:p>...</w:p> block, ignoring formatting. */
-function getParagraphText(pXml: string): string {
+export function getParagraphText(pXml: string): string {
   // Preserve tabs/line-breaks as whitespace BEFORE extracting runs.
   const normalised = pXml
     .replace(/<w:tab\b[^>]*\/?>/g, " ")
@@ -124,7 +140,10 @@ export function applyEditsToDocx(sourceBuffer: Buffer, edits: DocxEdit[]): DocxE
     if (isInsertion && !findNorm) {
       const newPara = buildHighlightedParagraph(`[Inserted — ${edit.paragraph ?? "new section"}]\n${replacementText}`);
       // Insert before the closing </w:body>
-      documentXml = documentXml.replace(/<\/w:body>/, `${newPara}</w:body>`);
+      // Replacer FUNCTION, not a string: `newPara` carries AI-authored text, and
+      // in a replacement string "$&", "$`", "$'" and "$1" are substitution
+      // patterns — "$`" would splice the entire preceding document in.
+      documentXml = documentXml.replace(/<\/w:body>/, () => `${newPara}</w:body>`);
       appliedCount += 1;
       continue;
     }

@@ -35,14 +35,43 @@ function decodeEntities(s: string): string {
  * drops or reorders words, so a match here is a real match.
  */
 export function normalizeForMatch(s: string): string {
-  return decodeEntities(String(s ?? "").replace(/<[^>]+>/g, " "))
-    .replace(/[‘’‚‛′´`]/g, "'")
-    .replace(/[“”„‟″]/g, '"')
-    .replace(/[‐‑‒–—―−]/g, "-")
-    .replace(/[\u00A0\u2007\u202F\u200B\u2060\uFEFF]/g, " ")
+  return foldMatchGlyphs(decodeEntities(String(s ?? "").replace(/<[^>]+>/g, " ")))
     .replace(/\s+/g, " ")
     .trim()
     .toLowerCase();
+}
+
+/**
+ * The encoding-noise fold, split out so the APPLY engine can share the exact
+ * semantics the validator uses. Previously docx-editor.ts folded only the two
+ * common quote pairs, so a `before` containing an en/em dash verified here at
+ * full confidence and then failed to locate on apply — the edit was silently
+ * dropped.
+ *
+ * Every replacement is ONE character for ONE character, so a caller may fold a
+ * string, find a match index in it, and map that index straight back onto the
+ * original text. `tolerantLocate` / `looseLocateSpan` depend on that. Keep it
+ * 1:1: dropping a character instead of mapping it to a space would shift every
+ * downstream index and redline the wrong span.
+ */
+/** Occurrence count, capped — callers only need "is it ambiguous?". */
+function countOccurrences(hay: string, needle: string, cap = 2): number {
+  if (!needle) return 0;
+  let n = 0;
+  let at = hay.indexOf(needle);
+  while (at >= 0 && n < cap) {
+    n++;
+    at = hay.indexOf(needle, at + needle.length);
+  }
+  return n;
+}
+
+export function foldMatchGlyphs(s: string): string {
+  return String(s ?? "")
+    .replace(/[\u2018\u2019\u201A\u201B\u2032\u00B4\u0060]/g, "'")
+    .replace(/[\u201C\u201D\u201E\u201F\u2033]/g, '"')
+    .replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]/g, "-")
+    .replace(/[\u00A0\u2007\u202F\u200B\u2060\uFEFF]/g, " ");
 }
 
 /** Words-only form — drops ALL punctuation. A span that matches here but not
@@ -206,6 +235,20 @@ function classifyAction(
 
   // Exact (encoding-normalised) substring — the strongest anchor.
   if (docNorm.includes(beforeNorm)) {
+    // Existence is not enough: the apply engine replaces the FIRST occurrence, so
+    // a passage that appears twice (repeated boilerplate, or a heading that also
+    // sits in a table of contents) would be verified at full confidence, auto-
+    // accepted, and then redlined in an arbitrary one of its locations. Report
+    // the ambiguity instead of guessing — the same gate deriveConcreteEdits
+    // already applies on the recommend_edit path.
+    if (countOccurrences(docNorm, beforeNorm) > 1) {
+      return {
+        status: "review",
+        matchScore: 1,
+        reason:
+          "`before` appears more than once in the document — confirm which passage this should change (the editor would otherwise apply it to the first).",
+      };
+    }
     return isTable
       ? {
           status: "review",

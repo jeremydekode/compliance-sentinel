@@ -16,6 +16,7 @@
 //     surfaced in the report so the user knows it was missed.
 
 import PizZip from "pizzip";
+import { foldMatchGlyphs } from "./simplify";
 
 export type DocxEdit = {
   change_type: string;
@@ -90,12 +91,10 @@ export function getParagraphText(pXml: string): string {
 }
 
 function normaliseForCompare(s: string): string {
-  return (s ?? "")
-    .replace(/\s+/g, " ")
-    .replace(/[‘’]/g, "'")
-    .replace(/[“”]/g, '"')
-    .trim()
-    .toLowerCase();
+  // Same fold as the validator (simplify.ts) — see foldMatchGlyphs. This used to
+  // fold only the two common quote pairs, so it disagreed with the validator on
+  // dashes and zero-width characters.
+  return foldMatchGlyphs(s).replace(/\s+/g, " ").trim().toLowerCase();
 }
 
 /** Build a fresh <w:p> with each line as a yellow-highlighted run. */
@@ -841,24 +840,21 @@ const COMMENTS_EX_REL_TYPE =
  *  drift and case differences (a verified `before` may still differ slightly
  *  from the paragraph's raw text in punctuation glyphs or casing). */
 function tolerantReplace(paraText: string, before: string, after: string): string | null {
-  const q = (s: string) => s.replace(/[‘’]/g, "'").replace(/[“”]/g, '"');
-  const p = q(paraText);
-  const b = q(before);
-  if (!b) return null;
-  // 1. quote-normalised exact substring
-  let at = p.indexOf(b);
-  if (at >= 0) return p.slice(0, at) + after + p.slice(at + b.length);
-  // 2. case-insensitive — same length so indices line up
-  at = p.toLowerCase().indexOf(b.toLowerCase());
-  if (at >= 0) return p.slice(0, at) + after + p.slice(at + b.length);
-  return null;
+  // Delegates to tolerantLocate so both paths share one matching semantic, then
+  // slices the ORIGINAL text. The old version sliced the folded copy, which
+  // rewrote every smart quote in the untouched remainder of the paragraph.
+  const loc = tolerantLocate(paraText, before);
+  if (!loc) return null;
+  return paraText.slice(0, loc.start) + after + paraText.slice(loc.end);
 }
 
 /** Like tolerantReplace, but returns the match span (indices into the ORIGINAL
  *  paraText) instead of replacing — used to build a redline. Quote-normalisation
  *  is 1:1 in length, so indices map straight back to the original text. */
 function tolerantLocate(paraText: string, before: string): { start: number; end: number } | null {
-  const q = (s: string) => s.replace(/[‘’]/g, "'").replace(/[“”]/g, '"');
+  // foldMatchGlyphs is the SAME fold the validator uses (simplify.ts) and is
+  // 1:1 in length, so indices still map back onto the original paraText.
+  const q = foldMatchGlyphs;
   const p = q(paraText);
   const b = q(before);
   if (!b) return null;
@@ -880,7 +876,7 @@ function tolerantLocate(paraText: string, before: string): { start: number; end:
  */
 function paragraphContainsLoose(paraText: string, before: string): boolean {
   const norm = (s: string) =>
-    (s ?? "").replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/\s+/g, " ").trim().toLowerCase();
+    foldMatchGlyphs(s).replace(/\s+/g, " ").trim().toLowerCase();
   const p = norm(paraText);
   const b = norm(before);
   // EXACT equality is safe at any reasonable length — the length gate below
@@ -917,8 +913,8 @@ function paragraphContainsLoose(paraText: string, before: string): boolean {
  * span swaps keep their exact fidelity when the exact match succeeds.
  */
 function looseLocateSpan(paraText: string, before: string): { start: number; end: number } | null {
-  const q = (s: string) => s.replace(/[‘’]/g, "'").replace(/[“”]/g, '"').toLowerCase();
-  const pq = q(paraText); // 1:1 length with paraText (quote-swap + lowercase preserve length)
+  const q = (s: string) => foldMatchGlyphs(s).toLowerCase();
+  const pq = q(paraText); // 1:1 length with paraText (glyph fold + lowercase preserve length)
   const kept: string[] = [];
   const map: number[] = []; // index in `kept` → index in paraText
   for (let i = 0; i < pq.length; i++) {

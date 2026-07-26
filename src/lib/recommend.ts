@@ -991,7 +991,14 @@ ${text.slice(0, 400_000)}
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const root: any = Array.isArray(items) ? (items[0] ?? {}) : items;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const rawEdits: any[] = Array.isArray(root?.edits) ? root.edits : (Array.isArray(items) && items.length && items[0]?.find_text ? items : []);
+  // Salvage path: when the response is truncated, parseJsonArrayLoose returns the
+  // partial `edits` array itself, so `root` is the first EDIT, not the wrapper.
+  // Recognise every edit form here — testing only `find_text` threw away a
+  // salvaged batch whose first entry was an insertion or a table row, reporting
+  // "no edit returned" for every finding after the quality call was fully billed.
+  const isEditShape = (x: any) => !!(x?.find_text || x?.insert_after || x?.insert_row_after);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const rawEdits: any[] = Array.isArray(root?.edits) ? root.edits : (Array.isArray(items) && items.some(isEditShape) ? items : []);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const rawUnresolved: any[] = Array.isArray(root?.unresolved) ? root.unresolved : [];
 

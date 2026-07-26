@@ -8,7 +8,7 @@
 // ============================================================================
 
 import PizZip from "pizzip";
-import { stripInvalidXmlChars } from "./docx-editor";
+import { escapeXml, getParagraphText } from "./docx-editor";
 
 export interface DocxComment {
   quote: string; // anchor text (a distinctive snippet of the flagged text)
@@ -36,31 +36,12 @@ export function buildFindingComments(findings: any[]): DocxComment[] {
     .filter((c): c is DocxComment => !!c);
 }
 
-function escapeXml(s: string): string {
-  // stripInvalidXmlChars first (shared with docx-editor.ts): escaping alone
-  // does not save us from C0 controls or lone surrogates, which are illegal
-  // anywhere in an XML 1.0 document and make Word offer to "repair" the file.
-  return stripInvalidXmlChars(s ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
-}
-
-function getParagraphText(pXml: string): string {
-  const normalised = pXml
-    .replace(/<w:tab\b[^>]*\/?>/g, " ")
-    .replace(/<w:br\b[^>]*\/?>/g, "\n");
-  const out: string[] = [];
-  const re = /<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(normalised)) !== null) out.push(m[1]);
-  return out.join("")
-    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
-    .replace(/\s+/g, " ").trim();
-}
+// Shared with docx-editor.ts rather than re-implemented. The local copies had
+// drifted: this file decoded `&amp;` FIRST, which turns a literal "&amp;lt;" into
+// "&lt;" and then wrongly into "<" — the exact bug docx-editor.ts documents and
+// guards against by decoding `&amp;` LAST. That made extracted text diverge from
+// the finding quote, so the comment silently failed to anchor. The local
+// escapeXml also lacked invalid-XML-character stripping.
 
 function norm(s: string): string {
   return (s ?? "").replace(/\s+/g, " ").replace(/[‘’]/g, "'").replace(/[“”]/g, '"').trim().toLowerCase();

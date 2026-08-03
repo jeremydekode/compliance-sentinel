@@ -216,3 +216,142 @@ shipping the crash/leak fixes above.
 - **"Safe to deploy" and "one commit" are different questions.** A single review session can produce fixes
   at different risk tiers; splitting the commit by risk (crash/leak/infra vs analysis-behavior-changing)
   let the safe half ship without waiting on a product decision about the riskier half.
+
+---
+
+## 8. Cloud Run migration — first live step off Vercel (2026-08-04)
+
+**Goal:** move hosting off Vercel (RM80/mo) to GCP Cloud Run, prove it works, keep Vercel/Supabase/Railway
+running untouched until proven. This section is the durable record — everything below survives
+regardless of conversation/session state.
+
+### 8.1 What's built (committed as new files, untested-by-git-history but verified working)
+- `Dockerfile` — multi-stage build. Builder stage needs `--build-arg VITE_SUPABASE_URL` and
+  `--build-arg VITE_SUPABASE_PUBLISHABLE_KEY` (Vite bakes these into the client bundle at BUILD time,
+  not runtime — the one real gotcha found this session). Runtime stage needs full `node_modules`
+  (`npm ci --omit=dev`), not just `dist/` — heavy packages like `pizzip`/`mammoth` stay as real
+  `node_modules` imports in the built server chunks, confirmed by grepping the build output.
+- `server.cloud-run.mjs` — replaces what Vercel did automatically: serves `dist/client/*` as static
+  files, falls through to the same `dist/server/server.js` fetch-handler `api/server.js` already uses
+  for Vercel. Listens on `process.env.PORT` (Cloud Run's convention).
+- `.dockerignore` — excludes node_modules/dist/scratch/.env/etc from the build context.
+- **Must build `--platform linux/amd64` explicitly** — building on an Apple Silicon Mac without this
+  flag produces an arm64 image Cloud Run will reject outright ("must support amd64/linux").
+
+### 8.2 Current live deployment
+- **Project:** `jeremy-dev-504410` (existing project, chosen from several already on the account)
+- **Region:** `asia-southeast1` (Singapore — nearest to Malaysia; GCP has no confirmed Malaysia region)
+- **Artifact Registry:** `asia-southeast1-docker.pkg.dev/jeremy-dev-504410/docai-sandbox/app:latest`
+  — 322MB stored, under the 0.5 GiB free tier, so **$0/month** storage cost currently.
+- **Cloud Run service:** `docai-sandbox`, URL `https://docai-sandbox-413246732174.asia-southeast1.run.app`
+  — `min-instances=0` (scale to zero, $0 while idle — genuinely verified, not assumed), `max-instances=2`
+  as a safety ceiling, 1Gi/1cpu.
+- **Secrets:** all 9 sensitive `.env` values (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`,
+  `GOOGLE_GENERATIVE_AI_API_KEY`, etc.) live in Secret Manager, granted to the Cloud Run service account
+  (`413246732174-compute@developer.gserviceaccount.com`) via `roles/secretmanager.secretAccessor` —
+  NOT plain env vars. The two `VITE_*` values are build-time only and were never runtime secrets.
+
+### 8.3 Verified working (real tests, not assumed)
+- Static assets serve correctly (200 OK), SSR renders real content, login gate correctly redirects.
+- Google sign-in actually completes on this Cloud Run URL (this **overturned** an initial worry that
+  the OAuth redirect-URI allowlist would reject the new domain — it didn't; worth knowing the client
+  config is either already permissive or doesn't need updating for new hosts).
+- Dashboard renders correctly once signed in.
+
+### 8.4 Confirmed NOT working yet — OnlyOffice save-back
+- Opening a document and editing in the OnlyOffice "exact editor" works (loads fine), but **saving
+  fails**: "The document could not be saved."
+- Root cause, confirmed via direct testing (not guessed): Cloud Run's IAM gate (`--no-allow-unauthenticated`,
+  set deliberately for cost/safety during testing) rejects OnlyOffice's save-back callback with a 403,
+  because OnlyOffice's Document Server (still on Railway, outside GCP) has no Google Cloud identity to
+  present. Confirmed directly: `curl .../api/onlyoffice-callback` → 403 anonymous.
+- **This is an architecture-pattern issue, not specific to OnlyOffice** — any self-hosted "Document
+  Server" that calls back via its own webhook (Collabora, self-hosted Office Online Server) would hit
+  the exact same wall. Two real fixes, discussed and not yet started:
+  1. Self-host OnlyOffice inside the same GCP VPC — its save-callback would then travel over internal
+     networking, never touching the public internet, sidestepping this entirely. Requires a GCE VM (or
+     similar), a Serverless VPC Access connector, and re-pointing `ONLYOFFICE_URL`/JWT config. A real,
+     separate infrastructure task, not attempted yet.
+  2. Replace the editor with a browser-embedded editor SDK (e.g. Syncfusion Document Editor) — editing
+     runs as JS in the browser, saving is just a normal authenticated API call from the logged-in user,
+     no separate server, no callback problem. Trade-off: uncertain track-changes fidelity for a
+     legal/compliance redlining product — would need piloting against a real document before trusting
+     it over what exists today.
+
+### 8.5 The org policy wall — access model, still open
+- This GCP organization (`dekode.ai`) enforces **Domain Restricted Sharing**
+  (`constraints/iam.allowedPolicyMemberDomains`) org-wide — confirmed via
+  `gcloud resource-manager org-policies describe --effective`, allowed values are specific customer IDs,
+  NOT `allUsers`/`allAuthenticatedUsers`. This is a deliberate governance guardrail, not a bug — it
+  blocks making ANY resource in ANY project under this org publicly reachable without a Google identity.
+- **Project Owner does NOT include the ability to override this** — confirmed directly (`jeremy@dekode.ai`
+  has `roles/owner` + `roles/secretmanager.admin`, no org-policy role). Overriding it at the project
+  level needs `roles/orgpolicy.policyAdmin` specifically, and even then, whether an override is *accepted*
+  depends on how the org root configured the policy (some orgs block any exception below the org node).
+- **Current access model:** only `jeremy@dekode.ai`'s own Google identity can reach the Cloud Run URL at
+  all (Cloud Run Invoker), checked *before* the app's own Supabase login/allowlist ever runs. A user who
+  is correctly allowlisted in Supabase would still be rejected at this layer — being in Supabase doesn't
+  matter if Cloud Run's IAM rejects them first. To let other real people in: grant their specific
+  `@dekode.ai` Google accounts (or a Google Group) `roles/run.invoker` on this service — NOT `allUsers`,
+  which the org policy blocks outright regardless of role.
+- **Open decision (as of writing):** this deployment is explicitly a demo, and the ask is for anyone to
+  be able to use it — which needs the org-policy-admin exception path above, not just more IAM grants.
+  Whoever administers the `dekode.ai` org policy is the one who can grant `roles/orgpolicy.policyAdmin`
+  (scoped to just this project) or make the exception directly.
+
+### 8.6 Not yet done (deliberately, in order)
+1. ~~Decide the public-access question (§8.5)~~ — resolved for now, see §8.7 (named-account grants,
+   not the org-policy exception).
+2. ~~Decide the OnlyOffice fix (§8.4)~~ — resolved, see §8.8 (staying on Vercel, not fixing).
+3. Point the real domain at Cloud Run — still pointing at Vercel; **on hold indefinitely**, see §8.8.
+4. Cancel Vercel/Supabase/Railway subscriptions — **not happening** until/unless §8.8 changes.
+
+### 8.7 Access model decision (2026-08-04): named accounts, not public
+Chose **named-account `run.invoker` grants over the org-policy-admin exception path** — no admin
+request made, none planned unless the demo audience grows beyond a short list of known people.
+- Granted: `gcloud run services add-iam-policy-binding docai-sandbox --region=asia-southeast1
+  --project=jeremy-dev-504410 --member="user:jeremy@dekode.ai" --role="roles/run.invoker"` — works,
+  verified end-to-end.
+- **Real gotcha hit and fixed**: after Cloud Run's IAM gate passes, Google sign-in bounced back to
+  `http://localhost:3000` instead of the Cloud Run URL. Root cause: Supabase Auth only honors
+  `redirectTo` targets on its own **Redirect URLs allow-list** — the Cloud Run origin wasn't on it, so
+  Supabase silently fell back to the project's default Site URL (still `localhost:3000` from local dev).
+  The app code itself (`src/routes/login.tsx`, `src/routes/auth.callback.tsx`) was already fully
+  origin-relative (`window.location.origin`) — nothing to fix there. Fix was in the Supabase Dashboard:
+  Authentication → URL Configuration → Redirect URLs → add `https://docai-sandbox-413246732174.
+  asia-southeast1.run.app/**`. Site URL was left untouched (can stay `localhost:3000` for dev).
+- **Constraint to remember for the next person added**: named-account grants only work for Google
+  identities belonging to one of the org's allowed Domain Restricted Sharing customer IDs (`C0408dka2`,
+  `C0167l72t`, `C02brtpgm` — confirmed via `gcloud resource-manager org-policies describe
+  iam.allowedPolicyMemberDomains --effective`). A personal `@gmail.com` account or an external client
+  domain outside those three IDs will hit the **same** `FAILED_PRECONDITION` org-policy error `allUsers`
+  did — this isn't just an `allUsers` restriction, it blocks any disallowed identity, named or not.
+
+### 8.8 OnlyOffice decision (2026-08-04): staying on Vercel, not fixing
+Evaluated both real fixes from §8.4 plus two more options that came up, and decided **not to fix this
+right now** — OnlyOffice-dependent editing stays on Vercel; Cloud Run runs in parallel for everything
+else. Reasoning, so this doesn't get re-litigated from scratch:
+- **Self-host OnlyOffice in GCP (§8.4 option 1), priced out**: verified against the actual Cloud Billing
+  Catalog API (not a guess) — an always-on VM big enough for OnlyOffice (2 vCPU/4GB, e.g. `e2-medium`)
+  costs ~$50/month in `asia-southeast1` compute alone, plus ~$1-2/month disk. A VM can't scale to zero
+  the way Cloud Run does. That would eat most of the RM80/month this whole migration was meant to save.
+  A cheaper idea — run OnlyOffice's Document Server as *another* Cloud Run service (scale-to-zero,
+  same $0-idle story) instead of a VM — was raised but **never tested**: real open questions around
+  cold-start time on a heavy image and whether it tolerates Cloud Run's ephemeral/stateless model. Worth
+  revisiting if this ever becomes worth the engineering time again.
+- **Replace OnlyOffice with a browser-embedded SDK (§8.4 option 2, e.g. Syncfusion)**: explicitly flagged
+  as low-confidence, not a drop-in — this app has real, hard-won OnlyOffice-specific tuning (see commit
+  `c2ed87e`: docx matcher drift, comment decode order) that doesn't transfer to a different editor.
+  Would need a real prototype (one document, tracked changes + comments, end to end) before trusting it.
+- **Microsoft Office Online Server**: ruled out outright — same callback/IAM problem as OnlyOffice, and
+  Microsoft is retiring it December 31, 2026 (Volume Licensing only, not available via M365 subscriptions).
+- **Microsoft SharePoint Embedded**: the actual modern Microsoft answer (2023+ product), and it
+  architecturally avoids the callback problem entirely (Microsoft's own cloud hosts editing + saves).
+  Genuinely worth pursuing **once building against the real client's Microsoft 365 tenant** — the
+  client is reportedly on Microsoft/Azure — but not usable for the current dekode.ai demo, since it
+  needs the client's actual tenant, container-type registration, and Azure AD app consent. Keep this in
+  mind for the real production build, not the sandbox.
+- **Net decision**: none of the fixes clearly pay for themselves right now. Simplest path — keep paying
+  for Vercel specifically for OnlyOffice editing, keep Cloud Run for everything else at ~$0 idle cost.
+  Revisit if either (a) the Cloud-Run-hosted OnlyOffice idea gets tested and works, or (b) the real
+  production build against the client's own Microsoft tenant starts, making SharePoint Embedded relevant.

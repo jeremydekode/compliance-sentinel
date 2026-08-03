@@ -1,0 +1,17 @@
+node_modules
+dist
+.output
+.vinxi
+.tanstack
+.nitro
+.git
+.vercel
+scratch
+.env
+.env.local
+.env.*.local
+*.log
+.DS_Store
+.claude
+onlyoffice
+supabase

@@ -152,6 +152,30 @@ export const REQUIRED_ENTITY_KEYS = [
   "previousPeriodStart", "previousPeriodEnd",
 ] as const;
 
+/**
+ * Fields that come from the company's SSM REGISTRATION record, not from its
+ * audited accounts — so they must never be taken from the report, however
+ * confidently an extractor offers them.
+ *
+ * Verified against a real filing: IOT Foresight's submitted XBRL declares
+ * MSIC 71102 / 71109 / 62099 (engineering and IT services), while extraction
+ * of its audited report produced "Retail sale of any kind of product over the
+ * Internet" — a different industry entirely. Worse, that string is verbatim
+ * MSIC 47912 vocabulary, so a label-match check "confirmed" it: the model had
+ * echoed the taxonomy back, and matching against it was circular, not
+ * corroborating. A wrong MSIC code on a statutory filing is materially worse
+ * than a blank one the filer must fill, so these stay blank and flagged.
+ *
+ * `businessDescriptionN` is derived from the chosen code instead — in the real
+ * filing each DescriptionOfBusiness is exactly the official MSIC label for the
+ * code beside it, so code → label is authoritative rather than a guess.
+ */
+export const REGISTRY_ONLY_ENTITY_KEYS = [
+  "msicCode1", "businessDescription1",
+  "msicCode2", "businessDescription2",
+  "msicCode3", "businessDescription3",
+] as const;
+
 /** Subtotals the taxonomy requires as their own facts but which sit between a
  *  note breakdown and a face amount, so nobody reads them off a statement.
  *

@@ -18,7 +18,7 @@ import {
   REQUIRED_ENTITY_KEYS,
   type FieldSpec, type MbrsExtraction, type ValidationIssue,
 } from "@/lib/mbrs";
-import { findExactMsic } from "@/lib/msic";
+import { msicLabel } from "@/lib/msic";
 import { MsicField } from "@/components/msic-field";
 import { computeCost, formatUsd } from "@/lib/pricing";
 import { cn } from "@/lib/utils";
@@ -93,8 +93,6 @@ function MbrsFilingPage() {
   const [draft, setDraft] = useState<MbrsExtraction | null>(null);
   const [collapsed, setCollapsed] = useState<Set<Group>>(new Set());
   const [activeGroup, setActiveGroup] = useState<Group>("entity");
-  /** MSIC codes machine-matched this session — flagged until saved. */
-  const [autoFilled, setAutoFilled] = useState<Set<string>>(new Set());
 
   const report = useQuery({
     queryKey: ["mbrs_report", reportId],
@@ -111,33 +109,14 @@ function MbrsFilingPage() {
   const issues: ValidationIssue[] = sj.mbrs_issues ?? [];
   const status: string = sj.mbrs_status ?? (sj.pending_analysis ? "queued" : "unknown");
 
-  // Seed the editable draft — and enter MSIC codes the filer would otherwise
-  // have to look up. Only an EXACT label match may auto-enter (a wrong MSIC
-  // code on a statutory filing is worse than a blank), it's flagged "confirm",
-  // and the fill lands in the unsaved draft so the save step is the
-  // confirmation gate — nothing reaches the filing unseen.
+  // Seed the editable draft. MSIC codes are deliberately NOT auto-entered:
+  // they belong to the SSM registration record, not the accounts, and a
+  // plausible-looking wrong code on a statutory filing is worse than a blank
+  // the filer must fill. The searchable picker below does the lookup work
+  // instead of guessing the answer.
   useEffect(() => {
     if (!extraction || draft) return;
-    const seeded: MbrsExtraction = { ...extraction, entity: { ...extraction.entity } };
-    const filled = new Set<string>();
-    for (const [codeKey, descKey] of MSIC_PAIRS) {
-      if (String(seeded.entity[codeKey] ?? "").trim()) continue;
-      const desc = String(seeded.entity[descKey] ?? "").trim();
-      if (!desc) continue;
-      const hit = findExactMsic(desc);
-      if (hit) {
-        seeded.entity[codeKey] = hit.code;
-        filled.add(codeKey);
-      }
-    }
-    setDraft(seeded);
-    if (filled.size) {
-      setAutoFilled(filled);
-      toast.info(
-        `Matched ${filled.size} MSIC code${filled.size === 1 ? "" : "s"} from the business description`,
-        { description: "Confirm and save — codes come from the official MSIC 2008 list, never guessed." },
-      );
-    }
+    setDraft(extraction);
   }, [extraction]);
 
   async function runAnalysis() {
@@ -181,11 +160,11 @@ function MbrsFilingPage() {
 
   /** Per-section outstanding work, driving the rail badges and the checklist. */
   const stats = useMemo(() => {
-    const out: Record<Group, { errors: number; toFill: FieldSpec[]; toConfirm: FieldSpec[] }> = {
-      entity: { errors: 0, toFill: [], toConfirm: [] },
-      sofp: { errors: 0, toFill: [], toConfirm: [] },
-      pl: { errors: 0, toFill: [], toConfirm: [] },
-      cf: { errors: 0, toFill: [], toConfirm: [] },
+    const out: Record<Group, { errors: number; toFill: FieldSpec[] }> = {
+      entity: { errors: 0, toFill: [] },
+      sofp: { errors: 0, toFill: [] },
+      pl: { errors: 0, toFill: [] },
+      cf: { errors: 0, toFill: [] },
     };
     if (!view) return out;
     for (const i of issues) {
@@ -194,18 +173,13 @@ function MbrsFilingPage() {
     for (const { group, fields } of SECTIONS) {
       for (const f of fields) {
         if (DERIVED_KEYS.has(f.key) || naSet.has(f.key)) continue;
-        if (autoFilled.has(f.key) && !isBlank(f, view)) {
-          out[group].toConfirm.push(f);
-          continue;
-        }
         if (view.missing?.includes(f.key) && isBlank(f, view)) out[group].toFill.push(f);
       }
     }
     return out;
-  }, [view, issues, autoFilled, naSet]);
+  }, [view, issues, naSet]);
 
   const totalToFill = SECTIONS.reduce((n, s) => n + stats[s.group].toFill.length, 0);
-  const totalToConfirm = SECTIONS.reduce((n, s) => n + stats[s.group].toConfirm.length, 0);
   const errors = issues.filter((i) => i.severity === "error");
 
   const jumpTo = useCallback((group: Group, fieldKey?: string) => {
@@ -253,12 +227,6 @@ function MbrsFilingPage() {
       na.delete(key);
     } else {
       na.add(key);
-      setAutoFilled((prev) => {
-        if (!prev.has(key)) return prev;
-        const next = new Set(prev);
-        next.delete(key);
-        return next;
-      });
     }
     setDraft({
       ...view,
@@ -282,7 +250,6 @@ function MbrsFilingPage() {
         },
       });
       setDraft(null);
-      setAutoFilled(new Set()); // saving IS the confirmation
       await qc.invalidateQueries({ queryKey: ["mbrs_report", reportId] });
       toast.success("Saved and re-validated");
     } catch (e: any) {
@@ -354,7 +321,7 @@ function MbrsFilingPage() {
     );
   }
 
-  const outstanding = totalToFill + totalToConfirm + errors.length;
+  const outstanding = totalToFill + errors.length;
 
   return (
     <AppShell>
@@ -414,7 +381,7 @@ function MbrsFilingPage() {
               {SECTIONS.map(({ group }) => {
                 const s = stats[group];
                 const active = activeGroup === group;
-                const count = s.errors + s.toFill.length + s.toConfirm.length;
+                const count = s.errors + s.toFill.length;
                 return (
                   <li key={group}>
                     <button
@@ -467,7 +434,6 @@ function MbrsFilingPage() {
                     {[
                       errors.length && `${errors.length} error${errors.length === 1 ? "" : "s"}`,
                       totalToFill && `${totalToFill} to fill in`,
-                      totalToConfirm && `${totalToConfirm} to confirm`,
                     ].filter(Boolean).join(" · ")}
                   </span>
                 )}
@@ -493,7 +459,7 @@ function MbrsFilingPage() {
             {SECTIONS.map(({ group, fields }) => {
               const s = stats[group];
               const isOpen = !collapsed.has(group);
-              const count = s.errors + s.toFill.length + s.toConfirm.length;
+              const count = s.errors + s.toFill.length;
               return (
                 <section
                   key={group}
@@ -562,7 +528,6 @@ function MbrsFilingPage() {
                           const na = naSet.has(f.key);
                           const flaggedMissing = !na && view.missing?.includes(f.key) && isBlank(f, view);
                           const derived = DERIVED_KEYS.has(f.key);
-                          const isAutoFilled = autoFilled.has(f.key) && !isBlank(f, view);
                           const flagged = issues.some(
                             (i) => i.severity === "error" && i.fields.includes(f.key),
                           );
@@ -578,11 +543,6 @@ function MbrsFilingPage() {
                               )}
                             >
                               <div className="flex items-center sm:justify-end gap-2 min-w-0">
-                                {isAutoFilled && (
-                                  <span className="text-[10px] font-semibold uppercase tracking-wide text-amber-800 bg-amber-100 px-1.5 py-0.5 rounded shrink-0">
-                                    confirm
-                                  </span>
-                                )}
                                 {derived && (
                                   <span className="text-[10px] font-semibold uppercase tracking-wide text-gray-400 shrink-0">
                                     auto
@@ -609,17 +569,21 @@ function MbrsFilingPage() {
                                     <MsicField
                                       value={view.entity[f.key] ?? ""}
                                       onChange={(v) => {
-                                        setAutoFilled((prev) => {
-                                          if (!prev.has(f.key)) return prev;
-                                          const next = new Set(prev);
-                                          next.delete(f.key);
-                                          return next;
+                                        const descKey = MSIC_PAIRS.find(([c]) => c === f.key)?.[1];
+                                        const label = v ? msicLabel(v) : null;
+                                        setDraft({
+                                          ...view,
+                                          entity: {
+                                            ...view.entity,
+                                            [f.key]: v,
+                                            // SSM prints the official label, uppercased, as the
+                                            // business description — derive it rather than ask.
+                                            ...(descKey && label ? { [descKey]: label.toUpperCase() } : {}),
+                                          },
                                         });
-                                        setDraft({ ...view, entity: { ...view.entity, [f.key]: v } });
                                       }}
                                       description={view.entity[MSIC_PAIRS.find(([c]) => c === f.key)?.[1] ?? ""] ?? ""}
                                       flaggedMissing={flaggedMissing}
-                                      autoFilled={isAutoFilled}
                                     />
                                   ) : (
                                     <input

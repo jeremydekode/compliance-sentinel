@@ -18,15 +18,12 @@ export function MsicField({
   onChange,
   description,
   flaggedMissing,
-  autoFilled,
 }: {
   value: string;
   onChange: (v: string) => void;
   /** The extracted nature-of-business text this code should correspond to. */
   description?: string;
   flaggedMissing?: boolean;
-  /** True when the value was machine-matched from the description. */
-  autoFilled?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -92,7 +89,6 @@ export function MsicField({
             "focus:outline-none focus:ring-2 focus:ring-teal-500/30 focus:border-teal-500",
             "placeholder:text-gray-400",
             invalid ? "border-red-400"
-              : autoFilled ? "border-amber-400 bg-amber-50/40"
               : flaggedMissing && !value ? "border-amber-400 bg-amber-50/40"
               : "border-gray-300",
           )}

@@ -17,6 +17,7 @@ import { type TokenUsage } from "./pricing";
 import {
   ENTITY_FIELDS, FINANCIAL_FIELDS, NARRATIVE_CONCEPTS,
   emptyExtraction, type MbrsExtraction,
+  REGISTRY_ONLY_ENTITY_KEYS,
 } from "./mbrs";
 
 /** Below this many characters the text layer is treated as absent and the PDF
@@ -181,6 +182,12 @@ export async function extractMbrsFromAfs(
       ? parsed.extractionNotes.filter((s: unknown): s is string => typeof s === "string")
       : [],
   };
+
+  // MSIC codes and their business descriptions belong to the SSM registration
+  // record, not the accounts. Drop whatever the model offered and flag them for
+  // the filer — see REGISTRY_ONLY_ENTITY_KEYS for the case that proved this.
+  for (const k of REGISTRY_ONLY_ENTITY_KEYS) delete extraction.entity[k];
+  extraction.missing = [...new Set([...extraction.missing, ...REGISTRY_ONLY_ENTITY_KEYS])];
 
   return { extraction, usage, model, ocrUsed };
 }

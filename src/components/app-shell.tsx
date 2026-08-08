@@ -92,8 +92,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   return (
     <div className="flex min-h-screen bg-background">
       {/* Sidebar */}
+      {/* sticky + h-screen: the nav stays put while the page scrolls. Its inner
+          list already has overflow-y-auto, so long nav lists scroll internally. */}
       <aside className={cn(
         "hidden md:flex shrink-0 flex-col bg-sidebar text-sidebar-foreground border-r border-sidebar-border transition-[width] duration-200",
+        "sticky top-0 h-screen",
         collapsed ? "w-14" : "w-60"
       )}>
         {/* Logo + collapse button */}

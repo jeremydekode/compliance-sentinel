@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-export type WorkspaceId = "rmit" | "fatf" | "forms" | "simplify" | "simplify_v2" | "layout" | "policy" | "credit_risk" | "credit_risk_demo";
+export type WorkspaceId = "rmit" | "fatf" | "forms" | "simplify" | "simplify_v2" | "layout" | "policy" | "credit_risk" | "credit_risk_demo" | "mbrs";
 
 export const WORKSPACES: Record<WorkspaceId, {
   id: WorkspaceId;
@@ -81,6 +81,14 @@ export const WORKSPACES: Record<WorkspaceId, {
     tagline: "Demo environment · Mocked data · Safe to show",
     color: "text-orange-700",
     bgColor: "bg-orange-100",
+  },
+  mbrs: {
+    id: "mbrs",
+    name: "MBRS Filing",
+    short: "MBRS",
+    tagline: "Audited accounts → SSM XBRL · OCR extraction & validation",
+    color: "text-teal-700",
+    bgColor: "bg-teal-100",
   },
 };
 

@@ -19,6 +19,7 @@ import { Route as LayoutIndexRouteImport } from './routes/layout.index'
 import { Route as Simplify2ReportIdRouteImport } from './routes/simplify2.$reportId'
 import { Route as SimplifyReportIdRouteImport } from './routes/simplify.$reportId'
 import { Route as ReportsReportIdRouteImport } from './routes/reports.$reportId'
+import { Route as MbrsReportIdRouteImport } from './routes/mbrs.$reportId'
 import { Route as LegalRequestsRouteImport } from './routes/legal.requests'
 import { Route as LegalRepositoryRouteImport } from './routes/legal.repository'
 import { Route as LegalNewRouteImport } from './routes/legal.new'
@@ -78,6 +79,11 @@ const SimplifyReportIdRoute = SimplifyReportIdRouteImport.update({
 const ReportsReportIdRoute = ReportsReportIdRouteImport.update({
   id: '/reports/$reportId',
   path: '/reports/$reportId',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const MbrsReportIdRoute = MbrsReportIdRouteImport.update({
+  id: '/mbrs/$reportId',
+  path: '/mbrs/$reportId',
   getParentRoute: () => rootRouteImport,
 } as any)
 const LegalRequestsRoute = LegalRequestsRouteImport.update({
@@ -143,6 +149,7 @@ export interface FileRoutesByFullPath {
   '/legal/new': typeof LegalNewRoute
   '/legal/repository': typeof LegalRepositoryRoute
   '/legal/requests': typeof LegalRequestsRoute
+  '/mbrs/$reportId': typeof MbrsReportIdRoute
   '/reports/$reportId': typeof ReportsReportIdRouteWithChildren
   '/simplify/$reportId': typeof SimplifyReportIdRoute
   '/simplify2/$reportId': typeof Simplify2ReportIdRoute
@@ -165,6 +172,7 @@ export interface FileRoutesByTo {
   '/legal/new': typeof LegalNewRoute
   '/legal/repository': typeof LegalRepositoryRoute
   '/legal/requests': typeof LegalRequestsRoute
+  '/mbrs/$reportId': typeof MbrsReportIdRoute
   '/reports/$reportId': typeof ReportsReportIdRouteWithChildren
   '/simplify/$reportId': typeof SimplifyReportIdRoute
   '/simplify2/$reportId': typeof Simplify2ReportIdRoute
@@ -188,6 +196,7 @@ export interface FileRoutesById {
   '/legal/new': typeof LegalNewRoute
   '/legal/repository': typeof LegalRepositoryRoute
   '/legal/requests': typeof LegalRequestsRoute
+  '/mbrs/$reportId': typeof MbrsReportIdRoute
   '/reports/$reportId': typeof ReportsReportIdRouteWithChildren
   '/simplify/$reportId': typeof SimplifyReportIdRoute
   '/simplify2/$reportId': typeof Simplify2ReportIdRoute
@@ -212,6 +221,7 @@ export interface FileRouteTypes {
     | '/legal/new'
     | '/legal/repository'
     | '/legal/requests'
+    | '/mbrs/$reportId'
     | '/reports/$reportId'
     | '/simplify/$reportId'
     | '/simplify2/$reportId'
@@ -234,6 +244,7 @@ export interface FileRouteTypes {
     | '/legal/new'
     | '/legal/repository'
     | '/legal/requests'
+    | '/mbrs/$reportId'
     | '/reports/$reportId'
     | '/simplify/$reportId'
     | '/simplify2/$reportId'
@@ -256,6 +267,7 @@ export interface FileRouteTypes {
     | '/legal/new'
     | '/legal/repository'
     | '/legal/requests'
+    | '/mbrs/$reportId'
     | '/reports/$reportId'
     | '/simplify/$reportId'
     | '/simplify2/$reportId'
@@ -279,6 +291,7 @@ export interface RootRouteChildren {
   LegalNewRoute: typeof LegalNewRoute
   LegalRepositoryRoute: typeof LegalRepositoryRoute
   LegalRequestsRoute: typeof LegalRequestsRoute
+  MbrsReportIdRoute: typeof MbrsReportIdRoute
   ReportsReportIdRoute: typeof ReportsReportIdRouteWithChildren
   SimplifyReportIdRoute: typeof SimplifyReportIdRoute
   Simplify2ReportIdRoute: typeof Simplify2ReportIdRoute
@@ -359,6 +372,13 @@ declare module '@tanstack/react-router' {
       path: '/reports/$reportId'
       fullPath: '/reports/$reportId'
       preLoaderRoute: typeof ReportsReportIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/mbrs/$reportId': {
+      id: '/mbrs/$reportId'
+      path: '/mbrs/$reportId'
+      fullPath: '/mbrs/$reportId'
+      preLoaderRoute: typeof MbrsReportIdRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/legal/requests': {
@@ -458,6 +478,7 @@ const rootRouteChildren: RootRouteChildren = {
   LegalNewRoute: LegalNewRoute,
   LegalRepositoryRoute: LegalRepositoryRoute,
   LegalRequestsRoute: LegalRequestsRoute,
+  MbrsReportIdRoute: MbrsReportIdRoute,
   ReportsReportIdRoute: ReportsReportIdRouteWithChildren,
   SimplifyReportIdRoute: SimplifyReportIdRoute,
   Simplify2ReportIdRoute: Simplify2ReportIdRoute,

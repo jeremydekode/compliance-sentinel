@@ -31,11 +31,13 @@ import {
   RefreshCw,
   ShieldPlus,
   ShieldAlert,
+  FileSpreadsheet,
 } from "lucide-react";
 import { FormUpdateDialog } from "@/components/form-update-dialog";
 import { SimplifyUploadDialog } from "@/components/simplify-upload-dialog";
 import { SimplifyV2UploadDialog } from "@/components/simplify-v2-upload-dialog";
 import { CreditUploadDialog } from "@/components/credit-upload-dialog";
+import { MbrsUploadDialog } from "@/components/mbrs-upload-dialog";
 import { formatDate, statusMeta } from "@/lib/format";
 import {
   deleteReport,
@@ -66,7 +68,173 @@ function ReportsRoute() {
   if (workspace === "simplify") return <SimplifyReportsList />;
   if (workspace === "simplify_v2") return <SimplifyV2ReportsList />;
   if (workspace === "credit_risk" || workspace === "credit_risk_demo") return <CreditRiskReportsList />;
+  if (workspace === "mbrs") return <MbrsReportsList />;
   return <ReportsList />;
+}
+
+/** MBRS — audited accounts converted to SSM XBRL filings. */
+function MbrsReportsList() {
+  const qc = useQueryClient();
+  const nav = useNavigate();
+  const remove = useServerFn(deleteReport);
+  const auth = useAuth();
+  const [showUpload, setShowUpload] = useState(false);
+
+  const reports = useQuery({
+    queryKey: ["reports", "all", "mbrs", auth.tenantId],
+    enabled: !auth.loading,
+    queryFn: async () => {
+      const { data } = await (supabase as any)
+        .from("analysis_reports")
+        .select("id, title, policy_name, status, created_at, summary_json")
+        .eq("workspace_id", "mbrs")
+        .eq("tenant_id", auth.tenantId)
+        .order("created_at", { ascending: false });
+      return data ?? [];
+    },
+  });
+
+  async function handleDelete(e: React.MouseEvent, id: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!confirm("Delete this MBRS filing and all related data?")) return;
+    try {
+      await remove({ data: { id } });
+      toast.success("Filing deleted");
+      qc.invalidateQueries({ queryKey: ["reports"] });
+    } catch (err: any) {
+      toast.error(err?.message ?? "Failed to delete");
+    }
+  }
+
+  function statusBadge(sj: any): { label: string; classes: string } {
+    const errs = (sj?.mbrs_issues ?? []).filter((i: any) => i.severity === "error").length;
+    if (sj?.pending_analysis || sj?.mbrs_status === "running") {
+      return { label: "Extracting", classes: "bg-sky-100 text-sky-800 border-sky-200" };
+    }
+    if (sj?.mbrs_status === "failed") {
+      return { label: "Failed", classes: "bg-rose-100 text-rose-800 border-rose-200" };
+    }
+    if (sj?.mbrs_status === "generated") {
+      return { label: "Generated", classes: "bg-emerald-100 text-emerald-800 border-emerald-200" };
+    }
+    if (errs > 0) {
+      return { label: `${errs} to fix`, classes: "bg-amber-100 text-amber-800 border-amber-200" };
+    }
+    if (sj?.mbrs_extraction) {
+      return { label: "Ready", classes: "bg-teal-100 text-teal-800 border-teal-200" };
+    }
+    return { label: "Queued", classes: "bg-muted text-muted-foreground border-border" };
+  }
+
+  return (
+    <AppShell>
+      <div className="p-8 max-w-[1400px] mx-auto space-y-8">
+        <div className="flex items-end justify-between">
+          <div>
+            <h1 className="text-3xl font-bold tracking-tight">MBRS Filing</h1>
+            <p className="text-muted-foreground mt-1 text-lg">
+              Turn audited financial statements into SSM-format XBRL — figures checked against the
+              statement's own arithmetic before anything is generated.
+            </p>
+          </div>
+          <Button
+            size="lg"
+            onClick={() => setShowUpload(true)}
+            className="gap-2 h-12 px-6 rounded-xl font-bold bg-teal-600 hover:bg-teal-700 text-white shadow-lg shadow-teal-500/20 active:scale-95"
+          >
+            <Plus className="size-4" /> New MBRS Filing
+          </Button>
+        </div>
+
+        <Card className="p-0 overflow-hidden border-border/50 shadow-sm glass-card">
+          <div className="px-6 py-4 border-b border-border/50 bg-muted/30 flex items-center justify-between">
+            <h2 className="font-bold text-sm uppercase tracking-[0.2em] text-muted-foreground">
+              Filings
+            </h2>
+            <Badge variant="secondary" className="font-black text-[10px]">
+              {reports.data?.length ?? 0} TOTAL
+            </Badge>
+          </div>
+
+          {reports.isLoading && (
+            <div className="p-12 text-center text-muted-foreground font-medium italic animate-pulse">
+              Loading…
+            </div>
+          )}
+
+          {!reports.isLoading && (reports.data?.length ?? 0) === 0 && (
+            <div className="p-20 text-center">
+              <div className="size-16 bg-muted rounded-full grid place-items-center mx-auto mb-4">
+                <FileSpreadsheet className="size-8 text-muted-foreground" />
+              </div>
+              <h3 className="text-xl font-bold">No filings yet</h3>
+              <p className="text-muted-foreground mt-2 max-w-sm mx-auto">
+                Upload a set of audited financial statements to extract the figures and generate the
+                SSM XBRL submission file.
+              </p>
+              <Button onClick={() => setShowUpload(true)} className="mt-6 gap-2 bg-teal-600 hover:bg-teal-700 text-white">
+                <Plus className="size-4" /> New MBRS Filing
+              </Button>
+            </div>
+          )}
+
+          <div className="divide-y divide-border/50">
+            {(reports.data ?? []).map((r: any) => {
+              const sj = r.summary_json ?? {};
+              const badge = statusBadge(sj);
+              const fy = sj.mbrs_extraction?.entity?.currentPeriodEnd;
+              return (
+                <Link
+                  key={r.id}
+                  to="/mbrs/$reportId"
+                  params={{ reportId: r.id }}
+                  className="group flex items-center gap-4 px-6 py-4 hover:bg-muted/40 transition-colors"
+                >
+                  <div className="flex-1 min-w-0">
+                    <div className="font-bold truncate">{r.title}</div>
+                    <div className="text-xs text-muted-foreground mt-0.5">
+                      {sj.mbrs_extraction?.entity?.registrationNumber
+                        ? `Reg. ${sj.mbrs_extraction.entity.registrationNumber}`
+                        : sj.source_filename ?? "—"}
+                      {fy ? ` · FYE ${fy}` : ""}
+                      {sj.mbrs_ocr_used ? " · OCR" : ""}
+                    </div>
+                  </div>
+                  <Badge
+                    variant="outline"
+                    className={cn("font-black text-[10px] uppercase tracking-widest px-2", badge.classes)}
+                  >
+                    {badge.label}
+                  </Badge>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="size-9 rounded-lg text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
+                    onClick={(e) => handleDelete(e, r.id)}
+                  >
+                    <Trash2 className="size-4" />
+                  </Button>
+                  <div className="size-9 rounded-lg bg-muted grid place-items-center group-hover:bg-teal-600 group-hover:text-white transition-all">
+                    <ArrowRight className="size-4" />
+                  </div>
+                </Link>
+              );
+            })}
+          </div>
+        </Card>
+      </div>
+
+      <MbrsUploadDialog
+        open={showUpload}
+        onOpenChange={setShowUpload}
+        onCreated={(reportId) => {
+          qc.invalidateQueries({ queryKey: ["reports"] });
+          nav({ to: "/mbrs/$reportId", params: { reportId } });
+        }}
+      />
+    </AppShell>
+  );
 }
 
 /** Simplify v2 — three-mode workspace (Simplify / Recommendation / Recommend & Edit). */

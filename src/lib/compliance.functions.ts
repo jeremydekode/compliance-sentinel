@@ -104,7 +104,7 @@ import { REGULATION_FAMILIES, INTERNAL_DOC_TYPES as INTERNAL_DOC_TYPES_CONST, re
 // Allowed workspace identifiers — shared across every workspace-scoped input
 // validator. Declared up here so server fns defined anywhere in the file can
 // reference it in their .inputValidator() (evaluated at module load).
-const workspaceSchema = z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo"]);
+const workspaceSchema = z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo", "mbrs"]);
 
 // Guidance rows are keyed by workspace_id, plus synthetic sub-keys for flows
 // that need a second editable prompt within one workspace (v2 recommendation).
@@ -192,7 +192,7 @@ export const createReport = createServerFn({ method: "POST" })
     z.object({
       filename: z.string(),
       fileUrl: z.string().nullable(),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo", "mbrs"]).default("rmit"),
       customTitle: z.string().optional(),
       notes: z.string().optional(),
       detected: z
@@ -527,7 +527,7 @@ export const createRegulatoryReport = createServerFn({ method: "POST" })
     z.object({
       filename: z.string(),
       fileUrl: z.string().nullable(),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo", "mbrs"]).default("rmit"),
       customTitle: z.string().optional(),
       notes: z.string().optional(),
       detected: z
@@ -1840,7 +1840,7 @@ export const createSop = createServerFn({ method: "POST" })
       title: z.string().min(2).max(200),
       doc_type: z.enum(["sop", "rmit", "rmit_reg", "fatf", "circular", "it_policy", "policy", "form"]),
       version: z.string().min(1).max(20),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo", "mbrs"]).default("rmit"),
       summary: z.string().max(2000).optional(),
       tags: z.array(z.string().max(40)).max(20).optional(),
       file_url: z.string().nullable().optional(),
@@ -1951,7 +1951,7 @@ export const clearWorkspace = createServerFn({ method: "POST" })
   .inputValidator(
     z.object({
       scope: z.enum(["analyses", "kb", "all"]),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo", "mbrs"]).default("rmit"),
     })
   )
   .handler(async ({ data, context }) => {
@@ -2359,7 +2359,7 @@ function escapeHtml(s: string): string {
  */
 export const getChunkCounts = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .inputValidator(z.object({ workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo"]).default("rmit") }))
+  .inputValidator(z.object({ workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo", "mbrs"]).default("rmit") }))
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
     const { tenantId } = await getCallerTenant(context.userId);
@@ -2649,7 +2649,7 @@ function applyPageOverrides(formId: string, impacts: any[]): any[] {
 export const createFormUpdateReport = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator(z.object({
-    workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo"]).default("forms"),
+    workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo", "mbrs"]).default("forms"),
     formId: z.string().min(1),                  // e.g. "FGROP 037/2016"
     friendlyName: z.string().optional(),         // e.g. "Account Opening Application Form"
     customTitle: z.string().optional(),
@@ -7154,4 +7154,225 @@ ${kbCtx || "(none retrieved)"}`;
       question: data.question,
     });
     return { answer };
+  });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MBRS — audited financial statements → SSM XBRL filing
+//
+// The pipeline is OCR/text → MbrsExtraction → (human review) → XBRL. The AI
+// only ever produces the intermediate; mbrs-xbrl.ts owns every concept name and
+// context ref, because a hallucinated tag is a silent SSM rejection rather than
+// a visible error.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const createMbrsFiling = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    z.object({
+      filename: z.string(),
+      fileUrl: z.string().nullable(),
+      workspace: workspaceSchema,
+      companyName: z.string().min(1).max(200),
+    }),
+  )
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    if (!data.fileUrl) throw new Error("No file URL provided for the audited report");
+    const company = data.companyName.trim();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report, error } = await (supabase as any)
+      .from("analysis_reports")
+      .insert({
+        title: company,
+        policy_name: company,
+        status: "pending_validation",
+        workflow_type: "mbrs",
+        source_file_url: data.fileUrl,
+        workspace_id: data.workspace,
+        summary_json: {
+          workflow_type: "mbrs",
+          company_name: company,
+          source_filename: data.filename,
+          executive: ["Queued — reading the audited report and extracting MBRS fields…"],
+          pending_analysis: true,
+        },
+      })
+      .select("id")
+      .single();
+    if (error || !report) throw new Error(error?.message || "Failed to create MBRS filing");
+    return { reportId: report.id as string };
+  });
+
+export const runMbrsExtraction = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(z.object({ reportId: z.string().uuid() }))
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report, error: repErr } = await (supabase as any)
+      .from("analysis_reports")
+      .select("id, title, source_file_url, summary_json, tenant_id")
+      .eq("id", data.reportId)
+      .single();
+    if (repErr || !report) throw new Error(repErr?.message || "Filing not found");
+    const { tenantId } = await getCallerTenant(context.userId);
+    assertRowTenant(report.tenant_id, tenantId);
+    if (!report.source_file_url) throw new Error("Filing has no source file — cannot extract");
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase as any)
+      .from("analysis_reports")
+      .update({ summary_json: { ...(report.summary_json ?? {}), pending_analysis: false, mbrs_status: "running" } })
+      .eq("id", report.id);
+
+    try {
+      const { extractMbrsFromAfs } = await import("./mbrs-extract");
+      const { normalizeExtraction, validateExtraction } = await import("./mbrs");
+
+      const f = await fetchFile(report.source_file_url);
+      const { extraction, usage, ocrUsed } = await extractMbrsFromAfs({
+        buffer: f.buffer,
+        mimeType: f.mimeType,
+      });
+      const normalized = normalizeExtraction(extraction);
+      const issues = validateExtraction(normalized);
+
+      const cost = computeCost(usage);
+      let sj = await freshSj(supabase, report.id, report.summary_json ?? {});
+      sj = appendCostLog(sj, "mbrs_extract", cost);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (supabase as any)
+        .from("analysis_reports")
+        .update({
+          summary_json: {
+            ...sj,
+            pending_analysis: false,
+            mbrs_status: "extracted",
+            mbrs_error: null,
+            mbrs_extraction: normalized,
+            mbrs_issues: issues,
+            mbrs_ocr_used: ocrUsed,
+            mbrs_extracted_at: new Date().toISOString(),
+            usage: addUsage(sj.usage ?? { inputTokens: 0, outputTokens: 0, thinkingTokens: 0, calls: 0 }, usage),
+          },
+        })
+        .eq("id", report.id);
+
+      return { ok: true as const, ocrUsed, issueCount: issues.length };
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Extraction failed";
+      const sj = await freshSj(supabase, report.id, report.summary_json ?? {});
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (supabase as any)
+        .from("analysis_reports")
+        .update({ summary_json: { ...sj, pending_analysis: false, mbrs_status: "failed", mbrs_error: message } })
+        .eq("id", report.id);
+      throw new Error(message);
+    }
+  });
+
+/** Persists reviewer corrections. The whole extraction is written back so a
+ *  correction and a re-validation stay atomic. */
+export const saveMbrsExtraction = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    z.object({
+      reportId: z.string().uuid(),
+      entity: z.record(z.string(), z.string()).optional(),
+      current: z.record(z.string(), z.number().nullable()).optional(),
+      previous: z.record(z.string(), z.number().nullable()).optional(),
+      na: z.array(z.string()).optional(),
+    }),
+  )
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report, error } = await (supabase as any)
+      .from("analysis_reports")
+      .select("id, summary_json, tenant_id")
+      .eq("id", data.reportId)
+      .single();
+    if (error || !report) throw new Error(error?.message || "Filing not found");
+    const { tenantId } = await getCallerTenant(context.userId);
+    assertRowTenant(report.tenant_id, tenantId);
+
+    const { normalizeExtraction, validateExtraction, emptyExtraction } = await import("./mbrs");
+    const sj = await freshSj(supabase, report.id, report.summary_json ?? {});
+    const prev = (sj.mbrs_extraction ?? emptyExtraction()) as Awaited<ReturnType<typeof emptyExtraction>>;
+
+    const merged = normalizeExtraction({
+      ...prev,
+      entity: { ...prev.entity, ...(data.entity ?? {}) },
+      current: { ...prev.current, ...(data.current ?? {}) },
+      previous: { ...prev.previous, ...(data.previous ?? {}) },
+      na: data.na ?? prev.na ?? [],
+    });
+    const issues = validateExtraction(merged);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase as any)
+      .from("analysis_reports")
+      .update({
+        summary_json: {
+          ...sj,
+          mbrs_extraction: merged,
+          mbrs_issues: issues,
+          mbrs_reviewed_at: new Date().toISOString(),
+        },
+      })
+      .eq("id", report.id);
+
+    return { extraction: merged, issues };
+  });
+
+/** Validates then renders the XBRL instance. Blocking errors refuse to
+ *  generate — an unbalanced filing is rejected by SSM anyway, and emitting it
+ *  would just move the failure somewhere less legible. */
+export const generateMbrsXml = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(z.object({ reportId: z.string().uuid() }))
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report, error } = await (supabase as any)
+      .from("analysis_reports")
+      .select("id, summary_json, tenant_id")
+      .eq("id", data.reportId)
+      .single();
+    if (error || !report) throw new Error(error?.message || "Filing not found");
+    const { tenantId } = await getCallerTenant(context.userId);
+    assertRowTenant(report.tenant_id, tenantId);
+
+    const { normalizeExtraction, validateExtraction, hasBlockingErrors } = await import("./mbrs");
+    const { generateMbrsXbrl, mbrsFilename } = await import("./mbrs-xbrl");
+
+    const sj = report.summary_json ?? {};
+    if (!sj.mbrs_extraction) throw new Error("Nothing extracted yet — run the extraction first");
+
+    const extraction = normalizeExtraction(sj.mbrs_extraction);
+    const issues = validateExtraction(extraction);
+    if (hasBlockingErrors(issues)) {
+      const first = issues.filter((i) => i.severity === "error").slice(0, 3).map((i) => i.message);
+      throw new Error(`Cannot generate — ${issues.filter((i) => i.severity === "error").length} validation error(s) must be fixed first:\n• ${first.join("\n• ")}`);
+    }
+
+    const { xml, factCount, skipped } = generateMbrsXbrl(extraction);
+    const filename = mbrsFilename(extraction);
+
+    const fresh = await freshSj(supabase, report.id, sj);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase as any)
+      .from("analysis_reports")
+      .update({
+        summary_json: {
+          ...fresh,
+          mbrs_status: "generated",
+          mbrs_generated_at: new Date().toISOString(),
+          mbrs_fact_count: factCount,
+          mbrs_skipped_count: skipped.length,
+        },
+      })
+      .eq("id", report.id);
+
+    return { xml, filename, factCount, skipped };
   });

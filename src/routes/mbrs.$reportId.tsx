@@ -578,11 +578,12 @@ function MbrsFilingPage() {
                                             [f.key]: v,
                                             // SSM prints the official label, uppercased, as the
                                             // business description — derive it rather than ask.
-                                            ...(descKey && label ? { [descKey]: label.toUpperCase() } : {}),
+                                            // Clearing the code clears the description with it, so
+                                            // a stale activity can't outlive the code it came from.
+                                            ...(descKey ? { [descKey]: label ? label.toUpperCase() : "" } : {}),
                                           },
                                         });
                                       }}
-                                      description={view.entity[MSIC_PAIRS.find(([c]) => c === f.key)?.[1] ?? ""] ?? ""}
                                       flaggedMissing={flaggedMissing}
                                     />
                                   ) : (

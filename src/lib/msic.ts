@@ -1,10 +1,10 @@
-// MSIC lookup + matching helpers for the MBRS review form.
+// MSIC lookup helpers for the MBRS review form.
 //
-// The rule that matters: a code is only ever AUTO-ENTERED when the extracted
-// nature-of-business text lexically matches an official MSIC label. No model
-// call, no semantic guessing — an invented MSIC code on a statutory filing is
-// worse than a blank one. Weaker matches are offered as ranked suggestions the
-// filer picks from.
+// The rule that matters: a code is NEVER auto-entered. MSIC codes come from the
+// company's SSM registration record, not its accounts, so nothing in an audited
+// report can establish one — see REGISTRY_ONLY_ENTITY_KEYS in ./mbrs for the
+// real filing that proved it. These helpers only power the filer's own lookup:
+// search, browse, and code -> official label (the one authoritative direction).
 
 import { MSIC_CODES } from "./msic-codes";
 
@@ -41,18 +41,6 @@ function all() {
   return normalizedCache;
 }
 
-/** Exact (normalised) label match — the only match strong enough to fill a
- *  code in without the filer picking it themselves. */
-export function findExactMsic(description: string): MsicEntry | null {
-  const n = norm(description);
-  if (!n) return null;
-  const hit = all().find((e) => e.norm === n);
-  return hit ? { code: hit.code, label: hit.label } : null;
-}
-
-/** Ranked suggestions for a free-text business description. Token-overlap
- *  scoring — cheap, deterministic, good enough to put the right code in the
- *  top handful for a filer to confirm. */
 export function suggestMsic(description: string, limit = 5): MsicEntry[] {
   const qt = tokens(description);
   if (!qt.size) return [];
@@ -94,3 +82,11 @@ export function msicLabel(code: string): string | null {
   const hit = all().find((e) => e.code === code.trim());
   return hit ? hit.label : null;
 }
+
+/** The whole code list, for browsing when the filer has no search term yet. */
+export function allMsic(): MsicEntry[] {
+  return all().map(({ code, label }) => ({ code, label }));
+}
+
+/** Total number of codes — shown so the filer knows the browse list is complete. */
+export const MSIC_COUNT = MSIC_CODES.length;

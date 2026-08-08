@@ -371,7 +371,7 @@ function MbrsFilingPage() {
                 MBRS · FS-MPERS
                 {view.entity.registrationNumber ? ` · Reg. ${view.entity.registrationNumber}` : ""}
                 {" · FY "}{view.entity.currentPeriodStart || "?"} – {view.entity.currentPeriodEnd || "?"}
-                {sj.usage ? ` · ${formatUsd(computeCost(sj.usage).usd)}` : ""}
+                {sj.usage ? ` · ${formatUsd(computeCost(sj.usage, sj.mbrs_model).usd)}` : ""}
               </p>
             </div>
             <div className="flex items-center gap-2">

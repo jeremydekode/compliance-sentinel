@@ -52,6 +52,8 @@ import { useWorkspace, WORKSPACES } from "@/lib/workspace";
 import { useAuth } from "@/lib/auth";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
+import { AiCostTooltip } from "@/components/ai-cost-tooltip";
+import { computeCost } from "@/lib/pricing";
 
 export const Route = createFileRoute("/reports/")({
   component: ReportsRoute,
@@ -201,6 +203,13 @@ function MbrsReportsList() {
                       {sj.mbrs_ocr_used ? " · OCR" : ""}
                     </div>
                   </div>
+                  <span onClick={(e) => { e.preventDefault(); e.stopPropagation(); }}>
+                    <AiCostTooltip
+                      costLog={sj.costLog}
+                      fallbackUsd={sj.usage ? computeCost(sj.usage, sj.mbrs_model).usd : 0}
+                      ocrUsed={sj.mbrs_ocr_used}
+                    />
+                  </span>
                   <Badge
                     variant="outline"
                     className={cn("font-black text-[10px] uppercase tracking-widest px-2", badge.classes)}

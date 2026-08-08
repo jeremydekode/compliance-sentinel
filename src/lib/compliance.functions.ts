@@ -25,10 +25,15 @@ function appendCostLog(sj: Record<string, any>, op: string, cost: RunCost | null
   const log = Array.isArray(sj.costLog) ? sj.costLog.slice(-49) : [];
   log.push({
     op,
-    usd: Number(cost.usd.toFixed(4)),
+    usd: Number(cost.usd.toFixed(6)),
     calls: cost.calls,
     inputTokens: cost.inputTokens,
     outputTokens: cost.outputTokens + (cost.thinkingTokens ?? 0),
+    model: cost.model || cost.pricedAs,
+    pricedAs: cost.pricedAs,
+    priceIsEstimated: cost.priceIsEstimated,
+    inputUsd: Number(cost.inputUsd.toFixed(6)),
+    outputUsd: Number(cost.outputUsd.toFixed(6)),
     at: new Date().toISOString(),
   });
   return { ...sj, costLog: log };
@@ -7230,16 +7235,16 @@ export const runMbrsExtraction = createServerFn({ method: "POST" })
       const { normalizeExtraction, validateExtraction } = await import("./mbrs");
 
       const f = await fetchFile(report.source_file_url);
-      const { extraction, usage, ocrUsed } = await extractMbrsFromAfs({
+      const { extraction, usage, model, ocrUsed } = await extractMbrsFromAfs({
         buffer: f.buffer,
         mimeType: f.mimeType,
       });
       const normalized = normalizeExtraction(extraction);
       const issues = validateExtraction(normalized);
 
-      const cost = computeCost(usage);
+      const cost = computeCost(usage, model);
       let sj = await freshSj(supabase, report.id, report.summary_json ?? {});
-      sj = appendCostLog(sj, "mbrs_extract", cost);
+      sj = appendCostLog(sj, ocrUsed ? "mbrs_extract_ocr" : "mbrs_extract", cost);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await (supabase as any)
         .from("analysis_reports")
@@ -7252,6 +7257,7 @@ export const runMbrsExtraction = createServerFn({ method: "POST" })
             mbrs_extraction: normalized,
             mbrs_issues: issues,
             mbrs_ocr_used: ocrUsed,
+            mbrs_model: model,
             mbrs_extracted_at: new Date().toISOString(),
             usage: addUsage(sj.usage ?? { inputTokens: 0, outputTokens: 0, thinkingTokens: 0, calls: 0 }, usage),
           },

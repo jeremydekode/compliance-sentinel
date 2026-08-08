@@ -77,6 +77,10 @@ ${NARRATIVE_CONCEPTS.map((c) => `  "${c}"`).join("\n")}`;
 export interface MbrsExtractResult {
   extraction: MbrsExtraction;
   usage: TokenUsage;
+  /** The model the API actually answered with — generateWithFallback may have
+   *  fallen through the chain, and the rate differs per model, so the caller
+   *  must price against this rather than assume the requested model. */
+  model: string;
   /** True when the PDF had no usable text layer and OCR was used. */
   ocrUsed: boolean;
 }
@@ -150,6 +154,10 @@ export async function extractMbrsFromAfs(
     thinkingTokens: m.thoughtsTokenCount ?? 0,
     calls: 1,
   };
+  // In OCR mode the whole PDF rides along as inlineData, so the pages' image
+  // tokens are already inside promptTokenCount — there is no separate image
+  // line to bill, and the input figure carries it.
+  const model = (response as { modelVersion?: string }).modelVersion ?? "";
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let parsed: any = {};
@@ -174,5 +182,5 @@ export async function extractMbrsFromAfs(
       : [],
   };
 
-  return { extraction, usage, ocrUsed };
+  return { extraction, usage, model, ocrUsed };
 }

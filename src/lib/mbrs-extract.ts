@@ -55,6 +55,7 @@ RULES
 - Dates must be ISO yyyy-mm-dd. Convert "30th June, 2025" → "2025-06-30".
 - The registration number has two forms: the 12-digit MyCoID (e.g. 202101011095) is "registrationNumber"; the older suffixed form (e.g. 1411394-T) is "oldRegistrationNumber".
 - If the company declares only one business activity, leave activity 2 and 3 fields empty.
+- "principalActivities": quote VERBATIM the sentence(s) describing the company's principal activities / nature of business, usually in the Directors' Report or note 1. Copy the wording exactly as printed — do not paraphrase, do not translate into industry-classification language, and do not invent one. Empty string if the report never states it.
 
 OUTPUT
 Return ONLY a JSON object of this shape — no markdown fence, no commentary:
@@ -63,6 +64,7 @@ Return ONLY a JSON object of this shape — no markdown fence, no commentary:
   "current": { "<field>": <number|null>, ... },
   "previous": { "<field>": <number|null>, ... },
   "narratives": { "<concept>": "<html or plain text>", ... },
+  "principalActivities": "<verbatim wording from the report, or empty string>",
   "missing": ["<field>", ...],
   "extractionNotes": ["<short note about anything ambiguous>", ...]
 }`;
@@ -84,6 +86,9 @@ export interface MbrsExtractResult {
   model: string;
   /** True when the PDF had no usable text layer and OCR was used. */
   ocrUsed: boolean;
+  /** The report's own principal-activities wording, verbatim. Evidence shown to
+   *  the filer beside MSIC suggestions — never a value in its own right. */
+  principalActivities: string;
 }
 
 function toNumberMap(raw: unknown): Record<string, number | null> {
@@ -189,5 +194,8 @@ export async function extractMbrsFromAfs(
   for (const k of REGISTRY_ONLY_ENTITY_KEYS) delete extraction.entity[k];
   extraction.missing = [...new Set([...extraction.missing, ...REGISTRY_ONLY_ENTITY_KEYS])];
 
-  return { extraction, usage, model, ocrUsed };
+  const principalActivities =
+    typeof parsed.principalActivities === "string" ? parsed.principalActivities.trim() : "";
+
+  return { extraction, usage, model, ocrUsed, principalActivities };
 }

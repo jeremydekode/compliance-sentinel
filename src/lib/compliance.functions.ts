@@ -7235,16 +7235,31 @@ export const runMbrsExtraction = createServerFn({ method: "POST" })
       const { normalizeExtraction, validateExtraction } = await import("./mbrs");
 
       const f = await fetchFile(report.source_file_url);
-      const { extraction, usage, model, ocrUsed } = await extractMbrsFromAfs({
+      const { extraction, usage, model, ocrUsed, principalActivities } = await extractMbrsFromAfs({
         buffer: f.buffer,
         mimeType: f.mimeType,
       });
+
+      // Candidate MSIC codes for the filer to choose from. Never auto-applied:
+      // these are suggestions shown beside the report wording they came from,
+      // and the MSIC fields stay flagged until a human picks. Failure here must
+      // not fail the extraction — the filing is perfectly usable without them.
+      const { suggestMsicForActivities } = await import("./mbrs-msic-suggest");
+      let msicSuggestions: Awaited<ReturnType<typeof suggestMsicForActivities>> | null = null;
+      try {
+        msicSuggestions = await suggestMsicForActivities(principalActivities);
+      } catch (err) {
+        console.warn("MSIC suggestion failed (non-fatal):", err);
+      }
       const normalized = normalizeExtraction(extraction);
       const issues = validateExtraction(normalized);
 
       const cost = computeCost(usage, model);
       let sj = await freshSj(supabase, report.id, report.summary_json ?? {});
       sj = appendCostLog(sj, ocrUsed ? "mbrs_extract_ocr" : "mbrs_extract", cost);
+      if (msicSuggestions && msicSuggestions.usage.calls > 0) {
+        sj = appendCostLog(sj, "mbrs_msic_suggest", computeCost(msicSuggestions.usage, msicSuggestions.model));
+      }
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await (supabase as any)
         .from("analysis_reports")
@@ -7258,6 +7273,9 @@ export const runMbrsExtraction = createServerFn({ method: "POST" })
             mbrs_issues: issues,
             mbrs_ocr_used: ocrUsed,
             mbrs_model: model,
+            mbrs_principal_activities: principalActivities,
+            mbrs_msic_suggestions: msicSuggestions?.suggestions ?? [],
+            mbrs_msic_suggest_note: msicSuggestions?.note ?? null,
             mbrs_extracted_at: new Date().toISOString(),
             usage: addUsage(sj.usage ?? { inputTokens: 0, outputTokens: 0, thinkingTokens: 0, calls: 0 }, usage),
           },

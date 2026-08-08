@@ -90,3 +90,31 @@ export function allMsic(): MsicEntry[] {
 
 /** Total number of codes — shown so the filer knows the browse list is complete. */
 export const MSIC_COUNT = MSIC_CODES.length;
+
+/**
+ * Lexical shortlist for the AI suggester. Recall matters here, not precision:
+ * this only narrows 1,175 codes to a set small enough to put in a prompt, and
+ * the model does the actual judging. Scores overlap of meaningful words, then
+ * pads with same-division codes so a thin text still yields real candidates.
+ */
+export function prefilterMsic(text: string, limit = 60): MsicEntry[] {
+  const want = tokens(text);
+  if (!want.size) return [];
+  const scored = all().map((e) => {
+    let hits = 0;
+    for (const t of e.tokens) if (want.has(t)) hits++;
+    // Normalise so a short precise label isn't buried by a long vague one.
+    return { e, score: hits === 0 ? 0 : hits / Math.sqrt(e.tokens.size || 1) };
+  });
+  return scored
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map((x) => ({ code: x.e.code, label: x.e.label }));
+}
+
+/** True when a code exists in the official list — the gate every AI-proposed
+ *  code must pass before it can be shown to a filer. */
+export function isRealMsic(code: string): boolean {
+  return msicLabel(code) !== null;
+}

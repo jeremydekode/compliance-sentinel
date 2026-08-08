@@ -585,6 +585,9 @@ function MbrsFilingPage() {
                                         });
                                       }}
                                       flaggedMissing={flaggedMissing}
+                                      suggestions={sj.mbrs_msic_suggestions ?? []}
+                                      suggestNote={sj.mbrs_msic_suggest_note}
+                                      evidence={sj.mbrs_principal_activities}
                                     />
                                   ) : (
                                     <input

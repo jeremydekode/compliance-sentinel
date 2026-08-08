@@ -1,57 +1,44 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { searchMsic, msicLabel, allMsic, MSIC_COUNT, type MsicEntry } from "@/lib/msic";
 import { cn } from "@/lib/utils";
-import { Check, Search, X } from "lucide-react";
+import { Check, Search, X, Sparkles } from "lucide-react";
 
-const RECENT_KEY = "mbrs.msic.recent";
-const RECENT_MAX = 5;
 /** Rows rendered when browsing unfiltered. The full list is 1,175 entries —
  *  rendering all of them into a dropdown janks the scroll, and nobody browses
  *  to the tail anyway; typing is the real path there. */
 const BROWSE_RENDER_CAP = 60;
 
-function readRecent(): string[] {
-  try {
-    const raw = window.localStorage.getItem(RECENT_KEY);
-    const arr = raw ? JSON.parse(raw) : [];
-    return Array.isArray(arr) ? arr.filter((x) => typeof x === "string") : [];
-  } catch {
-    return [];
-  }
-}
-
-function pushRecent(code: string) {
-  try {
-    const next = [code, ...readRecent().filter((c) => c !== code)].slice(0, RECENT_MAX);
-    window.localStorage.setItem(RECENT_KEY, JSON.stringify(next));
-  } catch {
-    /* private mode / quota — recents are a convenience, never load-bearing */
-  }
-}
-
 /**
- * MSIC code picker: search, browse, clear.
+ * MSIC code picker: suggestions, search, browse, clear.
  *
- * Deliberately does NOT suggest a code from the audited report. MSIC belongs to
- * the SSM registration record, and inferring it from the accounts put a
- * wrong-industry code on a real filing — see REGISTRY_ONLY_ENTITY_KEYS in
- * lib/mbrs. With no search term the dropdown opens on the filer's OWN recently
- * used codes (their previous picks, not a machine guess), then the full list to
- * browse. Typing filters across every code.
+ * Opening with no search term shows AI-suggested codes for THIS company —
+ * grounded in the report's own principal-activities wording, validated against
+ * the official list, and shown with that wording so the filer can judge them
+ * (see lib/mbrs-msic-suggest). They are candidates only: picking is always a
+ * human act, and the field stays flagged until one is chosen. The full list
+ * follows underneath, and typing searches all 1,175 codes.
  */
 export function MsicField({
   value,
   onChange,
   flaggedMissing,
+  suggestions = [],
+  suggestNote,
+  evidence,
 }: {
   value: string;
   onChange: (v: string) => void;
   flaggedMissing?: boolean;
+  /** AI candidates for this company, already validated against the code list. */
+  suggestions?: Array<{ code: string; label: string; reason?: string }>;
+  /** Why there are none, when there are none. */
+  suggestNote?: string | null;
+  /** The report wording the suggestions were drawn from. */
+  evidence?: string | null;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [highlight, setHighlight] = useState(0);
-  const [recent, setRecent] = useState<string[]>([]);
   const rootRef = useRef<HTMLDivElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
 
@@ -59,27 +46,28 @@ export function MsicField({
   const display = value ? (knownLabel ? `${value} · ${knownLabel}` : value) : "";
   const invalid = !!value && !knownLabel;
 
-  useEffect(() => setRecent(readRecent()), []);
-
   const searching = query.trim().length > 0;
 
-  const recentEntries: MsicEntry[] = useMemo(() => {
+  const suggestEntries: MsicEntry[] = useMemo(() => {
     if (searching) return [];
-    return recent
-      .filter((c) => c !== value)
-      .map((c) => ({ code: c, label: msicLabel(c) ?? "" }))
-      .filter((e) => e.label);
-  }, [recent, value, searching]);
+    return suggestions
+      .filter((sg) => sg.code && sg.label)
+      .map((sg) => ({ code: sg.code, label: sg.label }));
+  }, [suggestions, searching]);
+  const reasonFor = useMemo(
+    () => new Map(suggestions.map((sg) => [sg.code, sg.reason ?? ""])),
+    [suggestions],
+  );
 
   const browseEntries: MsicEntry[] = useMemo(() => {
     if (searching) return searchMsic(query, 40);
-    const skip = new Set(recentEntries.map((e) => e.code));
+    const skip = new Set(suggestEntries.map((e) => e.code));
     return allMsic().filter((e) => !skip.has(e.code));
-  }, [query, searching, recentEntries]);
+  }, [query, searching, suggestEntries]);
 
   const rendered = searching ? browseEntries : browseEntries.slice(0, BROWSE_RENDER_CAP);
   /** Flat option list — keyboard nav runs across both groups. */
-  const options = useMemo(() => [...recentEntries, ...rendered], [recentEntries, rendered]);
+  const options = useMemo(() => [...suggestEntries, ...rendered], [suggestEntries, rendered]);
   const hiddenCount = searching ? 0 : browseEntries.length - rendered.length;
 
   useEffect(() => {
@@ -103,8 +91,6 @@ export function MsicField({
 
   function pick(e: MsicEntry) {
     onChange(e.code);
-    pushRecent(e.code);
-    setRecent(readRecent());
     setQuery("");
     setOpen(false);
   }
@@ -167,13 +153,30 @@ export function MsicField({
       {open && (
         <div className="absolute right-0 top-full z-40 mt-1 w-[28rem] max-w-[80vw] rounded-lg border border-gray-200 bg-white shadow-lg overflow-hidden">
           <ul ref={listRef} role="listbox" className="max-h-72 overflow-y-auto">
-            {recentEntries.length > 0 && (
-              <li className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-gray-400 bg-gray-50">
-                Recently used
+            {!searching && suggestEntries.length > 0 && (
+              <li className="px-3 pt-2 pb-1.5 bg-amber-50/60 border-b border-amber-100">
+                <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-amber-800">
+                  <Sparkles className="size-3" />
+                  Suggested for this company
+                </div>
+                {evidence && (
+                  <p className="mt-1 text-[11px] text-amber-900/80 leading-snug">
+                    From the report: “{evidence.slice(0, 180)}{evidence.length > 180 ? "…" : ""}”
+                  </p>
+                )}
+                <p className="mt-1 text-[11px] text-amber-900/70 leading-snug">
+                  Suggestions only — confirm against the company's SSM registration before filing.
+                </p>
+              </li>
+            )}
+            {!searching && suggestEntries.length === 0 && suggestNote && (
+              <li className="px-3 py-2 text-[11px] text-gray-500 leading-snug bg-gray-50 border-b border-gray-100">
+                {suggestNote}
               </li>
             )}
             {options.map((o, i) => {
-              const startsBrowse = !searching && recentEntries.length > 0 && i === recentEntries.length;
+              const startsBrowse = !searching && suggestEntries.length > 0 && i === suggestEntries.length;
+              const reason = !searching && i < suggestEntries.length ? reasonFor.get(o.code) : "";
               return (
                 <li key={`${o.code}-${i}`} role="option" aria-selected={i === highlight}>
                   {startsBrowse && (
@@ -191,7 +194,12 @@ export function MsicField({
                     )}
                   >
                     <span className="font-mono font-semibold tabular-nums shrink-0 text-gray-900">{o.code}</span>
-                    <span className="text-gray-600 leading-snug">{o.label}</span>
+                    <span className="leading-snug">
+                      <span className="text-gray-600">{o.label}</span>
+                      {reason && (
+                        <span className="block text-[11px] text-amber-800/80 mt-0.5">{reason}</span>
+                      )}
+                    </span>
                     {o.code === value && <Check className="size-3.5 ml-auto shrink-0 text-teal-600" />}
                   </button>
                 </li>

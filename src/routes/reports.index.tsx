@@ -38,6 +38,8 @@ import { SimplifyUploadDialog } from "@/components/simplify-upload-dialog";
 import { SimplifyV2UploadDialog } from "@/components/simplify-v2-upload-dialog";
 import { CreditUploadDialog } from "@/components/credit-upload-dialog";
 import { MbrsUploadDialog } from "@/components/mbrs-upload-dialog";
+import { RspoUploadDialog } from "@/components/rspo-upload-dialog";
+import { CERT_TYPE_LABELS } from "@/lib/rspo-checklist";
 import { formatDate, statusMeta } from "@/lib/format";
 import {
   deleteReport,
@@ -71,6 +73,7 @@ function ReportsRoute() {
   if (workspace === "simplify_v2") return <SimplifyV2ReportsList />;
   if (workspace === "credit_risk" || workspace === "credit_risk_demo") return <CreditRiskReportsList />;
   if (workspace === "mbrs") return <MbrsReportsList />;
+  if (workspace === "rspo") return <RspoReportsList />;
   return <ReportsList />;
 }
 
@@ -240,6 +243,175 @@ function MbrsReportsList() {
         onCreated={(reportId) => {
           qc.invalidateQueries({ queryKey: ["reports"] });
           nav({ to: "/mbrs/$reportId", params: { reportId } });
+        }}
+      />
+    </AppShell>
+  );
+}
+
+/** RSPO — SCC licence reviews: certificate + audit report + PRISMA cross-check. */
+function RspoReportsList() {
+  const qc = useQueryClient();
+  const nav = useNavigate();
+  const remove = useServerFn(deleteReport);
+  const auth = useAuth();
+  const [showUpload, setShowUpload] = useState(false);
+
+  const reports = useQuery({
+    queryKey: ["reports", "all", "rspo", auth.tenantId],
+    enabled: !auth.loading,
+    queryFn: async () => {
+      const { data } = await (supabase as any)
+        .from("analysis_reports")
+        .select("id, title, policy_name, status, created_at, summary_json")
+        .eq("workspace_id", "rspo")
+        .eq("tenant_id", auth.tenantId)
+        .order("created_at", { ascending: false });
+      return data ?? [];
+    },
+  });
+
+  async function handleDelete(e: React.MouseEvent, id: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!confirm("Delete this licence review and all related data?")) return;
+    try {
+      await remove({ data: { id } });
+      toast.success("Review deleted");
+      qc.invalidateQueries({ queryKey: ["reports"] });
+    } catch (err: any) {
+      toast.error(err?.message ?? "Failed to delete");
+    }
+  }
+
+  function statusBadge(sj: any): { label: string; classes: string } {
+    const st = sj?.rspo_status;
+    if (sj?.pending_analysis || st === "queued" || st === "parsing_prisma" || st === "extracting") {
+      return { label: "Checking", classes: "bg-sky-100 text-sky-800 border-sky-200" };
+    }
+    if (st === "failed") return { label: "Failed", classes: "bg-rose-100 text-rose-800 border-rose-200" };
+    if (st === "awaiting_application") {
+      return { label: "Pick application", classes: "bg-violet-100 text-violet-800 border-violet-200" };
+    }
+    if (st === "ready") {
+      const results = (sj?.rspo_results ?? []) as any[];
+      const mism = results.filter((r) => r.status === "mismatch").length;
+      if (mism > 0) {
+        return { label: `${mism} discrepanc${mism === 1 ? "y" : "ies"}`, classes: "bg-amber-100 text-amber-800 border-amber-200" };
+      }
+      return { label: "Clean", classes: "bg-emerald-100 text-emerald-800 border-emerald-200" };
+    }
+    return { label: "Queued", classes: "bg-muted text-muted-foreground border-border" };
+  }
+
+  return (
+    <AppShell>
+      <div className="p-8 max-w-[1400px] mx-auto space-y-8">
+        <div className="flex items-end justify-between">
+          <div>
+            <h1 className="text-3xl font-bold tracking-tight">RSPO Cert Check</h1>
+            <p className="text-muted-foreground mt-1 text-lg">
+              Certificate, audit report and PRISMA cross-checked against the SCC licence review
+              checklist — every discrepancy flagged with its evidence.
+            </p>
+          </div>
+          <Button
+            size="lg"
+            onClick={() => setShowUpload(true)}
+            className="gap-2 h-12 px-6 rounded-xl font-bold bg-lime-600 hover:bg-lime-700 text-white shadow-lg shadow-lime-500/20 active:scale-95"
+          >
+            <Plus className="size-4" /> New Licence Review
+          </Button>
+        </div>
+
+        <Card className="p-0 overflow-hidden border-border/50 shadow-sm glass-card">
+          <div className="px-6 py-4 border-b border-border/50 bg-muted/30 flex items-center justify-between">
+            <h2 className="font-bold text-sm uppercase tracking-[0.2em] text-muted-foreground">
+              Reviews
+            </h2>
+            <Badge variant="secondary" className="font-black text-[10px]">
+              {reports.data?.length ?? 0} TOTAL
+            </Badge>
+          </div>
+
+          {reports.isLoading && (
+            <div className="p-12 text-center text-muted-foreground font-medium italic animate-pulse">
+              Loading…
+            </div>
+          )}
+
+          {!reports.isLoading && (reports.data?.length ?? 0) === 0 && (
+            <div className="p-20 text-center">
+              <div className="size-16 bg-muted rounded-full grid place-items-center mx-auto mb-4">
+                <ShieldPlus className="size-8 text-muted-foreground" />
+              </div>
+              <h3 className="text-xl font-bold">No reviews yet</h3>
+              <p className="text-muted-foreground mt-2 max-w-sm mx-auto">
+                Upload a certificate, its audit report and the PRISMA export to run the full
+                licence review checklist automatically.
+              </p>
+              <Button onClick={() => setShowUpload(true)} className="mt-6 gap-2 bg-lime-600 hover:bg-lime-700 text-white">
+                <Plus className="size-4" /> New Licence Review
+              </Button>
+            </div>
+          )}
+
+          <div className="divide-y divide-border/50">
+            {(reports.data ?? []).map((r: any) => {
+              const sj = r.summary_json ?? {};
+              const badge = statusBadge(sj);
+              return (
+                <Link
+                  key={r.id}
+                  to="/rspo/$reportId"
+                  params={{ reportId: r.id }}
+                  className="group flex items-center gap-4 px-6 py-4 hover:bg-muted/40 transition-colors"
+                >
+                  <div className="flex-1 min-w-0">
+                    <div className="font-bold truncate">{r.title}</div>
+                    <div className="text-xs text-muted-foreground mt-0.5">
+                      {sj.rspo_application_number ?? sj.rspo_files?.certificateName ?? "—"}
+                      {sj.rspo_cert_type ? ` · ${CERT_TYPE_LABELS[sj.rspo_cert_type as keyof typeof CERT_TYPE_LABELS] ?? sj.rspo_cert_type}` : ""}
+                      {sj.rspo_ocr_used?.certificate || sj.rspo_ocr_used?.audit_report ? " · OCR" : ""}
+                    </div>
+                  </div>
+                  <span onClick={(e) => { e.preventDefault(); e.stopPropagation(); }}>
+                    <AiCostTooltip
+                      costLog={sj.costLog}
+                      fallbackUsd={sj.usage ? computeCost(sj.usage, sj.rspo_model).usd : 0}
+                      ocrUsed={!!(sj.rspo_ocr_used?.certificate || sj.rspo_ocr_used?.audit_report)}
+                    />
+                  </span>
+                  <Badge
+                    variant="outline"
+                    className={cn("font-black text-[10px] uppercase tracking-widest px-2", badge.classes)}
+                  >
+                    {badge.label}
+                  </Badge>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="size-9 rounded-lg text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
+                    onClick={(e) => handleDelete(e, r.id)}
+                  >
+                    <Trash2 className="size-4" />
+                  </Button>
+                  <div className="size-9 rounded-lg bg-muted grid place-items-center group-hover:bg-lime-600 group-hover:text-white transition-all">
+                    <ArrowRight className="size-4" />
+                  </div>
+                </Link>
+              );
+            })}
+          </div>
+        </Card>
+      </div>
+
+      <RspoUploadDialog
+        open={showUpload}
+        onOpenChange={setShowUpload}
+        onCreated={(reportId) => {
+          qc.invalidateQueries({ queryKey: ["reports"] });
+          nav({ to: "/rspo/$reportId", params: { reportId } });
         }}
       />
     </AppShell>

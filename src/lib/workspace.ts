@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-export type WorkspaceId = "rmit" | "fatf" | "forms" | "simplify" | "simplify_v2" | "layout" | "policy" | "credit_risk" | "credit_risk_demo" | "mbrs";
+export type WorkspaceId = "rmit" | "fatf" | "forms" | "simplify" | "simplify_v2" | "layout" | "policy" | "credit_risk" | "credit_risk_demo" | "mbrs" | "rspo";
 
 export const WORKSPACES: Record<WorkspaceId, {
   id: WorkspaceId;
@@ -89,6 +89,14 @@ export const WORKSPACES: Record<WorkspaceId, {
     tagline: "Audited accounts → SSM XBRL · OCR extraction & validation",
     color: "text-teal-700",
     bgColor: "bg-teal-100",
+  },
+  rspo: {
+    id: "rspo",
+    name: "RSPO Cert Check",
+    short: "RSPO",
+    tagline: "SCC licence review · certificate, audit report & PRISMA cross-check",
+    color: "text-lime-700",
+    bgColor: "bg-lime-100",
   },
 };
 

@@ -109,7 +109,7 @@ import { REGULATION_FAMILIES, INTERNAL_DOC_TYPES as INTERNAL_DOC_TYPES_CONST, re
 // Allowed workspace identifiers — shared across every workspace-scoped input
 // validator. Declared up here so server fns defined anywhere in the file can
 // reference it in their .inputValidator() (evaluated at module load).
-const workspaceSchema = z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo", "mbrs"]);
+const workspaceSchema = z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo", "mbrs", "rspo"]);
 
 // Guidance rows are keyed by workspace_id, plus synthetic sub-keys for flows
 // that need a second editable prompt within one workspace (v2 recommendation).
@@ -197,7 +197,7 @@ export const createReport = createServerFn({ method: "POST" })
     z.object({
       filename: z.string(),
       fileUrl: z.string().nullable(),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo", "mbrs"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo", "mbrs", "rspo"]).default("rmit"),
       customTitle: z.string().optional(),
       notes: z.string().optional(),
       detected: z
@@ -532,7 +532,7 @@ export const createRegulatoryReport = createServerFn({ method: "POST" })
     z.object({
       filename: z.string(),
       fileUrl: z.string().nullable(),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo", "mbrs"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo", "mbrs", "rspo"]).default("rmit"),
       customTitle: z.string().optional(),
       notes: z.string().optional(),
       detected: z
@@ -1845,7 +1845,7 @@ export const createSop = createServerFn({ method: "POST" })
       title: z.string().min(2).max(200),
       doc_type: z.enum(["sop", "rmit", "rmit_reg", "fatf", "circular", "it_policy", "policy", "form"]),
       version: z.string().min(1).max(20),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo", "mbrs"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo", "mbrs", "rspo"]).default("rmit"),
       summary: z.string().max(2000).optional(),
       tags: z.array(z.string().max(40)).max(20).optional(),
       file_url: z.string().nullable().optional(),
@@ -1956,7 +1956,7 @@ export const clearWorkspace = createServerFn({ method: "POST" })
   .inputValidator(
     z.object({
       scope: z.enum(["analyses", "kb", "all"]),
-      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo", "mbrs"]).default("rmit"),
+      workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo", "mbrs", "rspo"]).default("rmit"),
     })
   )
   .handler(async ({ data, context }) => {
@@ -2364,7 +2364,7 @@ function escapeHtml(s: string): string {
  */
 export const getChunkCounts = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
-  .inputValidator(z.object({ workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo", "mbrs"]).default("rmit") }))
+  .inputValidator(z.object({ workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo", "mbrs", "rspo"]).default("rmit") }))
   .handler(async ({ data, context }) => {
     const supabase = context.supabase;
     const { tenantId } = await getCallerTenant(context.userId);
@@ -2654,7 +2654,7 @@ function applyPageOverrides(formId: string, impacts: any[]): any[] {
 export const createFormUpdateReport = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator(z.object({
-    workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo", "mbrs"]).default("forms"),
+    workspace: z.enum(["rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy", "credit_risk", "credit_risk_demo", "mbrs", "rspo"]).default("forms"),
     formId: z.string().min(1),                  // e.g. "FGROP 037/2016"
     friendlyName: z.string().optional(),         // e.g. "Account Opening Application Form"
     customTitle: z.string().optional(),
@@ -7399,4 +7399,319 @@ export const generateMbrsXml = createServerFn({ method: "POST" })
       .eq("id", report.id);
 
     return { xml, filename, factCount, skipped };
+  });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RSPO Cert Check — SCC licence review: certificate + audit report + PRISMA
+// export cross-checked against the 78-item SCC License Review Checklist.
+//
+// The AI never decides an item: deterministic comparisons run in code, fuzzy
+// text goes to one batched consistency call whose verdicts always carry the
+// verbatim values they judged, and the reviewer's Accept/Flag is the only
+// thing that completes a checklist row. See rspo-engine.ts.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const createRspoReview = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    z.object({
+      companyName: z.string().min(1).max(200),
+      certType: z.enum(["single_site", "multi_site", "group"]),
+      workspace: workspaceSchema,
+      certificateUrl: z.string().min(1),
+      certificateName: z.string().min(1),
+      auditReportUrl: z.string().min(1),
+      auditReportName: z.string().min(1),
+      prismaUrl: z.string().min(1),
+      prismaName: z.string().min(1),
+    }),
+  )
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    const company = data.companyName.trim();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report, error } = await (supabase as any)
+      .from("analysis_reports")
+      .insert({
+        title: company,
+        policy_name: company,
+        status: "pending_validation",
+        workflow_type: "rspo",
+        source_file_url: data.certificateUrl,
+        workspace_id: data.workspace,
+        summary_json: {
+          workflow_type: "rspo",
+          company_name: company,
+          source_filename: data.certificateName,
+          executive: ["Queued — parsing the PRISMA export and reading the documents…"],
+          pending_analysis: true,
+          rspo_status: "queued",
+          rspo_cert_type: data.certType,
+          rspo_files: {
+            certificateUrl: data.certificateUrl,
+            certificateName: data.certificateName,
+            auditReportUrl: data.auditReportUrl,
+            auditReportName: data.auditReportName,
+            prismaUrl: data.prismaUrl,
+            prismaName: data.prismaName,
+          },
+        },
+      })
+      .select("id")
+      .single();
+    if (error || !report) throw new Error(error?.message || "Failed to create the RSPO review");
+    return { reportId: report.id as string };
+  });
+
+export const runRspoPrismaParse = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(z.object({ reportId: z.string().uuid() }))
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report, error } = await (supabase as any)
+      .from("analysis_reports")
+      .select("id, summary_json, tenant_id")
+      .eq("id", data.reportId)
+      .single();
+    if (error || !report) throw new Error("Review not found");
+    const { tenantId } = await getCallerTenant(context.userId);
+    assertRowTenant(report.tenant_id, tenantId);
+
+    const sj0 = (report.summary_json ?? {}) as Record<string, any>;
+    const prismaUrl: string | undefined = sj0.rspo_files?.prismaUrl;
+    if (!prismaUrl) throw new Error("No PRISMA export attached to this review");
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase as any)
+      .from("analysis_reports")
+      .update({ summary_json: { ...sj0, pending_analysis: false, rspo_status: "parsing_prisma", rspo_error: null } })
+      .eq("id", report.id);
+
+    try {
+      const { parsePrismaWorkbook } = await import("./rspo-prisma");
+      const f = await fetchFile(prismaUrl);
+      const parsed = await parsePrismaWorkbook(f.buffer);
+      if (!parsed.applicationNumbers.length) {
+        throw new Error("The PRISMA export holds no applications");
+      }
+      const autoSelected = parsed.applicationNumbers.length === 1 ? parsed.applicationNumbers[0] : null;
+
+      const sj = await freshSj(supabase, report.id, sj0);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (supabase as any)
+        .from("analysis_reports")
+        .update({
+          summary_json: {
+            ...sj,
+            pending_analysis: false,
+            rspo_status: autoSelected ? "extracting" : "awaiting_application",
+            rspo_error: null,
+            rspo_prisma_apps: parsed.applications,
+            rspo_application_numbers: parsed.applicationNumbers,
+            rspo_application_number: autoSelected,
+            rspo_prisma_warnings: parsed.warnings,
+            rspo_prisma_parsed_at: new Date().toISOString(),
+          },
+        })
+        .eq("id", report.id);
+      return {
+        ok: true as const,
+        applicationNumbers: parsed.applicationNumbers,
+        autoSelected,
+        warnings: parsed.warnings.length,
+      };
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "PRISMA parse failed";
+      const sj = await freshSj(supabase, report.id, sj0);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (supabase as any)
+        .from("analysis_reports")
+        .update({ summary_json: { ...sj, pending_analysis: false, rspo_status: "failed", rspo_error: message } })
+        .eq("id", report.id);
+      throw e;
+    }
+  });
+
+export const runRspoExtraction = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(z.object({ reportId: z.string().uuid(), applicationNumber: z.string().min(1) }))
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report, error } = await (supabase as any)
+      .from("analysis_reports")
+      .select("id, summary_json, tenant_id")
+      .eq("id", data.reportId)
+      .single();
+    if (error || !report) throw new Error("Review not found");
+    const { tenantId } = await getCallerTenant(context.userId);
+    assertRowTenant(report.tenant_id, tenantId);
+
+    const sj0 = (report.summary_json ?? {}) as Record<string, any>;
+    const files = sj0.rspo_files ?? {};
+    const certType = sj0.rspo_cert_type as "single_site" | "multi_site" | "group" | undefined;
+    if (!certType) throw new Error("The review has no certification type");
+    if (!files.certificateUrl || !files.auditReportUrl) throw new Error("Certificate or audit report file missing");
+    const prismaApp = sj0.rspo_prisma_apps?.[data.applicationNumber];
+    if (!prismaApp) throw new Error(`Application ${data.applicationNumber} not found in the parsed PRISMA export`);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase as any)
+      .from("analysis_reports")
+      .update({
+        summary_json: {
+          ...sj0,
+          rspo_status: "extracting",
+          rspo_error: null,
+          rspo_application_number: data.applicationNumber,
+        },
+      })
+      .eq("id", report.id);
+
+    try {
+      const [{ extractRspoCertificate, extractRspoAuditReport }, { runRspoChecks, summarizeResults, diffRuns }] =
+        await Promise.all([import("./rspo-extract"), import("./rspo-engine")]);
+
+      const [certFile, auditFile] = await Promise.all([
+        fetchFile(files.certificateUrl),
+        fetchFile(files.auditReportUrl),
+      ]);
+      const [certRes, auditRes] = await Promise.all([
+        extractRspoCertificate({ buffer: certFile.buffer, mimeType: certFile.mimeType, certType }),
+        extractRspoAuditReport({ buffer: auditFile.buffer, mimeType: auditFile.mimeType, certType }),
+      ]);
+
+      const checkRes = await runRspoChecks({
+        prisma: prismaApp,
+        certificate: certRes.certificate,
+        audit: auditRes.audit,
+        certType,
+        uploadedFiles: {
+          certificateName: files.certificateName ?? null,
+          auditReportName: files.auditReportName ?? null,
+        },
+      });
+
+      let sj = await freshSj(supabase, report.id, sj0);
+      sj = appendCostLog(sj, certRes.ocrUsed ? "rspo_cert_extract_ocr" : "rspo_cert_extract", computeCost(certRes.usage, certRes.model));
+      sj = appendCostLog(sj, auditRes.ocrUsed ? "rspo_audit_extract_ocr" : "rspo_audit_extract", computeCost(auditRes.usage, auditRes.model));
+      if (checkRes.usage.calls > 0) {
+        sj = appendCostLog(sj, "rspo_consistency", computeCost(checkRes.usage, checkRes.model));
+      }
+
+      // Prior results go into the run history (cap 2); verdicts whose item
+      // changed status since they were given get flagged stale, not erased —
+      // the reviewer's judgement is theirs to withdraw, not ours.
+      const priorResults = Array.isArray(sj.rspo_results) ? sj.rspo_results : null;
+      const runs = Array.isArray(sj.rspo_runs) ? sj.rspo_runs.slice(-1) : [];
+      if (priorResults) {
+        runs.push({
+          at: sj.rspo_extracted_at ?? new Date().toISOString(),
+          application_number: sj.rspo_application_number ?? data.applicationNumber,
+          results: priorResults,
+          summary: sj.rspo_result_summary ?? null,
+        });
+      }
+      const changed = priorResults ? diffRuns(priorResults, checkRes.results) : {};
+      const verdicts = { ...(sj.rspo_verdicts ?? {}) } as Record<string, any>;
+      for (const itemId of Object.keys(changed)) {
+        if (verdicts[itemId]) verdicts[itemId] = { ...verdicts[itemId], stale: true };
+      }
+
+      const totalUsage = [certRes.usage, auditRes.usage, checkRes.usage].reduce(
+        (acc, u) => addUsage(acc, u),
+        sj.usage ?? { inputTokens: 0, outputTokens: 0, thinkingTokens: 0, calls: 0 },
+      );
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (supabase as any)
+        .from("analysis_reports")
+        .update({
+          summary_json: {
+            ...sj,
+            pending_analysis: false,
+            rspo_status: "ready",
+            rspo_error: null,
+            rspo_application_number: data.applicationNumber,
+            rspo_certificate: certRes.certificate,
+            rspo_audit: auditRes.audit,
+            rspo_results: checkRes.results,
+            rspo_result_summary: summarizeResults(checkRes.results),
+            rspo_changed_items: changed,
+            rspo_runs: runs,
+            rspo_verdicts: verdicts,
+            rspo_ocr_used: { certificate: certRes.ocrUsed, audit_report: auditRes.ocrUsed },
+            rspo_model: auditRes.model || certRes.model,
+            rspo_extracted_at: new Date().toISOString(),
+            usage: totalUsage,
+          },
+        })
+        .eq("id", report.id);
+
+      const mismatches = checkRes.results.filter((r) => r.status === "mismatch").length;
+      return { ok: true as const, mismatches, changed: Object.keys(changed).length };
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Extraction failed";
+      const sj = await freshSj(supabase, report.id, sj0);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (supabase as any)
+        .from("analysis_reports")
+        .update({ summary_json: { ...sj, pending_analysis: false, rspo_status: "failed", rspo_error: message } })
+        .eq("id", report.id);
+      throw e;
+    }
+  });
+
+export const saveRspoVerdicts = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    z.object({
+      reportId: z.string().uuid(),
+      verdicts: z.record(
+        z.string(),
+        z.object({
+          verdict: z.enum(["accepted", "flagged"]).nullable(),
+          remarks: z.string().max(2000),
+        }),
+      ),
+    }),
+  )
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report, error } = await (supabase as any)
+      .from("analysis_reports")
+      .select("id, summary_json, tenant_id")
+      .eq("id", data.reportId)
+      .single();
+    if (error || !report) throw new Error("Review not found");
+    const { tenantId } = await getCallerTenant(context.userId);
+    assertRowTenant(report.tenant_id, tenantId);
+
+    // Partial per-item merge — only the items THIS save touches are written,
+    // so two reviewers working different sections can't clobber each other.
+    const sj = await freshSj(supabase, report.id, report.summary_json ?? {});
+    const merged = { ...(sj.rspo_verdicts ?? {}) } as Record<string, any>;
+    const now = new Date().toISOString();
+    for (const [itemId, v] of Object.entries(data.verdicts)) {
+      if (v.verdict === null && !v.remarks.trim()) {
+        delete merged[itemId];
+        continue;
+      }
+      merged[itemId] = {
+        verdict: v.verdict,
+        remarks: v.remarks.trim(),
+        by: context.claims?.email ?? null,
+        at: now,
+        runAt: sj.rspo_extracted_at ?? null,
+        stale: false,
+      };
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase as any)
+      .from("analysis_reports")
+      .update({ summary_json: { ...sj, rspo_verdicts: merged } })
+      .eq("id", report.id);
+    return { ok: true as const, count: Object.keys(merged).length };
   });

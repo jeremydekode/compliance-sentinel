@@ -22,6 +22,11 @@ interface CostLogEntry {
 const OP_LABELS: Record<string, string> = {
   mbrs_extract: "Read statements (text layer)",
   mbrs_extract_ocr: "Read statements (OCR — scanned pages)",
+  rspo_cert_extract: "Read certificate",
+  rspo_cert_extract_ocr: "Read certificate (OCR)",
+  rspo_audit_extract: "Read audit report",
+  rspo_audit_extract_ocr: "Read audit report (OCR)",
+  rspo_consistency: "Cross-check fuzzy fields",
   mbrs_narratives: "Narrative disclosures",
   mbrs_xbrl: "XBRL generation",
 };

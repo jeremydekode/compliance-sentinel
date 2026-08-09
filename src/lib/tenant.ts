@@ -29,7 +29,7 @@ export interface TenantBranding {
  *  it as ALL_TENANT_FEATURES. */
 export const ALL_FEATURES = [
   "rmit", "fatf", "forms", "simplify", "simplify_v2", "layout", "policy",
-  "credit_risk", "credit_risk_demo", "mbrs", "legal_cms", "rudy", "create_document",
+  "credit_risk", "credit_risk_demo", "mbrs", "rspo", "legal_cms", "rudy", "create_document",
 ] as const;
 
 // Mirrors the seeded 'default' row in 20260716_tenant_branding.sql — used as

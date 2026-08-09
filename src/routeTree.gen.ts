@@ -18,6 +18,7 @@ import { Route as LegalIndexRouteImport } from './routes/legal.index'
 import { Route as LayoutIndexRouteImport } from './routes/layout.index'
 import { Route as Simplify2ReportIdRouteImport } from './routes/simplify2.$reportId'
 import { Route as SimplifyReportIdRouteImport } from './routes/simplify.$reportId'
+import { Route as RspoReportIdRouteImport } from './routes/rspo.$reportId'
 import { Route as ReportsReportIdRouteImport } from './routes/reports.$reportId'
 import { Route as MbrsReportIdRouteImport } from './routes/mbrs.$reportId'
 import { Route as LegalRequestsRouteImport } from './routes/legal.requests'
@@ -74,6 +75,11 @@ const Simplify2ReportIdRoute = Simplify2ReportIdRouteImport.update({
 const SimplifyReportIdRoute = SimplifyReportIdRouteImport.update({
   id: '/simplify/$reportId',
   path: '/simplify/$reportId',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const RspoReportIdRoute = RspoReportIdRouteImport.update({
+  id: '/rspo/$reportId',
+  path: '/rspo/$reportId',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ReportsReportIdRoute = ReportsReportIdRouteImport.update({
@@ -151,6 +157,7 @@ export interface FileRoutesByFullPath {
   '/legal/requests': typeof LegalRequestsRoute
   '/mbrs/$reportId': typeof MbrsReportIdRoute
   '/reports/$reportId': typeof ReportsReportIdRouteWithChildren
+  '/rspo/$reportId': typeof RspoReportIdRoute
   '/simplify/$reportId': typeof SimplifyReportIdRoute
   '/simplify2/$reportId': typeof Simplify2ReportIdRoute
   '/layout/': typeof LayoutIndexRoute
@@ -174,6 +181,7 @@ export interface FileRoutesByTo {
   '/legal/requests': typeof LegalRequestsRoute
   '/mbrs/$reportId': typeof MbrsReportIdRoute
   '/reports/$reportId': typeof ReportsReportIdRouteWithChildren
+  '/rspo/$reportId': typeof RspoReportIdRoute
   '/simplify/$reportId': typeof SimplifyReportIdRoute
   '/simplify2/$reportId': typeof Simplify2ReportIdRoute
   '/layout': typeof LayoutIndexRoute
@@ -198,6 +206,7 @@ export interface FileRoutesById {
   '/legal/requests': typeof LegalRequestsRoute
   '/mbrs/$reportId': typeof MbrsReportIdRoute
   '/reports/$reportId': typeof ReportsReportIdRouteWithChildren
+  '/rspo/$reportId': typeof RspoReportIdRoute
   '/simplify/$reportId': typeof SimplifyReportIdRoute
   '/simplify2/$reportId': typeof Simplify2ReportIdRoute
   '/layout/': typeof LayoutIndexRoute
@@ -223,6 +232,7 @@ export interface FileRouteTypes {
     | '/legal/requests'
     | '/mbrs/$reportId'
     | '/reports/$reportId'
+    | '/rspo/$reportId'
     | '/simplify/$reportId'
     | '/simplify2/$reportId'
     | '/layout/'
@@ -246,6 +256,7 @@ export interface FileRouteTypes {
     | '/legal/requests'
     | '/mbrs/$reportId'
     | '/reports/$reportId'
+    | '/rspo/$reportId'
     | '/simplify/$reportId'
     | '/simplify2/$reportId'
     | '/layout'
@@ -269,6 +280,7 @@ export interface FileRouteTypes {
     | '/legal/requests'
     | '/mbrs/$reportId'
     | '/reports/$reportId'
+    | '/rspo/$reportId'
     | '/simplify/$reportId'
     | '/simplify2/$reportId'
     | '/layout/'
@@ -293,6 +305,7 @@ export interface RootRouteChildren {
   LegalRequestsRoute: typeof LegalRequestsRoute
   MbrsReportIdRoute: typeof MbrsReportIdRoute
   ReportsReportIdRoute: typeof ReportsReportIdRouteWithChildren
+  RspoReportIdRoute: typeof RspoReportIdRoute
   SimplifyReportIdRoute: typeof SimplifyReportIdRoute
   Simplify2ReportIdRoute: typeof Simplify2ReportIdRoute
   LayoutIndexRoute: typeof LayoutIndexRoute
@@ -365,6 +378,13 @@ declare module '@tanstack/react-router' {
       path: '/simplify/$reportId'
       fullPath: '/simplify/$reportId'
       preLoaderRoute: typeof SimplifyReportIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/rspo/$reportId': {
+      id: '/rspo/$reportId'
+      path: '/rspo/$reportId'
+      fullPath: '/rspo/$reportId'
+      preLoaderRoute: typeof RspoReportIdRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/reports/$reportId': {
@@ -480,6 +500,7 @@ const rootRouteChildren: RootRouteChildren = {
   LegalRequestsRoute: LegalRequestsRoute,
   MbrsReportIdRoute: MbrsReportIdRoute,
   ReportsReportIdRoute: ReportsReportIdRouteWithChildren,
+  RspoReportIdRoute: RspoReportIdRoute,
   SimplifyReportIdRoute: SimplifyReportIdRoute,
   Simplify2ReportIdRoute: Simplify2ReportIdRoute,
   LayoutIndexRoute: LayoutIndexRoute,

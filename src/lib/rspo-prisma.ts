@@ -405,13 +405,22 @@ export async function parsePrismaWorkbook(buffer: Buffer): Promise<{
     const managementUnitsRaw = (cell("management_units") as unknown[]) ?? [];
     const sitesRaw = (cell("sites") as unknown[]) ?? [];
 
-    // Address lookup: audit-data "sites" rows carry addresses; CLM rows carry
-    // the business data. Joined by loose name key.
+    // Address AND site-id lookup: audit-data "sites" rows carry both address
+    // and prisma_site_id; CLM rows carry the business data (asset id, supply
+    // chain models, products) but not the site's own PRISMA id. Joined by
+    // loose name key — the id was previously discarded here even though it
+    // sits right next to the address in the same source row, which made
+    // "Site ID" read as not-found for every site that DID have one.
     const addressByName = new Map<string, string>();
+    const siteIdByName = new Map<string, string>();
     for (const s of sitesRaw) {
       const name = str(get(s, "name"));
+      if (!name) continue;
+      const key = nameKey(name);
       const addr = joinAddress(get(s, "address"));
-      if (name && addr) addressByName.set(nameKey(name), addr);
+      if (addr) addressByName.set(key, addr);
+      const sid = str(get(s, "prisma_site_id"));
+      if (sid) siteIdByName.set(key, sid);
     }
     for (const mu of managementUnitsRaw) {
       const name = str(get(mu, "name"));
@@ -431,7 +440,7 @@ export async function parsePrismaWorkbook(buffer: Buffer): Promise<{
         const name = str(r["name"]) ?? assetId;
         site = {
           businessId: str(r["asset_prisma_id"]),
-          id: null,
+          id: siteIdByName.get(nameKey(name)) ?? null,
           name,
           address: addressByName.get(nameKey(name)) ?? null,
           businessType: str(r["business_type"]),

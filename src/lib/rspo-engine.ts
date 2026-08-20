@@ -97,7 +97,11 @@ function readValues(ctx: RspoRunContext, item: RspoChecklistItem): Partial<Recor
     for (const p of list) {
       const r = resolvePath(sourceRoot(ctx, source), p);
       if (r.value != null) {
-        parts.push(list.length > 1 ? `${lastSeg(p)}: ${r.value}` : r.value);
+        // Plain value, no field-path label — "certifiedCompanyName:" in front
+        // of a company name is an implementation detail, not something a
+        // reviewer needs. The values read in a natural order (e.g. name, then
+        // address) without it; the page reference below carries the evidence.
+        parts.push(r.value);
         if (page == null) page = r.page;
         if (!quote) quote = r.quote;
       }
@@ -105,11 +109,6 @@ function readValues(ctx: RspoRunContext, item: RspoChecklistItem): Partial<Recor
     out[source] = { value: parts.length ? parts.join(" · ") : null, page, quote };
   }
   return out;
-}
-
-function lastSeg(path: string): string {
-  const s = path.split(".").pop() ?? path;
-  return s.replace("[]", "");
 }
 
 // ── Deterministic comparison ────────────────────────────────────────────────

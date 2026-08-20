@@ -20,7 +20,8 @@ import {
 } from "@/lib/mbrs";
 import { msicLabel } from "@/lib/msic";
 import { MsicField } from "@/components/msic-field";
-import { computeCost, formatUsd } from "@/lib/pricing";
+import { computeCost } from "@/lib/pricing";
+import { AiCostTooltip } from "@/components/ai-cost-tooltip";
 import { cn } from "@/lib/utils";
 
 export const Route = createFileRoute("/mbrs/$reportId")({
@@ -338,10 +339,14 @@ function MbrsFilingPage() {
                 MBRS · FS-MPERS
                 {view.entity.registrationNumber ? ` · Reg. ${view.entity.registrationNumber}` : ""}
                 {" · FY "}{view.entity.currentPeriodStart || "?"} – {view.entity.currentPeriodEnd || "?"}
-                {sj.usage ? ` · ${formatUsd(computeCost(sj.usage, sj.mbrs_model).usd)}` : ""}
               </p>
             </div>
             <div className="flex items-center gap-2">
+              <AiCostTooltip
+                costLog={sj.costLog}
+                fallbackUsd={sj.usage ? computeCost(sj.usage, sj.mbrs_model).usd : 0}
+                ocrUsed={sj.mbrs_ocr_used}
+              />
               <Button onClick={runAnalysis} variant="ghost" size="sm" className="gap-1.5 text-gray-600" disabled={running}>
                 <RefreshCw className="size-3.5" /> Re-extract
               </Button>

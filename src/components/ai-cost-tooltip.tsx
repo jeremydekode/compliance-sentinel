@@ -79,16 +79,18 @@ export function AiCostTooltip({
       onMouseEnter={() => setOpen(true)}
       onMouseLeave={() => setOpen(false)}
     >
+      {/* Icon only — the amount is deliberately NOT rendered here. Cost is
+          operator information, not something a reviewer (or a client watching
+          a demo) should read off every row; it lives in the hover panel. */}
       <span
         tabIndex={0}
         role="button"
-        aria-label={`AI cost ${formatUsd(total)} — hover for the breakdown`}
+        aria-label="AI cost — hover or focus for the breakdown"
         onFocus={() => setOpen(true)}
         onBlur={() => setOpen(false)}
-        className="inline-flex items-center gap-1 rounded-md border border-border/70 bg-muted/40 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-muted-foreground hover:text-foreground hover:border-border transition-colors cursor-default focus:outline-none focus:ring-2 focus:ring-teal-500/30"
+        className="inline-flex items-center justify-center size-6 rounded-md border border-border/70 bg-muted/40 text-muted-foreground hover:text-foreground hover:border-border transition-colors cursor-default focus:outline-none focus:ring-2 focus:ring-teal-500/30"
       >
         <Sparkles className="size-3" />
-        {formatUsd(total)}
       </span>
 
       {open && (

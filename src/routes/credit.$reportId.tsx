@@ -451,7 +451,9 @@ function CreditReportPage() {
             <Provenance
               icon={<Sparkles className="size-4" />}
               label="Analysed"
-              value={cost ? formatUsd(cost.usd) : "done"}
+              // Cost is not shown on the tile — it lives in the popover, same
+              // as every other workspace. Operator info, not reviewer info.
+              value="done"
               info={cost ? <CostBreakdown usage={usage!} /> : undefined}
             />
           </div>

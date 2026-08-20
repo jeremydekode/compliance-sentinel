@@ -34,6 +34,10 @@ interface PdfViewerProps {
   activeId?: string | null;
   onSelect?: (id: string) => void;
   onAnchorStatus?: (status: Record<string, boolean>) => void;
+  /** 1-indexed page to scroll to once rendered, for callers with a page
+   *  reference but no exact quote to anchor a highlight on. Ignored when a
+   *  highlight is present — the highlight's own scroll is more precise. */
+  focusPage?: number | null;
 }
 
 // pdf.js paints a page in chunks scheduled with requestAnimationFrame. rAF is
@@ -105,7 +109,7 @@ interface PageEntry {
   items: any[];
 }
 
-export function PdfViewer({ fileUrl, className, highlights, activeId, onSelect, onAnchorStatus }: PdfViewerProps) {
+export function PdfViewer({ fileUrl, className, highlights, activeId, onSelect, onAnchorStatus, focusPage }: PdfViewerProps) {
   const rootRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [phase, setPhase] = useState<"loading" | "ready" | "error">("loading");
@@ -362,6 +366,23 @@ export function PdfViewer({ fileUrl, className, highlights, activeId, onSelect, 
     // e.g. mid-keystroke while typing a decision input.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeId, pagesReady, (highlights ?? []).map((h) => `${h.id} ${h.kind} ${h.text}`).join("|")]);
+
+  // ── Page-only jump: no quote to highlight, just a page reference ──────────
+  // Runs once per (fileUrl, focusPage) pair — pages render progressively, so
+  // this re-checks as pagesReady climbs until the target page exists, then
+  // marks itself done so later renders (e.g. an unrelated highlight update)
+  // don't yank the scroll position back.
+  const jumpedRef = useRef<string | null>(null);
+  const hasHighlights = (highlights?.length ?? 0) > 0;
+  useEffect(() => {
+    if (!focusPage || hasHighlights) return;
+    const key = `${fileUrl}:${focusPage}`;
+    if (jumpedRef.current === key) return;
+    const div = pagesRef.current[focusPage - 1]?.div;
+    if (!div) return; // not rendered yet — effect re-fires as pagesReady grows
+    jumpedRef.current = key;
+    div.scrollIntoView({ behavior: "auto", block: "start" });
+  }, [focusPage, pagesReady, fileUrl, hasHighlights]);
 
   return (
     <div

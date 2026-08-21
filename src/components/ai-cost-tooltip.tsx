@@ -1,7 +1,12 @@
-import { useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Sparkles } from "lucide-react";
 import { formatUsd, formatTokens, resolveModelPrice } from "@/lib/pricing";
 import { cn } from "@/lib/utils";
+
+/** Keep in sync with the panel's w-[22rem]. */
+const PANEL_W = 352;
+const GUTTER = 8;
 
 /** One metered model call, as written to summary_json.costLog. */
 interface CostLogEntry {
@@ -60,6 +65,65 @@ export function AiCostTooltip({
 }) {
   const [open, setOpen] = useState(false);
 
+  // The panel is portalled to <body> and positioned with fixed coordinates.
+  // It cannot be absolutely positioned inside the row: every list Card is
+  // `overflow-hidden` (for its rounded corners), which clips a descendant
+  // popover so it reads as folded into the card border.
+  const wrapRef = useRef<HTMLSpanElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Anchor carries BOTH edges, so flipping upward needs no height measurement:
+  // dropping down pins `top`, flipping up pins `bottom`.
+  const [anchor, setAnchor] = useState<{ top: number; bottom: number; left: number } | null>(null);
+  const [flipUp, setFlipUp] = useState(false);
+
+  const place = () => {
+    const el = wrapRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    // Right-align to the trigger, then clamp so a wide panel stays on screen.
+    const left = Math.min(
+      Math.max(GUTTER, r.right - PANEL_W),
+      Math.max(GUTTER, window.innerWidth - PANEL_W - GUTTER),
+    );
+    setAnchor({ top: r.bottom + 6, bottom: window.innerHeight - r.top + 6, left });
+  };
+
+  const show = () => {
+    if (closeTimer.current) { clearTimeout(closeTimer.current); closeTimer.current = null; }
+    place();
+    setOpen(true);
+  };
+  // Small grace period so the pointer can travel from the icon to the panel
+  // without it closing underneath — they are no longer DOM siblings.
+  const hide = () => {
+    if (closeTimer.current) clearTimeout(closeTimer.current);
+    closeTimer.current = setTimeout(() => setOpen(false), 120);
+  };
+
+  useEffect(() => () => { if (closeTimer.current) clearTimeout(closeTimer.current); }, []);
+
+  // A fixed panel doesn't travel with the row, so re-anchor while it's open.
+  useEffect(() => {
+    if (!open) return;
+    const onMove = () => place();
+    window.addEventListener("scroll", onMove, true);
+    window.addEventListener("resize", onMove);
+    return () => {
+      window.removeEventListener("scroll", onMove, true);
+      window.removeEventListener("resize", onMove);
+    };
+  }, [open]);
+
+  // Flip above the trigger for rows near the bottom of the viewport. Sets only
+  // a boolean, so it cannot feed back into `anchor` and loop.
+  useLayoutEffect(() => {
+    if (!open || !panelRef.current || !wrapRef.current) return;
+    const h = panelRef.current.offsetHeight;
+    const r = wrapRef.current.getBoundingClientRect();
+    setFlipUp(r.bottom + 6 + h > window.innerHeight - GUTTER && r.top - h - 6 > GUTTER);
+  }, [open, anchor?.top]);
+
   const entries = Array.isArray(costLog) ? costLog : [];
   const total = entries.length
     ? entries.reduce((n, e) => n + (Number(e.usd) || 0), 0)
@@ -75,9 +139,10 @@ export function AiCostTooltip({
 
   return (
     <span
-      className={cn("relative inline-flex", className)}
-      onMouseEnter={() => setOpen(true)}
-      onMouseLeave={() => setOpen(false)}
+      ref={wrapRef}
+      className={cn("inline-flex", className)}
+      onMouseEnter={show}
+      onMouseLeave={hide}
     >
       {/* Icon only — the amount is deliberately NOT rendered here. Cost is
           operator information, not something a reviewer (or a client watching
@@ -86,17 +151,25 @@ export function AiCostTooltip({
         tabIndex={0}
         role="button"
         aria-label="AI cost — hover or focus for the breakdown"
-        onFocus={() => setOpen(true)}
-        onBlur={() => setOpen(false)}
+        onFocus={show}
+        onBlur={hide}
         className="inline-flex items-center justify-center size-6 rounded-md border border-border/70 bg-muted/40 text-muted-foreground hover:text-foreground hover:border-border transition-colors cursor-default focus:outline-none focus:ring-2 focus:ring-teal-500/30"
       >
         <Sparkles className="size-3" />
       </span>
 
-      {open && (
-        // Fixed-position-free: the row isn't overflow-clipped, and right-0
-        // keeps a wide panel inside the card on narrow screens.
-        <div className="absolute right-0 top-full z-40 mt-1.5 w-[22rem] rounded-lg border bg-popover text-popover-foreground shadow-lg p-3 text-left cursor-default">
+      {open && anchor && typeof document !== "undefined" && createPortal(
+        <div
+          ref={panelRef}
+          onMouseEnter={show}
+          onMouseLeave={hide}
+          style={{
+            position: "fixed",
+            left: anchor.left,
+            ...(flipUp ? { bottom: anchor.bottom } : { top: anchor.top }),
+          }}
+          className="z-50 w-[22rem] rounded-lg border bg-popover text-popover-foreground shadow-lg p-3 text-left cursor-default"
+        >
           <div className="flex items-baseline justify-between gap-3">
             <span className="text-xs font-bold">AI cost for this filing</span>
             <span className="text-sm font-bold tabular-nums">{formatUsd(total)}</span>
@@ -164,7 +237,8 @@ export function AiCostTooltip({
               available. Re-extract to get the itemised breakdown.
             </p>
           )}
-        </div>
+        </div>,
+        document.body,
       )}
     </span>
   );

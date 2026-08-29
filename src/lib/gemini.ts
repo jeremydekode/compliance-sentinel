@@ -21,8 +21,8 @@ const ai = new GoogleGenAI({ apiKey: process.env.GOOGLE_GENERATIVE_AI_API_KEY ||
 // (the weak tier — capable of returning an empty extraction — so it is never
 // the primary for a quality call).
 const FALLBACK_CHAINS = {
-  quality: ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-3.1-flash-lite"],
-  fast:    ["gemini-3.1-flash-lite", "gemini-3.5-flash"],
+  quality: ["gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite"],
+  fast:    ["gemini-3.1-flash-lite", "gemini-3.7-flash"],
 } as const;
 
 export type ModelTier = keyof typeof FALLBACK_CHAINS;
@@ -32,6 +32,8 @@ export type ModelTier = keyof typeof FALLBACK_CHAINS;
 // still apply automatically when it errors. The FAST tier is deliberately
 // untouched — mechanical high-volume batch calls stay on the cheap model.
 export const AVAILABLE_MODELS = [
+  "gemini-3.7-flash",
+  "gemini-3.6-flash",
   "gemini-2.5-pro",
   "gemini-3.5-flash",
   "gemini-2.5-flash",
@@ -2369,7 +2371,7 @@ Write a concise MARKDOWN briefing:
 - Then 0-6 bullets, each: **entity** — what was found, the date, and why it matters to credit risk.
 - Only CREDIBLE, on-point items — no speculation or padding. If nothing material is found, say so and note what was checked.`;
 
-  const models = ["gemini-3.5-flash", "gemini-2.5-flash"];
+  const models = ["gemini-3.7-flash", "gemini-3.5-flash"];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let response: any;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

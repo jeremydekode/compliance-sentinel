@@ -327,6 +327,107 @@ function scmFromBraceSet(raw: unknown): string | null {
   return models.size ? [...models].sort().join("+") : s;
 }
 
+/**
+ * Header-keyed rows for one sheet, cells exactly as the workbook holds them.
+ * Shared by parsePrismaWorkbook and readPrismaSourceRows so the "source row"
+ * a reviewer sees is the same data the parser consumed — not a second reading
+ * that could drift from it.
+ *
+ * blankrows:false and NO defval: the sheet's !ref spans a million phantom rows
+ * and materialising them is an OOM, not a slowdown.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function readSheetRows(XLSX: any, wb: any, name: string): Record<string, unknown>[] {
+  const ws = wb.Sheets[name];
+  if (!ws) return [];
+  const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, blankrows: false }) as unknown[][];
+  if (aoa.length > MAX_DATA_ROWS) {
+    throw new Error(`Sheet "${name}" has ${aoa.length} rows — this doesn't look like the expected PRISMA export`);
+  }
+  const [hdr, ...rows] = aoa;
+  if (!hdr) return [];
+  const keys = (hdr as unknown[]).map((h) => String(h ?? "").trim());
+  return rows
+    .filter((r) => r.some((c) => c != null && String(c).trim() !== ""))
+    .map((r) => Object.fromEntries(keys.map((k, i) => [k, r[i]])));
+}
+
+/** One cell, verbatim. `truncated` marks values clipped for transport. */
+export interface PrismaSourceCell {
+  column: string;
+  value: string;
+  truncated?: boolean;
+}
+
+export interface PrismaSourceSheet {
+  sheet: string;
+  /** Which row this is, when a sheet contributes several (e.g. one CLM row per site). */
+  label?: string;
+  cells: PrismaSourceCell[];
+}
+
+/**
+ * The rows this application was actually built from, verbatim — the audit-data
+ * row, every CLM row joined on audit_id, and the membership row.
+ *
+ * Read on demand from the stored workbook rather than kept in summary_json:
+ * these cells run to Excel's 32,767-char limit apiece across ~30 columns, and
+ * the reports list selects summary_json for every row on the page.
+ */
+export async function readPrismaSourceRows(
+  buffer: Buffer,
+  applicationNumber: string,
+  opts?: { maxCellChars?: number },
+): Promise<{ sheets: PrismaSourceSheet[]; found: boolean }> {
+  const maxChars = opts?.maxCellChars ?? 12_000;
+  const XLSX = await import("xlsx");
+  const wb = XLSX.read(buffer, { type: "buffer", dense: true });
+
+  const toCells = (row: Record<string, unknown>): PrismaSourceCell[] =>
+    Object.entries(row)
+      .filter(([, v]) => v != null && String(v).trim() !== "")
+      .map(([column, v]) => {
+        const full = String(v);
+        return full.length > maxChars
+          ? { column, value: full.slice(0, maxChars), truncated: true }
+          : { column, value: full };
+      });
+
+  const sheets: PrismaSourceSheet[] = [];
+
+  const auditRow = readSheetRows(XLSX, wb, "audit data")
+    .find((r) => String(r["application_number"] ?? "").trim() === applicationNumber);
+  if (auditRow) sheets.push({ sheet: "audit data", cells: toCells(auditRow) });
+
+  const clmRows = readSheetRows(XLSX, wb, "clm data")
+    .filter((r) => String(r["audit_id"] ?? "").trim() === applicationNumber);
+  clmRows.forEach((r, i) => {
+    const name = String(r["name"] ?? "").trim();
+    sheets.push({
+      sheet: "clm data",
+      label: name ? `${name} (row ${i + 1})` : `row ${i + 1}`,
+      cells: toCells(r),
+    });
+  });
+
+  // Membership joins through the audit row's membership number, which lives
+  // inside a repr cell — so reuse the parsed value rather than re-parsing here.
+  const membershipNumber = auditRow
+    ? (() => {
+        const raw = String(auditRow["memberships"] ?? "");
+        const m = raw.match(/'membership_number':\s*'([^']+)'/);
+        return m ? m[1] : null;
+      })()
+    : null;
+  if (membershipNumber) {
+    const memberRow = readSheetRows(XLSX, wb, "clm-membership data")
+      .find((r) => String(r["membership_number"] ?? "").trim() === membershipNumber);
+    if (memberRow) sheets.push({ sheet: "clm-membership data", cells: toCells(memberRow) });
+  }
+
+  return { sheets, found: sheets.length > 0 };
+}
+
 export async function parsePrismaWorkbook(buffer: Buffer): Promise<{
   applications: Record<string, PrismaApplication>;
   applicationNumbers: string[];
@@ -338,20 +439,7 @@ export async function parsePrismaWorkbook(buffer: Buffer): Promise<{
   const wb = XLSX.read(buffer, { type: "buffer", dense: true });
   const warnings: string[] = [];
 
-  function sheetRows(name: string): Record<string, unknown>[] {
-    const ws = wb.Sheets[name];
-    if (!ws) return [];
-    const aoa = XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, blankrows: false });
-    if (aoa.length > MAX_DATA_ROWS) {
-      throw new Error(`Sheet "${name}" has ${aoa.length} rows — this doesn't look like the expected PRISMA export`);
-    }
-    const [hdr, ...rows] = aoa;
-    if (!hdr) return [];
-    const keys = (hdr as unknown[]).map((h) => String(h ?? "").trim());
-    return rows
-      .filter((r) => r.some((c) => c != null && String(c).trim() !== ""))
-      .map((r) => Object.fromEntries(keys.map((k, i) => [k, r[i]])));
-  }
+  const sheetRows = (name: string) => readSheetRows(XLSX, wb, name);
 
   const auditRows = sheetRows("audit data");
   const clmRows = sheetRows("clm data");

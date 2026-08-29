@@ -1728,7 +1728,7 @@ ${summaryJsonCtx}`;
       .from("chat_messages")
       .insert({ report_id: data.reportId, role: "user", content: data.message });
 
-    const CHAT_MODELS = ["gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash"];
+    const CHAT_MODELS = ["gemini-3.7-flash", "gemini-3.1-flash-lite"];
 
     let buffer = "";
     let usedModel = CHAT_MODELS[0];
@@ -7661,6 +7661,45 @@ export const runRspoExtraction = createServerFn({ method: "POST" })
         .eq("id", report.id);
       throw e;
     }
+  });
+
+/**
+ * The workbook rows this application was built from, verbatim.
+ *
+ * Read on demand from the stored xlsx rather than kept in summary_json: these
+ * cells run to Excel's 32,767-char limit apiece across ~30 columns, and the
+ * reports list selects summary_json for every row on the page — caching them
+ * would slow that page down for every RSPO review to serve a panel most
+ * reviewers open occasionally.
+ */
+export const getRspoPrismaSource = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator(
+    z.object({
+      reportId: z.string().uuid(),
+      applicationNumber: z.string().min(1),
+    }),
+  )
+  .handler(async ({ data, context }) => {
+    const supabase = context.supabase;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: report, error } = await (supabase as any)
+      .from("analysis_reports")
+      .select("id, summary_json, tenant_id")
+      .eq("id", data.reportId)
+      .single();
+    if (error || !report) throw new Error("Review not found");
+    const { tenantId } = await getCallerTenant(context.userId);
+    assertRowTenant(report.tenant_id, tenantId);
+
+    const sj = (report.summary_json ?? {}) as Record<string, any>;
+    const prismaUrl = sj.rspo_files?.prismaUrl as string | undefined;
+    if (!prismaUrl) throw new Error("No PRISMA export stored for this review");
+
+    const { buffer } = await fetchFile(prismaUrl);
+    const { readPrismaSourceRows } = await import("./rspo-prisma");
+    const { sheets, found } = await readPrismaSourceRows(buffer, data.applicationNumber);
+    return { sheets, found, fileName: (sj.rspo_files?.prismaName as string) ?? null };
   });
 
 export const saveRspoVerdicts = createServerFn({ method: "POST" })

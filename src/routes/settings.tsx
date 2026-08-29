@@ -1511,8 +1511,10 @@ function ModelSettingsCard() {
   if (!isSuper) return null;
 
   const MODEL_BLURB: Record<string, string> = {
+    "gemini-3.7-flash": "Latest flash — strongest & cheapest (promo rate to 31 Dec 2026)",
+    "gemini-3.6-flash": "Previous latest flash — same promo rate as 3.7",
     "gemini-2.5-pro": "Strongest reasoning — best audit accuracy, slower & pricier",
-    "gemini-3.5-flash": "Balanced default — fast, strong, economical",
+    "gemini-3.5-flash": "Previous-gen flash — now the priciest flash tier",
     "gemini-2.5-flash": "Previous-gen balanced model",
     "gemini-3.1-flash-lite": "Cheapest & fastest — light tasks only",
   };

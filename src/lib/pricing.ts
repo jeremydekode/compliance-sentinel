@@ -42,18 +42,26 @@ export function addUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
  * prices from this one map.
  */
 export const MODEL_PRICES: Record<string, { inputUsdPer1M: number; outputUsdPer1M: number }> = {
+  // Promotional rate through 31 Dec 2026; reverts to 1.50 / 7.50 on 1 Jan 2027.
+  // ⚠ Static table — revisit before then or costs under-report by 2x.
+  "gemini-3.7-flash":      { inputUsdPer1M: 0.75, outputUsdPer1M: 3.75 },
+  "gemini-3.6-flash":      { inputUsdPer1M: 0.75, outputUsdPer1M: 3.75 },
   "gemini-2.5-pro":        { inputUsdPer1M: 1.25, outputUsdPer1M: 10.0 },
-  "gemini-3.5-flash":      { inputUsdPer1M: 0.3,  outputUsdPer1M: 2.5 },
+  // Corrected 26 Aug 2026 against ai.google.dev/gemini-api/docs/pricing —
+  // the previous 3.5-flash (0.30/2.50) and flash-lite (0.10/0.40) rates were
+  // wrong, understating shown costs ~3-5x. Historical costLogs re-price
+  // automatically since the tooltip resolves rates from this table at render.
+  "gemini-3.5-flash":      { inputUsdPer1M: 1.5,  outputUsdPer1M: 9.0 },
   "gemini-2.5-flash":      { inputUsdPer1M: 0.3,  outputUsdPer1M: 2.5 },
-  "gemini-3.1-flash-lite": { inputUsdPer1M: 0.1,  outputUsdPer1M: 0.4 },
+  "gemini-3.1-flash-lite": { inputUsdPer1M: 0.25, outputUsdPer1M: 1.5 },
   "gemini-2.0-flash":      { inputUsdPer1M: 0.1,  outputUsdPer1M: 0.4 },
 };
 
 /** Legacy single-rate constant — kept for old call sites; rates = 3.5-flash. */
 export const GEMINI_PRICE = {
   model: "gemini-3.5-flash",
-  inputUsdPer1M: 0.3,
-  outputUsdPer1M: 2.5,
+  inputUsdPer1M: 1.5,
+  outputUsdPer1M: 9.0,
 };
 
 /** A token-usage record costed out into dollars. */

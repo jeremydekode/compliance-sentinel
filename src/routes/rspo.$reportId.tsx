@@ -11,7 +11,7 @@ import {
   Download, Flag, Check, ScanSearch, FileWarning, Eye, X,
 } from "lucide-react";
 import {
-  runRspoPrismaParse, runRspoExtraction, saveRspoVerdicts,
+  runRspoPrismaParse, runRspoExtraction, saveRspoVerdicts, getRspoPrismaSource,
 } from "@/lib/compliance.functions";
 import {
   RSPO_CHECKLIST, RSPO_AREAS, CERT_TYPE_LABELS,
@@ -548,6 +548,8 @@ function RspoReviewPage() {
           result={evidenceItemId ? results.find((r) => r.itemId === evidenceItemId) : undefined}
           certificateUrl={sj.rspo_files?.certificateUrl ?? null}
           auditReportUrl={sj.rspo_files?.auditReportUrl ?? null}
+          reportId={reportId}
+          applicationNumber={sj.rspo_application_number ?? null}
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           prismaApp={sj.rspo_prisma_apps?.[sj.rspo_application_number] as any}
         />
@@ -927,6 +929,7 @@ interface PrismaApplicationLike {
 
 function RspoEvidenceOverlay({
   visible, onClose, item, result, certificateUrl, auditReportUrl, prismaApp,
+  reportId, applicationNumber,
 }: {
   visible: boolean;
   onClose: () => void;
@@ -935,6 +938,8 @@ function RspoEvidenceOverlay({
   certificateUrl: string | null;
   auditReportUrl: string | null;
   prismaApp?: PrismaApplicationLike;
+  reportId: string;
+  applicationNumber: string | null;
 }) {
   useEffect(() => {
     if (!visible) return;
@@ -981,7 +986,13 @@ function RspoEvidenceOverlay({
           <div className="flex flex-col min-h-0">
             <PaneHeader label="PRISMA" applies={!!item?.sources.includes("prisma")} />
             <div className="flex-1 min-h-0 overflow-y-auto p-4">
-              <PrismaPane app={prismaApp} value={prismaV} />
+              <PrismaPane
+                app={prismaApp}
+                value={prismaV}
+                reportId={reportId}
+                applicationNumber={applicationNumber}
+                overlayVisible={visible}
+              />
             </div>
           </div>
 
@@ -1039,14 +1050,53 @@ function EmptyPane({ text }: { text: string }) {
 }
 
 function PrismaPane({
-  app, value,
+  app, value, reportId, applicationNumber, overlayVisible,
 }: {
   app?: PrismaApplicationLike;
   value?: { value: string | null; quote?: string };
+  reportId: string;
+  applicationNumber: string | null;
+  overlayVisible: boolean;
 }) {
+  const [view, setView] = useState<"parsed" | "source">("parsed");
+  const sourceFn = useServerFn(getRspoPrismaSource);
+
+  // Fetched only once the reviewer actually asks for the source rows — the
+  // workbook is re-read server-side for this, so it isn't worth doing on the
+  // chance someone opens the panel. Cached for the session thereafter.
+  const { data: source, isLoading: sourceLoading, error: sourceError } = useQuery({
+    queryKey: ["rspo_prisma_source", reportId, applicationNumber],
+    enabled: overlayVisible && view === "source" && !!applicationNumber,
+    staleTime: Infinity,
+    queryFn: () => sourceFn({ data: { reportId, applicationNumber: applicationNumber! } }),
+  });
+
   if (!app) return <EmptyPane text="No PRISMA data" />;
   return (
     <div className="space-y-4">
+      <div className="flex items-center gap-1 rounded-lg bg-gray-100 p-0.5 w-fit">
+        {(["parsed", "source"] as const).map((v) => (
+          <button
+            key={v}
+            onClick={() => setView(v)}
+            className={cn(
+              "px-2.5 py-1 rounded-md text-[11px] font-semibold transition-colors",
+              view === v ? "bg-white text-gray-900 shadow-sm" : "text-gray-500 hover:text-gray-700",
+            )}
+          >
+            {v === "parsed" ? "Parsed record" : "Source row"}
+          </button>
+        ))}
+      </div>
+
+      {view === "source" ? (
+        <PrismaSourceView
+          loading={sourceLoading}
+          error={sourceError ? String((sourceError as Error).message ?? sourceError) : null}
+          source={source}
+        />
+      ) : (
+      <>
       {value?.value && (
         <div className="rounded-lg border border-lime-200 bg-lime-50 px-3 py-2.5">
           <div className="text-[10px] font-bold uppercase tracking-wide text-lime-700">Value used in this check</div>
@@ -1069,8 +1119,56 @@ function PrismaPane({
       </div>
       <p className="text-[11px] text-gray-400 leading-relaxed">
         PRISMA is a system export, not a paginated document — shown here as the parsed record
-        rather than a page location.
+        rather than a page location. Switch to <span className="font-semibold">Source row</span> for
+        the cells exactly as they appear in the uploaded workbook.
       </p>
+      </>
+      )}
+    </div>
+  );
+}
+
+/** The workbook cells verbatim — what the parser above was given to work with. */
+function PrismaSourceView({
+  loading, error, source,
+}: {
+  loading: boolean;
+  error: string | null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  source?: { sheets: Array<{ sheet: string; label?: string; cells: Array<{ column: string; value: string; truncated?: boolean }> }>; found: boolean; fileName: string | null };
+}) {
+  if (loading) return <p className="text-[12px] text-gray-400 italic">Reading the workbook…</p>;
+  if (error) return <p className="text-[12px] text-rose-600">Couldn't read the source rows — {error}</p>;
+  if (!source?.found) return <p className="text-[12px] text-gray-400 italic">No matching rows found in the workbook.</p>;
+
+  return (
+    <div className="space-y-4">
+      {source.fileName && (
+        <div className="text-[11px] text-gray-400 font-mono truncate">{source.fileName}</div>
+      )}
+      {source.sheets.map((sh, i) => (
+        <div key={`${sh.sheet}-${i}`}>
+          <div className="text-[10px] font-bold uppercase tracking-wide text-gray-400 mb-1.5">
+            {sh.sheet}
+            {sh.label ? <span className="normal-case font-medium text-gray-400"> · {sh.label}</span> : null}
+          </div>
+          <dl className="space-y-2">
+            {sh.cells.map((c) => (
+              <div key={c.column}>
+                <dt className="text-[10.5px] font-mono text-gray-500">{c.column}</dt>
+                <dd className="text-[11.5px] font-mono text-gray-900 whitespace-pre-wrap break-all bg-gray-50 border border-gray-200 rounded px-2 py-1.5 mt-0.5 max-h-52 overflow-y-auto">
+                  {c.value}
+                  {c.truncated && (
+                    <span className="block mt-1 text-[10px] not-italic text-amber-600 font-sans">
+                      … clipped for display — the full cell is in the workbook
+                    </span>
+                  )}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        </div>
+      ))}
     </div>
   );
 }

@@ -78,6 +78,7 @@ export const SOFP_FIELDS: FieldSpec[] = [
   { key: "totalCurrentAssets", label: "Total current assets", group: "sofp", type: "money", periodic: true },
   { key: "totalAssets", label: "Total assets", group: "sofp", type: "money", periodic: true },
   { key: "shareCapital", label: "Share capital", group: "sofp", type: "money", periodic: true },
+  { key: "numberOfShares", label: "Number of shares issued and fully paid", group: "sofp", type: "number", periodic: true },
   { key: "retainedEarnings", label: "Retained profit / (accumulated loss)", group: "sofp", type: "money", periodic: true },
   { key: "totalEquity", label: "Total equity", group: "sofp", type: "money", periodic: true },
   { key: "tradePayables", label: "Trade payables", group: "sofp", type: "money", periodic: true },
@@ -116,6 +117,7 @@ export const PL_FIELDS: FieldSpec[] = [
   // profit comes from anything but trading — QSK earned RM2.39m on RM66k of
   // revenue, essentially all of it other income.
   { key: "otherIncome", label: "Other income", group: "pl", type: "money", periodic: true },
+  { key: "costOfSales", label: "Cost of sales", group: "pl", type: "money", periodic: true, hint: "Positive number — sign is applied by the mapper" },
   { key: "otherOperatingExpenses", label: "Other operating expenses", group: "pl", type: "money", periodic: true, hint: "Positive number — sign is applied by the mapper" },
   { key: "financeCosts", label: "Finance costs", group: "pl", type: "money", periodic: true, hint: "Positive number — sign is applied by the mapper" },
 ];
@@ -131,6 +133,7 @@ export const CF_FIELDS: FieldSpec[] = [
   { key: "cfFromOperatingActivities", label: "Net cash from operating activities", group: "cf", type: "money", periodic: true },
   { key: "cfPurchaseOfPpe", label: "Purchase of property, plant and equipment", group: "cf", type: "money", periodic: true },
   { key: "cfFromInvestingActivities", label: "Net cash from investing activities", group: "cf", type: "money", periodic: true },
+  { key: "cfFromFinancingActivities", label: "Net cash from financing activities", group: "cf", type: "money", periodic: true },
   { key: "cfNetIncreaseInCash", label: "Net increase / (decrease) in cash", group: "cf", type: "money", periodic: true },
 ];
 

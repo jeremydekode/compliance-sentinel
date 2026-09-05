@@ -22,6 +22,7 @@ against a sample of that variant and extend the mapping tables below.
 import json
 import re
 import sys
+from datetime import date, timedelta
 from xml.sax.saxutils import unescape as _unescape
 
 SRC_DIR = "src/lib"
@@ -68,6 +69,13 @@ SOFP = {
     "ifrs-smes:InvestmentProperty": "investmentProperty",
     "ifrs-smes:InvestmentsInAssociates": "investmentsInAssociates",
     "ifrs-smes:Inventories": "inventories",
+    # Real concept names, learned from the multi-donor literal diff — the
+    # ifrs-smes spellings guessed earlier never appear in an actual filing.
+    "ssmt-mpers:CurrentTradeReceivables": "tradeReceivables",
+    "ssmt-mpers:NoncurrentBorrowings": "noncurrentBorrowings",
+    "ifrs-smes:ShorttermBorrowings": "currentBorrowings",
+    "ssmt-mpers:AmountOfSharesIssuedAndFullyPaidOutstanding": "shareCapital",
+    "ifrs-smes:NumberOfSharesIssuedAndFullyPaid": "numberOfShares",
     "ifrs-smes:TradeAndOtherCurrentReceivablesToTradeCustomers": "tradeReceivables",
     "ifrs-smes:NoncurrentLiabilities": "totalNoncurrentLiabilities",
     "ifrs-smes:NoncurrentPortionOfNoncurrentBorrowings": "noncurrentBorrowings",
@@ -96,6 +104,8 @@ PL = {
     "ifrs-smes:AdministrativeExpense": "administrativeExpenses",
     "ifrs-smes:OtherIncome": "otherIncome",
     "ifrs-smes:OtherOperatingExpense": "otherOperatingExpenses",
+    "ifrs-smes:OtherExpenseByFunction": "otherOperatingExpenses",
+    "ifrs-smes:CostOfSales": "costOfSales",
     "ifrs-smes:FinanceCosts": "financeCosts",
     "ifrs-smes:ProfitLossBeforeTax": "profitBeforeTax",
     "ssmt-mpers:AggregateProfitLossBeforeTax": "profitBeforeTax",
@@ -117,6 +127,7 @@ CF = {
     "ifrs-smes:CashFlowsFromUsedInOperatingActivities": "cfFromOperatingActivities",
     "ifrs-smes:PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities": "cfPurchaseOfPpe",
     "ifrs-smes:CashFlowsFromUsedInInvestingActivities": "cfFromInvestingActivities",
+    "ifrs-smes:CashFlowsFromUsedInFinancingActivities": "cfFromFinancingActivities",
     "ifrs-smes:IncreaseDecreaseInCashAndCashEquivalents": "cfNetIncreaseInCash",
     "ifrs-smes:IncreaseDecreaseInCashAndCashEquivalentsBeforeEffectOfExchangeRateChanges": "cfNetIncreaseInCash",
 }
@@ -255,26 +266,45 @@ def tsj(o):
     return json.dumps(o, separators=(",", ":"), ensure_ascii=False)
 
 
-def main(path):
+def derive_maps(raw):
+    """Per-sample date/entity tokens, read from the filing itself rather than
+    hardcoded, so any accepted filing can serve as a donor."""
+    def dei(tag):
+        m = re.search(rf"<ssmt-dei:{tag}[^>]*>([^<]+)<", raw)
+        return m.group(1).strip() if m else None
+
+    cs, ce = dei("CompanyCurrentFinancialYearStartDate"), dei("CompanyCurrentFinancialYearEndDate")
+    ps, pe = dei("CompanyPreviousFinancialYearStartDate"), dei("CompanyPreviousFinancialYearEndDate")
+    ent = re.search(r"<xbrli:identifier[^>]*>([^<]+)</xbrli:identifier>", raw).group(1).strip()
+    if not all([cs, ce, ps, pe]):
+        raise SystemExit("sample is missing the ssmt-dei period dates")
+    ppe = (date.fromisoformat(ps) - timedelta(days=1)).isoformat()
+    iso = {ce: "{CE-}", cs: "{CS-}", pe: "{PE-}", ps: "{PS-}", ppe: "{PPE-}"}
+    dates = {k.replace("-", ""): v.replace("-}", "}") for k, v in iso.items()}
+    return dates, iso, ent
+
+
+def parse_sample(path):
+    """One donor -> {(concept, ctx): entry} plus its context structures."""
+    global ISO
     raw = open(path, encoding="utf-8", errors="replace").read()
+    dates, iso, ent = derive_maps(raw)
+    ISO = iso  # resolve() and the literal tokeniser read the module-level map
 
     contexts = {
         m.group(1): " ".join(m.group(2).split())
         for m in re.finditer(r'<xbrli:context id="([^"]+)">(.*?)</xbrli:context>', raw, re.S)
     }
-
-    # Parse facts from the body with contexts and units removed, so typed-member
-    # elements nested inside a context are never mistaken for top-level facts.
     body = re.sub(r"<xbrli:context .*?</xbrli:context>", "", raw, flags=re.S)
     body = re.sub(r"<xbrli:unit .*?</xbrli:unit>", "", body, flags=re.S)
 
-    facts, bound, narrative, dropped = [], 0, 0, []
+    out, order = {}, []
     for m in FACT_RE.finditer(body):
         name, attrs, val = m.group(1), m.group(2), m.group(3).strip()
         cm = re.search(r'contextRef="([^"]+)"', attrs)
         um = re.search(r'unitRef="([^"]+)"', attrs)
         dm = re.search(r'decimals="([^"]+)"', attrs)
-        ctx = tok(cm.group(1), DATES) if cm else None
+        ctx = tok(cm.group(1), dates) if cm else None
 
         entry = {"c": name}
         if ctx:
@@ -284,37 +314,25 @@ def main(path):
         if dm:
             entry["d"] = dm.group(1)
 
-        # *Explanatory facts are the company's own narrative disclosures. They
-        # must never carry a template default — that would publish the reference
-        # company's directors' report into every other filing.
         if name.endswith("Explanatory"):
             entry["narrative"] = True
-            narrative += 1
-            facts.append(entry)
-            continue
-
-        r = resolve(name, ctx)
-        if r:
-            entry["field"] = r[0]
-            if r[1]:
-                entry["period"] = r[1]
-            bound += 1
         else:
-            literal = tok(unesc(val), {k: v for k, v in ISO.items()})
-            # A monetary literal we could not bind is the REFERENCE COMPANY's
-            # money. A structural zero is safe to reproduce; any other figure is
-            # someone else's balance and must never be filed. Dropping it leaves
-            # the fact absent, which the validator surfaces, instead of stating
-            # a false amount.
-            if entry.get("u") == "MYR" and _nonzero_money(literal):
-                dropped.append(f"{name} ({literal})")
-                continue
-            entry["v"] = literal
-        facts.append(entry)
+            r = resolve(name, ctx)
+            if r:
+                entry["field"] = r[0]
+                if r[1]:
+                    entry["period"] = r[1]
+            else:
+                entry["v"] = tok(unesc(val), iso)
+
+        key = (name, ctx)
+        if key not in out:
+            out[key] = entry
+            order.append(key)
 
     ctx_struct = {}
     for cid, cbody in contexts.items():
-        b = tok(tok(cbody, DATES), ISO).replace(ENTITY_ID, "{ENTITY}")
+        b = tok(tok(cbody, dates), iso).replace(ent, "{ENTITY}")
         inst = re.search(r"<xbrli:instant>([^<]+)</xbrli:instant>", b)
         sd = re.search(r"<xbrli:startDate>([^<]+)</xbrli:startDate>", b)
         ed = re.search(r"<xbrli:endDate>([^<]+)</xbrli:endDate>", b)
@@ -331,7 +349,55 @@ def main(path):
             e["dims"] = [[a, mm] for a, mm in ex]
         if ty:
             e["typed"] = [[a, el, v] for a, el, v in ty]
-        ctx_struct[tok(cid, DATES)] = e
+        ctx_struct[tok(cid, dates)] = e
+
+    return out, order, ctx_struct
+
+
+def main(*paths):
+    merged, order, ctx_struct = {}, [], {}
+    seen_literal = {}   # key -> set of literal values across donors
+
+    for path in paths:
+        sample, sample_order, sctx = parse_sample(path)
+        for key in sample_order:
+            e = sample[key]
+            if "v" in e:
+                seen_literal.setdefault(key, set()).add(e["v"])
+            if key not in merged:
+                merged[key] = e
+                order.append(key)
+            elif "field" in e and "field" not in merged[key]:
+                merged[key] = e     # a later donor let us bind what an earlier one could not
+        ctx_struct.update(sctx)
+
+    facts, bound, narrative, dropped, varying = [], 0, 0, [], []
+    for key in order:
+        e = merged[key]
+        name = e["c"]
+        if e.get("narrative"):
+            narrative += 1
+            facts.append(e)
+            continue
+        if "field" in e:
+            bound += 1
+            facts.append(e)
+            continue
+
+        lits = seen_literal.get(key, set())
+        # A literal that DIFFERS between donors is company data, not a constant.
+        # Emitting either one publishes one company's answer into every other
+        # filing - exactly the defect this generator shipped before. Drop it and
+        # let the fact be absent.
+        if len(lits) > 1:
+            varying.append(f"{name} ({' | '.join(sorted(lits))[:70]})")
+            continue
+        # Single-donor monetary literals are still that donor's money unless
+        # they are a structural zero.
+        if e.get("u") == "MYR" and _nonzero_money(e.get("v", "")):
+            dropped.append(f"{name} ({e['v']})")
+            continue
+        facts.append(e)
 
     header = f'''// AUTO-DERIVED from a real SSM MBRS Preparation Tool instance document
 // (FS-MPERS, taxonomy SSMxT_2022v1.0). Do not hand-edit — regenerate with:
@@ -415,15 +481,17 @@ export interface TemplateContext {{
     print(f"facts {len(facts)} (bound {bound}, narrative {narrative}, "
           f"literal {len(facts)-bound-narrative}) | contexts {len(ctx_struct)}")
     if dropped:
-        print(f"dropped {len(dropped)} unbindable monetary literals "
-              f"(reference company's figures, not ours):")
-        for d in dropped[:12]:
+        print(f"dropped {len(dropped)} unbindable monetary literals (donor's money)")
+    if varying:
+        print(f"dropped {len(varying)} literals that DIFFER between donors "
+              f"(company data, not constants):")
+        for d in varying[:80]:
             print(f"   - {d}")
     print(f"wrote {SRC_DIR}/mbrs-template.ts ({len(out)} bytes)")
     print(f"wrote {SRC_DIR}/mbrs-narratives.ts ({len(narr)} concepts)")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
+    if len(sys.argv) < 2:
         sys.exit(__doc__)
-    main(sys.argv[1])
+    main(*sys.argv[1:])

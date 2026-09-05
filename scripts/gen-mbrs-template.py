@@ -47,9 +47,12 @@ ENTITY_ID = "202101011095"
 SOFP = {
     "ifrs-smes:PropertyPlantAndEquipment": "propertyPlantAndEquipment",
     "ifrs-smes:NoncurrentAssets": "totalNoncurrentAssets",
-    "ssmt-mpers:OtherCurrentReceivables": "otherReceivables",
+    "ssmt-mpers:OtherCurrentReceivables": "otherReceivablesInclRelated",
     "ssmt-mpers:OtherCurrentReceivablesDueFromHoldingCompany": "receivablesDueFromHoldingCompany",
-    "ssmt-mpers:OtherCurrentReceivablesDueFromRelatedParties": "receivablesDueFromHoldingCompany",
+    "ssmt-mpers:OtherCurrentReceivablesDueFromRelatedParties": "receivablesDueFromRelatedParties",
+    "ifrs-smes:AmountsReceivableRelatedPartyTransactions": "receivablesDueFromRelatedParties",
+    "ifrs-smes:AmountsPayableRelatedPartyTransactions": "payablesDueToRelatedParties",
+    "ifrs-smes:Buildings": "buildings",
     "ifrs-smes:CashAndCashEquivalents": "cashAndCashEquivalents",
     "ifrs-smes:Cash": "cashAndCashEquivalents",
     "ifrs-smes:BalancesWithBanks": "cashAndCashEquivalents",
@@ -80,7 +83,7 @@ SOFP = {
     "ssmt-mpers:OtherCurrentNontradeReceivables": "otherReceivables",
     "ssmt-mpers:OtherCurrentPrepaymentsAndCurrentAccruedIncome": "prepayments",
     "ssmt-mpers:OtherCurrentNontradeDeposits": "deposits",
-    "ssmt-mpers:OtherCurrentReceivablesDueFromOtherRelatedParties": "receivablesDueFromHoldingCompany",
+    "ssmt-mpers:OtherCurrentReceivablesDueFromOtherRelatedParties": "receivablesDueFromRelatedParties",
     "ssmt-mpers:NoncurrentPortionOfNoncurrentSecuredBankLoansReceived": "noncurrentBorrowings",
     "ifrs-smes:TradeAndOtherCurrentPayables": "totalPayables",
     "ssmt-mpers:NoncurrentBorrowings": "noncurrentBorrowings",
@@ -101,7 +104,7 @@ SOFP = {
     "ssmt-mpers:CurrentNontradeAccruals": "accruals",
     "ssmt-mpers:OtherCurrentNontradePayables": "otherNontradePayables",
     "ssmt-mpers:OtherCurrentPayablesDueToHoldingCompany": "payablesDueToHoldingCompany",
-    "ssmt-mpers:OtherCurrentPayablesDueToRelatedParties": "payablesDueToHoldingCompany",
+    "ssmt-mpers:OtherCurrentPayablesDueToRelatedParties": "payablesDueToRelatedParties",
     "ifrs-smes:CurrentTaxLiabilitiesCurrent": "currentTaxLiabilities",
     "ifrs-smes:CurrentLiabilities": "totalCurrentLiabilities",
     "ifrs-smes:Liabilities": "totalLiabilities",
@@ -125,6 +128,7 @@ PL = {
     "ifrs-smes:CostOfInventories": "costOfSales",
     "ifrs-smes:FinanceCosts": "financeCosts",
     "ifrs-smes:KeyManagementPersonnelCompensation": "keyManagementCompensation",
+    "ssmt-mpers:AuditorsRemuneration": "auditorsRemuneration",
     "ssmt-mpers:DividendIncomeRelatedPartyTransactions": "relatedPartyDividendIncome",
     "ssmt-mpers:RentalExpensesRelatedPartyTransactions": "relatedPartyRentalExpense",
     "ifrs-smes:ProfitLossBeforeTax": "profitBeforeTax",
@@ -149,6 +153,9 @@ CF = {
     "ifrs-smes:PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities": "cfPurchaseOfPpe",
     "ifrs-smes:CashFlowsFromUsedInInvestingActivities": "cfFromInvestingActivities",
     "ifrs-smes:CashFlowsFromUsedInFinancingActivities": "cfFromFinancingActivities",
+    "ifrs-smes:IncomeTaxesPaidRefundClassifiedAsOperatingActivities": "incomeTaxPaid",
+    # add-back of finance costs in the operating reconciliation = the P&L line
+    "ifrs-smes:AdjustmentsForFinanceCosts": "financeCosts",
     "ifrs-smes:IncreaseDecreaseInCashAndCashEquivalents": "cfNetIncreaseInCash",
     "ifrs-smes:IncreaseDecreaseInCashAndCashEquivalentsBeforeEffectOfExchangeRateChanges": "cfNetIncreaseInCash",
 }
@@ -163,6 +170,9 @@ DEI = {
     "ssmt:NumberOfEmployees": "numberOfEmployees",
     "ssmt:TypeOfAuditorsOpinion": "auditorsOpinion",
     "ssmt:DisclosureOfStatusOfDividend": "dividendStatus",
+    "ssmt:DisclosureOfDirectorsReceivedOrBecomeEntitledToReceiveOtherBenefitsByReasonOfContractMadeByCompanyOrRelatedCorporation": "directorsOtherBenefits",
+    "ssmt:DisclosureOfContingentOrOtherLiabilityBeingEnforceableWithinTwelveMonthsAfterEndOfFinancialYear": "contingentLiabilityEnforceable",
+    "ssmt:DisclosureOfOccurenceOfAnySubstantialMaterialOrUnusualInNatureItemsTransactionsOrEvents": "materialUnusualEvents",
     "ssmt:DateOfSigningAuditorsReport": "auditorReportDate",
     "ssmt:LicenseNumberOfAuditor": "auditorLicenseNumber",
     "ssmt:NameOfAuditorSigningReport": "auditorName",
@@ -205,6 +215,13 @@ EQUITY_COMPONENTS = {
 # Both carry a per-component equity balance; EquityBalanceRestated is the
 # opening column, ifrs-smes:Equity the closing one.
 EQUITY_CONCEPTS = {"ifrs-smes:Equity", "ssmt-mpers:EquityBalanceRestated"}
+# At the {PPE} instant the same concepts mean the OPENING balance of the
+# comparative year, which lives under separate keys in the previous bag.
+OPENING_COMPONENTS = {
+    "IssuedCapitalMember": "openingShareCapital",
+    "RetainedEarningsMember": "openingRetainedEarnings",
+    "EquityAttributableToOwnersOfParentMember": "openingTotalEquity",
+}
 
 # Movement rows on the grid's total column. Profit attributable to owners is
 # profit after tax for a company with no non-controlling interests, which is
@@ -258,6 +275,10 @@ def period_of(ctx):
         return "current"
     if "{PS}_{PE}" in ctx or re.search(r"asof_\{PE\}", ctx):
         return "previous"
+    # The instant before the comparative year opens: the SOCE's earliest
+    # balance row. Belongs to the previous bag under its opening* keys.
+    if re.search(r"asof_\{PPE\}", ctx):
+        return "opening"
     return None
 
 
@@ -272,6 +293,15 @@ def resolve(concept, ctx):
     p = period_of(ctx)
     if p is None:
         return None
+    if p == "opening":
+        if concept not in EQUITY_CONCEPTS:
+            return None
+        if PLAIN_CTX.match(ctx or ""):
+            return ("openingTotalEquity", "previous")
+        for member, field in OPENING_COMPONENTS.items():
+            if (ctx or "").endswith("_" + member):
+                return (field, "previous")
+        return None
     if not PLAIN_CTX.match(ctx or ""):
         # SOCE equity columns: bind the component we can identify. Previously
         # every dimensional fact kept the reference company's literal, which is
@@ -285,7 +315,7 @@ def resolve(concept, ctx):
             for member in EQUITY_MOVEMENT_MEMBERS:
                 if (ctx or "").endswith("_" + member):
                     return (EQUITY_MOVEMENT_CONCEPTS[concept], p)
-        if concept == "ifrs-smes:ChangesInEquity" and p == "current":
+        if concept == "ifrs-smes:ChangesInEquity":
             for member, field in EQUITY_CHANGE_FIELDS.items():
                 if (ctx or "").endswith("_" + member):
                     return (field, p)

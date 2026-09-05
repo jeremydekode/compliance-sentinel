@@ -56,6 +56,9 @@ export const ENTITY_FIELDS: FieldSpec[] = [
   { key: "boardApprovalDate", label: "Date approved by the Board", group: "entity", type: "date", periodic: false, hint: "Statement by Directors / Directors' report signing date if not stated separately" },
   { key: "statutoryDeclarationDate", label: "Statutory declaration date", group: "entity", type: "date", periodic: false, hint: "Date the statutory declaration was signed before the Commissioner for Oaths" },
   { key: "circulationDate", label: "Date circulated to members", group: "entity", type: "date", periodic: false, hint: "Often stamped on the cover page — \"circulated on ...\"" },
+  { key: "directorsOtherBenefits", label: "Directors received other benefits by contract?", group: "entity", type: "text", periodic: false, hint: "Yes or No, from the Directors' Report" },
+  { key: "contingentLiabilityEnforceable", label: "Contingent liability enforceable within 12 months?", group: "entity", type: "text", periodic: false, hint: "Yes or No, from the Directors' Report" },
+  { key: "materialUnusualEvents", label: "Substantial, material or unusual items/events?", group: "entity", type: "text", periodic: false, hint: "Yes or No, from the Directors' Report" },
   { key: "dividendStatus", label: "Status of dividend", group: "entity", type: "text", periodic: false, hint: "As stated in the Directors' Report — e.g. \"Not mentioned\" or \"Mentioned but not recommended\"" },
   { key: "auditorsOpinion", label: "Auditor's opinion", group: "entity", type: "text", periodic: false, hint: "e.g. Unmodified opinion" },
   { key: "auditorName", label: "Auditor name", group: "entity", type: "text", periodic: false },
@@ -73,18 +76,24 @@ export const ENTITY_FIELDS: FieldSpec[] = [
 export const SOFP_FIELDS: FieldSpec[] = [
   { key: "propertyPlantAndEquipment", label: "Property, plant and equipment", group: "sofp", type: "money", periodic: true },
   { key: "totalNoncurrentAssets", label: "Total non-current assets", group: "sofp", type: "money", periodic: true },
-  { key: "otherReceivables", label: "Other receivables, deposits and prepayments", group: "sofp", type: "money", periodic: true, hint: "The face-of-statement figure. Do not also report the same money as trade or related-party amounts." },
-  { key: "receivablesDueFromHoldingCompany", label: "— of which due from holding company or related parties", group: "sofp", type: "money", periodic: true, hint: "Include amounts due from directors, holding company, subsidiaries and other related parties. From the receivables note." },
+  { key: "otherReceivables", label: "Other receivables, deposits and prepayments", group: "sofp", type: "money", periodic: true, hint: "EXCLUDING trade receivables and EXCLUDING amounts due from holding company or related parties. If the face shows one combined \"trade and other receivables\" line, take only the non-trade, non-related-party components from the note (deposits, prepayments, sundry receivables)." },
+  { key: "receivablesDueFromHoldingCompany", label: "— of which due from holding company", group: "sofp", type: "money", periodic: true, hint: "Holding / parent company ONLY. Breakdown inside other receivables." },
+  { key: "receivablesDueFromRelatedParties", label: "— of which due from other related parties", group: "sofp", type: "money", periodic: true, hint: "Directors, subsidiaries, associates, companies under common control — NOT the holding company. Breakdown inside other receivables." },
   { key: "cashAndCashEquivalents", label: "Cash and cash equivalents", group: "sofp", type: "money", periodic: true },
   { key: "totalCurrentAssets", label: "Total current assets", group: "sofp", type: "money", periodic: true },
   { key: "totalAssets", label: "Total assets", group: "sofp", type: "money", periodic: true },
   { key: "shareCapital", label: "Share capital", group: "sofp", type: "money", periodic: true },
+  { key: "openingShareCapital", label: "Share capital at START of period", group: "sofp", type: "money", periodic: true, hint: "Opening balance row of the statement of changes in equity" },
+  { key: "openingRetainedEarnings", label: "Retained earnings at START of period", group: "sofp", type: "money", periodic: true, hint: "Opening balance row of the statement of changes in equity" },
+  { key: "openingTotalEquity", label: "Total equity at START of period", group: "sofp", type: "money", periodic: true, hint: "Opening balance row of the statement of changes in equity" },
+  { key: "buildings", label: "— of which buildings", group: "sofp", type: "money", periodic: true, hint: "Carrying amount from the PPE note. Breakdown inside PPE, not additional to it." },
   { key: "numberOfShares", label: "Number of shares issued and fully paid", group: "sofp", type: "number", periodic: true },
   { key: "retainedEarnings", label: "Retained profit / (accumulated loss)", group: "sofp", type: "money", periodic: true },
   { key: "totalEquity", label: "Total equity", group: "sofp", type: "money", periodic: true },
   { key: "tradePayables", label: "Trade payables", group: "sofp", type: "money", periodic: true },
   { key: "otherPayablesAndAccruals", label: "Other payables and accruals", group: "sofp", type: "money", periodic: true },
-  { key: "payablesDueToHoldingCompany", label: "— of which due to holding company or related parties", group: "sofp", type: "money", periodic: true, hint: "Breakdown inside other payables, not additional to it" },
+  { key: "payablesDueToHoldingCompany", label: "— of which due to holding company", group: "sofp", type: "money", periodic: true, hint: "Holding / parent company ONLY. Breakdown inside other payables." },
+  { key: "payablesDueToRelatedParties", label: "— of which due to other related parties", group: "sofp", type: "money", periodic: true, hint: "Directors, subsidiaries, associates, companies under common control — NOT the holding company. Breakdown inside other payables." },
   { key: "accruals", label: "— of which accruals", group: "sofp", type: "money", periodic: true, hint: "From the payables note" },
   { key: "prepayments", label: "Prepayments and accrued income", group: "sofp", type: "money", periodic: true, hint: "Breakdown from the receivables note — already inside other receivables, not additional to it" },
   { key: "deposits", label: "Deposits (non-trade)", group: "sofp", type: "money", periodic: true, hint: "Breakdown from the receivables note — already inside other receivables, not additional to it" },
@@ -125,6 +134,7 @@ export const PL_FIELDS: FieldSpec[] = [
   { key: "costOfSales", label: "Cost of sales", group: "pl", type: "money", periodic: true, hint: "Positive number — sign is applied by the mapper" },
   { key: "otherOperatingExpenses", label: "Other operating expenses", group: "pl", type: "money", periodic: true, hint: "Positive number — sign is applied by the mapper" },
   { key: "financeCosts", label: "Finance costs", group: "pl", type: "money", periodic: true, hint: "Positive number — sign is applied by the mapper" },
+  { key: "auditorsRemuneration", label: "Auditors' remuneration", group: "pl", type: "money", periodic: true },
   { key: "keyManagementCompensation", label: "Key management personnel compensation", group: "pl", type: "money", periodic: true, hint: "Directors' remuneration and other key management pay, from the related-party note" },
   { key: "relatedPartyDividendIncome", label: "Dividend income from related parties", group: "pl", type: "money", periodic: true },
   { key: "relatedPartyRentalExpense", label: "Rental expense to related parties", group: "pl", type: "money", periodic: true },
@@ -134,14 +144,15 @@ export const PL_FIELDS: FieldSpec[] = [
 export const CF_FIELDS: FieldSpec[] = [
   { key: "depreciation", label: "Depreciation adjustment", group: "cf", type: "money", periodic: true },
   { key: "cfChangeInTradeReceivables", label: "Change in trade receivables", group: "cf", type: "money", periodic: true, hint: "Trade debtors only; other receivables have their own line" },
-  { key: "cfChangeInReceivables", label: "Change in receivables", group: "cf", type: "money", periodic: true },
-  { key: "cfChangeInTradePayables", label: "Change in trade payables", group: "cf", type: "money", periodic: true },
-  { key: "cfChangeInOtherPayables", label: "Change in other payables", group: "cf", type: "money", periodic: true },
+  { key: "cfChangeInReceivables", label: "Change in OTHER receivables", group: "cf", type: "money", periodic: true, hint: "Other receivables, deposits and prepayments only — NOT trade debtors, which have their own line" },
+  { key: "cfChangeInTradePayables", label: "Change in TRADE payables", group: "cf", type: "money", periodic: true, hint: "Trade creditors only — other payables have their own line" },
+  { key: "cfChangeInOtherPayables", label: "Change in OTHER payables", group: "cf", type: "money", periodic: true, hint: "Other payables and accruals only — NOT trade creditors" },
   { key: "cfTotalAdjustments", label: "Total adjustments to reconcile profit", group: "cf", type: "money", periodic: true },
   { key: "cfFromOperations", label: "Cash flows from operations", group: "cf", type: "money", periodic: true },
   { key: "cfFromOperatingActivities", label: "Net cash from operating activities", group: "cf", type: "money", periodic: true },
   { key: "cfPurchaseOfPpe", label: "Purchase of property, plant and equipment", group: "cf", type: "money", periodic: true },
   { key: "cfFromInvestingActivities", label: "Net cash from investing activities", group: "cf", type: "money", periodic: true },
+  { key: "incomeTaxPaid", label: "Income taxes paid", group: "cf", type: "money", periodic: true, hint: "Negative number as shown in the cash flow (an outflow)" },
   { key: "cfFromFinancingActivities", label: "Net cash from financing activities", group: "cf", type: "money", periodic: true },
   { key: "cfNetIncreaseInCash", label: "Net increase / (decrease) in cash", group: "cf", type: "money", periodic: true },
 ];
@@ -239,7 +250,10 @@ const DERIVED: Array<{
   // Recoverable arithmetically when the face of the statement shows only the
   // totals. QSK's RM607,211.94 of non-current liabilities was sitting derivable
   // in the extraction the whole time, while the filing declared zero.
-  { key: "totalReceivables", from: ["tradeReceivables", "otherReceivables", "receivablesDueFromHoldingCompany"] },
+  { key: "totalReceivables", from: ["tradeReceivables", "otherReceivables", "receivablesDueFromHoldingCompany", "receivablesDueFromRelatedParties"] },
+  // SSM's "other current receivables" concept is other + every related-party
+  // balance; the face line we extract excludes related parties.
+  { key: "otherReceivablesInclRelated", from: ["otherReceivables", "receivablesDueFromHoldingCompany", "receivablesDueFromRelatedParties"] },
   { key: "totalPayables", from: ["tradePayables", "otherPayablesAndAccruals"] },
   {
     key: "totalNoncurrentLiabilities",
@@ -341,7 +355,9 @@ export function normalizeExtraction(x: MbrsExtraction): MbrsExtraction {
     ...x,
     entity: normalizeEntity(x.entity ?? {}),
     current: withEquityMovements(current, previous),
-    previous,
+    // The comparative year's movement needs ITS opening balance, which only the
+    // SOCE carries — so it is derived only when the extractor read it.
+    previous: withEquityMovements(previous, {}),
   };
 }
 
@@ -355,20 +371,26 @@ export function normalizeExtraction(x: MbrsExtraction): MbrsExtraction {
  * need the balance from the year before last, which the accounts don't carry.
  */
 function withEquityMovements(current: PeriodValues, previous: PeriodValues): PeriodValues {
-  const move = (key: string): number | null => {
-    const c = num(current[key]);
-    const p = num(previous[key]);
-    return c === null || p === null ? null : c - p;
-  };
   const out = { ...current };
-  const pairs: Array<[string, string]> = [
-    ["equityMovementShareCapital", "shareCapital"],
-    ["equityMovementRetainedEarnings", "retainedEarnings"],
-    ["equityMovementTotal", "totalEquity"],
+  // The current year's opening balance IS last year's closing balance — fill
+  // it from there when the extractor didn't read it off the SOCE directly.
+  const openings: Array<[string, string]> = [
+    ["openingShareCapital", "shareCapital"],
+    ["openingRetainedEarnings", "retainedEarnings"],
+    ["openingTotalEquity", "totalEquity"],
   ];
-  for (const [target, source] of pairs) {
-    const v = move(source);
-    if (v !== null) out[target] = v;
+  for (const [opening, closing] of openings) {
+    if (num(out[opening]) === null && num(previous[closing]) !== null) out[opening] = previous[closing]!;
+  }
+  const pairs: Array<[string, string, string]> = [
+    ["equityMovementShareCapital", "shareCapital", "openingShareCapital"],
+    ["equityMovementRetainedEarnings", "retainedEarnings", "openingRetainedEarnings"],
+    ["equityMovementTotal", "totalEquity", "openingTotalEquity"],
+  ];
+  for (const [target, closing, opening] of pairs) {
+    const c = num(out[closing]);
+    const o = num(out[opening]);
+    if (c !== null && o !== null) out[target] = c - o;
   }
   return out;
 }
@@ -397,11 +419,11 @@ interface RollUp {
 const ROLLUPS: RollUp[] = [
   { total: "totalAssets", parts: ["totalNoncurrentAssets", "totalCurrentAssets"], label: "Total assets = non-current + current assets", group: "sofp" },
   { total: "totalNoncurrentAssets", parts: ["propertyPlantAndEquipment", "investmentProperty", "investmentsInAssociates", "otherNoncurrentAssets"], label: "Non-current assets = PPE + investment property + associates + other", group: "sofp" },
-  { total: "totalCurrentAssets", parts: ["inventories", "tradeReceivables", "otherReceivables", "receivablesDueFromHoldingCompany", "cashAndCashEquivalents"], label: "Current assets = inventories + receivables + cash", group: "sofp" },
+  { total: "totalCurrentAssets", parts: ["inventories", "tradeReceivables", "otherReceivables", "receivablesDueFromHoldingCompany", "receivablesDueFromRelatedParties", "cashAndCashEquivalents"], label: "Current assets = inventories + receivables + cash", group: "sofp" },
   { total: "totalLiabilities", parts: ["totalCurrentLiabilities", "totalNoncurrentLiabilities"], label: "Total liabilities = current + non-current", group: "sofp" },
   { total: "totalEquity", parts: ["shareCapital", "retainedEarnings"], label: "Equity = share capital + retained earnings", group: "sofp" },
   { total: "totalCurrentLiabilities", parts: ["tradePayables", "otherPayablesAndAccruals", "currentTaxLiabilities", "currentBorrowings"], label: "Current liabilities = trade + other payables + tax + borrowings", group: "sofp" },
-  { total: "otherPayablesAndAccruals", parts: ["payablesDueToHoldingCompany", "accruals", "otherNontradePayables"], label: "Other payables note reconciles to the face amount", group: "sofp" },
+  { total: "otherPayablesAndAccruals", parts: ["payablesDueToHoldingCompany", "payablesDueToRelatedParties", "accruals", "otherNontradePayables"], label: "Other payables note reconciles to the face amount", group: "sofp" },
   { total: "profitBeforeTax", parts: ["grossProfit", "otherIncome", "administrativeExpenses", "otherOperatingExpenses", "financeCosts"], label: "Profit before tax = gross profit + other income − expenses − finance costs", group: "pl" },
 ];
 

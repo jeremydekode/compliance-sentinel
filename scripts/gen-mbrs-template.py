@@ -164,6 +164,8 @@ DEI = {
     "ssmt:IdentificationNumberOfSecondDirectorWhoSignedStatementByDirectors": "director2Id",
     "ssmt:DateOfSigningDirectorsReport": "directorsReportDate",
     "ssmt:DateOfSigningStatementByDirectors": "directorsReportDate",
+    "ssmt:NumberOfDirectorsSigningDirectorsReport": "numberOfDirectorsSigning",
+    "ssmt:NumberOfDirectorsSigningStatementByDirectors": "numberOfDirectorsSigning",
     # These three carried the reference filing's literals (2027-12-31), while
     # the real dates sat extracted and unused.
     "ssmt:DateOfFinancialStatementsApprovedByBoardOfDirectors": "boardApprovalDate",

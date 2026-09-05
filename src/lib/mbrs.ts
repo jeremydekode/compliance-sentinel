@@ -73,7 +73,7 @@ export const SOFP_FIELDS: FieldSpec[] = [
   { key: "propertyPlantAndEquipment", label: "Property, plant and equipment", group: "sofp", type: "money", periodic: true },
   { key: "totalNoncurrentAssets", label: "Total non-current assets", group: "sofp", type: "money", periodic: true },
   { key: "otherReceivables", label: "Other receivables, deposits and prepayments", group: "sofp", type: "money", periodic: true },
-  { key: "receivablesDueFromHoldingCompany", label: "— of which due from holding company", group: "sofp", type: "money", periodic: true, hint: "From the receivables note, not the face of the statement" },
+  { key: "receivablesDueFromHoldingCompany", label: "— of which due from holding company or related parties", group: "sofp", type: "money", periodic: true, hint: "Include amounts due from directors, holding company, subsidiaries and other related parties. From the receivables note." },
   { key: "cashAndCashEquivalents", label: "Cash and cash equivalents", group: "sofp", type: "money", periodic: true },
   { key: "totalCurrentAssets", label: "Total current assets", group: "sofp", type: "money", periodic: true },
   { key: "totalAssets", label: "Total assets", group: "sofp", type: "money", periodic: true },
@@ -230,7 +230,7 @@ const DERIVED: Array<{
   // Recoverable arithmetically when the face of the statement shows only the
   // totals. QSK's RM607,211.94 of non-current liabilities was sitting derivable
   // in the extraction the whole time, while the filing declared zero.
-  { key: "totalReceivables", from: ["tradeReceivables", "otherReceivables"] },
+  { key: "totalReceivables", from: ["tradeReceivables", "otherReceivables", "receivablesDueFromHoldingCompany"] },
   {
     key: "totalNoncurrentLiabilities",
     from: ["totalLiabilities"],
@@ -267,6 +267,9 @@ function normalizeEntity(entity: EntityValues): EntityValues {
     const v = out[k];
     if (v) out[k] = v.replace(/\D/g, "");
   }
+
+  const signing = ["director1Name", "director2Name"].filter((k) => (out[k] ?? "").trim()).length;
+  if (signing > 0) out.numberOfDirectorsSigning = String(signing);
 
   const st = canonicalState(out.auditFirmState);
   if (st) out.auditFirmState = st;
@@ -384,7 +387,7 @@ interface RollUp {
 const ROLLUPS: RollUp[] = [
   { total: "totalAssets", parts: ["totalNoncurrentAssets", "totalCurrentAssets"], label: "Total assets = non-current + current assets", group: "sofp" },
   { total: "totalNoncurrentAssets", parts: ["propertyPlantAndEquipment", "investmentProperty", "investmentsInAssociates", "otherNoncurrentAssets"], label: "Non-current assets = PPE + investment property + associates + other", group: "sofp" },
-  { total: "totalCurrentAssets", parts: ["inventories", "tradeReceivables", "otherReceivables", "cashAndCashEquivalents"], label: "Current assets = inventories + receivables + cash", group: "sofp" },
+  { total: "totalCurrentAssets", parts: ["inventories", "tradeReceivables", "otherReceivables", "receivablesDueFromHoldingCompany", "cashAndCashEquivalents"], label: "Current assets = inventories + receivables + cash", group: "sofp" },
   { total: "totalLiabilities", parts: ["totalCurrentLiabilities", "totalNoncurrentLiabilities"], label: "Total liabilities = current + non-current", group: "sofp" },
   { total: "totalEquity", parts: ["shareCapital", "retainedEarnings"], label: "Equity = share capital + retained earnings", group: "sofp" },
   { total: "totalCurrentLiabilities", parts: ["tradePayables", "otherPayablesAndAccruals", "currentTaxLiabilities", "currentBorrowings"], label: "Current liabilities = trade + other payables + tax + borrowings", group: "sofp" },

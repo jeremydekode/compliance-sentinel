@@ -76,6 +76,10 @@ SOFP = {
     # Real concept names, learned from the multi-donor literal diff — the
     # ifrs-smes spellings guessed earlier never appear in an actual filing.
     "ssmt-mpers:CurrentTradeReceivables": "tradeReceivables",
+    "ssmt-mpers:OtherCurrentTradeReceivables": "tradeReceivables",
+    "ssmt-mpers:OtherCurrentNontradeReceivables": "otherReceivables",
+    "ssmt-mpers:OtherCurrentPrepaymentsAndCurrentAccruedIncome": "prepayments",
+    "ifrs-smes:TradeAndOtherCurrentPayables": "totalPayables",
     "ssmt-mpers:NoncurrentBorrowings": "noncurrentBorrowings",
     "ifrs-smes:ShorttermBorrowings": "currentBorrowings",
     "ssmt-mpers:AmountOfSharesIssuedAndFullyPaidOutstanding": "shareCapital",
@@ -102,14 +106,20 @@ SOFP = {
 }
 PL = {
     "ifrs-smes:Revenue": "revenue",
-    "ifrs-smes:RevenueFromRenderingOfServices": "revenue",
-    "ssmt-mpers:RevenueFromRenderingOfOtherServices": "revenue",
+    # Split by nature. Binding both to one "revenue" field emitted the full
+    # amount twice; every filing reports one and zero for the other.
+    "ifrs-smes:RevenueFromRenderingOfServices": "revenueFromServices",
+    "ssmt-mpers:RevenueFromRenderingOfOtherServices": "revenueFromServices",
+    "ifrs-smes:RevenueFromSaleOfGoods": "revenueFromGoods",
+    "ssmt-mpers:RevenueFromSaleOfOtherGoods": "revenueFromGoods",
     "ifrs-smes:GrossProfit": "grossProfit",
     "ifrs-smes:AdministrativeExpense": "administrativeExpenses",
     "ifrs-smes:OtherIncome": "otherIncome",
     "ifrs-smes:OtherOperatingExpense": "otherOperatingExpenses",
     "ifrs-smes:OtherExpenseByFunction": "otherOperatingExpenses",
     "ifrs-smes:CostOfSales": "costOfSales",
+    "ssmt-mpers:OtherCostOfSales": "costOfSales",
+    "ifrs-smes:CostOfInventories": "costOfSales",
     "ifrs-smes:FinanceCosts": "financeCosts",
     "ifrs-smes:ProfitLossBeforeTax": "profitBeforeTax",
     "ssmt-mpers:AggregateProfitLossBeforeTax": "profitBeforeTax",
@@ -145,6 +155,7 @@ DEI = {
     "ssmt-dei:CompanyPreviousFinancialYearEndDate": "previousPeriodEnd",
     "ssmt:NumberOfEmployees": "numberOfEmployees",
     "ssmt:TypeOfAuditorsOpinion": "auditorsOpinion",
+    "ssmt:DisclosureOfStatusOfDividend": "dividendStatus",
     "ssmt:DateOfSigningAuditorsReport": "auditorReportDate",
     "ssmt:LicenseNumberOfAuditor": "auditorLicenseNumber",
     "ssmt:NameOfAuditorSigningReport": "auditorName",

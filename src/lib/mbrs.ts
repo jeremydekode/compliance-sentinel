@@ -56,6 +56,7 @@ export const ENTITY_FIELDS: FieldSpec[] = [
   { key: "boardApprovalDate", label: "Date approved by the Board", group: "entity", type: "date", periodic: false, hint: "Statement by Directors / Directors' report signing date if not stated separately" },
   { key: "statutoryDeclarationDate", label: "Statutory declaration date", group: "entity", type: "date", periodic: false, hint: "Date the statutory declaration was signed before the Commissioner for Oaths" },
   { key: "circulationDate", label: "Date circulated to members", group: "entity", type: "date", periodic: false, hint: "Often stamped on the cover page — \"circulated on ...\"" },
+  { key: "dividendStatus", label: "Status of dividend", group: "entity", type: "text", periodic: false, hint: "As stated in the Directors' Report — e.g. \"Not mentioned\" or \"Mentioned but not recommended\"" },
   { key: "auditorsOpinion", label: "Auditor's opinion", group: "entity", type: "text", periodic: false, hint: "e.g. Unmodified opinion" },
   { key: "auditorName", label: "Auditor name", group: "entity", type: "text", periodic: false },
   { key: "auditorLicenseNumber", label: "Auditor licence no.", group: "entity", type: "text", periodic: false },
@@ -85,6 +86,7 @@ export const SOFP_FIELDS: FieldSpec[] = [
   { key: "otherPayablesAndAccruals", label: "Other payables and accruals", group: "sofp", type: "money", periodic: true },
   { key: "payablesDueToHoldingCompany", label: "— of which due to holding company", group: "sofp", type: "money", periodic: true, hint: "From the payables note" },
   { key: "accruals", label: "— of which accruals", group: "sofp", type: "money", periodic: true, hint: "From the payables note" },
+  { key: "prepayments", label: "Prepayments and accrued income", group: "sofp", type: "money", periodic: true },
   { key: "otherNontradePayables", label: "— of which other non-trade payables", group: "sofp", type: "money", periodic: true, hint: "From the payables note" },
   { key: "currentNontradePayables", label: "— non-trade payables subtotal", group: "sofp", type: "money", periodic: true, hint: "Accruals + other non-trade payables. Computed automatically if left blank." },
   { key: "currentTaxLiabilities", label: "Current tax liabilities", group: "sofp", type: "money", periodic: true },
@@ -108,6 +110,8 @@ export const SOFP_FIELDS: FieldSpec[] = [
 /** Statement of profit or loss / comprehensive income. */
 export const PL_FIELDS: FieldSpec[] = [
   { key: "revenue", label: "Revenue", group: "pl", type: "money", periodic: true },
+  { key: "revenueFromGoods", label: "— of which sale of goods", group: "pl", type: "money", periodic: true, hint: "Leave blank if the company sells services only" },
+  { key: "revenueFromServices", label: "— of which rendering of services", group: "pl", type: "money", periodic: true, hint: "Leave blank if the company sells goods only" },
   { key: "grossProfit", label: "Gross profit", group: "pl", type: "money", periodic: true },
   { key: "administrativeExpenses", label: "Administrative expenses", group: "pl", type: "money", periodic: true, hint: "Positive number — sign is applied by the mapper" },
   { key: "profitBeforeTax", label: "Profit / (loss) before tax", group: "pl", type: "money", periodic: true },
@@ -231,6 +235,7 @@ const DERIVED: Array<{
   // totals. QSK's RM607,211.94 of non-current liabilities was sitting derivable
   // in the extraction the whole time, while the filing declared zero.
   { key: "totalReceivables", from: ["tradeReceivables", "otherReceivables", "receivablesDueFromHoldingCompany"] },
+  { key: "totalPayables", from: ["tradePayables", "otherPayablesAndAccruals"] },
   {
     key: "totalNoncurrentLiabilities",
     from: ["totalLiabilities"],

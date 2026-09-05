@@ -73,7 +73,7 @@ export const ENTITY_FIELDS: FieldSpec[] = [
 export const SOFP_FIELDS: FieldSpec[] = [
   { key: "propertyPlantAndEquipment", label: "Property, plant and equipment", group: "sofp", type: "money", periodic: true },
   { key: "totalNoncurrentAssets", label: "Total non-current assets", group: "sofp", type: "money", periodic: true },
-  { key: "otherReceivables", label: "Other receivables, deposits and prepayments", group: "sofp", type: "money", periodic: true },
+  { key: "otherReceivables", label: "Other receivables, deposits and prepayments", group: "sofp", type: "money", periodic: true, hint: "The face-of-statement figure. Do not also report the same money as trade or related-party amounts." },
   { key: "receivablesDueFromHoldingCompany", label: "— of which due from holding company or related parties", group: "sofp", type: "money", periodic: true, hint: "Include amounts due from directors, holding company, subsidiaries and other related parties. From the receivables note." },
   { key: "cashAndCashEquivalents", label: "Cash and cash equivalents", group: "sofp", type: "money", periodic: true },
   { key: "totalCurrentAssets", label: "Total current assets", group: "sofp", type: "money", periodic: true },
@@ -84,9 +84,10 @@ export const SOFP_FIELDS: FieldSpec[] = [
   { key: "totalEquity", label: "Total equity", group: "sofp", type: "money", periodic: true },
   { key: "tradePayables", label: "Trade payables", group: "sofp", type: "money", periodic: true },
   { key: "otherPayablesAndAccruals", label: "Other payables and accruals", group: "sofp", type: "money", periodic: true },
-  { key: "payablesDueToHoldingCompany", label: "— of which due to holding company", group: "sofp", type: "money", periodic: true, hint: "From the payables note" },
+  { key: "payablesDueToHoldingCompany", label: "— of which due to holding company or related parties", group: "sofp", type: "money", periodic: true, hint: "Breakdown inside other payables, not additional to it" },
   { key: "accruals", label: "— of which accruals", group: "sofp", type: "money", periodic: true, hint: "From the payables note" },
-  { key: "prepayments", label: "Prepayments and accrued income", group: "sofp", type: "money", periodic: true },
+  { key: "prepayments", label: "Prepayments and accrued income", group: "sofp", type: "money", periodic: true, hint: "Breakdown from the receivables note — already inside other receivables, not additional to it" },
+  { key: "deposits", label: "Deposits (non-trade)", group: "sofp", type: "money", periodic: true, hint: "Breakdown from the receivables note — already inside other receivables, not additional to it" },
   { key: "otherNontradePayables", label: "— of which other non-trade payables", group: "sofp", type: "money", periodic: true, hint: "From the payables note" },
   { key: "currentNontradePayables", label: "— non-trade payables subtotal", group: "sofp", type: "money", periodic: true, hint: "Accruals + other non-trade payables. Computed automatically if left blank." },
   { key: "currentTaxLiabilities", label: "Current tax liabilities", group: "sofp", type: "money", periodic: true },
@@ -124,11 +125,15 @@ export const PL_FIELDS: FieldSpec[] = [
   { key: "costOfSales", label: "Cost of sales", group: "pl", type: "money", periodic: true, hint: "Positive number — sign is applied by the mapper" },
   { key: "otherOperatingExpenses", label: "Other operating expenses", group: "pl", type: "money", periodic: true, hint: "Positive number — sign is applied by the mapper" },
   { key: "financeCosts", label: "Finance costs", group: "pl", type: "money", periodic: true, hint: "Positive number — sign is applied by the mapper" },
+  { key: "keyManagementCompensation", label: "Key management personnel compensation", group: "pl", type: "money", periodic: true, hint: "Directors' remuneration and other key management pay, from the related-party note" },
+  { key: "relatedPartyDividendIncome", label: "Dividend income from related parties", group: "pl", type: "money", periodic: true },
+  { key: "relatedPartyRentalExpense", label: "Rental expense to related parties", group: "pl", type: "money", periodic: true },
 ];
 
 /** Statement of cash flows (indirect method). */
 export const CF_FIELDS: FieldSpec[] = [
   { key: "depreciation", label: "Depreciation adjustment", group: "cf", type: "money", periodic: true },
+  { key: "cfChangeInTradeReceivables", label: "Change in trade receivables", group: "cf", type: "money", periodic: true, hint: "Trade debtors only; other receivables have their own line" },
   { key: "cfChangeInReceivables", label: "Change in receivables", group: "cf", type: "money", periodic: true },
   { key: "cfChangeInTradePayables", label: "Change in trade payables", group: "cf", type: "money", periodic: true },
   { key: "cfChangeInOtherPayables", label: "Change in other payables", group: "cf", type: "money", periodic: true },
@@ -229,7 +234,7 @@ const DERIVED: Array<{
   // add-back with an obvious label, so it is computed rather than trusted.
   {
     key: "cfTotalAdjustments",
-    from: ["depreciation", "cfChangeInReceivables", "cfChangeInTradePayables", "cfChangeInOtherPayables"],
+    from: ["depreciation", "cfChangeInTradeReceivables", "cfChangeInReceivables", "cfChangeInTradePayables", "cfChangeInOtherPayables"],
   },
   // Recoverable arithmetically when the face of the statement shows only the
   // totals. QSK's RM607,211.94 of non-current liabilities was sitting derivable

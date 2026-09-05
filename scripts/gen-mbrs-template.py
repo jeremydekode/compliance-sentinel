@@ -79,6 +79,9 @@ SOFP = {
     "ssmt-mpers:OtherCurrentTradeReceivables": "tradeReceivables",
     "ssmt-mpers:OtherCurrentNontradeReceivables": "otherReceivables",
     "ssmt-mpers:OtherCurrentPrepaymentsAndCurrentAccruedIncome": "prepayments",
+    "ssmt-mpers:OtherCurrentNontradeDeposits": "deposits",
+    "ssmt-mpers:OtherCurrentReceivablesDueFromOtherRelatedParties": "receivablesDueFromHoldingCompany",
+    "ssmt-mpers:NoncurrentPortionOfNoncurrentSecuredBankLoansReceived": "noncurrentBorrowings",
     "ifrs-smes:TradeAndOtherCurrentPayables": "totalPayables",
     "ssmt-mpers:NoncurrentBorrowings": "noncurrentBorrowings",
     "ifrs-smes:ShorttermBorrowings": "currentBorrowings",
@@ -121,6 +124,9 @@ PL = {
     "ssmt-mpers:OtherCostOfSales": "costOfSales",
     "ifrs-smes:CostOfInventories": "costOfSales",
     "ifrs-smes:FinanceCosts": "financeCosts",
+    "ifrs-smes:KeyManagementPersonnelCompensation": "keyManagementCompensation",
+    "ssmt-mpers:DividendIncomeRelatedPartyTransactions": "relatedPartyDividendIncome",
+    "ssmt-mpers:RentalExpensesRelatedPartyTransactions": "relatedPartyRentalExpense",
     "ifrs-smes:ProfitLossBeforeTax": "profitBeforeTax",
     "ssmt-mpers:AggregateProfitLossBeforeTax": "profitBeforeTax",
     "ssmt-mpers:ProfitLossFromOperatingActivities": "profitBeforeTax",
@@ -134,6 +140,7 @@ PL = {
 CF = {
     "ssmt-mpers:AdjustmentsForDepreciationExpense": "depreciation",
     "ifrs-smes:AdjustmentsForDecreaseIncreaseInOtherOperatingReceivables": "cfChangeInReceivables",
+    "ifrs-smes:AdjustmentsForDecreaseIncreaseInTradeAccountReceivable": "cfChangeInTradeReceivables",
     "ifrs-smes:AdjustmentsForIncreaseDecreaseInTradeAccountPayable": "cfChangeInTradePayables",
     "ifrs-smes:AdjustmentsForIncreaseDecreaseInOtherOperatingPayables": "cfChangeInOtherPayables",
     "ifrs-smes:AdjustmentsForReconcileProfitLoss": "cfTotalAdjustments",
@@ -348,7 +355,9 @@ def parse_sample(path):
         if dm:
             entry["d"] = dm.group(1)
 
-        if name.endswith("Explanatory"):
+        if name.endswith("Explanatory") or name.split(":")[-1].startswith(
+            "DescriptionOfAccountingPolicy"
+        ):
             entry["narrative"] = True
         else:
             r = resolve(name, ctx)

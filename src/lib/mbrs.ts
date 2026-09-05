@@ -230,6 +230,7 @@ const DERIVED: Array<{
   // Recoverable arithmetically when the face of the statement shows only the
   // totals. QSK's RM607,211.94 of non-current liabilities was sitting derivable
   // in the extraction the whole time, while the filing declared zero.
+  { key: "totalReceivables", from: ["tradeReceivables", "otherReceivables"] },
   {
     key: "totalNoncurrentLiabilities",
     from: ["totalLiabilities"],
@@ -321,12 +322,42 @@ export function canonicalState(raw: string | undefined | null): string | null {
 }
 
 export function normalizeExtraction(x: MbrsExtraction): MbrsExtraction {
+  const current = deriveInto(x.current ?? {});
+  const previous = deriveInto(x.previous ?? {});
   return {
     ...x,
     entity: normalizeEntity(x.entity ?? {}),
-    current: deriveInto(x.current ?? {}),
-    previous: deriveInto(x.previous ?? {}),
+    current: withEquityMovements(current, previous),
+    previous,
   };
+}
+
+/**
+ * The statement of changes in equity is a roll-forward: each column's movement
+ * is closing minus opening. Deriving it that way is exact and survives
+ * dividends and share issues, whereas assuming "movement = profit" silently
+ * breaks for any company that distributed anything.
+ *
+ * Only the current year can be built this way — the comparative column would
+ * need the balance from the year before last, which the accounts don't carry.
+ */
+function withEquityMovements(current: PeriodValues, previous: PeriodValues): PeriodValues {
+  const move = (key: string): number | null => {
+    const c = num(current[key]);
+    const p = num(previous[key]);
+    return c === null || p === null ? null : c - p;
+  };
+  const out = { ...current };
+  const pairs: Array<[string, string]> = [
+    ["equityMovementShareCapital", "shareCapital"],
+    ["equityMovementRetainedEarnings", "retainedEarnings"],
+    ["equityMovementTotal", "totalEquity"],
+  ];
+  for (const [target, source] of pairs) {
+    const v = move(source);
+    if (v !== null) out[target] = v;
+  }
+  return out;
 }
 
 // ── validation ─────────────────────────────────────────────────────────────

@@ -46,10 +46,8 @@ ENTITY_ID = "202101011095"
 # ── concept → canonical field ──────────────────────────────────────────────
 SOFP = {
     "ifrs-smes:PropertyPlantAndEquipment": "propertyPlantAndEquipment",
-    "ifrs-smes:OtherPropertyPlantAndEquipment": "propertyPlantAndEquipment",
     "ifrs-smes:NoncurrentAssets": "totalNoncurrentAssets",
     "ssmt-mpers:OtherCurrentReceivables": "otherReceivables",
-    "ifrs-smes:TradeAndOtherCurrentReceivables": "otherReceivables",
     "ssmt-mpers:OtherCurrentReceivablesDueFromHoldingCompany": "receivablesDueFromHoldingCompany",
     "ssmt-mpers:OtherCurrentReceivablesDueFromRelatedParties": "receivablesDueFromHoldingCompany",
     "ifrs-smes:CashAndCashEquivalents": "cashAndCashEquivalents",
@@ -66,6 +64,12 @@ SOFP = {
     # company's literal, filing IOT Foresight's RM15,322 as every company's
     # total equity.
     "ifrs-smes:Equity": "totalEquity",
+    # The SOCE "total" column on a plain context: opening balance is last
+    # year's closing equity, and the movement row is the derived roll-forward.
+    "ssmt-mpers:EquityBalanceRestated": "totalEquity",
+    "ifrs-smes:ChangesInEquity": "equityMovementTotal",
+    # Face-of-statement receivables total, i.e. trade + other.
+    "ifrs-smes:TradeAndOtherCurrentReceivables": "totalReceivables",
     "ifrs-smes:InvestmentProperty": "investmentProperty",
     "ifrs-smes:InvestmentsInAssociates": "investmentsInAssociates",
     "ifrs-smes:Inventories": "inventories",
@@ -178,7 +182,9 @@ EQUITY_COMPONENTS = {
     # The "total" column of the grid.
     "EquityAttributableToOwnersOfParentMember": "totalEquity",
 }
-EQUITY_CONCEPTS = {"ifrs-smes:Equity"}
+# Both carry a per-component equity balance; EquityBalanceRestated is the
+# opening column, ifrs-smes:Equity the closing one.
+EQUITY_CONCEPTS = {"ifrs-smes:Equity", "ssmt-mpers:EquityBalanceRestated"}
 
 # Movement rows on the grid's total column. Profit attributable to owners is
 # profit after tax for a company with no non-controlling interests, which is
@@ -189,6 +195,17 @@ EQUITY_CONCEPTS = {"ifrs-smes:Equity"}
 EQUITY_MOVEMENT_CONCEPTS = {
     "ifrs-smes:ProfitLoss": "profitAfterTax",
     "ifrs-smes:ComprehensiveIncome": "profitAfterTax",
+}
+# The profit row lands in retained earnings, so both the total column and the
+# retained-earnings column carry profit after tax.
+EQUITY_MOVEMENT_MEMBERS = ("EquityAttributableToOwnersOfParentMember", "RetainedEarningsMember")
+
+# The "total movement" row: closing minus opening per component, derived in
+# mbrs.ts. Never equal to profit when a dividend or share issue occurred.
+EQUITY_CHANGE_FIELDS = {
+    "IssuedCapitalMember": "equityMovementShareCapital",
+    "RetainedEarningsMember": "equityMovementRetainedEarnings",
+    "EquityAttributableToOwnersOfParentMember": "equityMovementTotal",
 }
 
 BUSINESS_CONCEPTS = {
@@ -244,10 +261,14 @@ def resolve(concept, ctx):
             for member, field in EQUITY_COMPONENTS.items():
                 if (ctx or "").endswith("_" + member):
                     return (field, p)
-        if concept in EQUITY_MOVEMENT_CONCEPTS and (ctx or "").endswith(
-            "_EquityAttributableToOwnersOfParentMember"
-        ):
-            return (EQUITY_MOVEMENT_CONCEPTS[concept], p)
+        if concept in EQUITY_MOVEMENT_CONCEPTS:
+            for member in EQUITY_MOVEMENT_MEMBERS:
+                if (ctx or "").endswith("_" + member):
+                    return (EQUITY_MOVEMENT_CONCEPTS[concept], p)
+        if concept == "ifrs-smes:ChangesInEquity" and p == "current":
+            for member, field in EQUITY_CHANGE_FIELDS.items():
+                if (ctx or "").endswith("_" + member):
+                    return (field, p)
         return None
     for table in (SOFP, PL, CF):
         if concept in table:

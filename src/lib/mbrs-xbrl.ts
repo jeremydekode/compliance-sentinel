@@ -74,10 +74,31 @@ function resolveTokens(s: string, tokens: TokenMap): string {
   return s.replace(/\{[A-Z]+-?\}/g, (m) => tokens[m] ?? m);
 }
 
+/**
+ * SSM's tool emits every narrative disclosure as a self-contained XHTML
+ * document, and its validator expects that envelope. We were emitting bare
+ * `<p>` fragments, which is structurally wrong even when the text is right.
+ */
+function wrapNarrative(body: string): string {
+  if (!body.trim()) return "";
+  if (body.trimStart().startsWith("<?xml")) return body;
+  return [
+    '<?xml version="1.0" ?>',
+    '<html xmlns="http://www.w3.org/1999/xhtml">',
+    "<head>",
+    "<title></title>",
+    "</head>",
+    "<body style=\"font-family:'Arial';font-size:12pt;text-align:left;\">",
+    body,
+    "</body>",
+    "</html>",
+  ].join("\n");
+}
+
 function factValue(f: TemplateFact, x: MbrsExtraction): string | null {
   if (f.narrative) {
     const v = x.narratives?.[f.c];
-    return typeof v === "string" ? v : "";
+    return typeof v === "string" ? wrapNarrative(v) : "";
   }
   if (f.field) {
     if (f.period) {

@@ -61,6 +61,18 @@ SOFP = {
     "ssmt-mpers:CapitalFromOrdinaryShares": "shareCapital",
     "ifrs-smes:RetainedEarnings": "retainedEarnings",
     "ifrs-smes:EquityAttributableToOwnersOfParent": "totalEquity",
+    # WAS MISSING: plain ifrs-smes:Equity fell through to the reference
+    # company's literal, filing IOT Foresight's RM15,322 as every company's
+    # total equity.
+    "ifrs-smes:Equity": "totalEquity",
+    "ifrs-smes:InvestmentProperty": "investmentProperty",
+    "ifrs-smes:InvestmentsInAssociates": "investmentsInAssociates",
+    "ifrs-smes:Inventories": "inventories",
+    "ifrs-smes:TradeAndOtherCurrentReceivablesToTradeCustomers": "tradeReceivables",
+    "ifrs-smes:NoncurrentLiabilities": "totalNoncurrentLiabilities",
+    "ifrs-smes:NoncurrentPortionOfNoncurrentBorrowings": "noncurrentBorrowings",
+    "ifrs-smes:DeferredTaxLiabilities": "deferredTaxLiabilities",
+    "ifrs-smes:CurrentBorrowings": "currentBorrowings",
     "ssmt-mpers:OtherCurrentTradePayables": "tradePayables",
     "ifrs-smes:TradeAndOtherCurrentPayablesToTradeSuppliers": "tradePayables",
     "ssmt-mpers:OtherCurrentPayables": "otherPayablesAndAccruals",
@@ -82,6 +94,9 @@ PL = {
     "ssmt-mpers:RevenueFromRenderingOfOtherServices": "revenue",
     "ifrs-smes:GrossProfit": "grossProfit",
     "ifrs-smes:AdministrativeExpense": "administrativeExpenses",
+    "ifrs-smes:OtherIncome": "otherIncome",
+    "ifrs-smes:OtherOperatingExpense": "otherOperatingExpenses",
+    "ifrs-smes:FinanceCosts": "financeCosts",
     "ifrs-smes:ProfitLossBeforeTax": "profitBeforeTax",
     "ssmt-mpers:AggregateProfitLossBeforeTax": "profitBeforeTax",
     "ssmt-mpers:ProfitLossFromOperatingActivities": "profitBeforeTax",
@@ -134,10 +149,37 @@ DEI = {
     "ssmt:IdentificationNumberOfSecondDirectorWhoSignedStatementByDirectors": "director2Id",
     "ssmt:DateOfSigningDirectorsReport": "directorsReportDate",
     "ssmt:DateOfSigningStatementByDirectors": "directorsReportDate",
+    # These three carried the reference filing's literals (2027-12-31), while
+    # the real dates sat extracted and unused.
+    "ssmt:DateOfFinancialStatementsApprovedByBoardOfDirectors": "boardApprovalDate",
+    "ssmt:DateOfStatutoryDeclaration": "statutoryDeclarationDate",
+    "ssmt:DateOfCirculationOfFinancialStatementsAndReportsToMembers": "circulationDate",
 }
 # A company declares up to three business activities, each on its own
 # NatureOfBusinessAxis member with its OWN MSIC code and description.
 BUSINESS_SLOTS = {"BusinessOneMember": "1", "BusinessTwoMember": "2", "BusinessThreeMember": "3"}
+# Statement-of-changes-in-equity columns. The grid is a breakdown of equity by
+# component, NOT a restatement of the plain-context figure, so each column binds
+# to its own field.
+EQUITY_COMPONENTS = {
+    "IssuedCapitalMember": "shareCapital",
+    "RetainedEarningsMember": "retainedEarnings",
+    # The "total" column of the grid.
+    "EquityAttributableToOwnersOfParentMember": "totalEquity",
+}
+EQUITY_CONCEPTS = {"ifrs-smes:Equity"}
+
+# Movement rows on the grid's total column. Profit attributable to owners is
+# profit after tax for a company with no non-controlling interests, which is
+# every FS-MPERS filer. ChangesInEquity and EquityBalanceRestated are
+# deliberately NOT bound: the first also absorbs share issues and dividends,
+# the second is an opening balance whose period is ambiguous in this context
+# set — guessing either would put a wrong number back into the filing.
+EQUITY_MOVEMENT_CONCEPTS = {
+    "ifrs-smes:ProfitLoss": "profitAfterTax",
+    "ifrs-smes:ComprehensiveIncome": "profitAfterTax",
+}
+
 BUSINESS_CONCEPTS = {
     "ssmt:MSICCode": "msicCode",
     "ssmt:DescriptionOfBusiness": "businessDescription",
@@ -182,15 +224,31 @@ def resolve(concept, ctx):
     p = period_of(ctx)
     if p is None:
         return None
-    # Dimensional breakdowns (SOCE roll-forwards, related-party, share classes)
-    # stay literal — they restate figures already bound on the plain context,
-    # and binding them again would double-apply a reviewer's correction.
     if not PLAIN_CTX.match(ctx or ""):
+        # SOCE equity columns: bind the component we can identify. Previously
+        # every dimensional fact kept the reference company's literal, which is
+        # how another entity's share capital and retained earnings ended up in
+        # each filing.
+        if concept in EQUITY_CONCEPTS:
+            for member, field in EQUITY_COMPONENTS.items():
+                if (ctx or "").endswith("_" + member):
+                    return (field, p)
+        if concept in EQUITY_MOVEMENT_CONCEPTS and (ctx or "").endswith(
+            "_EquityAttributableToOwnersOfParentMember"
+        ):
+            return (EQUITY_MOVEMENT_CONCEPTS[concept], p)
         return None
     for table in (SOFP, PL, CF):
         if concept in table:
             return (table[concept], p)
     return None
+
+
+def _nonzero_money(v):
+    try:
+        return float(str(v).replace(",", "")) != 0.0
+    except ValueError:
+        return False
 
 
 def tsj(o):
@@ -210,7 +268,7 @@ def main(path):
     body = re.sub(r"<xbrli:context .*?</xbrli:context>", "", raw, flags=re.S)
     body = re.sub(r"<xbrli:unit .*?</xbrli:unit>", "", body, flags=re.S)
 
-    facts, bound, narrative = [], 0, 0
+    facts, bound, narrative, dropped = [], 0, 0, []
     for m in FACT_RE.finditer(body):
         name, attrs, val = m.group(1), m.group(2), m.group(3).strip()
         cm = re.search(r'contextRef="([^"]+)"', attrs)
@@ -242,7 +300,16 @@ def main(path):
                 entry["period"] = r[1]
             bound += 1
         else:
-            entry["v"] = tok(unesc(val), {k: v for k, v in ISO.items()})
+            literal = tok(unesc(val), {k: v for k, v in ISO.items()})
+            # A monetary literal we could not bind is the REFERENCE COMPANY's
+            # money. A structural zero is safe to reproduce; any other figure is
+            # someone else's balance and must never be filed. Dropping it leaves
+            # the fact absent, which the validator surfaces, instead of stating
+            # a false amount.
+            if entry.get("u") == "MYR" and _nonzero_money(literal):
+                dropped.append(f"{name} ({literal})")
+                continue
+            entry["v"] = literal
         facts.append(entry)
 
     ctx_struct = {}
@@ -347,6 +414,11 @@ export interface TemplateContext {{
 
     print(f"facts {len(facts)} (bound {bound}, narrative {narrative}, "
           f"literal {len(facts)-bound-narrative}) | contexts {len(ctx_struct)}")
+    if dropped:
+        print(f"dropped {len(dropped)} unbindable monetary literals "
+              f"(reference company's figures, not ours):")
+        for d in dropped[:12]:
+            print(f"   - {d}")
     print(f"wrote {SRC_DIR}/mbrs-template.ts ({len(out)} bytes)")
     print(f"wrote {SRC_DIR}/mbrs-narratives.ts ({len(narr)} concepts)")
 

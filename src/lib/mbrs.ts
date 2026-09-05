@@ -53,6 +53,9 @@ export const ENTITY_FIELDS: FieldSpec[] = [
   { key: "director2Name", label: "Second signing director", group: "entity", type: "text", periodic: false },
   { key: "director2Id", label: "Second director ID no.", group: "entity", type: "text", periodic: false },
   { key: "directorsReportDate", label: "Directors' report date", group: "entity", type: "date", periodic: false },
+  { key: "boardApprovalDate", label: "Date approved by the Board", group: "entity", type: "date", periodic: false, hint: "Statement by Directors / Directors' report signing date if not stated separately" },
+  { key: "statutoryDeclarationDate", label: "Statutory declaration date", group: "entity", type: "date", periodic: false, hint: "Date the statutory declaration was signed before the Commissioner for Oaths" },
+  { key: "circulationDate", label: "Date circulated to members", group: "entity", type: "date", periodic: false, hint: "Often stamped on the cover page — \"circulated on ...\"" },
   { key: "auditorsOpinion", label: "Auditor's opinion", group: "entity", type: "text", periodic: false, hint: "e.g. Unmodified opinion" },
   { key: "auditorName", label: "Auditor name", group: "entity", type: "text", periodic: false },
   { key: "auditorLicenseNumber", label: "Auditor licence no.", group: "entity", type: "text", periodic: false },
@@ -87,6 +90,18 @@ export const SOFP_FIELDS: FieldSpec[] = [
   { key: "totalCurrentLiabilities", label: "Total current liabilities", group: "sofp", type: "money", periodic: true },
   { key: "totalLiabilities", label: "Total liabilities", group: "sofp", type: "money", periodic: true },
   { key: "totalEquityAndLiabilities", label: "Total equity and liabilities", group: "sofp", type: "money", periodic: true },
+  // Added after the QSK / LS / Yee Fatt gap analysis: the original 20 lines were
+  // modelled on a simple services company, so an investment or trading company
+  // silently lost these balances (they were being FILED AS ZERO).
+  { key: "investmentProperty", label: "Investment property", group: "sofp", type: "money", periodic: true },
+  { key: "investmentsInAssociates", label: "Investments in associates", group: "sofp", type: "money", periodic: true },
+  { key: "otherNoncurrentAssets", label: "Other non-current assets", group: "sofp", type: "money", periodic: true },
+  { key: "inventories", label: "Inventories", group: "sofp", type: "money", periodic: true },
+  { key: "tradeReceivables", label: "Trade receivables", group: "sofp", type: "money", periodic: true, hint: "Trade debtors only — other receivables have their own line" },
+  { key: "totalNoncurrentLiabilities", label: "Total non-current liabilities", group: "sofp", type: "money", periodic: true },
+  { key: "noncurrentBorrowings", label: "— of which borrowings (non-current)", group: "sofp", type: "money", periodic: true },
+  { key: "deferredTaxLiabilities", label: "— of which deferred tax", group: "sofp", type: "money", periodic: true },
+  { key: "currentBorrowings", label: "Borrowings (current)", group: "sofp", type: "money", periodic: true },
 ];
 
 /** Statement of profit or loss / comprehensive income. */
@@ -97,6 +112,12 @@ export const PL_FIELDS: FieldSpec[] = [
   { key: "profitBeforeTax", label: "Profit / (loss) before tax", group: "pl", type: "money", periodic: true },
   { key: "taxExpense", label: "Income tax expense", group: "pl", type: "money", periodic: true },
   { key: "profitAfterTax", label: "Profit / (loss) after tax", group: "pl", type: "money", periodic: true },
+  // Without these, profit-before-tax never reconciles for a company whose
+  // profit comes from anything but trading — QSK earned RM2.39m on RM66k of
+  // revenue, essentially all of it other income.
+  { key: "otherIncome", label: "Other income", group: "pl", type: "money", periodic: true },
+  { key: "otherOperatingExpenses", label: "Other operating expenses", group: "pl", type: "money", periodic: true, hint: "Positive number — sign is applied by the mapper" },
+  { key: "financeCosts", label: "Finance costs", group: "pl", type: "money", periodic: true, hint: "Positive number — sign is applied by the mapper" },
 ];
 
 /** Statement of cash flows (indirect method). */
@@ -185,7 +206,16 @@ export const REGISTRY_ONLY_ENTITY_KEYS = [
  *  depreciation line, which is the only add-back with an obvious label). The
  *  components are what a reviewer can actually check against the page, so the
  *  components win. */
-const DERIVED: Array<{ key: string; from: string[] }> = [
+const DERIVED: Array<{
+  key: string;
+  from: string[];
+  /** Subtracted from the `from` total. */
+  minus?: string[];
+  /** Only fill when the field is absent, instead of overwriting an extracted
+   *  value. Used where the figure is normally read straight off the page and
+   *  the derivation is just a fallback. */
+  whenMissing?: boolean;
+}> = [
   { key: "currentNontradePayables", from: ["accruals", "otherNontradePayables"] },
   // Total adjustments reconciling profit to operating cash flow. Models
   // reliably read this as "the depreciation line" because that is the only
@@ -194,6 +224,15 @@ const DERIVED: Array<{ key: string; from: string[] }> = [
     key: "cfTotalAdjustments",
     from: ["depreciation", "cfChangeInReceivables", "cfChangeInTradePayables", "cfChangeInOtherPayables"],
   },
+  // Recoverable arithmetically when the face of the statement shows only the
+  // totals. QSK's RM607,211.94 of non-current liabilities was sitting derivable
+  // in the extraction the whole time, while the filing declared zero.
+  {
+    key: "totalNoncurrentLiabilities",
+    from: ["totalLiabilities"],
+    minus: ["totalCurrentLiabilities"],
+    whenMissing: true,
+  },
 ];
 
 export const DERIVED_KEYS = new Set(DERIVED.map((d) => d.key));
@@ -201,9 +240,15 @@ export const DERIVED_KEYS = new Set(DERIVED.map((d) => d.key));
 function deriveInto(values: PeriodValues): PeriodValues {
   const out = { ...values };
   for (const d of DERIVED) {
+    if (d.whenMissing && typeof out[d.key] === "number") continue;
     const parts = d.from.map((k) => out[k]);
+    const subs = (d.minus ?? []).map((k) => out[k]);
     if (parts.every((p) => typeof p !== "number")) continue;
-    out[d.key] = parts.reduce((a: number, p) => a + (typeof p === "number" ? p : 0), 0);
+    // A subtraction is only meaningful with both sides present, otherwise the
+    // "derived" figure would silently equal the gross total.
+    if (d.minus && subs.some((p) => typeof p !== "number")) continue;
+    const total = parts.reduce((a: number, p) => a + (typeof p === "number" ? p : 0), 0);
+    out[d.key] = subs.reduce((a: number, p) => a - (typeof p === "number" ? p : 0), total);
   }
   return out;
 }
@@ -218,6 +263,9 @@ function normalizeEntity(entity: EntityValues): EntityValues {
     const v = out[k];
     if (v) out[k] = v.replace(/\D/g, "");
   }
+
+  const st = canonicalState(out.auditFirmState);
+  if (st) out.auditFirmState = st;
 
   if (out.auditFirmRegistrationNumber) {
     // "AF : 1346" / "AF 1346" -> "AF1346"
@@ -240,6 +288,35 @@ function normalizeEntity(entity: EntityValues): EntityValues {
 
 /** Recomputes derived subtotals and normalises identifier formatting.
  *  Run before validating or generating XBRL. */
+/**
+ * SSM accepts only its own uppercase state names. Audited reports print the
+ * honorific form ("Pahang Darul Makmur", "Penang"), which the validator
+ * rejects, so fold them onto the controlled list.
+ */
+const STATE_CANON: Record<string, string> = {
+  "pahang": "PAHANG", "pahang darul makmur": "PAHANG",
+  "selangor": "SELANGOR", "selangor darul ehsan": "SELANGOR",
+  "johor": "JOHOR", "johor darul takzim": "JOHOR", "johore": "JOHOR",
+  "penang": "PULAU PINANG", "pulau pinang": "PULAU PINANG",
+  "perak": "PERAK", "perak darul ridzuan": "PERAK",
+  "kedah": "KEDAH", "kedah darul aman": "KEDAH",
+  "kelantan": "KELANTAN", "kelantan darul naim": "KELANTAN",
+  "melaka": "MELAKA", "malacca": "MELAKA",
+  "negeri sembilan": "NEGERI SEMBILAN", "negeri sembilan darul khusus": "NEGERI SEMBILAN",
+  "perlis": "PERLIS", "perlis indera kayangan": "PERLIS",
+  "terengganu": "TERENGGANU", "terengganu darul iman": "TERENGGANU",
+  "sabah": "SABAH", "sarawak": "SARAWAK",
+  "kuala lumpur": "WILAYAH PERSEKUTUAN KUALA LUMPUR",
+  "wilayah persekutuan kuala lumpur": "WILAYAH PERSEKUTUAN KUALA LUMPUR",
+  "labuan": "WILAYAH PERSEKUTUAN LABUAN",
+  "putrajaya": "WILAYAH PERSEKUTUAN PUTRAJAYA",
+};
+
+export function canonicalState(raw: string | undefined | null): string | null {
+  if (!raw || !raw.trim()) return null;
+  return STATE_CANON[raw.trim().toLowerCase()] ?? raw.trim().toUpperCase();
+}
+
 export function normalizeExtraction(x: MbrsExtraction): MbrsExtraction {
   return {
     ...x,
@@ -272,14 +349,16 @@ interface RollUp {
  *  These are what catch an OCR digit slip before it reaches SSM. */
 const ROLLUPS: RollUp[] = [
   { total: "totalAssets", parts: ["totalNoncurrentAssets", "totalCurrentAssets"], label: "Total assets = non-current + current assets", group: "sofp" },
-  { total: "totalCurrentAssets", parts: ["otherReceivables", "cashAndCashEquivalents"], label: "Current assets = receivables + cash", group: "sofp" },
+  { total: "totalNoncurrentAssets", parts: ["propertyPlantAndEquipment", "investmentProperty", "investmentsInAssociates", "otherNoncurrentAssets"], label: "Non-current assets = PPE + investment property + associates + other", group: "sofp" },
+  { total: "totalCurrentAssets", parts: ["inventories", "tradeReceivables", "otherReceivables", "cashAndCashEquivalents"], label: "Current assets = inventories + receivables + cash", group: "sofp" },
+  { total: "totalLiabilities", parts: ["totalCurrentLiabilities", "totalNoncurrentLiabilities"], label: "Total liabilities = current + non-current", group: "sofp" },
   { total: "totalEquity", parts: ["shareCapital", "retainedEarnings"], label: "Equity = share capital + retained earnings", group: "sofp" },
-  { total: "totalCurrentLiabilities", parts: ["tradePayables", "otherPayablesAndAccruals", "currentTaxLiabilities"], label: "Current liabilities = trade + other payables + tax", group: "sofp" },
+  { total: "totalCurrentLiabilities", parts: ["tradePayables", "otherPayablesAndAccruals", "currentTaxLiabilities", "currentBorrowings"], label: "Current liabilities = trade + other payables + tax + borrowings", group: "sofp" },
   { total: "otherPayablesAndAccruals", parts: ["payablesDueToHoldingCompany", "accruals", "otherNontradePayables"], label: "Other payables note reconciles to the face amount", group: "sofp" },
-  { total: "profitBeforeTax", parts: ["grossProfit", "administrativeExpenses"], label: "Profit before tax = gross profit − administrative expenses", group: "pl" },
+  { total: "profitBeforeTax", parts: ["grossProfit", "otherIncome", "administrativeExpenses", "otherOperatingExpenses", "financeCosts"], label: "Profit before tax = gross profit + other income − expenses − finance costs", group: "pl" },
 ];
 
-const NEGATED_PARTS = new Set(["administrativeExpenses"]);
+const NEGATED_PARTS = new Set(["administrativeExpenses", "otherOperatingExpenses", "financeCosts"]);
 
 function num(v: number | null | undefined): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;

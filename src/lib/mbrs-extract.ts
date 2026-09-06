@@ -121,6 +121,100 @@ function toStringMap(raw: unknown, allowed: Set<string>): Record<string, string>
   return out;
 }
 
+/**
+ * Fields whose only true source is a note to the accounts. The face of the
+ * statements shows a combined line ("Trade and other receivables 1,409,083"),
+ * so these can only be read from the note that itemises it.
+ */
+const NOTE_SOURCED = [
+  "tradeReceivables", "otherReceivables", "receivablesDueFromHoldingCompany",
+  "receivablesDueFromRelatedParties", "prepayments", "deposits", "inventories",
+  "tradePayables", "otherPayablesAndAccruals", "accruals", "otherNontradePayables",
+  "payablesDueToHoldingCompany", "payablesDueToRelatedParties",
+  "buildings", "officeEquipment", "noncurrentBorrowings", "currentBorrowings",
+  "deferredTaxLiabilities", "keyManagementCompensation", "auditorsRemuneration",
+  "relatedPartyDividendIncome", "relatedPartyRentalExpense",
+] as const;
+
+/**
+ * A second, narrow pass over the notes.
+ *
+ * The single whole-document pass reads the notes, but transcribes them
+ * unreliably: on one filing it returned 74,543 for a non-trade receivable the
+ * note prints as 747,493. The note itself carries the check — it prints its own
+ * total, so components that do not sum to it are provably wrong — and a pass
+ * with one job can be told to use it. Splitting this out costs about US$0.04
+ * per filing and buys a self-verifying read of the numbers most likely to be
+ * misread.
+ */
+const NOTES_SYSTEM = `You are reading ONLY the NOTES TO THE FINANCIAL STATEMENTS of a Malaysian audited report, to transcribe the note tables that break down the face-of-statement lines.
+
+Work note by note. For each note listed below:
+1. Find the note. Transcribe EVERY component line and its figure, for BOTH periods.
+2. Read the note's own printed TOTAL.
+3. ADD UP the components you transcribed and compare to that printed total.
+4. If they do not agree, you misread a digit — go back and re-read the note before answering. Report any that still disagree in "noteChecks".
+
+This arithmetic self-check is the point of this task. A component that does not reconcile to the note's printed total is wrong.
+
+HOW THE RECEIVABLE AND PAYABLE FIELDS NEST. SSM's taxonomy is a hierarchy, not a flat list. Some fields are SUBTOTALS that contain others, so a figure can legitimately appear in two places — but only in the nesting below.
+
+  tradeReceivables                  trade debtors only
+  otherReceivables                  ALL non-trade amounts EXCEPT related parties — this SUBTOTAL INCLUDES deposits and prepayments
+    deposits                        a component OF otherReceivables (report it as well, do not subtract it)
+    prepayments                     a component OF otherReceivables (report it as well, do not subtract it)
+  receivablesDueFromHoldingCompany  holding / parent company only
+  receivablesDueFromRelatedParties  directors, subsidiaries, associates, common control
+
+Before answering, run this reconciliation and fix it if it fails:
+  tradeReceivables + otherReceivables + receivablesDueFromHoldingCompany + receivablesDueFromRelatedParties  =  the receivables note's printed total
+(deposits and prepayments are NOT added again — they are already inside otherReceivables)
+
+Worked example. A note reading: trade 616,290 / non-trade 747,493 / deposits 45,300 / total 1,409,083 gives
+  tradeReceivables = 616290
+  otherReceivables = 792793   (747,493 + 45,300 — the whole non-trade subtotal)
+  deposits         = 45300    (its component, reported as well)
+and 616,290 + 792,793 = 1,409,083, which agrees with the printed total.
+
+Payables nest the same way:
+  tradePayables + otherPayablesAndAccruals + payablesDueToHoldingCompany + payablesDueToRelatedParties = the payables note's printed total
+with accruals and otherNontradePayables being components OF otherPayablesAndAccruals.
+
+Report both reconciliations in "noteChecks" whether they agree or not.
+
+CLASSIFICATION RULES — these decide which field a figure belongs to:
+- "Trade receivables" / "Trade debtors" -> tradeReceivables. Anything labelled non-trade, other, sundry -> otherReceivables.
+- "Deposits" -> deposits. "Prepayments" / "prepaid" / "accrued income" -> prepayments.
+- Amounts owing BY directors / holding company / subsidiaries / associates / related companies -> receivablesDueFromHoldingCompany (holding/parent ONLY) or receivablesDueFromRelatedParties (directors, subsidiaries, associates, common control).
+- The same split applies to payables: amounts owing TO those parties.
+- "Trade payables" / "Trade creditors" -> tradePayables. Accruals -> accruals. Other/sundry payables -> otherNontradePayables.
+- otherPayablesAndAccruals is the FACE line for other payables, EXCLUDING amounts owing to holding company / related parties.
+- From the property, plant and equipment note take the CARRYING AMOUNT (not cost, not accumulated depreciation) for: buildings (incl. showroom/factory/shoplot) and officeEquipment (office equipment, furniture and fittings).
+- Borrowings: split the current portion (currentBorrowings) from the non-current portion (noncurrentBorrowings), including bank loans, term loans, hire purchase and lease liabilities.
+- keyManagementCompensation: directors' remuneration / key management personnel compensation from the related-party or directors' remuneration note.
+- auditorsRemuneration: the auditors' remuneration figure, usually in the profit-before-tax note.
+
+RULES
+- Plain numbers only. Parentheses mean negative. A dash "-" means nil: use 0.
+- Expenses POSITIVE.
+- Two columns: LEFT/first = current period, RIGHT/second = previous. Do not swap.
+- If a note does not exist in this report, leave its fields null. Never invent a figure.
+- Report figures EXACTLY as printed. Do not round, rescale or adjust to make anything balance.
+
+OUTPUT — JSON only, no fence:
+{
+  "current":  { "<field>": <number|null>, ... },
+  "previous": { "<field>": <number|null>, ... },
+  "noteChecks": ["<note name>: components 1,409,083 vs printed total 1,409,083 — agrees", ...]
+}`;
+
+function notesFieldList(): string {
+  const specs = FINANCIAL_FIELDS.filter((f) => (NOTE_SOURCED as readonly string[]).includes(f.key));
+  return `FIELDS TO RETURN (numbers, both periods):\n${specs
+    .map((f) => `  "${f.key}" — ${f.label}${f.hint ? ` (${f.hint})` : ""}`)
+    .join("\n")}`;
+}
+
 export async function extractMbrsFromAfs(
   file: { buffer: Buffer; mimeType: string },
 ): Promise<MbrsExtractResult> {
@@ -196,6 +290,53 @@ export async function extractMbrsFromAfs(
 
   const principalActivities =
     typeof parsed.principalActivities === "string" ? parsed.principalActivities.trim() : "";
+
+  // Second pass: re-read the note tables with the arithmetic self-check. Its
+  // values win for note-sourced fields — it saw the itemised note with one job,
+  // where the first pass saw 48 pages and a hundred fields.
+  try {
+    const notesParts = ocrUsed
+      ? [
+          { text: [NOTES_SYSTEM, "", notesFieldList()].join("\n") },
+          { text: "\nThe report is attached as a scanned PDF. Read the notes with OCR, and check each note's components against its printed total before answering." },
+          { inlineData: { mimeType: file.mimeType || "application/pdf", data: file.buffer.toString("base64") } },
+        ]
+      : [
+          { text: [NOTES_SYSTEM, "", notesFieldList()].join("\n") },
+          { text: `\nAUDITED FINANCIAL STATEMENTS:\n\n${textLayer}` },
+        ];
+    const nres = await generateWithFallback({
+      contents: [{ role: "user", parts: notesParts }],
+      config: { responseMimeType: "application/json", maxOutputTokens: 16384 },
+    }, { tier: "quality" });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const nm = (nres.usageMetadata ?? {}) as any;
+    usage.inputTokens += nm.promptTokenCount ?? 0;
+    usage.outputTokens += nm.candidatesTokenCount ?? 0;
+    usage.thinkingTokens += nm.thoughtsTokenCount ?? 0;
+    usage.calls += 1;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let np: any = {};
+    try { np = JSON.parse(nres.text ?? "{}"); }
+    catch { const mm2 = (nres.text ?? "").match(/\{[\s\S]*\}/); if (mm2) { try { np = JSON.parse(mm2[0]); } catch { /* keep {} */ } } }
+
+    const nc = toNumberMap(np.current), npv = toNumberMap(np.previous);
+    for (const k of NOTE_SOURCED) {
+      if (typeof nc[k] === "number") extraction.current[k] = nc[k];
+      if (typeof npv[k] === "number") extraction.previous[k] = npv[k];
+    }
+    if (Array.isArray(np.noteChecks)) {
+      extraction.extractionNotes = [
+        ...(extraction.extractionNotes ?? []),
+        ...np.noteChecks.filter((x: unknown): x is string => typeof x === "string").slice(0, 20),
+      ];
+    }
+  } catch (err) {
+    // Non-fatal by design: the first pass already produced a usable extraction,
+    // and a filing without the refined note figures is better than no filing.
+    console.warn("MBRS notes pass failed (non-fatal):", err);
+  }
 
   return { extraction, usage, model, ocrUsed, principalActivities };
 }

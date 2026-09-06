@@ -314,6 +314,39 @@ function deriveInto(values: PeriodValues): PeriodValues {
   return out;
 }
 
+/**
+ * Fills a missing component with 0 — but only where the arithmetic PROVES it
+ * is nil, never where it is merely unknown.
+ *
+ * SSM's own filings put an explicit 0 in these boxes. Yee Fatt has no
+ * investment property, and its accepted filing says so with a zero; we left
+ * the box empty. But blanket zero-filling would be the original defect back
+ * again — of the empty boxes measured, 63 wanted a real figure and only 25
+ * wanted zero, so filling them all would file 63 false amounts.
+ *
+ * The test that separates the two: if the components we DID find already add
+ * up to the printed total, anything missing must be nil. Yee's non-current
+ * assets are 1,262,376 and its property, plant and equipment is 1,262,376 —
+ * so investment property, associates and other non-current assets are proven
+ * zero, not assumed. Where the sum does NOT reconcile, something real is
+ * missing and the box stays blank for the reviewer.
+ */
+function zeroFillProvenNil(values: PeriodValues): PeriodValues {
+  const out = { ...values };
+  for (const r of ROLLUPS) {
+    const total = num(out[r.total]);
+    if (total === null) continue;
+    const missing = r.parts.filter((p) => num(out[p]) === null);
+    if (!missing.length || missing.length === r.parts.length) continue;
+    const sum = r.parts.reduce(
+      (a, p) => a + (num(out[p]) ?? 0) * (NEGATED_PARTS.has(p) ? -1 : 1),
+      0,
+    );
+    if (Math.round(sum) === Math.round(total)) for (const p of missing) out[p] = 0;
+  }
+  return out;
+}
+
 /** Identifier fields SSM wants unpunctuated, but which are printed with
  *  separators on the page ("730516-08-5119", "AF : 1346"). Normalising here
  *  rather than in the prompt keeps it deterministic. */
@@ -382,8 +415,8 @@ export function canonicalState(raw: string | undefined | null): string | null {
 }
 
 export function normalizeExtraction(x: MbrsExtraction): MbrsExtraction {
-  const current = deriveInto(x.current ?? {});
-  const previous = deriveInto(x.previous ?? {});
+  const current = zeroFillProvenNil(deriveInto(x.current ?? {}));
+  const previous = zeroFillProvenNil(deriveInto(x.previous ?? {}));
   return {
     ...x,
     entity: normalizeEntity(x.entity ?? {}),

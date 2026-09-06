@@ -223,6 +223,36 @@ function notesFieldList(): string {
     .join("\n")}`;
 }
 
+/**
+ * A third pass for the narrative disclosures alone.
+ *
+ * Measured against the accepted filings, 42 of 75 disclosures came back under
+ * HALF the original length — one accounting policy printed 8,100 characters
+ * and we captured 183. Meaning was fine (average embedding similarity 0.911);
+ * the model was SUMMARISING because it was also juggling a hundred numeric
+ * fields in the same call. Given the single job of transcription, and its own
+ * output budget, it has room to copy the text out in full.
+ */
+const NARRATIVE_SYSTEM = `You are TRANSCRIBING sections of a Malaysian audited report into an SSM MBRS filing. You are NOT summarising.
+
+THE ONE RULE: reproduce each section IN FULL, word for word, exactly as printed. These are statutory disclosures — SSM receives what you return, and an abbreviated accounting policy is a deficient filing. If a policy note runs eight paragraphs, return eight paragraphs. Never condense, paraphrase, shorten, or write "..." / "and so on" / "[continues]".
+
+- Copy every paragraph of the section, including sub-headings and numbered or lettered sub-paragraphs.
+- Where a note runs across several pages, follow it to its end.
+- Keep the wording verbatim, including any spelling the report itself uses.
+- Simple HTML only: <p>, <b>, <ul>, <li>. One <p> per paragraph.
+- Do not include the figures TABLE inside a note — the numbers are captured separately. Do include the words around it.
+- If a section genuinely does not appear anywhere in the report, return an empty string for that key. Never invent disclosure text, and never substitute a generic policy.
+
+EACH KEY COVERS ITS OWN SECTION ONLY — never the whole chapter it sits in. The same text must not appear under two keys.
+- "DisclosureOfSignificantAccountingPoliciesExplanatory" is ONLY the short introductory paragraph that opens the accounting-policies note (typically one or two sentences, e.g. that the policies below have been applied consistently). It is NOT the policies themselves.
+- Each individual policy goes under its OWN key: "DescriptionOfAccountingPolicyForPropertyPlantAndEquipmentExplanatory", "...ForIncomeTaxExplanatory", "...ForRecognitionOfRevenue", and so on. Put each policy under the key that names it, and nowhere else.
+- Likewise "DisclosureOfOtherNotesToAccountsExplanatory" is for notes that have no key of their own — not a dumping ground for notes that do.
+A returned section running to many thousands of characters is a sign you have swept in neighbouring sections; re-read and return only the section the key names.
+
+OUTPUT — JSON only, no fence:
+{ "narratives": { "<concept>": "<full text>", ... } }`;
+
 export async function extractMbrsFromAfs(
   file: { buffer: Buffer; mimeType: string },
 ): Promise<MbrsExtractResult> {
@@ -344,6 +374,54 @@ export async function extractMbrsFromAfs(
     // Non-fatal by design: the first pass already produced a usable extraction,
     // and a filing without the refined note figures is better than no filing.
     console.warn("MBRS notes pass failed (non-fatal):", err);
+  }
+
+  // Third pass: the narrative disclosures, transcribed in full. Kept only when
+  // it returns MORE text than the first pass — a shorter answer means this pass
+  // summarised too, and the fuller text is the better filing either way.
+  try {
+    const narrParts = ocrUsed
+      ? [
+          { text: [NARRATIVE_SYSTEM, "", narrativeBrief()].join("\n") },
+          { text: "\nThe report is attached as a scanned PDF. Read it with OCR and transcribe each section in full." },
+          { inlineData: { mimeType: file.mimeType || "application/pdf", data: file.buffer.toString("base64") } },
+        ]
+      : [
+          { text: [NARRATIVE_SYSTEM, "", narrativeBrief()].join("\n") },
+          { text: `\nAUDITED FINANCIAL STATEMENTS:\n\n${textLayer}` },
+        ];
+    const rres = await generateWithFallback({
+      contents: [{ role: "user", parts: narrParts }],
+      config: { responseMimeType: "application/json", maxOutputTokens: 65536, temperature: 0 },
+    }, { tier: "quality" });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rm = (rres.usageMetadata ?? {}) as any;
+    usage.inputTokens += rm.promptTokenCount ?? 0;
+    usage.outputTokens += rm.candidatesTokenCount ?? 0;
+    usage.thinkingTokens += rm.thoughtsTokenCount ?? 0;
+    usage.calls += 1;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let rp: any = {};
+    try { rp = JSON.parse(rres.text ?? "{}"); }
+    catch { const m3 = (rres.text ?? "").match(/\{[\s\S]*\}/); if (m3) { try { rp = JSON.parse(m3[0]); } catch { /* keep {} */ } } }
+
+    const fuller = toStringMap(rp.narratives, new Set(NARRATIVE_CONCEPTS));
+    let improved = 0;
+    for (const [k, v] of Object.entries(fuller)) {
+      if (typeof v === "string" && v.trim().length > (extraction.narratives[k] ?? "").length) {
+        extraction.narratives[k] = v;
+        improved += 1;
+      }
+    }
+    if (improved) {
+      extraction.extractionNotes = [
+        ...(extraction.extractionNotes ?? []),
+        `Narrative pass returned fuller text for ${improved} disclosure(s).`,
+      ];
+    }
+  } catch (err) {
+    console.warn("MBRS narrative pass failed (non-fatal):", err);
   }
 
   return { extraction, usage, model, ocrUsed, principalActivities };

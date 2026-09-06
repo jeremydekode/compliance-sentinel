@@ -124,6 +124,7 @@ export const SOFP_FIELDS: FieldSpec[] = [
   { key: "investmentProperty", label: "Investment property", group: "sofp", type: "money", periodic: true },
   { key: "investmentsInAssociates", label: "Investments in associates", group: "sofp", type: "money", periodic: true },
   { key: "otherNoncurrentAssets", label: "Other non-current assets", group: "sofp", type: "money", periodic: true },
+  { key: "otherInvestments", label: "Other investments (non-current)", group: "sofp", type: "money", periodic: true, hint: "Investments not accounted for by the equity method — quoted/unquoted shares, funds" },
   { key: "inventories", label: "Inventories", group: "sofp", type: "money", periodic: true },
   { key: "tradeReceivables", label: "Trade receivables", group: "sofp", type: "money", periodic: true, hint: "Trade debtors only — other receivables have their own line" },
   { key: "totalNoncurrentLiabilities", label: "Total non-current liabilities", group: "sofp", type: "money", periodic: true },
@@ -147,7 +148,11 @@ export const PL_FIELDS: FieldSpec[] = [
   // Without these, profit-before-tax never reconciles for a company whose
   // profit comes from anything but trading — QSK earned RM2.39m on RM66k of
   // revenue, essentially all of it other income.
-  { key: "otherIncome", label: "Other income", group: "pl", type: "money", periodic: true },
+  { key: "otherIncome", label: "Other income (total)", group: "pl", type: "money", periodic: true },
+  { key: "rentalIncome", label: "— of which rental income", group: "pl", type: "money", periodic: true, hint: "Component INSIDE other income, reported separately as well" },
+  { key: "dividendIncome", label: "— of which dividend income", group: "pl", type: "money", periodic: true, hint: "Component INSIDE other income, reported separately as well" },
+  { key: "interestIncome", label: "— of which interest income", group: "pl", type: "money", periodic: true, hint: "Component INSIDE other income, reported separately as well" },
+  { key: "gainsOnDisposal", label: "— of which gain on disposal of assets", group: "pl", type: "money", periodic: true, hint: "Component INSIDE other income. Positive for a gain." },
   { key: "costOfSales", label: "Cost of sales", group: "pl", type: "money", periodic: true, hint: "Positive number — sign is applied by the mapper" },
   { key: "otherOperatingExpenses", label: "Other operating expenses", group: "pl", type: "money", periodic: true, hint: "Positive number — sign is applied by the mapper" },
   { key: "sellingAndDistributionExpenses", label: "Selling and distribution expenses", group: "pl", type: "money", periodic: true, hint: "Positive number — sign is applied by the mapper. Leave blank if the statement has no such line." },
@@ -446,7 +451,7 @@ interface RollUp {
  *  These are what catch an OCR digit slip before it reaches SSM. */
 const ROLLUPS: RollUp[] = [
   { total: "totalAssets", parts: ["totalNoncurrentAssets", "totalCurrentAssets"], label: "Total assets = non-current + current assets", group: "sofp" },
-  { total: "totalNoncurrentAssets", parts: ["propertyPlantAndEquipment", "investmentProperty", "investmentsInAssociates", "otherNoncurrentAssets"], label: "Non-current assets = PPE + investment property + associates + other", group: "sofp" },
+  { total: "totalNoncurrentAssets", parts: ["propertyPlantAndEquipment", "investmentProperty", "investmentsInAssociates", "otherInvestments", "otherNoncurrentAssets"], label: "Non-current assets = PPE + investment property + associates + investments + other", group: "sofp" },
   { total: "totalCurrentAssets", parts: ["inventories", "tradeReceivables", "otherReceivables", "prepayments", "receivablesDueFromHoldingCompany", "receivablesDueFromRelatedParties", "currentTaxAssets", "cashAndCashEquivalents"], label: "Current assets = inventories + receivables + cash", group: "sofp" },
   { total: "totalLiabilities", parts: ["totalCurrentLiabilities", "totalNoncurrentLiabilities"], label: "Total liabilities = current + non-current", group: "sofp" },
   { total: "totalEquity", parts: ["shareCapital", "retainedEarnings"], label: "Equity = share capital + retained earnings", group: "sofp" },

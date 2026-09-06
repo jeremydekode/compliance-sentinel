@@ -200,6 +200,7 @@ CLASSIFICATION RULES — these decide which field a figure belongs to:
     currentBorrowings / noncurrentBorrowings = ALL borrowings for that portion, including bank loans, term loans, hire purchase and lease liabilities.
     currentBankLoans / noncurrentBankLoans  = bank and term loans ONLY for that portion — exclude hire purchase and lease liabilities. Read them from the bank-borrowings note, not the lease note.
 - keyManagementCompensation: directors' remuneration / key management personnel compensation from the related-party or directors' remuneration note.
+- OTHER INCOME nests like the receivables note. otherIncome is the TOTAL; rentalIncome, dividendIncome, interestIncome and gainsOnDisposal are components INSIDE it — report each as well, and do not subtract them from the total. Read them from the other-income note, which itemises them. For a company whose profit comes mostly from investments this note carries the bulk of the profit, so it is worth finding.
 - auditorsRemuneration: the auditors' remuneration figure, usually in the profit-before-tax note.
 
 RULES

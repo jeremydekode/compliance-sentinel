@@ -443,7 +443,7 @@ const ROLLUPS: RollUp[] = [
   { total: "totalCurrentAssets", parts: ["inventories", "tradeReceivables", "otherReceivables", "prepayments", "receivablesDueFromHoldingCompany", "receivablesDueFromRelatedParties", "cashAndCashEquivalents"], label: "Current assets = inventories + receivables + cash", group: "sofp" },
   { total: "totalLiabilities", parts: ["totalCurrentLiabilities", "totalNoncurrentLiabilities"], label: "Total liabilities = current + non-current", group: "sofp" },
   { total: "totalEquity", parts: ["shareCapital", "retainedEarnings"], label: "Equity = share capital + retained earnings", group: "sofp" },
-  { total: "totalCurrentLiabilities", parts: ["tradePayables", "otherPayablesAndAccruals", "currentTaxLiabilities", "currentBorrowings"], label: "Current liabilities = trade + other payables + tax + borrowings", group: "sofp" },
+  { total: "totalCurrentLiabilities", parts: ["tradePayables", "otherPayablesAndAccruals", "payablesDueToHoldingCompany", "payablesDueToRelatedParties", "currentTaxLiabilities", "currentBorrowings"], label: "Current liabilities = trade + other payables + related parties + tax + borrowings", group: "sofp" },
   { total: "otherPayablesAndAccruals", parts: ["accruals", "otherNontradePayables"], label: "Other payables note reconciles to the face amount", group: "sofp" },
   { total: "profitBeforeTax", parts: ["grossProfit", "otherIncome", "administrativeExpenses", "otherOperatingExpenses", "financeCosts"], label: "Profit before tax = gross profit + other income − expenses − finance costs", group: "pl" },
 ];

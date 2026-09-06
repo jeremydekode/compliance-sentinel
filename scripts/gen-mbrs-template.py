@@ -126,6 +126,7 @@ PL = {
     "ifrs-smes:OtherIncome": "otherIncome",
     "ifrs-smes:OtherOperatingExpense": "otherOperatingExpenses",
     "ifrs-smes:OtherExpenseByFunction": "otherOperatingExpenses",
+    "ssmt-mpers:SellingAndDistributionExpenses": "sellingAndDistributionExpenses",
     "ifrs-smes:CostOfSales": "costOfSales",
     "ssmt-mpers:OtherCostOfSales": "costOfSales",
     "ifrs-smes:CostOfInventories": "costOfSales",

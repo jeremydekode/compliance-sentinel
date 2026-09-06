@@ -146,6 +146,7 @@ export const PL_FIELDS: FieldSpec[] = [
   { key: "otherIncome", label: "Other income", group: "pl", type: "money", periodic: true },
   { key: "costOfSales", label: "Cost of sales", group: "pl", type: "money", periodic: true, hint: "Positive number — sign is applied by the mapper" },
   { key: "otherOperatingExpenses", label: "Other operating expenses", group: "pl", type: "money", periodic: true, hint: "Positive number — sign is applied by the mapper" },
+  { key: "sellingAndDistributionExpenses", label: "Selling and distribution expenses", group: "pl", type: "money", periodic: true, hint: "Positive number — sign is applied by the mapper. Leave blank if the statement has no such line." },
   { key: "financeCosts", label: "Finance costs", group: "pl", type: "money", periodic: true, hint: "Positive number — sign is applied by the mapper" },
   { key: "auditorsRemuneration", label: "Auditors' remuneration", group: "pl", type: "money", periodic: true },
   { key: "keyManagementCompensation", label: "Key management personnel compensation", group: "pl", type: "money", periodic: true, hint: "Directors' remuneration and other key management pay, from the related-party note" },
@@ -446,10 +447,10 @@ const ROLLUPS: RollUp[] = [
   { total: "totalEquity", parts: ["shareCapital", "retainedEarnings"], label: "Equity = share capital + retained earnings", group: "sofp" },
   { total: "totalCurrentLiabilities", parts: ["tradePayables", "otherPayablesAndAccruals", "payablesDueToHoldingCompany", "payablesDueToRelatedParties", "currentTaxLiabilities", "currentBorrowings"], label: "Current liabilities = trade + other payables + related parties + tax + borrowings", group: "sofp" },
   { total: "otherPayablesAndAccruals", parts: ["accruals", "otherNontradePayables"], label: "Other payables note reconciles to the face amount", group: "sofp" },
-  { total: "profitBeforeTax", parts: ["grossProfit", "otherIncome", "administrativeExpenses", "otherOperatingExpenses", "financeCosts"], label: "Profit before tax = gross profit + other income − expenses − finance costs", group: "pl" },
+  { total: "profitBeforeTax", parts: ["grossProfit", "otherIncome", "administrativeExpenses", "sellingAndDistributionExpenses", "otherOperatingExpenses", "financeCosts"], label: "Profit before tax = gross profit + other income − expenses − finance costs", group: "pl" },
 ];
 
-const NEGATED_PARTS = new Set(["administrativeExpenses", "otherOperatingExpenses", "financeCosts"]);
+const NEGATED_PARTS = new Set(["administrativeExpenses", "sellingAndDistributionExpenses", "otherOperatingExpenses", "financeCosts"]);
 
 function num(v: number | null | undefined): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;

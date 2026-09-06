@@ -741,6 +741,8 @@ export const TEMPLATE_FACTS: TemplateFact[] = [
   {"c":"ssmt-mpers:OtherBalancesWithRelatedParties","ctx":"asof_{CE}_SeparateMember","u":"MYR","d":"0","v":"0"},
   {"c":"ifrs-smes:DeferredTaxLiabilities","ctx":"asof_{CE}_SeparateMember","u":"MYR","d":"0","field":"deferredTaxLiabilities","period":"current"},
   {"c":"ifrs-smes:DeferredTaxLiabilities","ctx":"asof_{PE}_SeparateMember","u":"MYR","d":"0","field":"deferredTaxLiabilities","period":"previous"},
+  {"c":"ssmt-mpers:OfficeEquipmentFixtureAndFittings","ctx":"asof_{CE}_SeparateMember","u":"MYR","d":"0","field":"officeEquipment","period":"current"},
+  {"c":"ssmt-mpers:OfficeEquipmentFixtureAndFittings","ctx":"asof_{PE}_SeparateMember","u":"MYR","d":"0","field":"officeEquipment","period":"previous"},
   {"c":"ssmt-mpers:InvestmentPropertyFreeholdLandAndBuilding","ctx":"asof_{CE}_SeparateMember","u":"MYR","d":"0","v":"0"},
   {"c":"ssmt-mpers:OtherCurrentTradeReceivables","ctx":"asof_{CE}_SeparateMember","u":"MYR","d":"0","field":"tradeReceivables","period":"current"},
   {"c":"ssmt-mpers:OtherCurrentTradeReceivables","ctx":"asof_{PE}_SeparateMember","u":"MYR","d":"0","field":"tradeReceivables","period":"previous"},

@@ -96,6 +96,7 @@ export const SOFP_FIELDS: FieldSpec[] = [
   { key: "openingRetainedEarnings", label: "Retained earnings at START of period", group: "sofp", type: "money", periodic: true, hint: "Opening balance row of the statement of changes in equity" },
   { key: "openingTotalEquity", label: "Total equity at START of period", group: "sofp", type: "money", periodic: true, hint: "Opening balance row of the statement of changes in equity" },
   { key: "buildings", label: "— of which buildings", group: "sofp", type: "money", periodic: true, hint: "Carrying amount from the PPE note. Breakdown inside PPE, not additional to it." },
+  { key: "officeEquipment", label: "— of which office equipment, fixtures and fittings", group: "sofp", type: "money", periodic: true, hint: "Carrying amount from the PPE note. Breakdown inside PPE, not additional to it." },
   { key: "numberOfShares", label: "Number of shares issued and fully paid", group: "sofp", type: "number", periodic: true },
   { key: "retainedEarnings", label: "Retained profit / (accumulated loss)", group: "sofp", type: "money", periodic: true },
   { key: "totalEquity", label: "Total equity", group: "sofp", type: "money", periodic: true },
@@ -152,10 +153,10 @@ export const PL_FIELDS: FieldSpec[] = [
 /** Statement of cash flows (indirect method). */
 export const CF_FIELDS: FieldSpec[] = [
   { key: "depreciation", label: "Depreciation adjustment", group: "cf", type: "money", periodic: true },
-  { key: "cfChangeInTradeReceivables", label: "Change in trade receivables", group: "cf", type: "money", periodic: true, hint: "Trade debtors only; other receivables have their own line" },
-  { key: "cfChangeInReceivables", label: "Change in OTHER receivables", group: "cf", type: "money", periodic: true, hint: "Other receivables, deposits and prepayments only — NOT trade debtors, which have their own line" },
+  { key: "cfChangeInTradeReceivables", label: "Cash flow: movement in TRADE receivables", group: "cf", type: "money", periodic: true, hint: "From the cash-flow statement. If it shows separate lines for trade and other receivables, fill BOTH this and the other-receivables line. If it shows only ONE combined line, put it here and leave the other blank." },
+  { key: "cfChangeInReceivables", label: "Cash flow: movement in OTHER receivables", group: "cf", type: "money", periodic: true, hint: "Only when the cash-flow statement shows a SEPARATE line for other receivables/deposits/prepayments. Leave blank if there is a single combined receivables line." },
   { key: "cfChangeInTradePayables", label: "Change in TRADE payables", group: "cf", type: "money", periodic: true, hint: "Trade creditors only — other payables have their own line" },
-  { key: "cfChangeInOtherPayables", label: "Change in OTHER payables", group: "cf", type: "money", periodic: true, hint: "Other payables and accruals only — NOT trade creditors" },
+  { key: "cfChangeInOtherPayables", label: "Cash flow: movement in OTHER payables", group: "cf", type: "money", periodic: true, hint: "Only when the cash-flow statement shows a SEPARATE line for other payables/accruals. Leave blank if there is a single combined payables line." },
   { key: "cfTotalAdjustments", label: "Total adjustments to reconcile profit", group: "cf", type: "money", periodic: true },
   { key: "cfFromOperations", label: "Cash flows from operations", group: "cf", type: "money", periodic: true },
   { key: "cfFromOperatingActivities", label: "Net cash from operating activities", group: "cf", type: "money", periodic: true },

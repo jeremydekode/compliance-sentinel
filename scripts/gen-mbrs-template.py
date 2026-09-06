@@ -53,6 +53,7 @@ SOFP = {
     "ifrs-smes:AmountsReceivableRelatedPartyTransactions": "receivablesDueFromRelatedParties",
     "ifrs-smes:AmountsPayableRelatedPartyTransactions": "payablesDueToRelatedParties",
     "ifrs-smes:Buildings": "buildings",
+    "ssmt-mpers:OfficeEquipmentFixtureAndFittings": "officeEquipment",
     "ifrs-smes:CashAndCashEquivalents": "cashAndCashEquivalents",
     "ifrs-smes:Cash": "cashAndCashEquivalents",
     "ifrs-smes:BalancesWithBanks": "cashAndCashEquivalents",

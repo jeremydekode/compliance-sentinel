@@ -739,6 +739,8 @@ export const TEMPLATE_FACTS: TemplateFact[] = [
   {"c":"ssmt-mpers:OtherBalancesWithRelatedParties","ctx":"asof_{CE}_SeparateMember_KeyManagementPersonnelOfEntityOrParentMember","u":"MYR","d":"0","v":"0"},
   {"c":"ssmt-mpers:OtherBalancesWithRelatedParties","ctx":"asof_{CE}_SeparateMember_OtherRelatedPartiesMember","u":"MYR","d":"0","v":"0"},
   {"c":"ssmt-mpers:OtherBalancesWithRelatedParties","ctx":"asof_{CE}_SeparateMember","u":"MYR","d":"0","v":"0"},
+  {"c":"ifrs-smes:CurrentTaxAssetsCurrent","ctx":"asof_{CE}_SeparateMember","u":"MYR","d":"0","field":"currentTaxAssets","period":"current"},
+  {"c":"ifrs-smes:CurrentTaxAssetsCurrent","ctx":"asof_{PE}_SeparateMember","u":"MYR","d":"0","field":"currentTaxAssets","period":"previous"},
   {"c":"ifrs-smes:DeferredTaxLiabilities","ctx":"asof_{CE}_SeparateMember","u":"MYR","d":"0","field":"deferredTaxLiabilities","period":"current"},
   {"c":"ifrs-smes:DeferredTaxLiabilities","ctx":"asof_{PE}_SeparateMember","u":"MYR","d":"0","field":"deferredTaxLiabilities","period":"previous"},
   {"c":"ssmt-mpers:OfficeEquipmentFixtureAndFittings","ctx":"asof_{CE}_SeparateMember","u":"MYR","d":"0","field":"officeEquipment","period":"current"},

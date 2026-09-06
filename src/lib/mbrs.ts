@@ -88,6 +88,7 @@ export const SOFP_FIELDS: FieldSpec[] = [
   { key: "otherReceivables", label: "Other (non-trade) receivables, incl. deposits", group: "sofp", type: "money", periodic: true, hint: "The non-trade subtotal INCLUDING deposits, but EXCLUDING prepayments, trade, and amounts due from holding company or related parties." },
   { key: "receivablesDueFromHoldingCompany", label: "— of which due from holding company", group: "sofp", type: "money", periodic: true, hint: "Holding / parent company ONLY. Breakdown inside other receivables." },
   { key: "receivablesDueFromRelatedParties", label: "— of which due from other related parties", group: "sofp", type: "money", periodic: true, hint: "Directors, subsidiaries, associates, companies under common control — NOT the holding company. Breakdown inside other receivables." },
+  { key: "currentTaxAssets", label: "Current tax assets / tax recoverable", group: "sofp", type: "money", periodic: true, hint: "A separate face line if present (tax recoverable / tax refundable). Leave blank if the statement has none." },
   { key: "cashAndCashEquivalents", label: "Cash and cash equivalents", group: "sofp", type: "money", periodic: true },
   { key: "totalCurrentAssets", label: "Total current assets", group: "sofp", type: "money", periodic: true },
   { key: "totalAssets", label: "Total assets", group: "sofp", type: "money", periodic: true },
@@ -440,7 +441,7 @@ interface RollUp {
 const ROLLUPS: RollUp[] = [
   { total: "totalAssets", parts: ["totalNoncurrentAssets", "totalCurrentAssets"], label: "Total assets = non-current + current assets", group: "sofp" },
   { total: "totalNoncurrentAssets", parts: ["propertyPlantAndEquipment", "investmentProperty", "investmentsInAssociates", "otherNoncurrentAssets"], label: "Non-current assets = PPE + investment property + associates + other", group: "sofp" },
-  { total: "totalCurrentAssets", parts: ["inventories", "tradeReceivables", "otherReceivables", "prepayments", "receivablesDueFromHoldingCompany", "receivablesDueFromRelatedParties", "cashAndCashEquivalents"], label: "Current assets = inventories + receivables + cash", group: "sofp" },
+  { total: "totalCurrentAssets", parts: ["inventories", "tradeReceivables", "otherReceivables", "prepayments", "receivablesDueFromHoldingCompany", "receivablesDueFromRelatedParties", "currentTaxAssets", "cashAndCashEquivalents"], label: "Current assets = inventories + receivables + cash", group: "sofp" },
   { total: "totalLiabilities", parts: ["totalCurrentLiabilities", "totalNoncurrentLiabilities"], label: "Total liabilities = current + non-current", group: "sofp" },
   { total: "totalEquity", parts: ["shareCapital", "retainedEarnings"], label: "Equity = share capital + retained earnings", group: "sofp" },
   { total: "totalCurrentLiabilities", parts: ["tradePayables", "otherPayablesAndAccruals", "payablesDueToHoldingCompany", "payablesDueToRelatedParties", "currentTaxLiabilities", "currentBorrowings"], label: "Current liabilities = trade + other payables + related parties + tax + borrowings", group: "sofp" },

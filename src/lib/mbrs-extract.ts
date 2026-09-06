@@ -179,6 +179,7 @@ and 616,290 + 792,793 = 1,409,083, which agrees with the printed total.
 Payables nest the same way:
   tradePayables + otherPayablesAndAccruals + payablesDueToHoldingCompany + payablesDueToRelatedParties = the payables note's printed total
 with accruals and otherNontradePayables being components OF otherPayablesAndAccruals.
+"Deposits received" / "customer deposits" is INSIDE otherNontradePayables (it nests exactly as deposits nest inside non-trade receivables) — include it there, do not drop it.
 
 Report both reconciliations in "noteChecks" whether they agree or not.
 
@@ -189,6 +190,7 @@ CLASSIFICATION RULES — these decide which field a figure belongs to:
     (a) A SEPARATE line on the face of the statement or in its own note — "Amount owing by directors", "Amount owing by related parties", "Amount due from holding company". THIS is receivablesDueFromHoldingCompany (holding/parent only) or receivablesDueFromRelatedParties (directors, subsidiaries, associates, common control).
     (b) A disclosure INSIDE the receivables note that reads "Included in the above are the following related party balances: ...". Those amounts are ALREADY COUNTED inside tradeReceivables / otherReceivables. Do NOT report them in the related-party fields — doing so counts the money twice.
   Apply exactly the same distinction to payables ("Amount owing to directors" is (a); "included in the above" is (b)).
+  IF THERE IS NO (a) LINE, THE RELATED-PARTY FIELD IS 0. Never fall back to the (b) disclosure to fill it — a filing whose only related-party mention is "included in the above" has NO separate related-party balance, and reporting the inclusion would count that money twice.
 - The same split applies to payables: amounts owing TO those parties.
 - "Trade payables" / "Trade creditors" -> tradePayables. Accruals -> accruals. Other/sundry payables -> otherNontradePayables.
 - otherPayablesAndAccruals is the FACE line for other payables, EXCLUDING amounts owing to holding company / related parties.

@@ -56,6 +56,15 @@ export const ENTITY_FIELDS: FieldSpec[] = [
   { key: "boardApprovalDate", label: "Date approved by the Board", group: "entity", type: "date", periodic: false, hint: "Statement by Directors / Directors' report signing date if not stated separately" },
   { key: "statutoryDeclarationDate", label: "Statutory declaration date", group: "entity", type: "date", periodic: false, hint: "Date the statutory declaration was signed before the Commissioner for Oaths" },
   { key: "circulationDate", label: "Date circulated to members", group: "entity", type: "date", periodic: false, hint: "Often stamped on the cover page — \"circulated on ...\"" },
+  // SSM's mTool generates the applicable template set from these "Filing
+  // Information" answers, then requires the minimum-requirement list for that
+  // set. Our template is derived from one profile (FS-MPERS · Separate ·
+  // audited · income statement by function), so we must read these back and
+  // refuse anything outside it rather than emit a structurally wrong filing.
+  { key: "basisOfAccounting", label: "Reporting framework", group: "entity", type: "text", periodic: false, hint: "MPERS or MFRS, as stated in the basis-of-preparation note" },
+  { key: "financialStatementsType", label: "Separate or consolidated", group: "entity", type: "text", periodic: false, hint: "\"Separate\" for a standalone company; \"Consolidated\" if the accounts consolidate subsidiaries" },
+  { key: "incomeStatementFormat", label: "Income statement presentation", group: "entity", type: "text", periodic: false, hint: "\"By function\" if it shows cost of sales / gross profit; \"By nature\" if it lists purchases, staff costs, depreciation" },
+  { key: "auditStatus", label: "Audit status", group: "entity", type: "text", periodic: false, hint: "Audited or Unaudited" },
   { key: "directorsOtherBenefits", label: "Directors received other benefits by contract?", group: "entity", type: "text", periodic: false, hint: "Yes or No, from the Directors' Report" },
   { key: "contingentLiabilityEnforceable", label: "Contingent liability enforceable within 12 months?", group: "entity", type: "text", periodic: false, hint: "Yes or No, from the Directors' Report" },
   { key: "materialUnusualEvents", label: "Substantial, material or unusual items/events?", group: "entity", type: "text", periodic: false, hint: "Yes or No, from the Directors' Report" },
@@ -91,7 +100,7 @@ export const SOFP_FIELDS: FieldSpec[] = [
   { key: "retainedEarnings", label: "Retained profit / (accumulated loss)", group: "sofp", type: "money", periodic: true },
   { key: "totalEquity", label: "Total equity", group: "sofp", type: "money", periodic: true },
   { key: "tradePayables", label: "Trade payables", group: "sofp", type: "money", periodic: true },
-  { key: "otherPayablesAndAccruals", label: "Other payables and accruals", group: "sofp", type: "money", periodic: true },
+  { key: "otherPayablesAndAccruals", label: "Other payables and accruals", group: "sofp", type: "money", periodic: true, hint: "EXCLUDING amounts due to holding company or related parties, which have their own lines" },
   { key: "payablesDueToHoldingCompany", label: "— of which due to holding company", group: "sofp", type: "money", periodic: true, hint: "Holding / parent company ONLY. Breakdown inside other payables." },
   { key: "payablesDueToRelatedParties", label: "— of which due to other related parties", group: "sofp", type: "money", periodic: true, hint: "Directors, subsidiaries, associates, companies under common control — NOT the holding company. Breakdown inside other payables." },
   { key: "accruals", label: "— of which accruals", group: "sofp", type: "money", periodic: true, hint: "From the payables note" },
@@ -254,6 +263,7 @@ const DERIVED: Array<{
   // SSM's "other current receivables" concept is other + every related-party
   // balance; the face line we extract excludes related parties.
   { key: "otherReceivablesInclRelated", from: ["otherReceivables", "receivablesDueFromHoldingCompany", "receivablesDueFromRelatedParties"] },
+  { key: "otherPayablesInclRelated", from: ["otherPayablesAndAccruals", "payablesDueToHoldingCompany", "payablesDueToRelatedParties"] },
   { key: "totalPayables", from: ["tradePayables", "otherPayablesAndAccruals"] },
   {
     key: "totalNoncurrentLiabilities",
@@ -423,7 +433,7 @@ const ROLLUPS: RollUp[] = [
   { total: "totalLiabilities", parts: ["totalCurrentLiabilities", "totalNoncurrentLiabilities"], label: "Total liabilities = current + non-current", group: "sofp" },
   { total: "totalEquity", parts: ["shareCapital", "retainedEarnings"], label: "Equity = share capital + retained earnings", group: "sofp" },
   { total: "totalCurrentLiabilities", parts: ["tradePayables", "otherPayablesAndAccruals", "currentTaxLiabilities", "currentBorrowings"], label: "Current liabilities = trade + other payables + tax + borrowings", group: "sofp" },
-  { total: "otherPayablesAndAccruals", parts: ["payablesDueToHoldingCompany", "payablesDueToRelatedParties", "accruals", "otherNontradePayables"], label: "Other payables note reconciles to the face amount", group: "sofp" },
+  { total: "otherPayablesAndAccruals", parts: ["accruals", "otherNontradePayables"], label: "Other payables note reconciles to the face amount", group: "sofp" },
   { total: "profitBeforeTax", parts: ["grossProfit", "otherIncome", "administrativeExpenses", "otherOperatingExpenses", "financeCosts"], label: "Profit before tax = gross profit + other income − expenses − finance costs", group: "pl" },
 ];
 
@@ -504,6 +514,62 @@ function validatePeriod(values: PeriodValues, period: Period): ValidationIssue[]
 }
 
 /** Full pre-generation check. Errors block XBRL generation; warnings don't. */
+/**
+ * The one Filing-Information profile our XBRL template was derived from.
+ * mTool builds a DIFFERENT template set for each combination, so a filing
+ * outside this profile needs a different template, not a best-effort fill.
+ */
+export const TEMPLATE_PROFILE = {
+  basis: "MPERS",
+  type: "Separate",
+  format: "By function",
+} as const;
+
+/** Loose contains-match: the extractor returns prose, not an enum. */
+function says(v: string | undefined, ...needles: string[]): boolean {
+  const t = (v ?? "").toLowerCase();
+  return needles.some((n) => t.includes(n));
+}
+
+/**
+ * Refuses filings whose scoping differs from the template's. Silently emitting
+ * a Separate / by-function / MPERS instance for a consolidated, by-nature or
+ * MFRS company would produce a structurally wrong submission that still looks
+ * plausible — the worst failure mode for a statutory return.
+ */
+export function validateProfile(entity: EntityValues): ValidationIssue[] {
+  const out: ValidationIssue[] = [];
+  if (says(entity.financialStatementsType, "consolidat")) {
+    out.push({
+      severity: "error", group: "entity",
+      message: "These are CONSOLIDATED financial statements. This workflow generates a Separate-entity FS-MPERS instance; SSM requires a different template set (with Consolidated columns) for a group filing.",
+      fields: ["financialStatementsType"],
+    });
+  }
+  if (says(entity.basisOfAccounting, "mfrs") && !says(entity.basisOfAccounting, "mpers")) {
+    out.push({
+      severity: "error", group: "entity",
+      message: "These accounts are prepared under MFRS, not MPERS. FS-MFRS uses a different SSM taxonomy and template set.",
+      fields: ["basisOfAccounting"],
+    });
+  }
+  if (says(entity.incomeStatementFormat, "by nature", "nature")) {
+    out.push({
+      severity: "error", group: "entity",
+      message: "The income statement is presented BY NATURE. This template is the by-function variant (cost of sales / gross profit); mTool generates different templates for the two.",
+      fields: ["incomeStatementFormat"],
+    });
+  }
+  if (says(entity.auditStatus, "unaudited")) {
+    out.push({
+      severity: "warning", group: "entity",
+      message: "Accounts are marked UNAUDITED — confirm the audit-status and auditor fields before filing.",
+      fields: ["auditStatus"],
+    });
+  }
+  return out;
+}
+
 export function validateExtraction(x: MbrsExtraction): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
 
@@ -548,6 +614,7 @@ export function validateExtraction(x: MbrsExtraction): ValidationIssue[] {
     });
   }
 
+  issues.push(...validateProfile(x.entity ?? {}));
   issues.push(...validatePeriod(x.current, "current"));
   issues.push(...validatePeriod(x.previous, "previous"));
 

@@ -97,7 +97,7 @@ SOFP = {
     "ifrs-smes:CurrentBorrowings": "currentBorrowings",
     "ssmt-mpers:OtherCurrentTradePayables": "tradePayables",
     "ifrs-smes:TradeAndOtherCurrentPayablesToTradeSuppliers": "tradePayables",
-    "ssmt-mpers:OtherCurrentPayables": "otherPayablesAndAccruals",
+    "ssmt-mpers:OtherCurrentPayables": "otherPayablesInclRelated",
     # Subtotal BELOW the face amount: accruals + other non-trade payables,
     # i.e. the face amount less the holding-company balance.
     "ssmt-mpers:CurrentNontradePayables": "currentNontradePayables",
@@ -170,6 +170,8 @@ DEI = {
     "ssmt:NumberOfEmployees": "numberOfEmployees",
     "ssmt:TypeOfAuditorsOpinion": "auditorsOpinion",
     "ssmt:DisclosureOfStatusOfDividend": "dividendStatus",
+    "ssmt:BasisOfAccountingStandardsAppliedToPrepareFinancialStatements": "basisOfAccounting",
+    "ssmt:DisclosureOfFinancialStatementsAuditStatus": "auditStatus",
     "ssmt:DisclosureOfDirectorsReceivedOrBecomeEntitledToReceiveOtherBenefitsByReasonOfContractMadeByCompanyOrRelatedCorporation": "directorsOtherBenefits",
     "ssmt:DisclosureOfContingentOrOtherLiabilityBeingEnforceableWithinTwelveMonthsAfterEndOfFinancialYear": "contingentLiabilityEnforceable",
     "ssmt:DisclosureOfOccurenceOfAnySubstantialMaterialOrUnusualInNatureItemsTransactionsOrEvents": "materialUnusualEvents",

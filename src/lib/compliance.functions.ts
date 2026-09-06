@@ -7231,14 +7231,23 @@ export const runMbrsExtraction = createServerFn({ method: "POST" })
       .eq("id", report.id);
 
     try {
-      const { extractMbrsFromAfs } = await import("./mbrs-extract");
+      const { extractMbrsConsensus } = await import("./mbrs-extract");
       const { normalizeExtraction, validateExtraction } = await import("./mbrs");
 
       const f = await fetchFile(report.source_file_url);
-      const { extraction, usage, model, ocrUsed, principalActivities } = await extractMbrsFromAfs({
-        buffer: f.buffer,
-        mimeType: f.mimeType,
-      });
+      // Consensus is available (MBRS_EXTRACTION_RUNS) but defaults to a single
+      // run. Measured on three accepted filings: at temperature 0 the runs are
+      // near-identical (spread 0-1.9 points, one filing produced three identical
+      // extractions) and three-run consensus matched the best single run
+      // exactly, with no change in the wrong-value rate. The residual errors
+      // are systematic, not random, so majority voting cannot remove them and
+      // tripling the cost buys nothing. Raise this only for a high-stakes
+      // filing where the per-field disagreement warnings are worth the spend.
+      const runs = Math.max(1, Number(process.env.MBRS_EXTRACTION_RUNS ?? 1) || 1);
+      const { extraction, usage, model, ocrUsed, principalActivities } = await extractMbrsConsensus(
+        { buffer: f.buffer, mimeType: f.mimeType },
+        runs,
+      );
 
       // Candidate MSIC codes for the filer to choose from. Never auto-applied:
       // these are suggestions shown beside the report wording they came from,

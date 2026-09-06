@@ -85,7 +85,7 @@ export const ENTITY_FIELDS: FieldSpec[] = [
 export const SOFP_FIELDS: FieldSpec[] = [
   { key: "propertyPlantAndEquipment", label: "Property, plant and equipment", group: "sofp", type: "money", periodic: true },
   { key: "totalNoncurrentAssets", label: "Total non-current assets", group: "sofp", type: "money", periodic: true },
-  { key: "otherReceivables", label: "Other (non-trade) receivables, incl. deposits and prepayments", group: "sofp", type: "money", periodic: true, hint: "The whole non-trade subtotal INCLUDING deposits and prepayments, but EXCLUDING trade and amounts due from holding company or related parties." },
+  { key: "otherReceivables", label: "Other (non-trade) receivables, incl. deposits", group: "sofp", type: "money", periodic: true, hint: "The non-trade subtotal INCLUDING deposits, but EXCLUDING prepayments, trade, and amounts due from holding company or related parties." },
   { key: "receivablesDueFromHoldingCompany", label: "— of which due from holding company", group: "sofp", type: "money", periodic: true, hint: "Holding / parent company ONLY. Breakdown inside other receivables." },
   { key: "receivablesDueFromRelatedParties", label: "— of which due from other related parties", group: "sofp", type: "money", periodic: true, hint: "Directors, subsidiaries, associates, companies under common control — NOT the holding company. Breakdown inside other receivables." },
   { key: "cashAndCashEquivalents", label: "Cash and cash equivalents", group: "sofp", type: "money", periodic: true },
@@ -105,7 +105,7 @@ export const SOFP_FIELDS: FieldSpec[] = [
   { key: "payablesDueToHoldingCompany", label: "— of which due to holding company", group: "sofp", type: "money", periodic: true, hint: "Holding / parent company ONLY. Breakdown inside other payables." },
   { key: "payablesDueToRelatedParties", label: "— of which due to other related parties", group: "sofp", type: "money", periodic: true, hint: "Directors, subsidiaries, associates, companies under common control — NOT the holding company. Breakdown inside other payables." },
   { key: "accruals", label: "— of which accruals", group: "sofp", type: "money", periodic: true, hint: "From the payables note" },
-  { key: "prepayments", label: "— of which prepayments and accrued income", group: "sofp", type: "money", periodic: true, hint: "A component INSIDE other receivables, reported separately as well" },
+  { key: "prepayments", label: "Prepayments and accrued income", group: "sofp", type: "money", periodic: true, hint: "Reported BESIDE other receivables, not inside it" },
   { key: "deposits", label: "— of which deposits", group: "sofp", type: "money", periodic: true, hint: "A component INSIDE other receivables, reported separately as well" },
   { key: "otherNontradePayables", label: "— of which other non-trade payables", group: "sofp", type: "money", periodic: true, hint: "From the payables note" },
   { key: "currentNontradePayables", label: "— non-trade payables subtotal", group: "sofp", type: "money", periodic: true, hint: "Accruals + other non-trade payables. Computed automatically if left blank." },
@@ -124,6 +124,8 @@ export const SOFP_FIELDS: FieldSpec[] = [
   { key: "totalNoncurrentLiabilities", label: "Total non-current liabilities", group: "sofp", type: "money", periodic: true },
   { key: "noncurrentBorrowings", label: "— of which borrowings (non-current)", group: "sofp", type: "money", periodic: true },
   { key: "deferredTaxLiabilities", label: "— of which deferred tax", group: "sofp", type: "money", periodic: true },
+  { key: "noncurrentBankLoans", label: "— of which bank / term loans (non-current)", group: "sofp", type: "money", periodic: true, hint: "Bank and term loans only, EXCLUDING hire purchase and lease liabilities" },
+  { key: "currentBankLoans", label: "— of which bank / term loans (current)", group: "sofp", type: "money", periodic: true, hint: "Bank and term loans only, EXCLUDING hire purchase and lease liabilities" },
   { key: "currentBorrowings", label: "Borrowings (current)", group: "sofp", type: "money", periodic: true },
 ];
 
@@ -193,6 +195,9 @@ export interface MbrsExtraction {
   na?: string[];
   /** Free-text notes from the extractor about anything ambiguous. */
   extractionNotes?: string[];
+  /** Per-field agreement across consensus runs, keyed "current.<field>" etc.
+   *  Only fields that were NOT unanimous are recorded. */
+  agreement?: Record<string, { level: "unanimous" | "majority" | "disputed"; candidates: Array<number | string | null> }>;
 }
 
 export function emptyExtraction(): MbrsExtraction {
@@ -253,19 +258,24 @@ const DERIVED: Array<{
   // Total adjustments reconciling profit to operating cash flow. Models
   // reliably read this as "the depreciation line" because that is the only
   // add-back with an obvious label, so it is computed rather than trusted.
-  {
-    key: "cfTotalAdjustments",
-    from: ["depreciation", "cfChangeInTradeReceivables", "cfChangeInReceivables", "cfChangeInTradePayables", "cfChangeInOtherPayables"],
-  },
+  // Exact by definition: the adjustments are whatever bridges profit before
+  // tax to cash generated from operations. Summing the individual working-
+  // capital lines was fragile (a mis-classified line broke it); this identity
+  // is not. Verified: LS 21,282 - 190,459 = -169,177; Yee 324,492 - (-162,240)
+  // = 486,732, both exactly the accepted filing's figure.
+  { key: "cfTotalAdjustments", from: ["cfFromOperations"], minus: ["profitBeforeTax"] },
+  // Operating profit before finance costs — SSM's ProfitLossFromOperatingActivities.
+  // Verified: Yee -162,240 + 52,217 = -110,023, the accepted figure.
+  { key: "operatingProfit", from: ["profitBeforeTax", "financeCosts"] },
   // Recoverable arithmetically when the face of the statement shows only the
   // totals. QSK's RM607,211.94 of non-current liabilities was sitting derivable
   // in the extraction the whole time, while the filing declared zero.
-  { key: "totalReceivables", from: ["tradeReceivables", "otherReceivables", "receivablesDueFromHoldingCompany", "receivablesDueFromRelatedParties"] },
+  { key: "totalReceivables", from: ["tradeReceivables", "otherReceivables", "prepayments", "receivablesDueFromHoldingCompany", "receivablesDueFromRelatedParties"] },
   // SSM's "other current receivables" concept is other + every related-party
   // balance; the face line we extract excludes related parties.
-  { key: "otherReceivablesInclRelated", from: ["otherReceivables", "receivablesDueFromHoldingCompany", "receivablesDueFromRelatedParties"] },
+  { key: "otherReceivablesInclRelated", from: ["otherReceivables", "prepayments", "receivablesDueFromHoldingCompany", "receivablesDueFromRelatedParties"] },
   { key: "otherPayablesInclRelated", from: ["otherPayablesAndAccruals", "payablesDueToHoldingCompany", "payablesDueToRelatedParties"] },
-  { key: "totalPayables", from: ["tradePayables", "otherPayablesAndAccruals"] },
+  { key: "totalPayables", from: ["tradePayables", "otherPayablesAndAccruals", "payablesDueToHoldingCompany", "payablesDueToRelatedParties"] },
   {
     key: "totalNoncurrentLiabilities",
     from: ["totalLiabilities"],
@@ -430,7 +440,7 @@ interface RollUp {
 const ROLLUPS: RollUp[] = [
   { total: "totalAssets", parts: ["totalNoncurrentAssets", "totalCurrentAssets"], label: "Total assets = non-current + current assets", group: "sofp" },
   { total: "totalNoncurrentAssets", parts: ["propertyPlantAndEquipment", "investmentProperty", "investmentsInAssociates", "otherNoncurrentAssets"], label: "Non-current assets = PPE + investment property + associates + other", group: "sofp" },
-  { total: "totalCurrentAssets", parts: ["inventories", "tradeReceivables", "otherReceivables", "receivablesDueFromHoldingCompany", "receivablesDueFromRelatedParties", "cashAndCashEquivalents"], label: "Current assets = inventories + receivables + cash", group: "sofp" },
+  { total: "totalCurrentAssets", parts: ["inventories", "tradeReceivables", "otherReceivables", "prepayments", "receivablesDueFromHoldingCompany", "receivablesDueFromRelatedParties", "cashAndCashEquivalents"], label: "Current assets = inventories + receivables + cash", group: "sofp" },
   { total: "totalLiabilities", parts: ["totalCurrentLiabilities", "totalNoncurrentLiabilities"], label: "Total liabilities = current + non-current", group: "sofp" },
   { total: "totalEquity", parts: ["shareCapital", "retainedEarnings"], label: "Equity = share capital + retained earnings", group: "sofp" },
   { total: "totalCurrentLiabilities", parts: ["tradePayables", "otherPayablesAndAccruals", "currentTaxLiabilities", "currentBorrowings"], label: "Current liabilities = trade + other payables + tax + borrowings", group: "sofp" },
@@ -571,6 +581,40 @@ export function validateProfile(entity: EntityValues): ValidationIssue[] {
   return out;
 }
 
+/**
+ * Turns consensus disagreement into reviewer-facing warnings. A disputed
+ * field has been left blank on purpose — the runs could not agree, so nothing
+ * was filed and the reviewer decides. A majority field IS filed, but the
+ * minority reading is shown so an honest 2-vs-1 split is not mistaken for
+ * certainty.
+ */
+function validateAgreement(x: MbrsExtraction): ValidationIssue[] {
+  const out: ValidationIssue[] = [];
+  const fmt = (v: number | string | null) =>
+    v === null ? "—" : typeof v === "number" ? v.toLocaleString("en-MY", { maximumFractionDigits: 2 }) : String(v);
+  const label = (key: string) => ALL_FIELDS.find((f) => f.key === key)?.label ?? key;
+  for (const [k, ag] of Object.entries(x.agreement ?? {})) {
+    const [scope, field] = k.split(".");
+    const group: FieldSpec["group"] = ALL_FIELDS.find((f) => f.key === field)?.group ?? "sofp";
+    const period = scope === "current" || scope === "previous" ? (scope as Period) : undefined;
+    const readings = ag.candidates.map(fmt).join(" / ");
+    if (ag.level === "disputed") {
+      out.push({
+        severity: "warning", group, period,
+        message: `${label(field)}${period ? ` (${period})` : ""}: extraction runs disagreed — ${readings}. Left blank; confirm from the report.`,
+        fields: [field],
+      });
+    } else if (ag.level === "majority") {
+      out.push({
+        severity: "warning", group, period,
+        message: `${label(field)}${period ? ` (${period})` : ""}: 2 of 3 runs agree — ${readings}. Worth a glance.`,
+        fields: [field],
+      });
+    }
+  }
+  return out;
+}
+
 export function validateExtraction(x: MbrsExtraction): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
 
@@ -616,6 +660,7 @@ export function validateExtraction(x: MbrsExtraction): ValidationIssue[] {
   }
 
   issues.push(...validateProfile(x.entity ?? {}));
+  issues.push(...validateAgreement(x));
   issues.push(...validatePeriod(x.current, "current"));
   issues.push(...validatePeriod(x.previous, "previous"));
 

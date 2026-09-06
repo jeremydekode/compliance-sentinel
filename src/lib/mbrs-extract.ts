@@ -160,15 +160,15 @@ This arithmetic self-check is the point of this task. A component that does not 
 HOW THE RECEIVABLE AND PAYABLE FIELDS NEST. SSM's taxonomy is a hierarchy, not a flat list. Some fields are SUBTOTALS that contain others, so a figure can legitimately appear in two places — but only in the nesting below.
 
   tradeReceivables                  trade debtors only
-  otherReceivables                  ALL non-trade amounts EXCEPT related parties — this SUBTOTAL INCLUDES deposits and prepayments
+  otherReceivables                  non-trade amounts EXCEPT prepayments and EXCEPT related parties — this SUBTOTAL INCLUDES deposits
     deposits                        a component OF otherReceivables (report it as well, do not subtract it)
-    prepayments                     a component OF otherReceivables (report it as well, do not subtract it)
+  prepayments                       prepayments and accrued income — a SIBLING of otherReceivables, NOT inside it
   receivablesDueFromHoldingCompany  holding / parent company only
   receivablesDueFromRelatedParties  directors, subsidiaries, associates, common control
 
 Before answering, run this reconciliation and fix it if it fails:
-  tradeReceivables + otherReceivables + receivablesDueFromHoldingCompany + receivablesDueFromRelatedParties  =  the receivables note's printed total
-(deposits and prepayments are NOT added again — they are already inside otherReceivables)
+  tradeReceivables + otherReceivables + prepayments + receivablesDueFromHoldingCompany + receivablesDueFromRelatedParties  =  the receivables note's printed total
+(deposits are NOT added again — they are already inside otherReceivables; prepayments ARE added — they sit beside it)
 
 Worked example. A note reading: trade 616,290 / non-trade 747,493 / deposits 45,300 / total 1,409,083 gives
   tradeReceivables = 616290
@@ -185,12 +185,17 @@ Report both reconciliations in "noteChecks" whether they agree or not.
 CLASSIFICATION RULES — these decide which field a figure belongs to:
 - "Trade receivables" / "Trade debtors" -> tradeReceivables. Anything labelled non-trade, other, sundry -> otherReceivables.
 - "Deposits" -> deposits. "Prepayments" / "prepaid" / "accrued income" -> prepayments.
-- Amounts owing BY directors / holding company / subsidiaries / associates / related companies -> receivablesDueFromHoldingCompany (holding/parent ONLY) or receivablesDueFromRelatedParties (directors, subsidiaries, associates, common control).
+- RELATED PARTIES — two very different things appear in these notes, and only one belongs in the related-party fields:
+    (a) A SEPARATE line on the face of the statement or in its own note — "Amount owing by directors", "Amount owing by related parties", "Amount due from holding company". THIS is receivablesDueFromHoldingCompany (holding/parent only) or receivablesDueFromRelatedParties (directors, subsidiaries, associates, common control).
+    (b) A disclosure INSIDE the receivables note that reads "Included in the above are the following related party balances: ...". Those amounts are ALREADY COUNTED inside tradeReceivables / otherReceivables. Do NOT report them in the related-party fields — doing so counts the money twice.
+  Apply exactly the same distinction to payables ("Amount owing to directors" is (a); "included in the above" is (b)).
 - The same split applies to payables: amounts owing TO those parties.
 - "Trade payables" / "Trade creditors" -> tradePayables. Accruals -> accruals. Other/sundry payables -> otherNontradePayables.
 - otherPayablesAndAccruals is the FACE line for other payables, EXCLUDING amounts owing to holding company / related parties.
-- From the property, plant and equipment note take the CARRYING AMOUNT (not cost, not accumulated depreciation) for: buildings (incl. showroom/factory/shoplot) and officeEquipment (office equipment, furniture and fittings).
-- Borrowings: split the current portion (currentBorrowings) from the non-current portion (noncurrentBorrowings), including bank loans, term loans, hire purchase and lease liabilities.
+- From the property, plant and equipment note take the CARRYING AMOUNT (not cost, not accumulated depreciation) for: buildings (incl. showroom, factory, shoplot, land and buildings) and officeEquipment — which is the SUM of office equipment + furniture and fittings + renovation / fixtures (SSM classes renovation here).
+- Borrowings, two levels:
+    currentBorrowings / noncurrentBorrowings = ALL borrowings for that portion, including bank loans, term loans, hire purchase and lease liabilities.
+    currentBankLoans / noncurrentBankLoans  = bank and term loans ONLY for that portion — exclude hire purchase and lease liabilities. Read them from the bank-borrowings note, not the lease note.
 - keyManagementCompensation: directors' remuneration / key management personnel compensation from the related-party or directors' remuneration note.
 - auditorsRemuneration: the auditors' remuneration figure, usually in the profit-before-tax note.
 
@@ -243,7 +248,7 @@ export async function extractMbrsFromAfs(
 
   const response = await generateWithFallback({
     contents: [{ role: "user", parts }],
-    config: { responseMimeType: "application/json", maxOutputTokens: 65536 },
+    config: { responseMimeType: "application/json", maxOutputTokens: 65536, temperature: 0 },
   }, { tier: "quality" });
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -307,7 +312,7 @@ export async function extractMbrsFromAfs(
         ];
     const nres = await generateWithFallback({
       contents: [{ role: "user", parts: notesParts }],
-      config: { responseMimeType: "application/json", maxOutputTokens: 16384 },
+      config: { responseMimeType: "application/json", maxOutputTokens: 16384, temperature: 0 },
     }, { tier: "quality" });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const nm = (nres.usageMetadata ?? {}) as any;
@@ -339,4 +344,142 @@ export async function extractMbrsFromAfs(
   }
 
   return { extraction, usage, model, ocrUsed, principalActivities };
+}
+
+
+// ── consensus extraction ─────────────────────────────────────────────────────
+
+export type AgreementLevel = "unanimous" | "majority" | "disputed";
+
+export interface FieldAgreement {
+  level: AgreementLevel;
+  /** Every run's reading, in run order, so a reviewer can see what disagreed. */
+  candidates: Array<number | string | null>;
+}
+
+export interface MbrsConsensusResult extends MbrsExtractResult {
+  /** How many runs were merged. */
+  runs: number;
+  /** Per-field agreement, keyed "current.revenue" / "previous.revenue" / "entity.auditorName". */
+  agreement: Record<string, FieldAgreement>;
+  /** The individual runs, for evaluation. Not for persistence — they are heavy. */
+  individual: MbrsExtraction[];
+}
+
+function voteNumbers(vals: Array<number | null | undefined>): { value: number | null; agreement: FieldAgreement } {
+  const cands = vals.map((v) => (typeof v === "number" && Number.isFinite(v) ? v : null));
+  const present = cands.filter((v): v is number => v !== null);
+  if (present.length === 0) return { value: null, agreement: { level: "unanimous", candidates: cands } };
+  // Group to the cent so 1234.5 and 1234.50 are one reading.
+  const groups = new Map<string, { value: number; n: number }>();
+  for (const v of present) {
+    const k = v.toFixed(2);
+    const g = groups.get(k);
+    if (g) g.n += 1; else groups.set(k, { value: v, n: 1 });
+  }
+  const best = [...groups.values()].sort((a, b) => b.n - a.n)[0];
+  const n = cands.length;
+  if (best.n === n) return { value: best.value, agreement: { level: "unanimous", candidates: cands } };
+  if (best.n > n / 2) return { value: best.value, agreement: { level: "majority", candidates: cands } };
+  // No reading commands a majority. A statutory figure the runs cannot agree on
+  // is not filed — it is handed to the reviewer with every candidate shown.
+  return { value: null, agreement: { level: "disputed", candidates: cands } };
+}
+
+function voteStrings(vals: Array<string | undefined>): { value: string | undefined; agreement: FieldAgreement } {
+  const cands = vals.map((v) => (typeof v === "string" && v.trim() ? v.trim() : null));
+  const present = cands.filter((v): v is string => v !== null);
+  if (present.length === 0) return { value: undefined, agreement: { level: "unanimous", candidates: cands } };
+  const norm = (v: string) => v.toLowerCase().replace(/\s+/g, " ").replace(/[.,]/g, "");
+  const groups = new Map<string, { value: string; n: number }>();
+  for (const v of present) {
+    const k = norm(v);
+    const g = groups.get(k);
+    if (g) g.n += 1; else groups.set(k, { value: v, n: 1 });
+  }
+  const best = [...groups.values()].sort((a, b) => b.n - a.n)[0];
+  const n = cands.length;
+  if (best.n === n) return { value: best.value, agreement: { level: "unanimous", candidates: cands } };
+  if (best.n > n / 2) return { value: best.value, agreement: { level: "majority", candidates: cands } };
+  return { value: undefined, agreement: { level: "disputed", candidates: cands } };
+}
+
+/**
+ * Runs the extraction `runs` times in parallel and keeps, per field, the reading
+ * a majority of runs agree on.
+ *
+ * WHY: at temperature 0 the model is still not deterministic on a 48-page
+ * scan, and a single run's misread (74,543 for a printed 747,493) is
+ * indistinguishable from a correct read. Three runs make a misread visible: it
+ * becomes the minority. Fields with no majority are returned as null and
+ * surfaced to the reviewer with every candidate, rather than filed.
+ *
+ * COST: linear in `runs` (three runs ≈ RM1.30 per filing at 2026 promo rates)
+ * — negligible against the labour of a rejected statutory filing, and the
+ * disagreement list tells the reviewer exactly which figures to check instead
+ * of all of them.
+ */
+export async function extractMbrsConsensus(
+  file: { buffer: Buffer; mimeType: string },
+  runs = 3,
+): Promise<MbrsConsensusResult> {
+  const n = Math.max(1, Math.floor(runs));
+  const results = await Promise.all(Array.from({ length: n }, () => extractMbrsFromAfs(file)));
+  const base = results[0];
+  if (n === 1) {
+    return { ...base, runs: 1, agreement: {}, individual: [base.extraction] };
+  }
+
+  const usage: TokenUsage = results.reduce(
+    (a, r) => ({
+      inputTokens: a.inputTokens + r.usage.inputTokens,
+      outputTokens: a.outputTokens + r.usage.outputTokens,
+      thinkingTokens: a.thinkingTokens + r.usage.thinkingTokens,
+      calls: a.calls + r.usage.calls,
+    }),
+    { inputTokens: 0, outputTokens: 0, thinkingTokens: 0, calls: 0 },
+  );
+
+  const agreement: Record<string, FieldAgreement> = {};
+  const merged: MbrsExtraction = { ...emptyExtraction(), narratives: { ...base.extraction.narratives } };
+
+  const numericKeys = new Set(FINANCIAL_FIELDS.map((f) => f.key));
+  for (const period of ["current", "previous"] as const) {
+    for (const k of numericKeys) {
+      const { value, agreement: ag } = voteNumbers(results.map((r) => r.extraction[period][k]));
+      if (value !== null) merged[period][k] = value;
+      if (ag.level !== "unanimous") agreement[`${period}.${k}`] = ag;
+    }
+  }
+  for (const f of ENTITY_FIELDS) {
+    const { value, agreement: ag } = voteStrings(results.map((r) => r.extraction.entity[f.key]));
+    if (value !== undefined) merged.entity[f.key] = value;
+    if (ag.level !== "unanimous") agreement[`entity.${f.key}`] = ag;
+  }
+
+  // Missing = still null after voting. Disputed fields join it, since nothing
+  // was filed for them.
+  const stillMissing = new Set<string>();
+  for (const r of results) for (const m of r.extraction.missing) stillMissing.add(m);
+  for (const k of numericKeys) {
+    if (typeof merged.current[k] !== "number" && typeof merged.previous[k] !== "number") stillMissing.add(k);
+    else stillMissing.delete(k);
+  }
+  for (const f of ENTITY_FIELDS) {
+    if (merged.entity[f.key]) stillMissing.delete(f.key); else if (results.some((r) => r.extraction.missing.includes(f.key))) stillMissing.add(f.key);
+  }
+  merged.missing = [...stillMissing];
+  merged.extractionNotes = [...new Set(results.flatMap((r) => r.extraction.extractionNotes ?? []))].slice(0, 40);
+  merged.agreement = agreement;
+
+  return {
+    extraction: merged,
+    usage,
+    model: base.model,
+    ocrUsed: results.some((r) => r.ocrUsed),
+    principalActivities: base.principalActivities,
+    runs: n,
+    agreement,
+    individual: results.map((r) => r.extraction),
+  };
 }

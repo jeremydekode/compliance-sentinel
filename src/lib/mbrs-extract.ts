@@ -191,6 +191,7 @@ CLASSIFICATION RULES — these decide which field a figure belongs to:
     (b) A disclosure INSIDE the receivables note that reads "Included in the above are the following related party balances: ...". Those amounts are ALREADY COUNTED inside tradeReceivables / otherReceivables. Do NOT report them in the related-party fields — doing so counts the money twice.
   Apply exactly the same distinction to payables ("Amount owing to directors" is (a); "included in the above" is (b)).
   IF THERE IS NO (a) LINE, THE RELATED-PARTY FIELD IS 0. Never fall back to the (b) disclosure to fill it — a filing whose only related-party mention is "included in the above" has NO separate related-party balance, and reporting the inclusion would count that money twice.
+  WHERE TO LOOK FOR THE (a) LINE: it is usually on the FACE of the Statement of Financial Position itself — a line such as "Amount owing by directors  9  669,885" with its own note number — because that note often carries no table, only wording like "unsecured, interest-free and repayable on demand". So for these related-party fields specifically, check the Statement of Financial Position face as well as the notes. A separate face line is an (a) line even when its note has no figures.
 - The same split applies to payables: amounts owing TO those parties.
 - "Trade payables" / "Trade creditors" -> tradePayables. Accruals -> accruals. Other/sundry payables -> otherNontradePayables.
 - otherPayablesAndAccruals is the FACE line for other payables, EXCLUDING amounts owing to holding company / related parties.

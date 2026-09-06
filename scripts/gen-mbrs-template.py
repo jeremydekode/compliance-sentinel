@@ -86,6 +86,14 @@ SOFP = {
     "ssmt-mpers:OtherCurrentNontradeReceivables": "otherReceivables",
     "ssmt-mpers:OtherCurrentPrepaymentsAndCurrentAccruedIncome": "prepayments",
     "ssmt-mpers:OtherCurrentNontradeDeposits": "deposits",
+    "ssmt-mpers:OtherCurrentPrepayments": "prepayments",
+    "ssmt-mpers:PlantAndEquipment": "plantAndEquipment",
+    "ifrs-smes:Vehicles": "vehicles",
+    "ssmt-mpers:OtherInvestmentProperty": "investmentProperty",
+    "ssmt-mpers:InvestmentsInAssociatesUnquotedSharesNetOfImpairmentLosses": "investmentsInAssociates",
+    "ssmt-mpers:CurrentSecuredBankLoansReceivedAndCurrentPortionOfNoncurrentSecuredBankLoansReceived": "currentBankLoans",
+    "ssmt-mpers:CurrentPortionOfFinanceLeaseLiabilities": "financeLeaseCurrent",
+    "ssmt-mpers:NoncurrentPortionOfFinanceLeaseLiabilities": "financeLeaseNoncurrent",
     "ssmt-mpers:OtherCurrentReceivablesDueFromOtherRelatedParties": "receivablesDueFromRelatedParties",
     "ssmt-mpers:NoncurrentPortionOfNoncurrentSecuredBankLoansReceived": "noncurrentBankLoans",
     "ifrs-smes:TradeAndOtherCurrentPayables": "totalPayables",
@@ -156,6 +164,7 @@ CF = {
     "ifrs-smes:PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities": "cfPurchaseOfPpe",
     "ifrs-smes:CashFlowsFromUsedInInvestingActivities": "cfFromInvestingActivities",
     "ifrs-smes:CashFlowsFromUsedInFinancingActivities": "cfFromFinancingActivities",
+    "ifrs-smes:RepaymentsOfBorrowingsClassifiedAsFinancingActivities": "cfRepaymentOfBorrowings",
     "ifrs-smes:IncomeTaxesPaidRefundClassifiedAsOperatingActivities": "incomeTaxPaid",
     # add-back of finance costs in the operating reconciliation = the P&L line
     "ifrs-smes:AdjustmentsForFinanceCosts": "financeCosts",
@@ -449,7 +458,7 @@ def main(*paths):
                 merged[key] = e     # a later donor let us bind what an earlier one could not
         ctx_struct.update(sctx)
 
-    facts, bound, narrative, dropped, varying = [], 0, 0, [], []
+    facts, bound, narrative, dropped, varying, unbound = [], 0, 0, [], [], []
     for key in order:
         e = merged[key]
         name = e["c"]
@@ -463,18 +472,19 @@ def main(*paths):
             continue
 
         lits = seen_literal.get(key, set())
-        # A literal that DIFFERS between donors is company data, not a constant.
-        # Emitting either one publishes one company's answer into every other
-        # filing - exactly the defect this generator shipped before. Drop it and
-        # let the fact be absent.
-        if len(lits) > 1:
-            varying.append(f"{name} ({' | '.join(sorted(lits))[:70]})")
-            continue
-        # Single-donor monetary literals are still that donor's money unless
-        # they are a structural zero.
-        if e.get("u") == "MYR" and _nonzero_money(e.get("v", "")):
-            dropped.append(f"{name} ({e['v']})")
-            continue
+        # A literal that DIFFERS between donors is company data, not a constant,
+        # and so is any non-zero amount. Strip the VALUE — but keep the box.
+        # Deleting the box was the deeper bug: 130 boxes SSM actually uses had
+        # vanished, and no amount of extraction quality can fill a box that
+        # isn't there. An unbound box emits nothing until a field is mapped to
+        # it, then works immediately.
+        strip = (len(lits) > 1) or (e.get("u") == "MYR" and _nonzero_money(e.get("v", "")))
+        if strip:
+            (varying if len(lits) > 1 else dropped).append(
+                f"{name} ({' | '.join(sorted(lits))[:60] if len(lits) > 1 else e.get('v')})"
+            )
+            e = {k: v for k, v in e.items() if k != "v"}
+            unbound.append(name)
         facts.append(e)
 
     header = f'''// AUTO-DERIVED from a real SSM MBRS Preparation Tool instance document
@@ -561,10 +571,13 @@ export interface TemplateContext {{
     if dropped:
         print(f"dropped {len(dropped)} unbindable monetary literals (donor's money)")
     if varying:
-        print(f"dropped {len(varying)} literals that DIFFER between donors "
-              f"(company data, not constants):")
-        for d in varying[:80]:
-            print(f"   - {d}")
+        print(f"stripped {len(varying)} literals that DIFFER between donors (company data)")
+    if unbound:
+        from collections import Counter as _C
+        u = _C(unbound)
+        print(f"{len(unbound)} boxes kept but UNBOUND — map a field to each to fill it:")
+        for c, n in u.most_common(25):
+            print(f"   {n:3}x {c}")
     print(f"wrote {SRC_DIR}/mbrs-template.ts ({len(out)} bytes)")
     print(f"wrote {SRC_DIR}/mbrs-narratives.ts ({len(narr)} concepts)")
 

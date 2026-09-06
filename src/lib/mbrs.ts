@@ -97,6 +97,10 @@ export const SOFP_FIELDS: FieldSpec[] = [
   { key: "openingRetainedEarnings", label: "Retained earnings at START of period", group: "sofp", type: "money", periodic: true, hint: "Opening balance row of the statement of changes in equity" },
   { key: "openingTotalEquity", label: "Total equity at START of period", group: "sofp", type: "money", periodic: true, hint: "Opening balance row of the statement of changes in equity" },
   { key: "buildings", label: "— of which buildings", group: "sofp", type: "money", periodic: true, hint: "Carrying amount from the PPE note. Breakdown inside PPE, not additional to it." },
+  { key: "vehicles", label: "— of which motor vehicles", group: "sofp", type: "money", periodic: true, hint: "Carrying amount from the PPE note. Breakdown inside PPE." },
+  { key: "plantAndEquipment", label: "— of which plant and machinery", group: "sofp", type: "money", periodic: true, hint: "Carrying amount from the PPE note. Breakdown inside PPE." },
+  { key: "financeLeaseCurrent", label: "Finance lease / hire purchase liabilities (current)", group: "sofp", type: "money", periodic: true },
+  { key: "financeLeaseNoncurrent", label: "Finance lease / hire purchase liabilities (non-current)", group: "sofp", type: "money", periodic: true },
   { key: "officeEquipment", label: "— of which office equipment, fixtures and fittings", group: "sofp", type: "money", periodic: true, hint: "Carrying amount from the PPE note. Breakdown inside PPE, not additional to it." },
   { key: "numberOfShares", label: "Number of shares issued and fully paid", group: "sofp", type: "number", periodic: true },
   { key: "retainedEarnings", label: "Retained profit / (accumulated loss)", group: "sofp", type: "money", periodic: true },
@@ -167,6 +171,7 @@ export const CF_FIELDS: FieldSpec[] = [
   { key: "cfPurchaseOfPpe", label: "Purchase of property, plant and equipment", group: "cf", type: "money", periodic: true },
   { key: "cfFromInvestingActivities", label: "Net cash from investing activities", group: "cf", type: "money", periodic: true },
   { key: "incomeTaxPaid", label: "Income taxes paid", group: "cf", type: "money", periodic: true, hint: "Negative number as shown in the cash flow (an outflow)" },
+  { key: "cfRepaymentOfBorrowings", label: "Repayment of borrowings", group: "cf", type: "money", periodic: true, hint: "Positive number — the gross repayment, as printed" },
   { key: "cfFromFinancingActivities", label: "Net cash from financing activities", group: "cf", type: "money", periodic: true },
   { key: "cfNetIncreaseInCash", label: "Net increase / (decrease) in cash", group: "cf", type: "money", periodic: true },
 ];

@@ -114,7 +114,9 @@ function factValue(f: TemplateFact, x: MbrsExtraction): string | null {
     const v = x.entity?.[f.field];
     return typeof v === "string" && v.trim() ? v.trim() : null;
   }
-  return f.v ?? "";
+  // No field, no narrative and no literal: the box exists in the template but
+  // nothing is bound to it yet. Skip it — an empty element is not a valid fact.
+  return f.v ?? null;
 }
 
 function renderContexts(used: Set<string>, tokens: TokenMap): string {
